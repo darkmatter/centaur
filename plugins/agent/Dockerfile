@@ -37,9 +37,10 @@ RUN useradd -m -s /bin/bash agent \
     && mkdir -p /repos \
     && chown agent:agent /repos
 
-# Pre-create config dirs
+# Set up agent user's home with amp runtime marker + config dirs
 USER agent
-RUN mkdir -p ~/.config/amp ~/.codex
+RUN mkdir -p ~/.amp/bin ~/.config/amp ~/.codex \
+    && ln -s /usr/local/bin/amp ~/.amp/bin/amp
 WORKDIR /repos
 
 # Copy pre-cloned repos

@@ -132,7 +132,7 @@ _LOGIN_HTML = """<!DOCTYPE html>
   <div class="card">
     <h1>Tempo AI</h1>
     <p class="subtitle">Enter the password to view agent threads</p>
-    <form method="POST" action="/ui/login">
+    <form method="POST" action="/login">
       <label for="password">Password</label>
       <input type="password" id="password" name="password"
              placeholder="••••••••" autofocus autocomplete="current-password"/>
@@ -144,29 +144,29 @@ _LOGIN_HTML = """<!DOCTYPE html>
 </html>"""
 
 
-@router.get("/ui/login")
+@router.get("/login")
 async def login_page(request: Request):
     """Serve the login form."""
     if _check_auth(request):
-        return RedirectResponse("/ui/threads", status_code=302)
+        return RedirectResponse("/threads", status_code=302)
     error = request.query_params.get("error", "")
     error_html = '<div class="error">Invalid password</div>' if error else ""
     return HTMLResponse(_LOGIN_HTML % {"error_html": error_html})
 
 
-@router.post("/ui/login")
+@router.post("/login")
 async def login_submit(request: Request):
     """Validate password and set session cookie."""
     form = await request.form()
     password = str(form.get("password", ""))
 
     if not settings.ui_password:
-        return RedirectResponse("/ui/threads", status_code=302)
+        return RedirectResponse("/threads", status_code=302)
 
     if not secrets.compare_digest(password, settings.ui_password):
-        return RedirectResponse("/ui/login?error=1", status_code=303)
+        return RedirectResponse("/login?error=1", status_code=303)
 
-    response = RedirectResponse("/ui/threads", status_code=303)
+    response = RedirectResponse("/threads", status_code=303)
     response.set_cookie(
         _COOKIE_NAME,
         _make_token(),
@@ -178,54 +178,9 @@ async def login_submit(request: Request):
     return response
 
 
-@router.get("/ui/logout")
+@router.get("/logout")
 async def logout():
     """Clear session cookie."""
-    response = RedirectResponse("/ui/login", status_code=302)
+    response = RedirectResponse("/login", status_code=302)
     response.delete_cookie(_COOKIE_NAME)
     return response
-
-
-@router.get("/ui")
-async def ui_root(request: Request):
-    """Redirect /ui to /ui/threads."""
-    if not _check_auth(request):
-        return RedirectResponse("/ui/login", status_code=302)
-    return RedirectResponse("/ui/threads", status_code=302)
-
-
-@router.api_route("/ui/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])
-async def proxy_ui(request: Request, path: str):
-    """Reverse proxy to the slackbot Next.js app with password protection."""
-    # Allow unauthenticated access to Next.js static assets
-    if not path.startswith("_next/") and not _check_auth(request):
-        return RedirectResponse("/ui/login", status_code=302)
-
-    target = f"{_SLACKBOT_URL}/ui/{path}"
-    qs = str(request.query_params)
-    if qs:
-        target += f"?{qs}"
-
-    body = await request.body()
-
-    # Forward headers (skip host and connection-specific headers)
-    skip = {"host", "connection", "transfer-encoding", "content-length"}
-    headers = {k: v for k, v in request.headers.items() if k.lower() not in skip}
-
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        resp = await client.request(
-            method=request.method,
-            url=target,
-            headers=headers,
-            content=body if body else None,
-        )
-
-    # Forward response headers, skip hop-by-hop
-    skip_resp = {"transfer-encoding", "connection", "content-encoding", "content-length"}
-    resp_headers = {k: v for k, v in resp.headers.items() if k.lower() not in skip_resp}
-
-    return Response(
-        content=resp.content,
-        status_code=resp.status_code,
-        headers=resp_headers,
-    )

@@ -14,7 +14,7 @@ import structlog
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.requests import Request
-from starlette.responses import JSONResponse, StreamingResponse
+from starlette.responses import JSONResponse, RedirectResponse, Response, StreamingResponse
 
 from api.mcp_server import mcp, set_plugin_manager, set_pool
 from api.routers import health, query, search, secrets, threads, ui
@@ -146,7 +146,7 @@ async def proxy_webhooks(request: Request, path: str):
     if not _verify_slack_signature(body, slack_timestamp, slack_signature):
         return JSONResponse({"detail": "Invalid Slack signature"}, status_code=401)
 
-    target = f"{_SLACKBOT_URL}/ui/api/webhooks/{path}"
+    target = f"{_SLACKBOT_URL}/api/webhooks/{path}"
     async with httpx.AsyncClient(timeout=30.0) as client:
         resp = await client.request(
             method=request.method,
@@ -158,4 +158,54 @@ async def proxy_webhooks(request: Request, path: str):
         content=iter([resp.content]),
         status_code=resp.status_code,
         headers=dict(resp.headers),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Catch-all: proxy everything else to the slackbot Next.js UI
+# ---------------------------------------------------------------------------
+# Must be registered LAST so it doesn't swallow API/MCP routes.
+
+@app.get("/")
+async def root_redirect(request: Request):
+    """Redirect / to /threads."""
+    from api.routers.ui import _check_auth
+
+    if not _check_auth(request):
+        return RedirectResponse("/login", status_code=302)
+    return RedirectResponse("/threads", status_code=302)
+
+
+@app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])
+async def proxy_ui_catchall(request: Request, path: str):
+    """Reverse proxy to the slackbot Next.js app with password protection."""
+    from api.routers.ui import _check_auth
+
+    if not path.startswith("_next/") and not _check_auth(request):
+        return RedirectResponse("/login", status_code=302)
+
+    target = f"{_SLACKBOT_URL}/{path}"
+    qs = str(request.query_params)
+    if qs:
+        target += f"?{qs}"
+
+    body = await request.body()
+    skip = {"host", "connection", "transfer-encoding", "content-length"}
+    headers = {k: v for k, v in request.headers.items() if k.lower() not in skip}
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.request(
+            method=request.method,
+            url=target,
+            headers=headers,
+            content=body if body else None,
+        )
+
+    skip_resp = {"transfer-encoding", "connection", "content-encoding", "content-length"}
+    resp_headers = {k: v for k, v in resp.headers.items() if k.lower() not in skip_resp}
+
+    return Response(
+        content=resp.content,
+        status_code=resp.status_code,
+        headers=resp_headers,
     )

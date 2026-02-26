@@ -7,11 +7,38 @@
  *   3. thread.post() → posts the result back to Slack
  */
 
-import { Chat } from "chat";
+import { Chat, parseMarkdown, type Root } from "chat";
 import { createSlackAdapter } from "@chat-adapter/slack";
 import { createRedisState } from "@chat-adapter/state-redis";
 import { createMemoryState } from "@chat-adapter/state-memory";
 import { extractHarness, spawn, execute } from "./harness";
+
+type MarkdownNode = Root | Root["children"][number];
+
+function renderSlackMessage(markdown: string) {
+  const ast = parseMarkdown(markdown);
+  const escapeLiteralTildes = (
+    node: MarkdownNode,
+    inDelete = false
+  ): void => {
+    const insideDelete = inDelete || node.type === "delete";
+
+    if (node.type === "text" && !insideDelete) {
+      // Slack treats paired single tildes as strikethrough; escape literal tildes.
+      node.value = node.value.replace(/~/g, "\\~");
+    }
+
+    if ("children" in node && Array.isArray(node.children)) {
+      for (const child of node.children as Root["children"]) {
+        escapeLiteralTildes(child, insideDelete);
+      }
+    }
+  };
+
+  escapeLiteralTildes(ast);
+
+  return { ast };
+}
 
 function createBot() {
   const hasSlackCreds =
@@ -59,7 +86,7 @@ function createBot() {
     // Execute message and get final result
     const result = await execute(threadKey, message);
 
-    await thread.post(result);
+    await thread.post(renderSlackMessage(result));
   }
 
   // First @mention — subscribe and run

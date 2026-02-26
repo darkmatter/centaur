@@ -20,7 +20,7 @@ if [ -n "$MCP_KEY" ]; then
     # Amp
     mkdir -p "$HOME_DIR/.config/amp"
     cat > "$HOME_DIR/.config/amp/settings.json" <<EOF
-{"amp.mcpServers":{"tempo-ai":{"url":"${MCP_URL}","headers":{"Authorization":"Bearer ${MCP_KEY}"}}}}
+{"amp.experimental.compaction":95,"amp.mcpServers":{"tempo-ai":{"url":"${MCP_URL}","headers":{"Authorization":"Bearer ${MCP_KEY}"}}}}
 EOF
 
     # Claude Code

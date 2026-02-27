@@ -40,13 +40,20 @@ _pool_lock = __import__("threading").Lock()
 # ---------------------------------------------------------------------------
 # Postgres persistence (best-effort — never breaks Docker operations)
 # ---------------------------------------------------------------------------
-def _pg_write(sql: str, params: tuple = ()) -> None:
-    """Execute a single write against Postgres. Silently skips on failure."""
+def _pg_conn():
+    """Create a Postgres connection. Returns None if DATABASE_URL not set."""
     url = os.getenv("DATABASE_URL", "")
     if not url:
-        return
+        return None
+    return psycopg2.connect(url, connect_timeout=3)
+
+
+def _pg_write(sql: str, params: tuple = ()) -> None:
+    """Execute a single write against Postgres. Silently skips on failure."""
     try:
-        conn = psycopg2.connect(url, connect_timeout=3)
+        conn = _pg_conn()
+        if not conn:
+            return
         try:
             with conn.cursor() as cur:
                 cur.execute(sql, params)
@@ -55,6 +62,23 @@ def _pg_write(sql: str, params: tuple = ()) -> None:
             conn.close()
     except Exception as exc:
         log.debug("pg_write_failed", error=str(exc))
+
+
+def _pg_read(sql: str, params: tuple = ()) -> list[dict]:
+    """Execute a read query. Returns list of dicts. Empty list on failure."""
+    try:
+        conn = _pg_conn()
+        if not conn:
+            return []
+        try:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(sql, params)
+                return [dict(row) for row in cur.fetchall()]
+        finally:
+            conn.close()
+    except Exception as exc:
+        log.debug("pg_read_failed", error=str(exc))
+        return []
 
 
 def _ts(epoch: float) -> datetime:
@@ -156,6 +180,7 @@ def _create_container(
     client: Any,
     name: str | None = None,
     repo: str | None = None,
+    extra_labels: dict[str, str] | None = None,
 ) -> tuple[Any, dict[str, float]]:
     """Create a ready-to-use agent container.
 
@@ -166,6 +191,11 @@ def _create_container(
     env = _container_env()
     if repo:
         env.append(f"AGENT_REPO={repo}")
+    labels = {
+        "agent2": "true",
+        **({"tempo.pool": "true"} if not name else {}),
+        **(extra_labels or {}),
+    }
     container = client.containers.run(
         _image(),
         detach=True,
@@ -179,10 +209,7 @@ def _create_container(
         volumes={
             _repos_host_dir(): {"bind": "/home/agent/github", "mode": "rw"},
         },
-        labels={
-            "agent2": "true",
-            **({"tempo.pool": "true"} if not name else {}),
-        },
+        labels=labels,
         **({"name": name} if name else {}),
     )
     docker_run_s = round(time.monotonic() - t0, 3)
@@ -447,6 +474,10 @@ class AgentClient:
                 client,
                 name=f"agent2-{slack_thread_key.replace(':', '-').replace('.', '-')[:40]}",
                 repo=repo,
+                extra_labels={
+                    "tempo.thread": slack_thread_key,
+                    "tempo.harness": harness,
+                },
             )
             log.info("spawn_container_created", request_id=rid, thread=slack_thread_key,
                      **create_timings)
@@ -702,8 +733,6 @@ class AgentClient:
 
     def threads(self) -> dict[str, Any]:
         """List all agent threads with summary info for the thread viewer."""
-        # Recover any running containers not in _sessions (e.g. after API restart)
-        self._recover_docker_sessions()
         result = []
         for key, session in _sessions.items():
             turns = session.get("turns", [])
@@ -738,10 +767,87 @@ class AgentClient:
             "turns": session.get("turns", []),
         }
 
-    def _recover_docker_sessions(self) -> None:
-        """Discover running agent containers not yet tracked in _sessions."""
+    def recover_sessions(self) -> dict[str, Any]:
+        """Recover sessions from Postgres and reconcile with live Docker state.
+
+        Called on API startup to re-attach to containers that survived a restart.
+        Also discovers labeled containers not yet in PG (belt-and-suspenders).
+        """
+        recovered = 0
+        pruned = 0
+
+        # 1. Load active sessions from Postgres
+        rows = _pg_read(
+            "SELECT * FROM agent_sessions WHERE state NOT IN ('stopped')"
+        )
+        client = _docker_client()
+
+        for row in rows:
+            key = row["slack_thread_key"]
+            if key in _sessions:
+                continue
+
+            container_id = row["container_id"]
+            try:
+                container = client.containers.get(container_id)
+                if container.status != "running":
+                    _pg_write(
+                        "UPDATE agent_sessions SET state = 'stopped'"
+                        " WHERE slack_thread_key = %s",
+                        (key,),
+                    )
+                    pruned += 1
+                    continue
+            except (NotFound, Exception):
+                _pg_write(
+                    "UPDATE agent_sessions SET state = 'stopped'"
+                    " WHERE slack_thread_key = %s",
+                    (key,),
+                )
+                pruned += 1
+                continue
+
+            # Load turns from PG
+            turn_rows = _pg_read(
+                "SELECT * FROM agent_turns WHERE slack_thread_key = %s"
+                " ORDER BY turn_id",
+                (key,),
+            )
+            turns = []
+            for tr in turn_rows:
+                events = tr.get("events", [])
+                if isinstance(events, str):
+                    events = json.loads(events)
+                started = tr.get("started_at")
+                finished = tr.get("finished_at")
+                turns.append({
+                    "turn_id": tr["turn_id"],
+                    "user_message": tr["user_message"],
+                    "events": events,
+                    "result": tr.get("result", ""),
+                    "started_at": started.timestamp() if started else time.time(),
+                    "finished_at": finished.timestamp() if finished else None,
+                    "exit_code": tr.get("exit_code"),
+                    "timed_out": tr.get("timed_out", False),
+                    "duration_s": tr.get("duration_s", 0),
+                })
+
+            created = row.get("created_at")
+            last_act = row.get("last_activity")
+            _sessions[key] = {
+                "container_id": container_id,
+                "harness": row.get("harness", "amp"),
+                "agent_thread_id": row.get("agent_thread_id"),
+                "state": "idle",
+                "created_at": created.timestamp() if created else time.time(),
+                "last_activity": last_act.timestamp() if last_act else time.time(),
+                "turns": turns,
+            }
+            recovered += 1
+            log.info("session_recovered", thread=key, turns=len(turns))
+
+        # 2. Discover labeled containers not in PG (e.g. PG write failed)
         try:
-            client = _docker_client()
             containers = client.containers.list(filters={"label": "agent2=true"})
             for container in containers:
                 key = container.labels.get("tempo.thread", "")
@@ -750,13 +856,19 @@ class AgentClient:
                         "container_id": container.id,
                         "harness": container.labels.get("tempo.harness", "amp"),
                         "agent_thread_id": None,
-                        "state": container.status,
+                        "state": "idle",
                         "created_at": time.time(),
                         "last_activity": time.time(),
                         "turns": [],
                     }
+                    _persist_session(_sessions[key], key)
+                    recovered += 1
+                    log.info("session_recovered_from_docker", thread=key)
         except Exception:
             pass
+
+        log.info("session_recovery_complete", recovered=recovered, pruned=pruned)
+        return {"recovered": recovered, "pruned": pruned}
 
     def interrupt(self, slack_thread_key: str) -> dict[str, Any]:
         """Interrupt the currently running command in a sandbox."""

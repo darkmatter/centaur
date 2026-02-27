@@ -15,12 +15,12 @@ from fastapi import APIRouter, Depends, HTTPException
 from starlette.responses import StreamingResponse
 
 from api.agent import _sessions
-from api.deps import get_pool, verify_api_key
+from api.deps import get_pool, verify_ui_or_api_key
 
 router = APIRouter(
-    prefix="/threads",
+    prefix="/api/threads",
     tags=["threads"],
-    dependencies=[Depends(verify_api_key)],
+    dependencies=[Depends(verify_ui_or_api_key)],
 )
 
 

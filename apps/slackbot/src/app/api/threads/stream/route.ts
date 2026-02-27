@@ -1,4 +1,4 @@
-/** Proxy /api/threads/stream?key=... → FastAPI /threads/stream?key=... as SSE */
+/** Proxy /api/threads/stream?key=... → FastAPI /api/threads/stream?key=... as SSE */
 
 const API_URL = process.env.AI_V2_API_URL || "http://localhost:8000";
 const API_KEY = process.env.AI_V2_API_KEY || "";
@@ -8,7 +8,7 @@ export async function GET(request: Request) {
   const key = searchParams.get("key") || "";
 
   const upstream = await fetch(
-    `${API_URL}/threads/stream?key=${encodeURIComponent(key)}`,
+    `${API_URL}/api/threads/stream?key=${encodeURIComponent(key)}`,
     {
       headers: { Authorization: `Bearer ${API_KEY}` },
       cache: "no-store",

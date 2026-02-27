@@ -66,6 +66,23 @@ def _warm_plugin_caches() -> None:
     threading.Thread(target=_warm, daemon=True).start()
 
 
+def _recover_agent_sessions() -> None:
+    """Recover agent sessions from Postgres + Docker on startup."""
+    import threading
+
+    def _recover() -> None:
+        try:
+            from api.agent import get_agent
+
+            agent = get_agent()
+            result = agent.recover_sessions()
+            log.info("agent_sessions_recovered", **result)
+        except Exception as e:
+            log.warning("agent_session_recovery_failed", error=str(e))
+
+    threading.Thread(target=_recover, daemon=True).start()
+
+
 async def _watch_plugins(pm: PluginManager) -> None:
     """Watch the plugins directory and auto-reload when files change."""
     from starlette.concurrency import run_in_threadpool
@@ -92,6 +109,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     async with mcp.session_manager.run():
         log.info("mcp session manager started")
         _warm_plugin_caches()
+        _recover_agent_sessions()
         watcher_task = asyncio.create_task(_watch_plugins(plugin_manager))
         try:
             yield

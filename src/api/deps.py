@@ -46,6 +46,18 @@ async def verify_api_key(
     return token
 
 
+async def verify_ui_or_api_key(
+    request: Request,
+    x_api_key: Annotated[str | None, Header()] = None,
+) -> str:
+    """Accept either a valid UI session cookie or an API key."""
+    from api.routers.ui import _check_auth
+
+    if _check_auth(request):
+        return "cookie"
+    return await verify_api_key(request, x_api_key)
+
+
 class EmbeddingService:
     def __init__(self, pool: asyncpg.Pool) -> None:
         self.pool = pool

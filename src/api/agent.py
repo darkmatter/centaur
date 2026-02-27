@@ -180,7 +180,7 @@ def _create_container(
             _repos_host_dir(): {"bind": "/home/agent/github", "mode": "rw"},
         },
         labels={
-            "tempo.agent": "true",
+            "agent2": "true",
             **({"tempo.pool": "true"} if not name else {}),
         },
         **({"name": name} if name else {}),
@@ -711,7 +711,7 @@ class AgentClient:
         """Discover running agent containers not yet tracked in _sessions."""
         try:
             client = _docker_client()
-            containers = client.containers.list(filters={"label": "tempo.agent=true"})
+            containers = client.containers.list(filters={"label": "agent2=true"})
             for container in containers:
                 key = container.labels.get("tempo.thread", "")
                 if key and key not in _sessions:

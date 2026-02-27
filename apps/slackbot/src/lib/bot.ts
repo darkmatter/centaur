@@ -1,22 +1,23 @@
-/**
- * Chat SDK bot — Slack adapter with Redis state.
- *
- * On @mention:
- *   1. spawn() → ensures a Docker container exists for this thread
- *   2. execute() → runs the message through the harness CLI
- *   3. thread.post() → posts the result back to Slack
- */
-
 import crypto from "node:crypto";
 import { Chat, parseMarkdown, type Root } from "chat";
 import { createSlackAdapter } from "@chat-adapter/slack";
 import { createRedisState } from "@chat-adapter/state-redis";
 import { createMemoryState } from "@chat-adapter/state-memory";
-import { extractHarness, execute, type FileAttachment } from "./harness";
+import {
+  execute,
+  extractRunOptions,
+  replyEngineerFlow,
+  spawn,
+  startEngineerFlow,
+  type AgentMode,
+  type FileAttachment,
+} from "./harness";
 
 const THREAD_VIEWER_URL = process.env.THREAD_VIEWER_URL || "https://svc-ai.paradigm.xyz";
+const MAX_TRACKED_THREAD_MODES = 500;
 
 type MarkdownNode = Root | Root["children"][number];
+type ThreadModeConfig = { mode: AgentMode; modelPreference: string | null };
 
 function renderSlackMessage(markdown: string) {
   const ast = parseMarkdown(markdown);
@@ -52,6 +53,15 @@ function createBot() {
     adapters: hasSlackCreds ? { slack: createSlackAdapter() } : {},
     state: process.env.REDIS_URL ? createRedisState() : createMemoryState(),
   });
+  const threadModes = new Map<string, ThreadModeConfig>();
+
+  function setThreadMode(threadKey: string, config: ThreadModeConfig): void {
+    if (!threadModes.has(threadKey) && threadModes.size >= MAX_TRACKED_THREAD_MODES) {
+      const oldestKey = threadModes.keys().next().value as string | undefined;
+      if (oldestKey) threadModes.delete(oldestKey);
+    }
+    threadModes.set(threadKey, config);
+  }
 
   function buildSessionContext(threadId: string): string {
     const now = new Date().toISOString().replace("T", " ").slice(0, 19);
@@ -79,63 +89,122 @@ function createBot() {
     thread: Parameters<Parameters<typeof bot.onNewMention>[0]>[0],
     messageText: string,
     isFirstMessage: boolean,
-    attachments?: Array<{ url?: string; name?: string }>,
+    attachments?: Array<{ url?: string; name?: string }>
   ) {
-    const t0 = performance.now();
+    const parsed = extractRunOptions(messageText);
     const requestId = crypto.randomUUID().slice(0, 8);
-    const { harness, cleanedText } = extractHarness(messageText);
     const threadKey = thread.id;
-    const timings: Record<string, number> = {};
-
-    // Collect file attachments
+    const previous = threadModes.get(threadKey);
     const files: FileAttachment[] = (attachments || [])
       .filter((a): a is { url: string; name: string } => !!a.url && !!a.name)
       .map((a) => ({ url: a.url, name: a.name }));
 
-    // Prepend session context on first message
+    const mode: AgentMode = isFirstMessage
+      ? parsed.mode
+      : (previous?.mode ?? parsed.mode);
+
+    if (
+      !isFirstMessage &&
+      previous &&
+      parsed.modeExplicit &&
+      parsed.mode !== previous.mode
+    ) {
+      await thread.post(
+        renderSlackMessage(
+          "This thread is already running in a different mode. Start a new thread to switch modes."
+        )
+      );
+      return;
+    }
+
+    if (!parsed.cleanedText) {
+      await thread.post(
+        renderSlackMessage(
+          "Please provide a prompt after flags. Example: `@tempo-ai --eng --claude implement retry logic`"
+        )
+      );
+      return;
+    }
+
+    if (mode === "eng") {
+      const modelPreference =
+        parsed.modelPreference ?? parsed.harness ?? previous?.modelPreference ?? null;
+      setThreadMode(threadKey, { mode: "eng", modelPreference });
+
+      if (isFirstMessage) {
+        await thread.startTyping("Starting engineer flow...");
+        const result = await startEngineerFlow(
+          threadKey,
+          parsed.cleanedText,
+          modelPreference,
+          files.length > 0 ? files : undefined
+        );
+        const viewerUrl = `${THREAD_VIEWER_URL}/threads/${encodeURIComponent(threadKey)}`;
+        const preferenceLine = modelPreference
+          ? `\nModel preference: \`${modelPreference}\``
+          : "";
+        const statusLine =
+          result.status === "already_running"
+            ? "Engineer flow is already running for this thread."
+            : "Engineer flow started.";
+        await thread.post(
+          renderSlackMessage(
+            `${statusLine}${preferenceLine}\n\n[🔗 Thread Viewer](${viewerUrl})`
+          )
+        );
+        return;
+      }
+
+      const reply = await replyEngineerFlow(
+        threadKey,
+        parsed.cleanedText,
+        files.length > 0 ? files : undefined
+      );
+      if (reply.status === "no_active_session") {
+        await thread.post(
+          renderSlackMessage(
+            "No active engineer session for this thread. Start a new run with `--eng`."
+          )
+        );
+      }
+      return;
+    }
+
+    setThreadMode(threadKey, { mode: "default", modelPreference: null });
+    const harness = parsed.harness ?? "amp";
+
+    await thread.startTyping("Spawning agent...");
+
+    await spawn(threadKey, harness, undefined, requestId);
+
+    await thread.startTyping("Running...");
+
     const message = isFirstMessage
-      ? buildSessionContext(threadKey) + cleanedText
-      : cleanedText;
+      ? buildSessionContext(threadKey) + parsed.cleanedText
+      : parsed.cleanedText;
+    const result = await execute(
+      threadKey,
+      message,
+      harness,
+      requestId,
+      files.length > 0 ? files : undefined
+    );
 
-    // Fire execute immediately — it auto-spawns if needed.
-    // Run typing indicator + viewer link in parallel (don't block execute).
-    const tExec = performance.now();
-    const execPromise = execute(threadKey, message, harness, requestId, files.length > 0 ? files : undefined);
-
+    let finalMessage = result;
     if (isFirstMessage) {
       const viewerUrl = `${THREAD_VIEWER_URL}/threads/${encodeURIComponent(threadKey)}`;
-      thread.post(renderSlackMessage(`[🔗 Thread Viewer](${viewerUrl})`)).catch(() => {});
+      finalMessage += `\n\n[🔗 Thread Viewer](${viewerUrl})`;
     }
-    thread.startTyping("Running...").catch(() => {});
 
-    const result = await execPromise;
-    timings.execute_ms = Math.round(performance.now() - tExec);
-
-    const tPost = performance.now();
-    await thread.post(renderSlackMessage(result));
-    timings.post_ms = Math.round(performance.now() - tPost);
-
-    timings.total_ms = Math.round(performance.now() - t0);
-    console.log(
-      JSON.stringify({
-        event: "message_handled",
-        request_id: requestId,
-        thread: threadKey,
-        harness,
-        is_first: isFirstMessage,
-        ...timings,
-      })
-    );
+    await thread.post(renderSlackMessage(finalMessage));
   }
 
-  // First @mention — subscribe and run
   bot.onNewMention(async (thread, message) => {
     thread.subscribe().catch(() => {});
     const attachments = message.attachments?.map((a) => ({ url: a.url, name: a.name }));
     await handleMessage(thread, message.text, true, attachments);
   });
 
-  // Follow-up messages in subscribed threads
   bot.onSubscribedMessage(async (thread, message) => {
     if (!message.isMention) return;
     const attachments = message.attachments?.map((a) => ({ url: a.url, name: a.name }));

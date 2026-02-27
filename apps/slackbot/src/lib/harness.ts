@@ -1,12 +1,3 @@
-/**
- * Agent API client — calls the agent plugin via the AI v2 REST API.
- *
- * spawn() → creates a Docker container for the thread
- * execute() → runs a message in the container, returns result text
- *
- * All calls accept a request_id for end-to-end latency tracing.
- */
-
 const API_URL = process.env.AI_V2_API_URL || "http://api:8000";
 const API_KEY = process.env.AI_V2_API_KEY || "";
 
@@ -44,24 +35,104 @@ async function agentCall(
 }
 
 export type Harness = "amp" | "claude-code" | "codex" | "pi-mono";
+export type AgentMode = "default" | "eng";
+export type FileAttachment = { url: string; name: string };
 
-/** Parse "harness=amp" directive from message text. */
+export type RunOptions = {
+  mode: AgentMode;
+  harness: Harness | null;
+  modelPreference: string | null;
+  cleanedText: string;
+  modeExplicit: boolean;
+  harnessExplicit: boolean;
+};
+
+export function extractRunOptions(text: string): RunOptions {
+  let cleaned = text;
+  let mode: AgentMode = "default";
+  let harness: Harness | null = null;
+  let modelPreference: string | null = null;
+  let modeExplicit = false;
+  let harnessExplicit = false;
+
+  const modeRegex = /(^|\s)--eng(?=\s|$)/gi;
+  if (modeRegex.test(cleaned)) {
+    mode = "eng";
+    modeExplicit = true;
+    cleaned = cleaned.replace(modeRegex, " ");
+  }
+
+  const kvMatch = cleaned.match(/\bharness\s*=\s*(amp|claude-code|codex|pi-mono)\b/i);
+  if (kvMatch) {
+    harness = kvMatch[1].toLowerCase() as Harness;
+    modelPreference = harness;
+    harnessExplicit = true;
+    cleaned = (
+      cleaned.slice(0, kvMatch.index) + cleaned.slice(kvMatch.index! + kvMatch[0].length)
+    ).trim();
+  }
+
+  const harnessFlags: Array<{ regex: RegExp; value: Harness }> = [
+    { regex: /(^|\s)--amp(?=\s|$)/gi, value: "amp" },
+    { regex: /(^|\s)--claude(?=\s|$)/gi, value: "claude-code" },
+    { regex: /(^|\s)--claude-code(?=\s|$)/gi, value: "claude-code" },
+    { regex: /(^|\s)--codex(?=\s|$)/gi, value: "codex" },
+    { regex: /(^|\s)--pi(?=\s|$)/gi, value: "pi-mono" },
+    { regex: /(^|\s)--pi-mono(?=\s|$)/gi, value: "pi-mono" },
+  ];
+  for (const { regex, value } of harnessFlags) {
+    if (regex.test(cleaned)) {
+      harness = value;
+      modelPreference = value;
+      harnessExplicit = true;
+      cleaned = cleaned.replace(regex, " ");
+    }
+  }
+
+  const engineFlagMatch = cleaned.match(
+    /(^|\s)--engine\s+(amp|claude-code|codex|pi-mono)(?=\s|$)/i
+  );
+  if (engineFlagMatch) {
+    harness = engineFlagMatch[2].toLowerCase() as Harness;
+    modelPreference = harness;
+    harnessExplicit = true;
+    cleaned = cleaned.replace(engineFlagMatch[0], " ");
+  }
+
+  const modelEqMatch = cleaned.match(/\bmodel\s*=\s*([A-Za-z0-9._-]+)\b/i);
+  if (modelEqMatch) {
+    modelPreference = modelEqMatch[1];
+    cleaned = (
+      cleaned.slice(0, modelEqMatch.index) +
+      cleaned.slice(modelEqMatch.index! + modelEqMatch[0].length)
+    ).trim();
+  }
+
+  const modelFlagMatch = cleaned.match(/(^|\s)--model\s+([A-Za-z0-9._-]+)(?=\s|$)/i);
+  if (modelFlagMatch) {
+    modelPreference = modelFlagMatch[2];
+    cleaned = cleaned.replace(modelFlagMatch[0], " ");
+  }
+
+  cleaned = cleaned.replace(/\s+/g, " ").trim();
+  return {
+    mode,
+    harness,
+    modelPreference,
+    cleanedText: cleaned,
+    modeExplicit,
+    harnessExplicit,
+  };
+}
+
 export function extractHarness(text: string): {
   harness: Harness;
   cleanedText: string;
 } {
-  const match = text.match(/\bharness\s*=\s*(amp|claude-code|codex|pi-mono)\b/i);
-  if (match) {
-    const harness = match[1].toLowerCase() as Harness;
-    const cleanedText = (
-      text.slice(0, match.index) + text.slice(match.index! + match[0].length)
-    ).trim();
-    return { harness, cleanedText };
-  }
-  return { harness: "amp", cleanedText: text };
+  const parsed = extractRunOptions(text);
+  return { harness: parsed.harness ?? "amp", cleanedText: parsed.cleanedText };
 }
 
-/** Spawn a container for a Slack thread (idempotent). */
 export async function spawn(
   threadKey: string,
   harness: Harness = "amp",
@@ -80,9 +151,6 @@ export async function spawn(
   };
 }
 
-export type FileAttachment = { url: string; name: string };
-
-/** Execute a message and return the final result text. Auto-spawns if needed. */
 export async function execute(
   threadKey: string,
   message: string,
@@ -100,12 +168,74 @@ export async function execute(
   return (result.result as string) || "No response from agent.";
 }
 
-/** Stop a session. */
 export async function stop(threadKey: string): Promise<void> {
   await agentCall("stop", { slack_thread_key: threadKey });
 }
 
-/** Interrupt a running command. */
 export async function interrupt(threadKey: string): Promise<void> {
   await agentCall("interrupt", { slack_thread_key: threadKey });
+}
+
+async function apiCall(
+  path: string,
+  payload: Record<string, unknown>
+): Promise<Record<string, unknown>> {
+  const res = await fetch(`${API_URL}${path}`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`api ${path} failed (${res.status}): ${text}`);
+  }
+  return (await res.json()) as Record<string, unknown>;
+}
+
+function splitThreadKey(threadKey: string): { channel: string; threadTs: string } {
+  const idx = threadKey.indexOf(":");
+  if (idx <= 0 || idx >= threadKey.length - 1) {
+    throw new Error(`Invalid thread key: ${threadKey}`);
+  }
+  return {
+    channel: threadKey.slice(0, idx),
+    threadTs: threadKey.slice(idx + 1),
+  };
+}
+
+export async function startEngineerFlow(
+  threadKey: string,
+  task: string,
+  modelPreference?: string | null,
+  attachments?: FileAttachment[]
+): Promise<{ status: string; runId?: string }> {
+  const { channel, threadTs } = splitThreadKey(threadKey);
+  const result = await apiCall("/slack/start", {
+    thread_key: threadKey,
+    channel,
+    thread_ts: threadTs,
+    task,
+    model_preference: modelPreference ?? null,
+    ...(attachments && attachments.length > 0 ? { attachments } : {}),
+  });
+  return {
+    status: (result.status as string) || "started",
+    runId: result.run_id as string | undefined,
+  };
+}
+
+export async function replyEngineerFlow(
+  threadKey: string,
+  reply: string,
+  attachments?: FileAttachment[]
+): Promise<{ status: string }> {
+  const result = await apiCall("/slack/reply", {
+    thread_key: threadKey,
+    reply,
+    ...(attachments && attachments.length > 0 ? { attachments } : {}),
+  });
+  return { status: (result.status as string) || "accepted" };
 }

@@ -21,7 +21,7 @@ from starlette.responses import JSONResponse, RedirectResponse, Response, Stream
 
 from api.mcp_server import mcp, set_plugin_manager, set_pool
 from api.routers import admin, agent as agent_router_mod
-from api.routers import health, query, search, secrets, threads, ui
+from api.routers import health, query, search, secrets, slack_events, threads, ui
 from shared.config import settings
 from shared.db import close_pool, create_pool
 from shared.plugin_manager import PluginManager
@@ -141,6 +141,7 @@ app.include_router(secrets.router)
 app.include_router(threads.router)
 app.include_router(agent_router_mod.router)
 app.include_router(admin.router)
+app.include_router(slack_events.router)
 app.include_router(ui.router)
 
 # Load plugins before creating MCP starlette app

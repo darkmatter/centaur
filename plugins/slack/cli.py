@@ -454,6 +454,84 @@ def usergroup_update(
         raise typer.Exit(1)
 
 
+@app.command("search-files")
+def search_files_cmd(
+    query: str = typer.Argument(..., help="Search query for files"),
+    limit: int = typer.Option(20, "--limit", "-n", help="Max results"),
+):
+    """Search files shared across the workspace.
+
+    Examples:
+        slack search-files "quarterly report"
+        slack search-files "architecture diagram" -n 10
+    """
+    from .client import search_files
+
+    try:
+        results = search_files(query, max_results=limit)
+    except RuntimeError as e:
+        console.print(f"[red]Error: {e}[/]")
+        raise typer.Exit(1)
+
+    if not results:
+        console.print("[yellow]No files found.[/]")
+        raise typer.Exit()
+
+    table = Table(title=f"Files matching '{query}' ({len(results)})")
+    table.add_column("Name", style="cyan", max_width=30)
+    table.add_column("Type", style="dim", max_width=8)
+    table.add_column("User", style="green", max_width=15)
+    table.add_column("Size", style="dim", justify="right", max_width=10)
+
+    for f in results:
+        size = f["size"]
+        if size > 1_000_000:
+            size_str = f"{size / 1_000_000:.1f}MB"
+        elif size > 1000:
+            size_str = f"{size / 1000:.0f}KB"
+        else:
+            size_str = f"{size}B"
+        table.add_row(f["name"], f["filetype"], f["user"], size_str)
+
+    console.print(table)
+
+
+@app.command("search-users")
+def search_users_cmd(
+    query: str = typer.Argument(..., help="Search by name, email, or title"),
+    limit: int = typer.Option(20, "--limit", "-n", help="Max results"),
+):
+    """Search workspace users by name, email, or title.
+
+    Examples:
+        slack search-users georgios
+        slack search-users "@paradigm.xyz"
+        slack search-users "engineer"
+    """
+    from .client import search_users
+
+    try:
+        results = search_users(query, max_results=limit)
+    except RuntimeError as e:
+        console.print(f"[red]Error: {e}[/]")
+        raise typer.Exit(1)
+
+    if not results:
+        console.print("[yellow]No users found.[/]")
+        raise typer.Exit()
+
+    table = Table(title=f"Users matching '{query}' ({len(results)})")
+    table.add_column("Name", style="cyan", max_width=20)
+    table.add_column("Real Name", style="white", max_width=25)
+    table.add_column("Email", style="green", max_width=35)
+    table.add_column("Title", style="dim", max_width=30)
+
+    for u in results:
+        table.add_row(f"@{u['name']}", u["real_name"], u["email"], u["title"][:30])
+
+    console.print(table)
+
+
 @app.command()
 def dump(
     name: str = typer.Argument(..., help="Channel name (without #)"),

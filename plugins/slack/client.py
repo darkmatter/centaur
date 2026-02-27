@@ -294,61 +294,125 @@ class SlackClient:
         return score
 
 
-    def search_messages(self, 
+    def search_messages(
+        self,
         query: str,
         max_results: int = 20,
         channels: list[str] | None = None,
         from_user: str | None = None,
         messages_per_channel: int = 200,
     ) -> list[dict]:
-        """Search messages across bot-accessible channels using local filtering.
+        """Search messages using Slack's native search.messages API.
 
-        Searches all channels the bot is a member of. For true cross-workspace search,
-        a user token with search:read scope would be required.
+        Uses the search:read.public scope for fast, workspace-wide search.
+        Falls back to local channel scanning if the native API fails
+        (e.g. missing scope).
+
+        Supports Slack search modifiers in the query string:
+            in:#channel, from:@user, before:YYYY-MM-DD, after:YYYY-MM-DD,
+            has:link, has:reaction, is:thread, etc.
 
         Args:
-            query: Text to search for (case-insensitive, supports multiple terms)
+            query: Search query (plain text or with Slack search modifiers)
             max_results: Maximum results to return
-            channels: Optional list of channel names to search (default: all bot channels)
+            channels: Optional list of channel names to filter by
             from_user: Optional username to filter by
-            messages_per_channel: Messages to fetch per channel for searching
+            messages_per_channel: Messages per channel (only used in fallback)
 
         Returns:
             List of matching message dicts, sorted by relevance
         """
-        client = self._client
+        # Build the search query with modifiers
+        search_query = query
+        if channels:
+            for ch in channels:
+                search_query += f" in:#{ch.lstrip('#')}"
+        if from_user:
+            search_query += f" from:@{from_user.lstrip('@')}"
 
+        try:
+            return self._search_messages_native(search_query, max_results)
+        except (SlackApiError, RuntimeError):
+            # Fall back to local scanning if native search fails
+            return self._search_messages_local(
+                query, max_results, channels, from_user, messages_per_channel
+            )
+
+    def _search_messages_native(
+        self,
+        query: str,
+        max_results: int = 20,
+    ) -> list[dict]:
+        """Search using Slack's native search.messages API."""
+        response = self._retry_on_ratelimit(
+            self._client.api_call,
+            "search.messages",
+            params={"query": query, "count": max_results, "sort": "timestamp"},
+        )
+
+        if not response.get("ok"):
+            raise RuntimeError(response.get("error", "search.messages failed"))
+
+        matches = response.get("messages", {}).get("matches", [])
+        user_cache = self._get_user_cache()
+
+        results = []
+        for m in matches:
+            user_id = m.get("user", "")
+            username = user_cache.get(user_id, m.get("username", user_id))
+            channel_info = m.get("channel", {})
+            channel_id = channel_info.get("id", "") if isinstance(channel_info, dict) else ""
+            channel_name = channel_info.get("name", "") if isinstance(channel_info, dict) else ""
+            ts = m.get("ts", "")
+            text = self._resolve_mentions(m.get("text", ""), user_cache)
+
+            results.append({
+                "channel": channel_name,
+                "channel_id": channel_id,
+                "user": username,
+                "user_id": user_id,
+                "text": text,
+                "timestamp": ts,
+                "permalink": m.get("permalink", ""),
+                "thread_ts": m.get("thread_ts"),
+                "reply_count": m.get("reply_count", 0),
+            })
+
+        return results
+
+    def _search_messages_local(
+        self,
+        query: str,
+        max_results: int = 20,
+        channels: list[str] | None = None,
+        from_user: str | None = None,
+        messages_per_channel: int = 200,
+    ) -> list[dict]:
+        """Search messages by scanning channel histories locally (fallback)."""
         bot_channels = self.list_bot_channels()
-
-        # Parse query terms early — needed for channel ranking
         query_terms = [t.strip().lower() for t in query.split() if t.strip()]
 
         if channels:
             channel_names = {c.lstrip("#").lower() for c in channels}
             bot_channels = [c for c in bot_channels if c["name"].lower() in channel_names]
         else:
-            # Rank by query relevance + activity and cap to avoid 200+ API calls
             bot_channels = self._rank_channels_for_query(bot_channels, query_terms)
             bot_channels = bot_channels[: self._MAX_SEARCH_CHANNELS]
 
         if not bot_channels:
             return []
 
-        # Use cached user lookup
         user_cache = self._get_user_cache()
-
-        # Scale messages_per_channel inversely with channel count for broad searches
         effective_limit = messages_per_channel
         if len(bot_channels) > 30 and messages_per_channel > 100:
             effective_limit = 100
 
-        # Fetch messages from channels in parallel
         all_messages = []
         with ThreadPoolExecutor(max_workers=20) as executor:
             futures = {
                 executor.submit(
                     self._fetch_channel_history,
-                    client,
+                    self._client,
                     ch["id"],
                     ch["name"],
                     effective_limit,
@@ -364,13 +428,9 @@ class SlackClient:
                 except Exception:
                     pass
 
-        # Score and filter messages
         scored_results = []
-
         for msg in all_messages:
             text_lower = msg["text"].lower()
-
-            # Must contain at least one query term
             if not any(term in text_lower for term in query_terms):
                 continue
 
@@ -379,18 +439,13 @@ class SlackClient:
                 if from_user.lower().lstrip("@") != username.lower():
                     continue
 
-            # Calculate relevance score
             score = self._score_match(query_terms, msg["text"])
-
             msg["user"] = user_cache.get(msg["user_id"], msg["user_id"])
             msg["text"] = self._resolve_mentions(msg["text"], user_cache)
             msg["_score"] = score
             scored_results.append(msg)
 
-        # Sort by score (relevance) first, then by timestamp
         scored_results.sort(key=lambda x: (-x["_score"], -float(x["timestamp"])))
-
-        # Remove internal score before returning
         for msg in scored_results:
             del msg["_score"]
 
@@ -832,6 +887,81 @@ class SlackClient:
         return output_path
 
 
+    def search_files(
+        self,
+        query: str,
+        max_results: int = 20,
+    ) -> list[dict]:
+        """Search files across the workspace using Slack's search.files API.
+
+        Requires the search:read.files bot scope.
+
+        Args:
+            query: Search query string
+            max_results: Maximum results to return
+
+        Returns:
+            List of file dicts with id, name, title, filetype, user, channels, permalink
+        """
+        try:
+            response = self._retry_on_ratelimit(
+                self._client.api_call,
+                "search.files",
+                params={"query": query, "count": max_results},
+            )
+        except SlackApiError as e:
+            raise RuntimeError(f"Slack API error: {e.response['error']}")
+
+        files_data = response.get("files", {})
+        matches = files_data.get("matches", [])
+        user_cache = self._get_user_cache()
+
+        results = []
+        for f in matches:
+            user_id = f.get("user", "")
+            results.append({
+                "id": f.get("id", ""),
+                "name": f.get("name", ""),
+                "title": f.get("title", ""),
+                "filetype": f.get("filetype", ""),
+                "size": f.get("size", 0),
+                "user": user_cache.get(user_id, user_id),
+                "channels": [ch.get("name", ch.get("id", "")) for ch in f.get("channels", [])],
+                "permalink": f.get("permalink", ""),
+                "url_private": f.get("url_private", ""),
+                "created": f.get("created", 0),
+            })
+
+        return results
+
+    def search_users(
+        self,
+        query: str,
+        max_results: int = 20,
+    ) -> list[dict]:
+        """Search workspace users by name, email, or title.
+
+        Uses users.list with local filtering. The users:read.email scope
+        ensures email addresses are included in results.
+
+        Args:
+            query: Search string to match against name, real_name, email, or title
+            max_results: Maximum results to return
+
+        Returns:
+            List of user dicts with id, name, real_name, email, title, timezone
+        """
+        all_users = self.list_users(limit=1000)
+        query_lower = query.lower()
+
+        matches = []
+        for u in all_users:
+            searchable = f"{u['name']} {u['real_name']} {u['email']} {u['title']}".lower()
+            if query_lower in searchable:
+                matches.append(u)
+
+        return matches[:max_results]
+
     def dump_channel_with_threads(self, 
         channel_name: str,
         limit: int = 500,
@@ -1006,3 +1136,11 @@ def download_file(*args, **kwargs):
 
 def dump_channel_with_threads(*args, **kwargs):
     return _client().dump_channel_with_threads(*args, **kwargs)
+
+
+def search_files(*args, **kwargs):
+    return _client().search_files(*args, **kwargs)
+
+
+def search_users(*args, **kwargs):
+    return _client().search_users(*args, **kwargs)

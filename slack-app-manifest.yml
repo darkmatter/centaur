@@ -1,0 +1,43 @@
+display_information:
+  name: AIv2
+  description: Paradigm AI assistant (v2)
+  background_color: "#000000"
+
+features:
+  app_home:
+    home_tab_enabled: false
+    messages_tab_enabled: true
+    messages_tab_read_only_enabled: false
+  bot_user:
+    display_name: AI2
+    always_online: true
+
+oauth_config:
+  scopes:
+    bot:
+      - app_mentions:read
+      - channels:history
+      - channels:read
+      - chat:write
+      - files:read
+      - files:write
+      - groups:history
+      - groups:read
+      - reactions:read
+      - reactions:write
+      - search:read.files
+      - search:read.public
+      - search:read.users
+      - users:read
+      - users:read.email
+
+settings:
+  event_subscriptions:
+    request_url: https://svc-ai.paradigm.xyz/api/webhooks/slack
+    bot_events:
+      - app_mention
+      - message.channels
+      - message.groups
+  org_deploy_enabled: false
+  socket_mode_enabled: false
+  token_rotation_enabled: false

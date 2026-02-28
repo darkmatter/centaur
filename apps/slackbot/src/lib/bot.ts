@@ -225,8 +225,11 @@ function createBot() {
       },
     );
 
-    // Post the final result as a new message
-    await thread.post(renderSlackMessage(result));
+    // Edit the status message in-place with the final result
+    const finalText = isFirstMessage
+      ? `${result}\n\n[🔗 Thread Viewer](${viewerUrl})`
+      : result;
+    await statusMsg.edit(renderSlackMessage(finalText));
   }
 
   bot.onNewMention(async (thread, message) => {

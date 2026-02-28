@@ -243,12 +243,11 @@ function createBot() {
       },
     );
 
-    // Edit status message with final result — thread.post would auto-clear typing
-    // but we edit-in-place to avoid a second message
     const finalText = isFirstMessage
       ? `${result}\n\n[🔗 Thread Viewer](${viewerUrl})`
       : result;
     await statusMsg.edit(renderSlackMessage(finalText));
+    await thread.startTyping("").catch(() => {});
   }
 
   bot.onNewMention(async (thread, message) => {

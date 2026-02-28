@@ -243,11 +243,10 @@ function createBot() {
       },
     );
 
-    const finalText = isFirstMessage
-      ? `${result}\n\n[🔗 Thread Viewer](${viewerUrl})`
-      : result;
-    await statusMsg.edit(renderSlackMessage(finalText));
-    await thread.startTyping("").catch(() => {});
+    // Edit status message to just the thread viewer link, post result as new message
+    // (posting auto-clears the typing indicator)
+    await statusMsg.edit(renderSlackMessage(`[🔗 Thread Viewer](${viewerUrl})`)).catch(() => {});
+    await thread.post(renderSlackMessage(result));
   }
 
   bot.onNewMention(async (thread, message) => {

@@ -12,6 +12,7 @@
     "@chat-adapter/slack": "latest",
     "@chat-adapter/state-redis": "latest",
     "@chat-adapter/state-memory": "latest",
+    "redis": "^4.7.0",
     "next": "^15",
     "react": "^19",
     "react-dom": "^19"

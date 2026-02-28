@@ -9,10 +9,12 @@
  * and replay them through the v2 agent.
  */
 
+import { createClient, type RedisClientType } from "redis";
 import { execute, type FileAttachment } from "./harness";
 
 const SLACK_BOT_TOKEN = process.env.SLACK_BOT_TOKEN || "";
 const THREAD_VIEWER_URL = process.env.THREAD_VIEWER_URL || "https://svc-ai.paradigm.xyz";
+const REDIS_URL = process.env.REDIS_URL || "";
 
 // v1 bot user ID (@ai in #ai-agent)
 const V1_BOT_USER_ID = "U0AARS3FNEL";
@@ -21,8 +23,45 @@ const V1_BOT_USER_ID = "U0AARS3FNEL";
 const AI_AGENT_CHANNEL = "C0A82R7S80N"; // #ai-agent
 const AI_V2_CHANNEL = "C0AJ07U8Z1N"; // #ai-v2
 
-// Track origin parent ts → shadow thread ts in #ai-v2 so replies land in the same thread
-const shadowThreadMap = new Map<string, string>();
+// Redis key prefix for shadow thread mappings
+const SHADOW_MAP_PREFIX = "shadow_thread:";
+const SHADOW_MAP_TTL = 60 * 60 * 24 * 7; // 7 days
+
+// In-memory fallback when Redis is unavailable
+const shadowThreadMapFallback = new Map<string, string>();
+
+let _redis: RedisClientType | null = null;
+
+async function getRedis(): Promise<RedisClientType | null> {
+  if (!REDIS_URL) return null;
+  if (_redis?.isOpen) return _redis;
+  try {
+    _redis = createClient({ url: REDIS_URL }) as RedisClientType;
+    _redis.on("error", () => {});
+    await _redis.connect();
+    return _redis;
+  } catch {
+    _redis = null;
+    return null;
+  }
+}
+
+async function getShadowTs(parentTs: string): Promise<string | undefined> {
+  const redis = await getRedis();
+  if (redis) {
+    const val = await redis.get(`${SHADOW_MAP_PREFIX}${parentTs}`);
+    return val ?? undefined;
+  }
+  return shadowThreadMapFallback.get(parentTs);
+}
+
+async function setShadowTs(parentTs: string, shadowTs: string): Promise<void> {
+  const redis = await getRedis();
+  if (redis) {
+    await redis.set(`${SHADOW_MAP_PREFIX}${parentTs}`, shadowTs, { EX: SHADOW_MAP_TTL });
+  }
+  shadowThreadMapFallback.set(parentTs, shadowTs);
+}
 
 /**
  * Run a single shadow: post to #ai-v2, execute via v2 agent, post result.
@@ -36,7 +75,7 @@ async function runShadow(
 ): Promise<string | null> {
   // If this is a thread reply, reuse the existing shadow thread
   const parentTs = originThreadTs || originTs;
-  const existingShadowTs = originThreadTs ? shadowThreadMap.get(originThreadTs) : undefined;
+  const existingShadowTs = originThreadTs ? await getShadowTs(originThreadTs) : undefined;
   const shadowThreadKey = `shadow:${AI_AGENT_CHANNEL}:${parentTs}`;
 
   let shadowTs: string;
@@ -78,7 +117,7 @@ async function runShadow(
     }
 
     shadowTs = postData.ts;
-    shadowThreadMap.set(parentTs, shadowTs);
+    await setShadowTs(parentTs, shadowTs);
 
     // Post thread viewer link
     const viewerUrl = `${THREAD_VIEWER_URL}/threads/${encodeURIComponent(shadowThreadKey)}`;

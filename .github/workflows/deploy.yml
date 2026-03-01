@@ -167,9 +167,17 @@ jobs:
           [ "${{ steps.changes.outputs.tools }}" = "true" ] && COMPONENTS="${COMPONENTS} tools"
           [ "${{ steps.changes.outputs.infra }}" = "true" ] && COMPONENTS="${COMPONENTS} infra"
 
+          # Capture error logs if the job failed
+          ERROR_LOG=""
+          if [ "${{ job.status }}" = "failure" ]; then
+            ERROR_LOG=$(gh run view ${{ github.run_id }} --log-failed --repo ${{ github.repository }} 2>&1 | tail -40 || echo "Failed to fetch logs")
+          fi
+
           export OPENAI_API_KEY SLACK_BOT_TOKEN
           ./scripts/deploy-notify.sh \
             "${{ github.event.before }}" \
             "${{ github.sha }}" \
             "$COMPONENTS" \
-            "${{ github.repository }}"
+            "${{ github.repository }}" \
+            "${{ job.status }}" \
+            "$ERROR_LOG"

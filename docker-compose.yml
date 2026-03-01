@@ -3,12 +3,12 @@ services:
     image: pgvector/pgvector:pg16
     environment:
       POSTGRES_DB: ai_v2
-      POSTGRES_USER: paradigm
-      POSTGRES_PASSWORD: paradigm_dev
+      POSTGRES_USER: tempo
+      POSTGRES_PASSWORD: tempo_dev
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U paradigm -d ai_v2"]
+      test: ["CMD-SHELL", "pg_isready -U tempo -d ai_v2"]
       interval: 5s
       timeout: 5s
       retries: 5
@@ -45,7 +45,7 @@ services:
       - path: .env
         required: false
     environment:
-      DATABASE_URL: postgresql://paradigm:paradigm_dev@postgres:5432/ai_v2
+      DATABASE_URL: postgresql://tempo:tempo_dev@postgres:5432/ai_v2
       SLACKBOT_URL: http://slackbot:3001
       AI_V2_LOG_LEVEL: info
       SECRET_MANAGER_URL: http://secrets:8100
@@ -75,7 +75,7 @@ services:
       - path: .env
         required: false
     environment:
-      DATABASE_URL: postgresql://paradigm:paradigm_dev@postgres:5432/ai_v2
+      DATABASE_URL: postgresql://tempo:tempo_dev@postgres:5432/ai_v2
       SECRET_MANAGER_URL: http://secrets:8100
     networks:
       - default

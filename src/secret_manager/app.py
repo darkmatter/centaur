@@ -57,12 +57,8 @@ def _normalize(title: str) -> str:
     return re.sub(r"[^A-Z0-9]", "_", title.upper()).strip("_")
 
 
-# Map common env var names to 1Password item titles that differ.
-_ALIASES: dict[str, list[str]] = {
-    "ANTHROPIC_API_KEY": ["CLAUDE_API"],
-    "OPENAI_API_KEY": ["CHATGPT_API"],
-    "GITHUB_TOKEN": ["GITHUB", "SVC_PARADIGM_GITHUB"],
-}
+# All vault items are now named with canonical ENV_VAR names directly.
+_ALIASES: dict[str, list[str]] = {}
 
 
 async def _init_client() -> Client:

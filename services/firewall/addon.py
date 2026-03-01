@@ -156,8 +156,11 @@ class CredentialInjector:
             with urllib.request.urlopen(req, timeout=5) as resp:
                 data = json.loads(resp.read().decode())
                 return data.get("value")
-        except Exception:
-            log.debug("failed to fetch secret %s", key)
+        except urllib.error.HTTPError as e:
+            log.warning("secret %s: HTTP %d from secret manager", key, e.code)
+            return None
+        except Exception as e:
+            log.warning("secret %s: fetch failed: %s", key, e)
             return None
 
     def _refresh_if_needed(self) -> None:
@@ -170,10 +173,15 @@ class CredentialInjector:
             if time.monotonic() - self._last_refresh < CACHE_TTL:
                 return
             new_secrets: dict[str, str] = {}
+            resolved: list[str] = []
+            missing: list[str] = []
             for key in self._needed_keys:
                 val = self._fetch_secret(key)
                 if val:
                     new_secrets[key] = val
+                    resolved.append(key)
+                else:
+                    missing.append(key)
 
             # Compute derived keys
             gh_token = new_secrets.get("GITHUB_TOKEN", "")
@@ -184,7 +192,11 @@ class CredentialInjector:
 
             self._secrets = new_secrets
             self._last_refresh = time.monotonic()
-            log.info("refreshed %d/%d secrets", len(new_secrets), len(self._needed_keys))
+            log.info(
+                "refreshed secrets: resolved=[%s], missing=[%s]",
+                ", ".join(sorted(resolved)),
+                ", ".join(sorted(missing)),
+            )
 
     def _resolve(self, template: str) -> str:
         """Resolve {KEY} placeholders in a template string."""

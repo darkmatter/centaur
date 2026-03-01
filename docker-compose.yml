@@ -27,7 +27,7 @@ services:
     build: .
     command: ["/app/.venv/bin/uvicorn", "secret_manager.app:app", "--host", "0.0.0.0", "--port", "8100"]
     environment:
-      OP_SERVICE_ACCOUNT_TOKEN: ${OP_SERVICE_ACCOUNT_TOKEN}
+      OP_SERVICE_ACCOUNT_TOKEN: ${OP_SERVICE_ACCOUNT_TOKEN:-}
       OP_VAULT: Paradigm AI Secrets & API Keys
     networks:
       - default

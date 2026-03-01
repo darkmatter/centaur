@@ -152,7 +152,12 @@ async def _load_all() -> int:
     # Atomic swap — avoids readers seeing an empty cache during refresh
     _cache = new_cache
     _last_refresh_error = None
-    log.info("loaded %d keys from vault '%s'", len(_cache), _VAULT_NAME)
+    log.info(
+        "loaded %d keys from vault '%s': %s",
+        len(_cache),
+        _VAULT_NAME,
+        ", ".join(sorted(_cache.keys())),
+    )
     return len(_cache)
 
 
@@ -210,6 +215,12 @@ def health() -> dict:
         "cached_keys": len(_cache),
         "last_refresh_error": _last_refresh_error,
     }
+
+
+@app.get("/keys")
+def list_keys() -> dict:
+    """List all cached key names (values are never exposed)."""
+    return {"keys": sorted(_cache.keys()), "count": len(_cache)}
 
 
 @app.get("/secrets/{key}")

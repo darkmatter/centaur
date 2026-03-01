@@ -40,7 +40,7 @@ services:
     restart: unless-stopped
 
   secrets-proxy:
-    build: secrets-proxy
+    build: services/mitm
     environment:
       SECRET_MANAGER_URL: http://secrets:8100
     networks:
@@ -205,5 +205,6 @@ volumes:
 
 networks:
   secrets_net:
+    internal: true
   agent_net:
     internal: true

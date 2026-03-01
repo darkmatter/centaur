@@ -109,6 +109,56 @@ The `docker-compose.yml` uses `env_file` with `required: false`, so it loads
 `.env` when present but doesn't fail when it's missing (e.g., on the deploy
 host where 1Password handles all secrets).
 
+## MITM Proxy — Zero-secret sandboxes
+
+When `MITM_HOST` is set, sandbox containers receive **no real API keys**.
+Instead, a transparent MITM proxy intercepts outgoing HTTPS and injects
+credentials fetched from the secrets service.
+
+### Architecture
+
+```
+Sandbox Container        MITM Proxy (stateless)      Secrets Service (1PW)
+  amp/claude/codex  ──►  mitmproxy addon         ──►  GET /secrets/{key}
+  (PROXY_MANAGED)        injects real creds            (in-memory cache)
+                         forwards to upstream
+```
+
+### How it works
+
+1. Sandboxes get placeholder values (`PROXY_MANAGED`) for all API keys
+2. `HTTPS_PROXY=http://mitm:8080` routes all traffic through the proxy
+3. The proxy addon matches request hosts to injection rules:
+   - `api.anthropic.com` → `x-api-key: {real key}`
+   - `api.openai.com` → `Authorization: Bearer {real key}`
+   - `github.com` / `api.github.com` → token auth
+4. TLS is terminated at the proxy (sandbox trusts the MITM CA via volume mount)
+5. Sandboxes cannot observe the injected credentials
+
+### One-time setup
+
+```bash
+# Generate and store MITM CA cert in 1Password
+./scripts/generate-mitm-ca.sh
+
+# The CA is stored as MITM_CA_CERT and MITM_CA_KEY in the vault.
+# All MITM proxy instances load it on startup → stateless horizontal scaling.
+```
+
+### Adding injection rules
+
+Edit `services/mitm/addon.py` `_DEFAULT_RULES` or set `MITM_EXTRA_RULES`
+env var (JSON) on the mitm service:
+
+```json
+{"custom.api.com": [["x-api-key", "{CUSTOM_API_KEY}"]]}
+```
+
+### Disabling the proxy
+
+Remove `MITM_HOST` from the api service environment. Sandboxes revert to
+receiving secrets directly as env vars (legacy mode).
+
 ## Security properties
 
 | Property | Status |
@@ -116,7 +166,11 @@ host where 1Password handles all secrets).
 | Secrets in git | ✅ None |
 | Secrets on disk (deploy host) | ✅ None |
 | Secrets in container env | ✅ Only OP_SA_TOKEN via Docker secret (tmpfs) |
-| Rotation | ✅ Update in 1PW, containers pick up within 5min |
+| Secrets in sandbox env | ✅ None (placeholder values only, with MITM proxy) |
+| Sandbox secret exfiltration | ✅ Blocked (no real keys + proxy-only internet) |
+| MITM proxy statefulness | ✅ Stateless (secrets fetched on demand, CA from 1PW) |
+| Horizontal scaling | ✅ Scale mitm replicas — all share CA from secrets service |
+| Rotation | ✅ Update in 1PW, containers pick up within 30s |
 | Team offboarding | ✅ Remove from vault, redeploy |
 | Audit trail | ✅ 1PW activity log shows who accessed what |
 | Cold start auth | ✅ Requires biometric (Touch ID) |

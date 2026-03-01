@@ -5,6 +5,12 @@ HOME_DIR="$(eval echo ~)"
 MCP_URL="${AI_V2_API_URL:-http://localhost:8000}/mcp/"
 MCP_KEY="${AI_V2_API_KEY:-}"
 
+# ── Trust MITM proxy CA (if proxy mode is active) ────────────────────────
+if [ -f /mitm-certs/ca-cert.pem ]; then
+    sudo cp /mitm-certs/ca-cert.pem /usr/local/share/ca-certificates/mitm-ca.crt
+    sudo update-ca-certificates --fresh > /dev/null 2>&1
+fi
+
 # ── Write harness configs (no MCP — adds ~10s startup overhead) ───────────────
 cat > "$HOME_DIR/.config/amp/settings.json" <<EOF
 {"amp.experimental.compaction":95}

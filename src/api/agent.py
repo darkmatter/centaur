@@ -881,25 +881,13 @@ def _refill_pool() -> None:
     _threading.Thread(target=_fill, daemon=True).start()
 
 
-def _fetch_placeholders() -> dict[str, str]:
-    """Fetch placeholder mappings from the secrets service."""
-    url = os.getenv("SECRET_MANAGER_URL", "http://secrets:8100")
-    try:
-        resp = httpx.get(f"{url}/placeholders", timeout=5.0)
-        resp.raise_for_status()
-        return resp.json()
-    except Exception as exc:
-        log.warning("placeholder_fetch_failed", error=str(exc))
-        return {}
-
-
 def _container_env() -> list[str]:
     """Build env vars to forward into the container.
 
     When MITM_HOST is set, secrets are NOT passed to sandboxes.  Instead,
-    placeholder tokens (fetched from the secrets service) are injected and
-    the MITM proxy replaces them with real values in-flight.  Secrets never
-    exist inside sandbox containers.
+    dummy values are injected so harness CLIs initialise normally, and the
+    MITM proxy overwrites HTTP headers with real credentials in-flight.
+    Secrets never exist inside sandbox containers.
     """
     env = [
         f"AI_V2_API_URL={os.getenv('AGENT_API_URL', 'http://api:8000')}",
@@ -908,10 +896,11 @@ def _container_env() -> list[str]:
 
     mitm_host = os.getenv("MITM_HOST", "")
     if mitm_host:
-        # Fetch real placeholder tokens from the secrets service.
-        placeholders = _fetch_placeholders()
-        for name, placeholder in placeholders.items():
-            env.append(f"{name}={placeholder}")
+        # Dummy values — the MITM proxy injects real credentials at the HTTP layer.
+        _ph = "PROXY_MANAGED"
+        for _k in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "CODEX_API_KEY",
+                    "AMP_API_KEY", "GITHUB_TOKEN"):
+            env.append(f"{_k}={_ph}")
 
         env.extend([
             f"HTTPS_PROXY=http://{mitm_host}:8080",

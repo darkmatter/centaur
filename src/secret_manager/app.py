@@ -218,3 +218,4 @@ def get_secret(key: str) -> dict:
     if value is None:
         raise HTTPException(status_code=404, detail="not found")
     return {"value": value}
+

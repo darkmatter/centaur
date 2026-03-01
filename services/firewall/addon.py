@@ -116,6 +116,7 @@ class CredentialInjector:
         )
 
         self._start_health_server()
+        self._start_background_refresh()
 
     # ── Health endpoint ───────────────────────────────────────────────
 
@@ -145,6 +146,20 @@ class CredentialInjector:
 
         threading.Thread(target=serve, daemon=True).start()
         log.info("health server listening on :%d", HEALTH_PORT)
+
+    # ── Background refresh ──────────────────────────────────────────
+
+    def _start_background_refresh(self) -> None:
+        def _poll() -> None:
+            while True:
+                with self._lock:
+                    all_resolved = len(self._secrets) >= len(self._needed_keys)
+                # Retry every 10s if missing secrets, else every 60s
+                time.sleep(10 if not all_resolved else 60)
+                self._last_refresh = 0  # force next refresh
+                self._refresh_if_needed()
+
+        threading.Thread(target=_poll, daemon=True).start()
 
     # ── Secret fetching ───────────────────────────────────────────────
 

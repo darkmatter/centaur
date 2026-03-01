@@ -20,6 +20,7 @@ import os
 import re
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from typing import Any
 
 from fastapi import FastAPI, HTTPException
 from onepassword.client import Client
@@ -70,11 +71,28 @@ async def _init_client() -> Client:
 
 async def _find_vault_id(client: Client, name: str) -> str:
     """Find a vault ID by name."""
-    vaults = await client.vaults.list_all()
-    async for v in vaults:
+    # onepassword-sdk versions expose either list() or list_all().
+    vaults = await _list_vaults(client)
+    for v in vaults:
         if v.title == name:
             return v.id
     raise RuntimeError(f"Vault '{name}' not found")
+
+
+async def _list_vaults(client: Client) -> list[Any]:
+    list_all = getattr(client.vaults, "list_all", None)
+    if callable(list_all):
+        vault_iter = await list_all()
+        return [v async for v in vault_iter]
+    return list(await client.vaults.list())
+
+
+async def _list_items(client: Client, vault_id: str) -> list[Any]:
+    list_all = getattr(client.items, "list_all", None)
+    if callable(list_all):
+        item_iter = await list_all(vault_id)
+        return [item async for item in item_iter]
+    return list(await client.items.list(vault_id))
 
 
 async def _load_all() -> int:
@@ -87,26 +105,31 @@ async def _load_all() -> int:
         _client = await _init_client()
 
     vault_id = await _find_vault_id(_client, _VAULT_NAME)
-    items = await _client.items.list_all(vault_id)
+    items = await _list_items(_client, vault_id)
 
     new_cache: dict[str, str] = {}
-    async for item_overview in items:
-        ref = f"op://{_VAULT_NAME}/{item_overview.id}/password"
+    for item_overview in items:
+        item_id = getattr(item_overview, "id", "")
+        item_title = getattr(item_overview, "title", "")
+        if not item_id:
+            continue
+
+        ref = f"op://{_VAULT_NAME}/{item_id}/password"
         try:
             value = await _client.secrets.resolve(ref)
         except Exception:
             # Try 'credential' field for API_CREDENTIAL items
             try:
-                ref_alt = f"op://{_VAULT_NAME}/{item_overview.id}/credential"
+                ref_alt = f"op://{_VAULT_NAME}/{item_id}/credential"
                 value = await _client.secrets.resolve(ref_alt)
             except Exception:
-                log.debug("skipping item %s — no password/credential field", item_overview.title)
+                log.debug("skipping item %s — no password/credential field", item_title)
                 continue
 
         if not value:
             continue
 
-        title = item_overview.title
+        title = item_title
         new_cache[title] = value
         norm = _normalize(title)
         if norm != title:

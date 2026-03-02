@@ -10,7 +10,8 @@ concurrency:
 
 jobs:
   deploy:
-    runs-on: self-hosted
+    # Restrict deploys to the Docker-capable self-hosted runner labels.
+    runs-on: [self-hosted, linux, x64]
     env:
       DEPLOY_DIR: ${{ github.workspace }}
       OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}

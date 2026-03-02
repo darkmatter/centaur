@@ -7,6 +7,7 @@
 - All imports at top of file, never inside functions
 - Absolute imports only: `from shared.X`, `from api.X`, `from etl.X` — no relative imports
 - All secrets via env vars, never hardcode
+- **1Password**: Use account `paradigmoperationslp` and vault `Paradigm AI Secrets & API Keys` (ID: `7ycqwxmheirj5zoyqmd27fmbca`). Always pass `--account paradigmoperationslp` to `op` commands.
 - `asyncpg` for Postgres, `pgvector` for embeddings
 - Query `raw_records` JSONB directly — no staging/mart views
 - Conventional commits: `feat:`, `fix:`, `docs:`, `refactor:`, `test:`, `chore:`

@@ -119,17 +119,19 @@ services:
   slackbot:
     build:
       context: apps/slackbot
-    env_file:
-      - path: .env
-        required: false
     environment:
       REDIS_URL: redis://redis:6379
       AI_V2_API_URL: http://api:8000
-      AI_V2_API_KEY: ${API_SECRET_KEY}
+      SECRET_MANAGER_URL: http://secrets:8100
+    networks:
+      - default
+      - secrets_net
     depends_on:
       api:
         condition: service_healthy
       redis:
+        condition: service_healthy
+      secrets:
         condition: service_healthy
     restart: unless-stopped
 

@@ -32,6 +32,7 @@ from shared.tool_sdk import _sm_read
 log = structlog.get_logger()
 
 HARNESSES = ("amp", "claude-code", "codex", "pi-mono")
+_DEFAULT_CODEX_MODEL = os.getenv("AGENT_CODEX_MODEL", "gpt-5.3-codex").strip() or "gpt-5.3-codex"
 
 # Max seconds of *idle* time (no output) before killing a hung exec.
 # Active agents that keep producing output are never killed by this timeout.
@@ -1054,6 +1055,8 @@ def _build_command(harness: str, message: str, thread_id: str | None) -> list[st
         return [
             "codex",
             "exec",
+            "--model",
+            _DEFAULT_CODEX_MODEL,
             "--json",
             "--full-auto",
             "--skip-git-repo-check",

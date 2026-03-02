@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -10,6 +11,7 @@ from typing import Any
 from shared.engineer.agent_loop import AgentLoopError, AgentLoopResult
 
 EventCallback = Callable[[dict[str, Any]], Awaitable[None]]
+_DEFAULT_CODEX_MODEL = os.getenv("AGENT_CODEX_MODEL", "gpt-5.3-codex").strip() or "gpt-5.3-codex"
 
 
 async def _noop_event(_: dict[str, Any]) -> None:
@@ -27,6 +29,8 @@ def _build_command(harness: str, prompt: str, thread_id: str | None) -> list[str
         return [
             "codex",
             "exec",
+            "--model",
+            _DEFAULT_CODEX_MODEL,
             "--json",
             "--full-auto",
             "--skip-git-repo-check",

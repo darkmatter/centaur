@@ -544,38 +544,49 @@ async def post_context_message(payload: ContextMessageRequest) -> dict[str, Any]
     )
 
 
-# Per-1M token pricing (as of early 2026)
-_MODEL_COST_PER_M: dict[str, tuple[float, float]] = {
-    # (input_cost_per_M, output_cost_per_M)
-    "claude-sonnet-4-20250514": (3.0, 15.0),
-    "claude-3-7-sonnet-20250219": (3.0, 15.0),
-    "claude-3-5-sonnet-20241022": (3.0, 15.0),
-    "claude-3-5-haiku-20241022": (0.80, 4.0),
-    "claude-3-opus-20240229": (15.0, 75.0),
-}
+def _resolve_model_costs_per_m(model_lower: str) -> tuple[float, float] | None:
+    """Return (input_cost_per_million, output_cost_per_million).
+
+    Keep this family-based so new snapshot suffixes inherit correct pricing
+    without requiring constant table maintenance.
+    """
+    # OpenAI Codex (official model page)
+    if "gpt-5.3-codex" in model_lower:
+        return (1.75, 14.0)
+
+    # Anthropic Opus tiers
+    if "claude-3-opus" in model_lower:
+        return (15.0, 75.0)
+    if "opus-4-6" in model_lower or "opus-4-5" in model_lower:
+        return (5.0, 25.0)
+    if "opus-4-1" in model_lower or "opus-4-0" in model_lower or "opus-4" in model_lower:
+        return (15.0, 75.0)
+    if "opus" in model_lower:
+        # Prefer current Opus pricing for ambiguous aliases like "claude-opus-4-6".
+        return (5.0, 25.0)
+
+    # Anthropic Sonnet pricing
+    if "sonnet" in model_lower:
+        return (3.0, 15.0)
+
+    # Anthropic Haiku tiers
+    if "haiku-3-5" in model_lower or "3-5-haiku" in model_lower:
+        return (0.80, 4.0)
+    if "haiku-3" in model_lower or "3-haiku" in model_lower:
+        return (0.25, 1.25)
+    if "haiku" in model_lower:
+        return (1.0, 5.0)
+
+    return None
 
 
 def _estimate_cost_usd(model: str | None, input_tokens: int, output_tokens: int) -> float | None:
     if not model or (input_tokens == 0 and output_tokens == 0):
         return None
     model_lower = model.lower()
-    # Try exact match first, then prefix match
-    costs = _MODEL_COST_PER_M.get(model_lower)
+    costs = _resolve_model_costs_per_m(model_lower)
     if not costs:
-        for key, val in _MODEL_COST_PER_M.items():
-            if model_lower.startswith(key.rsplit("-", 1)[0]):
-                costs = val
-                break
-    if not costs:
-        # Default to sonnet pricing as a reasonable fallback
-        if "opus" in model_lower:
-            costs = (15.0, 75.0)
-        elif "haiku" in model_lower:
-            costs = (0.80, 4.0)
-        elif "sonnet" in model_lower:
-            costs = (3.0, 15.0)
-        else:
-            return None
+        return None
     input_cost = (input_tokens / 1_000_000) * costs[0]
     output_cost = (output_tokens / 1_000_000) * costs[1]
     return round(input_cost + output_cost, 6)

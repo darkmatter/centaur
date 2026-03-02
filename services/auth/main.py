@@ -64,7 +64,9 @@ def _make_token() -> str:
 
 def _check_auth(request: Request) -> bool:
     if not _PASSWORD:
-        return True
+        # Fail closed: no password configured means secrets are unavailable.
+        # Never allow unauthenticated access.
+        return False
     token = request.cookies.get(_COOKIE_NAME, "")
     if not token:
         return False
@@ -181,7 +183,7 @@ _LOGIN_HTML = """<!DOCTYPE html>
 
 async def login_page(request: Request) -> Response:
     if _check_auth(request):
-        return RedirectResponse("/threads", status_code=302)
+        return RedirectResponse("/", status_code=302)
     error = request.query_params.get("error", "")
     error_html = '<div class="error">Invalid password</div>' if error else ""
     return HTMLResponse(_LOGIN_HTML % {"error_html": error_html})
@@ -192,12 +194,13 @@ async def login_submit(request: Request) -> Response:
     password = str(form.get("password", ""))
 
     if not _PASSWORD:
-        return RedirectResponse("/threads", status_code=302)
+        # Secrets unavailable — cannot validate password. Show error.
+        return RedirectResponse("/login?error=1", status_code=303)
 
     if not secrets.compare_digest(password, _PASSWORD):
         return RedirectResponse("/login?error=1", status_code=303)
 
-    response = RedirectResponse("/threads", status_code=303)
+    response = RedirectResponse("/", status_code=303)
     response.set_cookie(
         _COOKIE_NAME,
         _make_token(),

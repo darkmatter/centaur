@@ -66,6 +66,16 @@ _sessions: dict[str, dict[str, Any]] = {}
 _sessions_lock = threading.RLock()
 _execute_locks: dict[str, threading.Lock] = {}
 _execute_locks_guard = threading.Lock()
+_MAX_CONCURRENT_EXECUTIONS = max(1, int(os.getenv("AGENT_MAX_CONCURRENT_RUNS", "8")))
+_MAX_CONCURRENT_EXECUTIONS_PER_ACTOR = max(
+    1, int(os.getenv("AGENT_MAX_CONCURRENT_RUNS_PER_ACTOR", "2"))
+)
+_EXECUTION_QUEUE_WAIT_TIMEOUT_S = max(1.0, float(os.getenv("AGENT_EXEC_QUEUE_WAIT_TIMEOUT", "45")))
+_exec_scheduler_cond = threading.Condition()
+_exec_wait_queue: list[tuple[int, str, str]] = []
+_exec_active_total = 0
+_exec_active_by_actor: dict[str, int] = {}
+_exec_ticket_counter = 0
 
 # Active states that prevent engineer from overwriting a non-engineer session
 _ACTIVE_SESSION_STATES = ("working", "idle", "running", "stopping")
@@ -110,6 +120,75 @@ def get_execute_lock(thread_key: str) -> threading.Lock:
             lock = threading.Lock()
             _execute_locks[thread_key] = lock
         return lock
+
+
+def _execution_actor_key(user_id: str | None, source_tag: str, thread_key: str) -> str:
+    normalized_user = str(user_id or "").strip()
+    if normalized_user:
+        return f"user:{normalized_user}"
+    normalized_source = source_tag.strip() or "unknown"
+    # Keep anonymous traffic reasonably partitioned by source + thread.
+    return f"anon:{normalized_source}:{thread_key}"
+
+
+def _acquire_execution_slot(
+    *,
+    actor_key: str,
+    thread_key: str,
+    timeout_s: float,
+) -> tuple[bool, float, int]:
+    """Fair queue with global + per-actor concurrency caps.
+
+    Admission chooses the first *eligible* queued ticket so a capped actor at
+    queue head does not block unrelated actors behind it.
+    """
+    global _exec_active_total, _exec_ticket_counter
+
+    started_at = time.monotonic()
+    with _exec_scheduler_cond:
+        _exec_ticket_counter += 1
+        ticket_id = _exec_ticket_counter
+        _exec_wait_queue.append((ticket_id, actor_key, thread_key))
+        initial_position = len(_exec_wait_queue) - 1
+
+        while True:
+            elapsed = time.monotonic() - started_at
+            remaining = timeout_s - elapsed
+            eligible_index: int | None = None
+            if _exec_active_total < _MAX_CONCURRENT_EXECUTIONS:
+                for idx, (_, queued_actor, _) in enumerate(_exec_wait_queue):
+                    queued_actor_active = _exec_active_by_actor.get(queued_actor, 0)
+                    if queued_actor_active < _MAX_CONCURRENT_EXECUTIONS_PER_ACTOR:
+                        eligible_index = idx
+                        break
+
+            if (
+                eligible_index is not None
+                and _exec_wait_queue[eligible_index][0] == ticket_id
+            ):
+                _exec_wait_queue.pop(eligible_index)
+                _exec_active_total += 1
+                _exec_active_by_actor[actor_key] = _exec_active_by_actor.get(actor_key, 0) + 1
+                return True, elapsed, initial_position
+
+            if remaining <= 0:
+                _exec_wait_queue[:] = [item for item in _exec_wait_queue if item[0] != ticket_id]
+                _exec_scheduler_cond.notify_all()
+                return False, elapsed, initial_position
+
+            _exec_scheduler_cond.wait(timeout=remaining)
+
+
+def _release_execution_slot(actor_key: str) -> None:
+    global _exec_active_total
+    with _exec_scheduler_cond:
+        _exec_active_total = max(0, _exec_active_total - 1)
+        actor_active = _exec_active_by_actor.get(actor_key, 0)
+        if actor_active <= 1:
+            _exec_active_by_actor.pop(actor_key, None)
+        else:
+            _exec_active_by_actor[actor_key] = actor_active - 1
+        _exec_scheduler_cond.notify_all()
 
 
 def _session_has_active_turn(session: dict[str, Any]) -> bool:
@@ -1286,6 +1365,8 @@ class AgentClient:
         source_tag = str(source or "api").strip().lower()
         display_message = _display_user_message(message) or message.strip()
         mirror_to_slack = source_tag in {"thread_ui", "thread-view", "ui"}
+        actor_key = _execution_actor_key(user_id, source_tag, slack_thread_key)
+        slot_acquired = False
         execute_lock = get_execute_lock(slack_thread_key)
         if not execute_lock.acquire(blocking=False):
             return {
@@ -1312,6 +1393,28 @@ class AgentClient:
                 return {
                     "error": "A run is already in progress for this thread. Wait for it to finish first."
                 }
+
+            slot_acquired, queue_wait_s, queue_position = _acquire_execution_slot(
+                actor_key=actor_key,
+                thread_key=slack_thread_key,
+                timeout_s=_EXECUTION_QUEUE_WAIT_TIMEOUT_S,
+            )
+            if not slot_acquired:
+                return {
+                    "error": (
+                        "Run queue is saturated right now. "
+                        "Please retry in a few moments."
+                    )
+                }
+            if queue_wait_s > 0.1:
+                _emit(
+                    {
+                        "type": "status",
+                        "stage": "scheduler.acquired",
+                        "wait_s": round(queue_wait_s, 3),
+                        "queue_position": queue_position + 1,
+                    }
+                )
 
             if mirror_to_slack:
                 attributed_message = (
@@ -1648,6 +1751,8 @@ class AgentClient:
             _emit({"type": "final", **result})
             return result
         finally:
+            if slot_acquired:
+                _release_execution_slot(actor_key)
             execute_lock.release()
 
     def status(self, slack_thread_key: str | None = None) -> dict[str, Any]:
@@ -1852,8 +1957,8 @@ class AgentClient:
 
         log.info("session_recovery_complete", recovered=recovered, pruned=pruned)
 
-        # 3. Re-dispatch sessions that were in 'working' state (interrupted turns)
-        resumed = 0
+        # 3. Mark interrupted sessions safely; do not auto-replay side-effecting work.
+        interrupted = 0
         for row in rows:
             if row.get("state") != "working":
                 continue
@@ -1877,14 +1982,17 @@ class AgentClient:
                 continue
 
             interrupted_turn = incomplete[0]
-            user_message = interrupted_turn["user_message"]
+            interrupted_result = (
+                "⚠️ Interrupted by API restart — automatic retry disabled. "
+                "Please retry manually."
+            )
 
             # Mark the interrupted turn as failed
             _pg_write(
                 "UPDATE agent_turns SET finished_at = now(), result = %s, exit_code = -1 "
                 "WHERE slack_thread_key = %s AND turn_id = %s AND finished_at IS NULL",
                 (
-                    "⚠️ Interrupted by API restart — retrying automatically.",
+                    interrupted_result,
                     key,
                     interrupted_turn["turn_id"],
                 ),
@@ -1892,35 +2000,25 @@ class AgentClient:
             # Also update the in-memory turn if present
             for t in session.get("turns", []):
                 if t["turn_id"] == interrupted_turn["turn_id"] and not t.get("finished_at"):
-                    t["result"] = "⚠️ Interrupted by API restart — retrying automatically."
+                    t["result"] = interrupted_result
                     t["finished_at"] = time.time()
                     t["exit_code"] = -1
 
-            harness = session.get("harness", "amp")
+            session["state"] = "error"
+            session["last_activity"] = time.time()
+            _persist_session(session, key)
             log.info(
-                "session_resume_scheduled",
+                "session_marked_interrupted",
                 thread=key,
-                harness=harness,
-                message_len=len(user_message),
+                harness=session.get("harness", "amp"),
+                turn_id=interrupted_turn["turn_id"],
             )
+            interrupted += 1
 
-            def _resume(thread_key: str, msg: str, h: str) -> None:
-                try:
-                    result = self.execute(thread_key, msg, h)
-                    result_text = result.get("result", "")
-                    _post_to_slack_sync(thread_key, result_text)
-                    log.info("session_resumed_ok", thread=thread_key, result_len=len(result_text))
-                except Exception as exc:
-                    log.warning("session_resume_failed", thread=thread_key, error=str(exc))
-                    _post_to_slack_sync(thread_key, f"⚠️ Failed to resume interrupted job: {exc}")
+        if interrupted:
+            log.info("session_restart_interrupt_marked", count=interrupted)
 
-            threading.Thread(target=_resume, args=(key, user_message, harness), daemon=True).start()
-            resumed += 1
-
-        if resumed:
-            log.info("session_resume_dispatched", count=resumed)
-
-        return {"recovered": recovered, "pruned": pruned, "resumed": resumed}
+        return {"recovered": recovered, "pruned": pruned, "interrupted": interrupted}
 
     def interrupt(self, slack_thread_key: str) -> dict[str, Any]:
         """Interrupt the currently running command in a sandbox."""

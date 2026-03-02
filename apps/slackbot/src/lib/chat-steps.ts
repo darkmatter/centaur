@@ -16,13 +16,18 @@ function asRecord(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" ? (value as Record<string, unknown>) : {};
 }
 
-function asNumber(value: unknown): number | undefined {
+function asNumber(value: unknown): number | null {
   if (typeof value === "number" && Number.isFinite(value)) return value;
   if (typeof value === "string" && value.trim()) {
     const parsed = Number(value);
     if (Number.isFinite(parsed)) return parsed;
   }
-  return undefined;
+  return null;
+}
+
+function asBoolean(value: unknown): boolean | null {
+  if (typeof value === "boolean") return value;
+  return null;
 }
 
 function outputToText(output: unknown): string | undefined {
@@ -92,6 +97,7 @@ export function stepsFromUiMessages(messages: UIMessage[]): Step[] {
       if (partType === "data-file-changes") {
         flushGroup();
         const data = asRecord(part.data);
+        const streamId = asString(part.id);
         const changesRaw = Array.isArray(data.changes) ? data.changes : [];
         const changes = changesRaw
           .map((item) => asRecord(item))
@@ -101,7 +107,7 @@ export function stepsFromUiMessages(messages: UIMessage[]): Step[] {
           }))
           .filter((item) => item.path);
         if (changes.length > 0) {
-          steps.push({ id: `file-changes:${partId}`, type: "file-changes", changes });
+          steps.push({ id: streamId || `file-changes:${partId}`, type: "file-changes", changes });
         }
         continue;
       }
@@ -123,7 +129,9 @@ export function stepsFromUiMessages(messages: UIMessage[]): Step[] {
         flushGroup();
         const subagentId = asString(data.subagent_id);
         const phase = asString(data.phase) || undefined;
-        const stepId = `subagent:${subagentId || partId}:${status}`;
+        const streamId = asString(part.id);
+        const stepId = streamId || `subagent:${subagentId || partId}:${status}`;
+        const acceptableRaw = data.acceptable;
         steps.push({
           id: stepId,
           type: "subagent",
@@ -133,29 +141,43 @@ export function stepsFromUiMessages(messages: UIMessage[]): Step[] {
           name: asString(data.name) || undefined,
           summary: asString(data.summary) || undefined,
           error: asString(data.error) || undefined,
-          branchIndex: asNumber(data.branch_index),
-          totalBranches: asNumber(data.total_branches),
-          completed: asNumber(data.completed),
-          acceptable: asNumber(data.acceptable),
-          failed: asNumber(data.failed),
-          turns: asNumber(data.turns),
-          toolCalls: asNumber(data.tool_calls),
-          durationS: asNumber(data.duration_s),
-          maxParallel: asNumber(data.max_parallel),
-          inputTokens: asNumber(data.input_tokens),
-          outputTokens: asNumber(data.output_tokens),
-          totalTokens: asNumber(data.total_tokens),
-          costUsd: asNumber(data.cost_usd) ?? null,
+          branchIndex: asNumber(data.branch_index) ?? undefined,
+          totalBranches: asNumber(data.total_branches) ?? undefined,
+          completed: asNumber(data.completed_count ?? data.completed) ?? undefined,
+          acceptable:
+            asNumber(data.acceptable_count ?? (typeof acceptableRaw === "number" ? acceptableRaw : undefined))
+              ?? undefined,
+          failed: asNumber(data.failed_count ?? data.failed) ?? undefined,
+          completedCount: asNumber(data.completed_count) ?? undefined,
+          acceptableCount: asNumber(data.acceptable_count) ?? undefined,
+          failedCount: asNumber(data.failed_count) ?? undefined,
+          isAcceptable: asBoolean(data.is_acceptable ?? acceptableRaw) ?? undefined,
+          turns: asNumber(data.turns) ?? undefined,
+          toolCalls: asNumber(data.tool_calls) ?? undefined,
+          durationS: asNumber(data.duration_s) ?? undefined,
+          maxParallel: asNumber(data.max_parallel) ?? undefined,
+          inputTokens: asNumber(data.input_tokens) ?? undefined,
+          outputTokens: asNumber(data.output_tokens) ?? undefined,
+          totalTokens: asNumber(data.total_tokens) ?? undefined,
+          costUsd: asNumber(data.cost_usd),
           model: asString(data.model) || undefined,
         });
         continue;
       }
 
+      if (partType === "error") {
+        flushGroup();
+        const errorText = asString(part.errorText).trim();
+        if (!errorText) continue;
+        steps.push({ id: `error:${asString(part.id) || partId}`, type: "error", message: errorText });
+        continue;
+      }
       if (partType === "data-shell-command") {
         flushGroup();
         const data = asRecord(part.data);
+        const streamId = asString(part.id);
         steps.push({
-          id: `terminal:${partId}`,
+          id: streamId || `terminal:${partId}`,
           type: "terminal",
           description: "Ran shell command",
           command: asString(data.command),
@@ -176,7 +198,7 @@ export function stepsFromUiMessages(messages: UIMessage[]): Step[] {
           text,
           source: asString(data.source) || undefined,
           userId: asString(data.user_id) || undefined,
-          turnId: asNumber(data.turn_id),
+          turnId: asNumber(data.turn_id) ?? undefined,
         });
         continue;
       }

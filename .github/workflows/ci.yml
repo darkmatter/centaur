@@ -1,0 +1,76 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  merge_group:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  python-runtime:
+    name: Python runtime checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Install Python dependencies
+        run: uv sync --frozen --group dev
+
+      - name: Lint critical runtime paths
+        run: |
+          uv run ruff check \
+            src/api/agent.py \
+            src/api/harness_events.py \
+            src/api/routers/threads.py \
+            src/shared/engineer/agent_loop.py \
+            src/shared/engineer/git_ops.py \
+            src/shared/engineer/orchestrator.py \
+            src/shared/engineer/settings.py
+
+      - name: Compile critical runtime modules
+        run: |
+          uv run python -m py_compile \
+            src/api/agent.py \
+            src/api/harness_events.py \
+            src/api/routers/threads.py \
+            src/shared/engineer/agent_loop.py \
+            src/shared/engineer/git_ops.py \
+            src/shared/engineer/orchestrator.py \
+            src/shared/engineer/settings.py
+
+      - name: Run runtime regression tests
+        run: PYTHONPATH=src uv run pytest -q tests/test_harness_events.py tests/test_agent_thread_sync.py
+
+  slackbot-contract:
+    name: Slackbot TS contract checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Install workspace dependencies
+        run: |
+          corepack enable
+          pnpm install --frozen-lockfile
+
+      - name: Type-check slackbot stream contracts
+        run: pnpm --dir apps/slackbot exec tsc --noEmit

@@ -25,6 +25,8 @@ class AgentLoopResult:
     turns: int
     tool_calls: int
     stop_reason: str
+    input_tokens: int = 0
+    output_tokens: int = 0
 
 
 SAFE_PARALLEL_TOOL_NAMES = {
@@ -76,8 +78,18 @@ def _truncate(text: str, max_chars: int = _MAX_TOOL_RESULT_CHARS) -> str:
 
 def _is_unsupported_output_config_error(exc: Exception) -> bool:
     text = str(exc).lower()
-    return "output_config" in text and any(
-        marker in text for marker in ("unknown", "invalid", "unexpected", "not allowed")
+    output_config_hint = "output_config" in text or "effort parameter" in text
+    return output_config_hint and any(
+        marker in text
+        for marker in ("unknown", "invalid", "unexpected", "not allowed", "does not support")
+    )
+
+
+def _is_unsupported_thinking_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return "thinking" in text and any(
+        marker in text
+        for marker in ("not supported", "unsupported", "invalid_request_error", "not available")
     )
 
 
@@ -245,6 +257,8 @@ async def run_agent_loop(
     messages: list[dict[str, Any]] = [{"role": "user", "content": user_prompt}]
     last_stop_reason = "unknown"
     last_text = ""
+    total_input_tokens = 0
+    total_output_tokens = 0
 
     create_kwargs: dict[str, Any] = {
         "model": model,
@@ -272,6 +286,8 @@ async def run_agent_loop(
                     turns=guard_state.turns,
                     tool_calls=guard_state.tool_calls,
                     stop_reason="turn_budget_exceeded",
+                    input_tokens=total_input_tokens,
+                    output_tokens=total_output_tokens,
                 )
             raise AgentLoopError(str(exc)) from exc
 
@@ -292,6 +308,9 @@ async def run_agent_loop(
             except Exception as exc:
                 if "output_config" in create_kwargs and _is_unsupported_output_config_error(exc):
                     create_kwargs.pop("output_config", None)
+                    break
+                if "thinking" in create_kwargs and _is_unsupported_thinking_error(exc):
+                    create_kwargs.pop("thinking", None)
                     break
                 if _is_context_overflow_error(exc) and attempt < max_attempts:
                     messages = _compact_messages(messages)
@@ -318,6 +337,24 @@ async def run_agent_loop(
             last_text = candidate_text
 
         assistant_blocks = to_assistant_blocks(content_blocks)
+        usage_payload: dict[str, int] | None = None
+        if hasattr(response, "usage") and response.usage:
+            usage_payload = {
+                "input_tokens": int(getattr(response.usage, "input_tokens", 0) or 0),
+                "output_tokens": int(getattr(response.usage, "output_tokens", 0) or 0),
+                "cache_read_input_tokens": int(
+                    getattr(response.usage, "cache_read_input_tokens", 0) or 0
+                ),
+                "cache_creation_input_tokens": int(
+                    getattr(response.usage, "cache_creation_input_tokens", 0) or 0
+                ),
+            }
+            total_input_tokens += (
+                usage_payload["input_tokens"]
+                + usage_payload["cache_read_input_tokens"]
+                + usage_payload["cache_creation_input_tokens"]
+            )
+            total_output_tokens += usage_payload["output_tokens"]
         await emit(
             {
                 "type": "assistant",
@@ -325,18 +362,7 @@ async def run_agent_loop(
                     "role": "assistant",
                     "content": assistant_blocks,
                     "model": getattr(response, "model", None),
-                    "usage": {
-                        "input_tokens": getattr(response.usage, "input_tokens", 0),
-                        "output_tokens": getattr(response.usage, "output_tokens", 0),
-                        "cache_read_input_tokens": getattr(
-                            response.usage, "cache_read_input_tokens", 0
-                        ),
-                        "cache_creation_input_tokens": getattr(
-                            response.usage, "cache_creation_input_tokens", 0
-                        ),
-                    }
-                    if hasattr(response, "usage") and response.usage
-                    else None,
+                    "usage": usage_payload,
                 },
             }
         )
@@ -374,6 +400,8 @@ async def run_agent_loop(
                         turns=guard_state.turns,
                         tool_calls=guard_state.tool_calls,
                         stop_reason="turn_budget_exceeded",
+                        input_tokens=total_input_tokens,
+                        output_tokens=total_output_tokens,
                     )
                 raise AgentLoopError(str(exc)) from exc
 
@@ -400,4 +428,6 @@ async def run_agent_loop(
             turns=guard_state.turns,
             tool_calls=guard_state.tool_calls,
             stop_reason=last_stop_reason,
+            input_tokens=total_input_tokens,
+            output_tokens=total_output_tokens,
         )

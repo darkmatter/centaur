@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any, Literal, cast
@@ -413,25 +414,124 @@ class EngineerOrchestrator:
         is_acceptable: Callable[[str], bool],
         score: Callable[[str], int],
         session: EngineerSession,
+        emit: EventCallback,
+        model_name: str = "",
     ) -> AgentLoopResult:
-        tasks = [asyncio.create_task(run_branch(index)) for index in range(branch_count)]
-        completed: list[AgentLoopResult] = []
-        acceptable: list[AgentLoopResult] = []
+        timeout_seconds = float(self.settings.branch_timeout_seconds)
+        concurrency_limit = self._clamp(
+            self.settings.subagent_max_concurrency,
+            1,
+            max(1, branch_count),
+        )
+        semaphore = asyncio.Semaphore(concurrency_limit)
+
+        async def _run_with_lifecycle(index: int) -> tuple[int, AgentLoopResult]:
+            branch_number = index + 1
+            subagent_id = f"{phase_name}-{branch_number}"
+            branch_name = f"{phase_name} branch {branch_number}"
+            started_at = time.monotonic()
+            await emit(
+                {
+                    "type": "subagent",
+                    "phase": phase_name,
+                    "status": "started",
+                    "subagent_id": subagent_id,
+                    "name": branch_name,
+                    "branch_index": branch_number,
+                    "total_branches": branch_count,
+                    "max_parallel": concurrency_limit,
+                    "model": model_name or None,
+                }
+            )
+            try:
+                async with semaphore:
+                    result = await asyncio.wait_for(run_branch(index), timeout=timeout_seconds)
+            except asyncio.CancelledError:
+                await emit(
+                    {
+                        "type": "subagent",
+                        "phase": phase_name,
+                        "status": "cancelled",
+                        "subagent_id": subagent_id,
+                        "name": branch_name,
+                        "branch_index": branch_number,
+                        "duration_s": round(time.monotonic() - started_at, 3),
+                    }
+                )
+                raise
+            except Exception as exc:
+                await emit(
+                    {
+                        "type": "subagent",
+                        "phase": phase_name,
+                        "status": "failed",
+                        "subagent_id": subagent_id,
+                        "name": branch_name,
+                        "branch_index": branch_number,
+                        "duration_s": round(time.monotonic() - started_at, 3),
+                        "error": str(exc),
+                    }
+                )
+                raise
+
+            summary_line = (result.text.strip().splitlines() or [""])[0][:220]
+            await emit(
+                {
+                    "type": "subagent",
+                    "phase": phase_name,
+                    "status": "completed",
+                    "subagent_id": subagent_id,
+                    "name": branch_name,
+                    "branch_index": branch_number,
+                    "duration_s": round(time.monotonic() - started_at, 3),
+                    "turns": result.turns,
+                    "tool_calls": result.tool_calls,
+                    "input_tokens": result.input_tokens,
+                    "output_tokens": result.output_tokens,
+                    "total_tokens": result.input_tokens + result.output_tokens,
+                    "model": model_name or None,
+                    "is_acceptable": is_acceptable(result.text),
+                    "acceptable": is_acceptable(result.text),
+                    "summary": summary_line,
+                }
+            )
+            return index, result
+
+        tasks = [asyncio.create_task(_run_with_lifecycle(index)) for index in range(branch_count)]
+        completed: list[tuple[int, AgentLoopResult]] = []
+        acceptable: list[tuple[int, AgentLoopResult]] = []
         failures: list[str] = []
         early_stop_triggered = False
 
         for finished in asyncio.as_completed(tasks):
             try:
-                result = await asyncio.wait_for(
-                    finished, timeout=float(self.settings.branch_timeout_seconds)
-                )
+                index, result = await finished
             except Exception as exc:
                 log.warning("parallel_branch_failed", phase=phase_name, error=str(exc))
                 failures.append(str(exc))
                 continue
-            completed.append(result)
+            completed.append((index, result))
             if is_acceptable(result.text):
-                acceptable.append(result)
+                acceptable.append((index, result))
+            await emit(
+                {
+                    "type": "subagent",
+                    "phase": phase_name,
+                    "status": "progress",
+                    "subagent_id": f"{phase_name}-coordinator",
+                    "name": f"{phase_name} coordinator",
+                    "completed": len(completed),
+                    "acceptable": len(acceptable),
+                    "failed": len(failures),
+                    "completed_count": len(completed),
+                    "acceptable_count": len(acceptable),
+                    "failed_count": len(failures),
+                    "total_branches": branch_count,
+                    "input_tokens": sum(item.input_tokens for _, item in completed),
+                    "output_tokens": sum(item.output_tokens for _, item in completed),
+                    "model": model_name or None,
+                }
+            )
             enough_results = (
                 len(completed) >= self.settings.parallel_min_completed_before_early_stop
             )
@@ -445,6 +545,23 @@ class EngineerOrchestrator:
                 if not task.done():
                     task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
+            await emit(
+                {
+                    "type": "subagent",
+                    "phase": phase_name,
+                    "status": "early_stop",
+                    "subagent_id": f"{phase_name}-coordinator",
+                    "name": f"{phase_name} coordinator",
+                    "completed": len(completed),
+                    "acceptable": len(acceptable),
+                    "failed": len(failures),
+                    "completed_count": len(completed),
+                    "acceptable_count": len(acceptable),
+                    "failed_count": len(failures),
+                    "total_branches": branch_count,
+                    "model": model_name or None,
+                }
+            )
 
         if not completed:
             detail = "; ".join(msg for msg in failures[:3] if msg.strip())
@@ -455,7 +572,19 @@ class EngineerOrchestrator:
             raise AgentLoopError(f"{phase_name} phase failed across all parallel branches")
 
         winners = acceptable or completed
-        return max(winners, key=lambda item: score(item.text))
+        winner_index, winner_result = max(winners, key=lambda item: score(item[1].text))
+        await emit(
+            {
+                "type": "subagent",
+                "phase": phase_name,
+                "status": "selected",
+                "subagent_id": f"{phase_name}-{winner_index + 1}",
+                "name": f"{phase_name} branch {winner_index + 1}",
+                "total_branches": branch_count,
+                "model": model_name or None,
+            }
+        )
+        return winner_result
 
     async def run(
         self,
@@ -509,6 +638,7 @@ class EngineerOrchestrator:
                 github_owner=self.settings.github_repo_owner,
                 github_repo=self.settings.github_repo_name,
                 github_token=self.settings.github_token,
+                allow_local_clone_without_token=self.dry_run,
             )
             executor = ToolExecutor(
                 session.worktree,
@@ -590,6 +720,8 @@ class EngineerOrchestrator:
                 is_acceptable=self._is_structured_research,
                 score=self._score_research,
                 session=session,
+                emit=emit,
+                model_name=model,
             )
             session.phase_turns_used["research"] = research.turns
             session.phase_budget_exceeded["research"] = (
@@ -634,6 +766,8 @@ class EngineerOrchestrator:
                 is_acceptable=self._is_structured_plan,
                 score=self._score_plan,
                 session=session,
+                emit=emit,
+                model_name=model,
             )
             session.phase_turns_used["plan"] = plan_result.turns
             session.phase_budget_exceeded["plan"] = plan_result.stop_reason == "turn_budget_exceeded"

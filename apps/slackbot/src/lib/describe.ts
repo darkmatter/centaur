@@ -43,6 +43,10 @@ export type Step =
       totalBranches?: number;
       completed?: number;
       acceptable?: number;
+      completedCount?: number;
+      acceptableCount?: number;
+      failedCount?: number;
+      isAcceptable?: boolean;
       failed?: number;
       turns?: number;
       toolCalls?: number;

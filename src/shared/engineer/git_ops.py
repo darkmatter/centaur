@@ -48,6 +48,7 @@ async def create_worktree(
     github_owner: str,
     github_repo: str,
     github_token: str,
+    allow_local_clone_without_token: bool = False,
 ) -> Path:
     """Create an isolated engineer workspace via fresh clone.
 
@@ -55,7 +56,7 @@ async def create_worktree(
     without a `.git` checkout. Cloning with a token-authenticated URL makes the
     push/PR path deterministic in containerized environments.
     """
-    if not github_token:
+    if not github_token and not allow_local_clone_without_token:
         raise GitOperationError("Missing GITHUB_TOKEN for engineer git workspace setup")
 
     root = repo_root.parent / ".engineer-worktrees"
@@ -64,7 +65,10 @@ async def create_worktree(
     if worktree.exists():
         shutil.rmtree(worktree, ignore_errors=True)
 
-    repo_url = f"https://x-access-token:{github_token}@github.com/{github_owner}/{github_repo}.git"
+    if github_token:
+        repo_url = f"https://x-access-token:{github_token}@github.com/{github_owner}/{github_repo}.git"
+    else:
+        repo_url = str(repo_root)
     code, _, err = await _run(
         ["git", "clone", "--branch", base_ref, "--single-branch", repo_url, str(worktree)],
         cwd=root,

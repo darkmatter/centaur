@@ -594,51 +594,60 @@ def _parse_phase_label(user_message: str) -> str | None:
     return user_message[1:closing].strip().lower() or None
 
 
-def _extract_numeric_usage(value: Any) -> dict[str, int]:
-    usage = {"input_tokens": 0, "output_tokens": 0}
-
-    def walk(node: Any) -> None:
-        if isinstance(node, dict):
-            for key, raw in node.items():
-                key_l = str(key).lower()
-                if isinstance(raw, (int, float)) and raw >= 0:
-                    n = int(raw)
-                    if key_l in {
-                        "input_tokens",
-                        "prompt_tokens",
-                        "tokens_in",
-                        "cached_input_tokens",
-                        "cache_read_input_tokens",
-                        "cache_creation_input_tokens",
-                    }:
-                        usage["input_tokens"] = max(usage["input_tokens"], n)
-                    elif key_l in {"output_tokens", "completion_tokens", "tokens_out"}:
-                        usage["output_tokens"] = max(usage["output_tokens"], n)
-                    elif key_l in {"total_tokens", "tokens_total"} and n > 0:
-                        # Split unknown total conservatively when only total is present.
-                        usage["input_tokens"] = max(usage["input_tokens"], n // 2)
-                        usage["output_tokens"] = max(usage["output_tokens"], n - (n // 2))
-                walk(raw)
-        elif isinstance(node, list):
-            for item in node:
-                walk(item)
-
-    walk(value)
-    return usage
+def _coerce_non_negative_int(value: Any) -> int:
+    if isinstance(value, (int, float)) and value >= 0:
+        return int(value)
+    return 0
 
 
 def _has_usage(usage: dict[str, int]) -> bool:
     return usage["input_tokens"] > 0 or usage["output_tokens"] > 0
 
 
-def _is_authoritative_usage_event(event: dict[str, Any]) -> bool:
+def _extract_usage_from_payload(usage_payload: dict[str, Any]) -> dict[str, int]:
+    input_tokens = (
+        _coerce_non_negative_int(usage_payload.get("input_tokens"))
+        + _coerce_non_negative_int(usage_payload.get("prompt_tokens"))
+        + _coerce_non_negative_int(usage_payload.get("cached_input_tokens"))
+        + _coerce_non_negative_int(usage_payload.get("cache_read_input_tokens"))
+        + _coerce_non_negative_int(usage_payload.get("cache_creation_input_tokens"))
+    )
+    output_tokens = (
+        _coerce_non_negative_int(usage_payload.get("output_tokens"))
+        + _coerce_non_negative_int(usage_payload.get("completion_tokens"))
+    )
+    if input_tokens == 0 and output_tokens == 0:
+        total = _coerce_non_negative_int(usage_payload.get("total_tokens"))
+        if total > 0:
+            input_tokens = total // 2
+            output_tokens = total - input_tokens
+    return {"input_tokens": input_tokens, "output_tokens": output_tokens}
+
+
+def _extract_usage_from_event(event: dict[str, Any]) -> tuple[dict[str, int], bool]:
     event_type = str(event.get("type") or "")
-    if event_type == "turn.completed":
-        return True
-    return event_type == "result" and isinstance(event.get("usage"), dict)
+    if event_type == "subagent":
+        return {"input_tokens": 0, "output_tokens": 0}, False
+
+    usage_payload: dict[str, Any] | None = None
+    message = event.get("message")
+    if isinstance(message, dict) and isinstance(message.get("usage"), dict):
+        usage_payload = message.get("usage")
+    elif isinstance(event.get("usage"), dict):
+        usage_payload = event.get("usage")
+
+    if not isinstance(usage_payload, dict):
+        return {"input_tokens": 0, "output_tokens": 0}, False
+
+    usage = _extract_usage_from_payload(usage_payload)
+    is_authoritative = event_type == "turn.completed"
+    return usage, is_authoritative
 
 
 def _extract_usage_model(event: dict[str, Any]) -> str | None:
+    event_type = str(event.get("type") or "")
+    if event_type == "subagent":
+        return None
     message = event.get("message")
     if isinstance(message, dict):
         message_model = str(message.get("model") or "").strip()
@@ -767,9 +776,31 @@ def _ui_stream_chunks_for_event(
         status = str(event.get("status") or "").strip()
         if not status:
             return chunks
-        input_tokens = int(event.get("input_tokens") or 0)
-        output_tokens = int(event.get("output_tokens") or 0)
+        input_tokens_raw = event.get("input_tokens")
+        output_tokens_raw = event.get("output_tokens")
+        input_tokens = (
+            _coerce_non_negative_int(input_tokens_raw)
+            if input_tokens_raw is not None
+            else None
+        )
+        output_tokens = (
+            _coerce_non_negative_int(output_tokens_raw)
+            if output_tokens_raw is not None
+            else None
+        )
+        total_tokens_raw = event.get("total_tokens")
+        if total_tokens_raw is not None:
+            total_tokens: int | None = _coerce_non_negative_int(total_tokens_raw)
+        elif input_tokens is not None or output_tokens is not None:
+            total_tokens = (input_tokens or 0) + (output_tokens or 0)
+        else:
+            total_tokens = None
         model_name = str(event.get("model") or "").strip() or None
+        cost_usd = (
+            _estimate_cost_usd(model_name, input_tokens or 0, output_tokens or 0)
+            if input_tokens is not None and output_tokens is not None
+            else None
+        )
         stable_id = subagent_id or f"turn-{turn_id}-subagent-{event_index}"
         chunks.append(
             {
@@ -787,14 +818,18 @@ def _ui_stream_chunks_for_event(
                     "completed": event.get("completed"),
                     "acceptable": event.get("acceptable"),
                     "failed": event.get("failed"),
+                    "completed_count": event.get("completed_count"),
+                    "acceptable_count": event.get("acceptable_count"),
+                    "failed_count": event.get("failed_count"),
+                    "is_acceptable": event.get("is_acceptable"),
                     "turns": event.get("turns"),
                     "tool_calls": event.get("tool_calls"),
                     "duration_s": event.get("duration_s"),
                     "max_parallel": event.get("max_parallel"),
                     "input_tokens": input_tokens,
                     "output_tokens": output_tokens,
-                    "total_tokens": int(event.get("total_tokens") or (input_tokens + output_tokens)),
-                    "cost_usd": _estimate_cost_usd(model_name, input_tokens, output_tokens),
+                    "total_tokens": total_tokens,
+                    "cost_usd": cost_usd,
                     "model": model_name,
                 },
             }
@@ -991,10 +1026,10 @@ async def stream_thread_ui(
                         message_model = _extract_usage_model(event)
                         if message_model:
                             usage_model = message_model
-                        explicit_usage = _extract_numeric_usage(event)
+                        explicit_usage, is_authoritative = _extract_usage_from_event(event)
                         if _has_usage(explicit_usage):
                             usage_seen = True
-                            if _is_authoritative_usage_event(event):
+                            if is_authoritative:
                                 usage_by_turn[turn_id] = explicit_usage
                                 usage_authoritative_turns.add(turn_id)
                             elif turn_id not in usage_authoritative_turns:

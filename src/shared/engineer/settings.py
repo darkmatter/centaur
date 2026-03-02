@@ -39,8 +39,9 @@ class EngineerSettings(BaseSettings):
 
     max_parallel_tool_calls: int = 4
     tool_call_timeout_seconds: int = 180
-    research_parallel_branches_min: int = 3
-    research_parallel_branches_max: int = 5
+    # Favor broad parallel exploration by default; bounded by subagent_max_concurrency.
+    research_parallel_branches_min: int = 5
+    research_parallel_branches_max: int = 8
     research_max_turns: int = 80
     adaptive_turn_budgets_enabled: bool = True
     turn_budget_score_full_scale: int = 8
@@ -53,8 +54,9 @@ class EngineerSettings(BaseSettings):
     turn_budget_implement_floor: int = 40
     turn_budget_implement_cap: int = 120
     turn_budget_fail_soft: bool = True
-    plan_parallel_branches_min: int = 1
-    plan_parallel_branches_max: int = 1
+    plan_parallel_branches_min: int = 3
+    plan_parallel_branches_max: int = 5
+    subagent_max_concurrency: int = 6
     parallel_min_completed_before_early_stop: int = 2
     branch_timeout_seconds: int = 1200
 

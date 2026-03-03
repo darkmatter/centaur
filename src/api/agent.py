@@ -2308,6 +2308,24 @@ class AgentClient:
             }
         execute_lock.release()
 
+        # Pre-register a placeholder session so /api/threads/detail returns
+        # immediately instead of 404 while the background thread spawns.
+        if not session:
+            set_session_state(resolved_thread_key, {
+                "container_id": "",
+                "harness": requested_harness,
+                "engine": None,
+                "persona": None,
+                "agent_thread_id": None,
+                "state": "running",
+                "created_at": time.time(),
+                "last_activity": time.time(),
+                "turns": [],
+                "pending_context_messages": [],
+                "thread_name": None,
+                "next_event_seq": 1,
+            })
+
         def run_execute() -> None:
             try:
                 result = self.execute(

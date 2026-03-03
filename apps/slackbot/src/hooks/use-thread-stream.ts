@@ -459,8 +459,17 @@ export function useThreadStream(threadKey: string, initialThread?: Partial<Threa
     streamAttachedRef.current = false;
     setReconnectExhausted(false);
 
-    // Fetch full thread from Postgres, then decide on SSE
-    void fetchThread();
+    // Fetch full thread from Postgres, then decide on SSE.
+    // For freshly created ui: threads the session may not exist yet — retry briefly.
+    void (async () => {
+      const ok = await fetchThread();
+      if (!ok && threadKey.startsWith("ui:")) {
+        for (let i = 0; i < 4; i++) {
+          await new Promise((r) => setTimeout(r, 1500));
+          if (await fetchThread()) break;
+        }
+      }
+    })();
   }, [threadKey]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Attach stream only when thread is active; re-attach on every active run.

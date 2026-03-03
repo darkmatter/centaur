@@ -1817,7 +1817,7 @@ class AgentClient:
             except RuntimeError as exc:
                 return {"error": str(exc)}
 
-            if session:
+            if session and session.get("container_id"):
                 current_harness = str(session.get("harness") or "amp")
                 current_engine = str(session.get("engine") or _resolve_engine(current_harness))
                 current_persona = session.get("persona")
@@ -1869,13 +1869,18 @@ class AgentClient:
                 )
 
             # Auto-spawn if no session or container is gone
-            if session:
+            if session and session.get("container_id"):
                 client = _docker_client()
                 try:
                     container = client.containers.get(session["container_id"])
                 except NotFound:
                     pop_session_state(slack_thread_key)
                     session = None
+            elif session:
+                # Placeholder session (e.g. from execute_kickoff) — clear it
+                # so spawn() creates a real one.
+                pop_session_state(slack_thread_key)
+                session = None
 
             if not session:
                 log.info("exec_auto_spawn", request_id=rid, thread=slack_thread_key)

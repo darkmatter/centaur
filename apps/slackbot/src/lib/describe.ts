@@ -18,6 +18,20 @@ export type ToolCall = {
   input: Record<string, unknown>;
   output?: string;
   state?: "loading" | "done" | "error";
+  uiState?:
+    | "approval-requested"
+    | "approval-responded"
+    | "input-available"
+    | "input-streaming"
+    | "output-available"
+    | "output-denied"
+    | "output-error";
+  errorText?: string;
+  sources?: Array<{
+    url: string;
+    title: string;
+    snippet?: string;
+  }>;
 };
 
 export type ContextMessageItem = {
@@ -28,10 +42,18 @@ export type ContextMessageItem = {
   createdAt?: string;
 };
 
+type StepBase = {
+  id: string;
+  eventSeq?: number;
+  turnId?: number;
+};
+
 export type Step =
-  | { id: string; type: "phase"; phase: string }
+  | (StepBase & { type: "phase"; phase: string })
   | {
       id: string;
+      eventSeq?: number;
+      turnId?: number;
       type: "subagent";
       subagentId?: string;
       phase?: string;
@@ -58,28 +80,52 @@ export type Step =
       costUsd?: number | null;
       model?: string;
     }
-  | { id: string; type: "tool-group"; icon: LucideIcon; summary: string; category: string; calls: ToolCall[] }
-  | { id: string; type: "diff"; file: string; lang: string; oldStr: string; newStr: string; result?: string }
-  | { id: string; type: "terminal"; command: string; output?: string; exitCode?: number; description: string }
-  | { id: string; type: "thinking"; text: string; durationS?: number }
-  | { id: string; type: "error"; message: string }
-  | { id: string; type: "result"; text: string; streaming?: boolean }
-  | { id: string; type: "file-changes"; changes: Array<{ path: string; kind: "add" | "delete" | "update" }> }
-  | { id: string; type: "user-message"; text: string; source?: string; userId?: string; turnId?: number }
-  | { id: string; type: "context-group"; title: string; items: ContextMessageItem[] };
+  | (StepBase & {
+      type: "tool-group";
+      icon: LucideIcon;
+      summary: string;
+      category: string;
+      calls: ToolCall[];
+    })
+  | (StepBase & {
+      type: "diff";
+      file: string;
+      lang: string;
+      oldStr: string;
+      newStr: string;
+      result?: string;
+    })
+  | (StepBase & {
+      type: "terminal";
+      command: string;
+      output?: string;
+      exitCode?: number;
+      description: string;
+      streaming?: boolean;
+    })
+  | (StepBase & { type: "thinking"; text: string; durationS?: number; streaming?: boolean })
+  | (StepBase & { type: "error"; message: string })
+  | (StepBase & {
+      type: "result";
+      text: string;
+      streaming?: boolean;
+      sources?: Array<{ url: string; title: string; snippet?: string }>;
+    })
+  | (StepBase & { type: "system"; title: string; text: string; tone?: "info" | "warn" })
+  | (StepBase & {
+      type: "file-changes";
+      changes: Array<{ path: string; kind: "add" | "delete" | "update" }>;
+    })
+  | (StepBase & {
+      type: "user-message";
+      text: string;
+      source?: string;
+      userId?: string;
+      turnId?: number;
+    })
+  | (StepBase & { type: "context-group"; title: string; items: ContextMessageItem[] });
 
-function asString(value: unknown): string {
-  return typeof value === "string" ? value : "";
-}
-
-function asNumber(value: unknown): number | null {
-  if (typeof value === "number" && Number.isFinite(value)) return value;
-  if (typeof value === "string" && value.trim()) {
-    const parsed = Number(value);
-    if (Number.isFinite(parsed)) return parsed;
-  }
-  return null;
-}
+import { asString, asNumber } from "@/lib/parse-utils";
 
 function getPathBasename(path: string): string {
   const parts = path.split("/");

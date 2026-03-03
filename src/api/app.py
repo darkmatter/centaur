@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import ipaddress
 import json
 import os
 import secrets as _secrets
@@ -17,9 +18,14 @@ import structlog
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.requests import Request
-from starlette.responses import JSONResponse, Response, StreamingResponse
+from starlette.responses import JSONResponse, StreamingResponse
 
-from api.agent import reap_stale_running_sessions, session_items_snapshot, signal_shutdown
+from api.agent import (
+    clear_shutdown_signal,
+    reap_stale_running_sessions,
+    session_items_snapshot,
+    signal_shutdown,
+)
 from api.deps import _TRUSTED_PREFIXES
 from api.mcp_server import mcp, set_pool, set_tool_manager
 from api.routers import admin, health, query, search, secrets, threads
@@ -71,19 +77,14 @@ def _warm_tool_caches() -> None:
 
 def _recover_agent_sessions() -> None:
     """Recover agent sessions from Postgres + Docker on startup."""
-    import threading
+    try:
+        from api.agent import get_agent
 
-    def _recover() -> None:
-        try:
-            from api.agent import get_agent
-
-            agent = get_agent()
-            result = agent.recover_sessions()
-            log.info("agent_sessions_recovered", **result)
-        except Exception as e:
-            log.warning("agent_session_recovery_failed", error=str(e))
-
-    threading.Thread(target=_recover, daemon=True).start()
+        agent = get_agent()
+        result = agent.recover_sessions()
+        log.info("agent_sessions_recovered", **result)
+    except Exception as e:
+        log.warning("agent_session_recovery_failed", error=str(e))
 
 
 async def _watch_tools(pm: ToolManager) -> None:
@@ -120,6 +121,7 @@ async def _run_stale_session_reaper(
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    clear_shutdown_signal()
     log.info("connecting to database", url=settings.database_url.split("@")[-1])
     pool = await create_pool(settings.database_url)
     app.state.pool = pool
@@ -128,7 +130,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     async with mcp.session_manager.run():
         log.info("mcp session manager started")
         _warm_tool_caches()
-        _recover_agent_sessions()
+        await asyncio.to_thread(_recover_agent_sessions)
         watcher_task = asyncio.create_task(_watch_tools(tool_manager))
         reaper_task = asyncio.create_task(_run_stale_session_reaper())
         try:
@@ -185,6 +187,15 @@ app.include_router(tool_manager.create_rest_router())
 _mcp_starlette = mcp.streamable_http_app()
 
 
+def _is_localhost_ip(client_ip: str) -> bool:
+    if not client_ip:
+        return False
+    try:
+        return ipaddress.ip_address(client_ip).is_loopback
+    except ValueError:
+        return client_ip.startswith(_TRUSTED_PREFIXES)
+
+
 class _MCPAuthMiddleware:
     """ASGI middleware that validates Bearer token before forwarding to MCP.
 
@@ -195,7 +206,7 @@ class _MCPAuthMiddleware:
         if scope["type"] == "http":
             request = Request(scope, receive)
             client_ip = request.client.host if request.client else ""
-            if not client_ip.startswith(_TRUSTED_PREFIXES):
+            if not _is_localhost_ip(client_ip):
                 token: str | None = None
                 auth = request.headers.get("authorization", "")
                 if auth.lower().startswith("bearer "):

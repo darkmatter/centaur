@@ -185,4 +185,21 @@ async def _ensure_schema(pool: asyncpg.Pool) -> None:
         await conn.execute(
             "ALTER TABLE agent_turns ADD COLUMN IF NOT EXISTS artifacts JSONB NOT NULL DEFAULT '[]'"
         )
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS thread_events_ledger (
+                event_id           TEXT PRIMARY KEY,
+                slack_thread_key   TEXT NOT NULL,
+                source             TEXT NOT NULL,
+                event_type         TEXT NOT NULL,
+                event_seq          BIGINT NOT NULL,
+                occurred_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+                payload            JSONB NOT NULL DEFAULT '{}'
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_thread_events_ledger_thread_seq
+                ON thread_events_ledger (slack_thread_key, event_seq);
+            CREATE INDEX IF NOT EXISTS idx_thread_events_ledger_thread_time
+                ON thread_events_ledger (slack_thread_key, occurred_at DESC);
+            """
+        )
     log.info("schema_ensured")

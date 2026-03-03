@@ -1,38 +1,55 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
-import { useParams, useRouter } from "next/navigation";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import dynamic from "next/dynamic";
+import { useParams, useRouter, useSearchParams } from "next/navigation";
 import Link from "next/link";
 import { LoaderCircle } from "lucide-react";
 import { ActivityFeed } from "@/components/thread/activity-feed";
 import { MessageInput } from "@/components/thread/message-input";
 import { QuickActionChips } from "@/components/thread/quick-action-chips";
+import { ConnectivityBanner } from "@/components/thread/connectivity-banner";
 import { MobileTabBar } from "@/components/thread/mobile-tab-bar";
-import { ThreadInfoSheet } from "@/components/thread/thread-info-sheet";
-import { ThreadSidebarDrawer } from "@/components/thread/thread-sidebar-drawer";
 import { ThreadDetailHeader } from "@/components/thread/thread-detail-header";
+import { useThreadLayout } from "@/components/thread/thread-layout";
 import { threadName } from "@/lib/thread-name";
 import { useThreadStream } from "@/hooks/use-thread-stream";
 import { useElapsed } from "@/hooks/use-elapsed";
 import { useStableStatus } from "@/hooks/use-stable-status";
 import { BASE } from "@/lib/constants";
-import type { ThreadSummary } from "@/lib/types";
+import { toast } from "sonner";
+import { useThreadList } from "@/hooks/use-thread-list";
+import {
+  entrySourceLabel,
+  listQueryFromSearchParams,
+  listHrefWithAnchor,
+  parseEntryAnchor,
+  parseEntrySource,
+  detailHrefWithEntrySource,
+} from "@/lib/thread-navigation";
+
+const ThreadInfoSheet = dynamic(
+  () => import("@/components/thread/thread-info-sheet").then((module) => module.ThreadInfoSheet),
+  { ssr: false },
+);
+const CommandPalette = dynamic(
+  () => import("@/components/thread/command-palette").then((module) => module.CommandPalette),
+  { ssr: false },
+);
 
 export default function ThreadDetailPage() {
   const params = useParams();
+  const searchParams = useSearchParams();
   const router = useRouter();
-  const threadKey = decodeURIComponent(params.id as string);
-  const [cachedSummary] = useState(() => {
-    if (typeof window === "undefined") return null;
+  const { openMobileSidebar, closeMobileSidebar, mobileSidebarOpen } = useThreadLayout();
+  const rawThreadKey = typeof params.id === "string" ? params.id : "";
+  const threadKey = useMemo(() => {
     try {
-      const raw = sessionStorage.getItem(`thread:${threadKey}`);
-      if (raw) {
-        sessionStorage.removeItem(`thread:${threadKey}`);
-        return JSON.parse(raw);
-      }
-    } catch {}
-    return null;
-  });
+      return decodeURIComponent(rawThreadKey);
+    } catch {
+      return rawThreadKey;
+    }
+  }, [rawThreadKey]);
   const {
     thread,
     error,
@@ -40,21 +57,32 @@ export default function ThreadDetailPage() {
     isReconnecting,
     agentStatus,
     tokenUsage,
+    isFetchingThread,
     chatStatus,
     sendThreadMessage,
     liveSteps,
-  } = useThreadStream(threadKey, cachedSummary);
+  } = useThreadStream(threadKey);
   const humanName = thread?.thread_name || threadName(threadKey);
   const [isInterrupting, setIsInterrupting] = useState(false);
   const [interruptError, setInterruptError] = useState<string | null>(null);
   const [infoOpen, setInfoOpen] = useState(false);
-  const [drawerOpen, setDrawerOpen] = useState(false);
-  const [sidebarThreads, setSidebarThreads] = useState<ThreadSummary[]>([]);
+  const [paletteOpen, setPaletteOpen] = useState(false);
+  const [compactMode, setCompactMode] = useState(false);
+  const sendEpochRef = useRef(0);
+  const { threads } = useThreadList();
   const closeInfoSheet = useCallback(() => setInfoOpen(false), []);
-  const closeDrawer = useCallback(() => setDrawerOpen(false), []);
-  const isRunning = thread?.state === "running" || thread?.state === "working";
+  const entrySource = parseEntrySource(searchParams.get("entry_source"));
+  const entryAnchor = parseEntryAnchor(searchParams.get("entry_anchor"));
+  const sourceLabel = entrySourceLabel(entrySource);
+  const listQuery = listQueryFromSearchParams(new URLSearchParams(searchParams.toString()));
+  const upHref = listQuery ? `/?${listQuery}` : "/";
+  const backHref = listHrefWithAnchor(listQuery, entryAnchor);
+  const isEngineer = thread?.harness === "engineer";
+  const isRunning =
+    thread?.state === "running" || thread?.state === "working" || thread?.state === "stopping";
   const isStreaming = chatStatus === "submitted" || chatStatus === "streaming";
-  const canInterrupt = !!thread && isRunning;
+  const canInterrupt =
+    !!thread && !isEngineer && (thread.state === "running" || thread.state === "working");
   const activeTurnStartedAt =
     thread && thread.turns.length > 0 ? thread.turns[thread.turns.length - 1]?.started_at : null;
   const elapsedAnchor = isRunning ? activeTurnStartedAt : thread?.last_activity;
@@ -64,14 +92,33 @@ export default function ThreadDetailPage() {
     ? `${tokenUsage.total_tokens.toLocaleString()} tok / ${
         tokenUsage.cost_usd === null ? "--" : `$${tokenUsage.cost_usd.toFixed(4)}`
       }${tokenUsage.estimated ? "~" : ""}`
-    : null;
+    : "-- tok / --";
   const phases = liveSteps.flatMap((step) => (step.type === "phase" ? [step.phase] : []));
+  const turnDurationsById = useMemo(() => {
+    if (!thread) return {};
+    return Object.fromEntries(thread.turns.map((turn) => [turn.turn_id, turn.duration_s]));
+  }, [thread]);
   const latestUserMessage = thread?.turns[thread.turns.length - 1]?.user_message?.trim() ?? "";
   const retryMessage = latestUserMessage || "Please retry the previous request.";
+  const slackDeepLink = useMemo(() => {
+    if (!thread?.slack_thread_key?.startsWith("slack:")) return null;
+    const [channel, ts] = thread.slack_thread_key.replace(/^slack:/, "").split(":");
+    if (!channel || !ts) return null;
+    return `slack://app_redirect?channel=${encodeURIComponent(channel)}&thread_ts=${encodeURIComponent(ts)}`;
+  }, [thread?.slack_thread_key]);
 
-  const inputMode = isRunning ? "running" as const
-    : thread?.state === "error" ? "error" as const
-    : "idle" as const;
+  useEffect(() => {
+    sendEpochRef.current += 1;
+    return () => {
+      sendEpochRef.current += 1;
+    };
+  }, [threadKey]);
+
+  const inputMode = isRunning
+    ? ("running" as const)
+    : thread?.state === "error"
+      ? ("error" as const)
+      : ("idle" as const);
 
   const interruptRun = useCallback(async (): Promise<boolean> => {
     if (!thread || !canInterrupt || isInterrupting) return false;
@@ -94,6 +141,9 @@ export default function ThreadDetailPage() {
       }
       fetchThread();
       return true;
+    } catch {
+      setInterruptError("Interrupt failed due to a network error. Please retry.");
+      return false;
     } finally {
       setIsInterrupting(false);
     }
@@ -101,13 +151,53 @@ export default function ThreadDetailPage() {
 
   const handleSendMessage = useCallback(
     async (text: string) => {
-      if (canInterrupt) {
-        const interrupted = await interruptRun();
-        if (!interrupted) return;
+      const sendEpoch = sendEpochRef.current;
+      const route = "execute" as const;
+      const threadState = thread?.state;
+      const runInFlight =
+        threadState === "running" || threadState === "working" || threadState === "stopping";
+      if (route === "execute" && runInFlight && !isEngineer) {
+        if (threadState === "running" || threadState === "working") {
+          const interrupted = await interruptRun();
+          if (!interrupted) {
+            throw new Error("Failed to stop in-flight run before sending message.");
+          }
+        }
+        // Wait briefly for backend state transition to avoid "run already in progress" race.
+        let clearToSend = false;
+        for (let attempt = 0; attempt < 30; attempt += 1) {
+          if (sendEpochRef.current !== sendEpoch) {
+            return;
+          }
+          try {
+            const res = await fetch(`${BASE}/api/threads/detail?key=${encodeURIComponent(threadKey)}`);
+            if (res.ok) {
+              const data = (await res.json()) as { state?: string };
+              const currentState = String(data.state ?? "");
+              if (
+                currentState !== "running" &&
+                currentState !== "working" &&
+                currentState !== "stopping"
+              ) {
+                clearToSend = true;
+                break;
+              }
+            }
+          } catch {
+            // Keep polling through transient network errors.
+          }
+          await new Promise((resolve) => window.setTimeout(resolve, 150));
+        }
+        if (!clearToSend) {
+          throw new Error("Run is still stopping. Please retry sending in a moment.");
+        }
       }
-      await sendThreadMessage(text, "execute");
+      if (sendEpochRef.current !== sendEpoch) {
+        return;
+      }
+      await sendThreadMessage(text, route);
     },
-    [canInterrupt, interruptRun, sendThreadMessage],
+    [interruptRun, sendThreadMessage, thread?.state, threadKey],
   );
 
   const handleStopAgent = useCallback(async () => {
@@ -129,57 +219,95 @@ export default function ThreadDetailPage() {
     }
   }, [interruptRun, handleSendMessage, retryMessage, sendThreadMessage]);
 
-  useEffect(() => {
-    if (!drawerOpen) return;
-    fetch(`${BASE}/api/threads`)
-      .then((r: Response) => r.json())
-      .then((data: { threads?: ThreadSummary[] }) => setSidebarThreads(data.threads ?? []))
-      .catch(() => {});
-  }, [drawerOpen]);
+  const handleBackToSource = useCallback(() => {
+    if (entrySource === "direct" && window.history.length > 1) {
+      router.back();
+      return;
+    }
+    router.push(backHref, { scroll: false });
+  }, [backHref, entrySource, router]);
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      if (infoOpen || drawerOpen) {
-        return;
-      }
       const targetIsInput =
         e.target instanceof HTMLElement &&
         e.target.closest("input, textarea, select, [contenteditable='true']");
 
       if (e.key === "Escape") {
+        if (paletteOpen) {
+          e.preventDefault();
+          setPaletteOpen(false);
+          return;
+        }
+        if (infoOpen) {
+          e.preventDefault();
+          setInfoOpen(false);
+          return;
+        }
+        if (mobileSidebarOpen) {
+          e.preventDefault();
+          closeMobileSidebar();
+          return;
+        }
         if (targetIsInput) {
           (e.target as HTMLElement | null)?.blur?.();
           return;
         }
         e.preventDefault();
-        router.push("/", { scroll: false });
+        handleBackToSource();
         return;
       }
 
       if (targetIsInput) return;
 
-      if (e.key.toLowerCase() === "r" && !e.metaKey && !e.ctrlKey) {
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
+        e.preventDefault();
+        setPaletteOpen(true);
+        return;
+      }
+
+      if ((e.metaKey || e.ctrlKey) && e.key === ".") {
+        e.preventDefault();
+        setCompactMode((value) => !value);
+        return;
+      }
+
+      if (e.shiftKey && e.key === "?") {
+        e.preventDefault();
+        toast("Shortcuts: Cmd/Ctrl+K, R, S, Esc, Cmd+., Shift+?");
+        return;
+      }
+
+      if (!e.metaKey && !e.ctrlKey && !e.altKey && e.key.toLowerCase() === "r") {
         e.preventDefault();
         fetchThread();
         return;
       }
 
-      if (e.key.toLowerCase() === "s" && !e.metaKey && !e.ctrlKey && canInterrupt) {
+      if (!e.metaKey && !e.ctrlKey && !e.altKey && e.key.toLowerCase() === "s" && canInterrupt) {
         e.preventDefault();
         void interruptRun();
       }
     };
     document.addEventListener("keydown", handleKeyDown);
     return () => document.removeEventListener("keydown", handleKeyDown);
-  }, [canInterrupt, drawerOpen, fetchThread, infoOpen, interruptRun, router]);
+  }, [
+    canInterrupt,
+    closeMobileSidebar,
+    fetchThread,
+    infoOpen,
+    interruptRun,
+    mobileSidebarOpen,
+    paletteOpen,
+    handleBackToSource,
+  ]);
 
-  const threadState = thread?.state;
   useEffect(() => {
-    if (!threadState) return;
+    if (!thread) return;
     const previousTitle = document.title;
-    if (threadState === "working" || threadState === "running") {
+    if (thread.state === "working" || thread.state === "running") {
       document.title = `Working - ${humanName}`;
-    } else if (threadState === "error") {
+    } else if (thread.state === "error") {
       document.title = `Error - ${humanName}`;
     } else {
       document.title = `Done - ${humanName}`;
@@ -187,23 +315,25 @@ export default function ThreadDetailPage() {
     return () => {
       document.title = previousTitle;
     };
-  }, [humanName, threadState]);
+  }, [humanName, thread]);
 
   if (error && !thread) {
     return (
       <div className="h-dvh md:h-full flex items-center justify-center bg-background">
         <div className="text-center">
-          <p role="alert" className="text-destructive text-sm mb-4">{error}</p>
+          <p className="text-destructive text-sm mb-4">{error}</p>
           <div className="flex items-center justify-center gap-3">
             <button
               type="button"
-              onClick={fetchThread}
+              onClick={() => {
+                void fetchThread();
+              }}
               className="text-xs text-muted-foreground hover:text-foreground transition-colors cursor-pointer bg-transparent border border-border rounded-sm px-3 py-1"
             >
               Retry
             </button>
             <Link
-              href="/"
+              href={backHref}
               className="text-muted-foreground text-xs hover:text-foreground transition-colors rounded-sm"
             >
               Back to threads
@@ -218,8 +348,8 @@ export default function ThreadDetailPage() {
     return (
       <div className="h-dvh md:h-full flex items-center justify-center bg-background">
         <div className="text-center">
-          <p role="status" className="text-muted-foreground text-sm inline-flex items-center gap-2">
-            <LoaderCircle aria-hidden="true" className="size-4 animate-spin text-primary" />
+          <p className="text-muted-foreground text-sm inline-flex items-center gap-2">
+            <LoaderCircle className="size-4 animate-spin text-primary" />
             Connecting...
           </p>
           <p className="text-muted-foreground text-xs font-mono mt-2">{threadName(threadKey)}</p>
@@ -238,7 +368,7 @@ export default function ThreadDetailPage() {
         liveElapsed={liveElapsed}
         stableStatus={stableStatus}
         isRunning={isRunning}
-        isEng={thread?.harness === "eng" || thread?.harness === "engineer"}
+        isEngineer={isEngineer}
         phases={phases}
         isReconnecting={isReconnecting}
         error={error}
@@ -248,8 +378,13 @@ export default function ThreadDetailPage() {
         onInterrupt={() => void interruptRun()}
         onRefresh={() => void fetchThread()}
         onOpenInfo={() => setInfoOpen(true)}
-        onOpenDrawer={() => setDrawerOpen(true)}
+        onOpenDrawer={openMobileSidebar}
+        sourceLabel={sourceLabel}
+        onBack={handleBackToSource}
+        upHref={upHref}
       />
+
+      <ConnectivityBanner isReconnecting={isReconnecting} threadState={thread.state} />
 
       {/* Activity feed - the only scrollable area */}
       <div className="flex-1 min-h-0 max-w-[960px] mx-auto w-full flex flex-col">
@@ -258,7 +393,8 @@ export default function ThreadDetailPage() {
           state={thread.state}
           isStreaming={isStreaming}
           participants={thread.participants}
-          chatStatus={chatStatus}
+          turnDurationsById={turnDurationsById}
+          compactMode={compactMode}
         />
       </div>
 
@@ -292,11 +428,40 @@ export default function ThreadDetailPage() {
           canStop={canInterrupt}
         />
       )}
-      <ThreadSidebarDrawer
-        open={drawerOpen}
-        onClose={closeDrawer}
-        threads={sidebarThreads}
-        activeKey={threadKey}
+
+      <CommandPalette
+        open={paletteOpen}
+        onOpenChange={setPaletteOpen}
+        threads={threads}
+        currentThreadKey={threadKey}
+        compactMode={compactMode}
+        canInterrupt={canInterrupt}
+        isRefreshing={isFetchingThread}
+        onNavigate={(nextThreadKey) =>
+          router.push(
+            detailHrefWithEntrySource(nextThreadKey, {
+              source: entrySource,
+              listQuery,
+              anchor: nextThreadKey,
+            }),
+            { scroll: false },
+          )
+        }
+        onRefresh={() => void fetchThread()}
+        onStop={() => void interruptRun()}
+        onCopyUrl={() => {
+          navigator.clipboard
+            ?.writeText(window.location.href)
+            .then(() => toast("Copied link"))
+            .catch(() => {});
+        }}
+        onToggleCompact={() => setCompactMode((value) => !value)}
+        onOpenSlack={slackDeepLink
+          ? () => {
+              window.open(slackDeepLink, "_blank");
+            }
+          : null}
+        onOpenShortcuts={() => toast("Shortcuts: Cmd/Ctrl+K, R, S, Esc, Cmd+., Shift+?")}
       />
     </div>
   );

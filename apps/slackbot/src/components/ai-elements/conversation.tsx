@@ -3,6 +3,7 @@
 import type { ComponentProps } from "react";
 
 import { Button } from "@/components/ui/button";
+import { useMediaQuery } from "@/hooks/use-media-query";
 import { cn } from "@/lib/utils";
 import { ArrowDownIcon, DownloadIcon } from "lucide-react";
 import { useCallback } from "react";
@@ -10,15 +11,18 @@ import { StickToBottom, useStickToBottomContext } from "use-stick-to-bottom";
 
 export type ConversationProps = ComponentProps<typeof StickToBottom>;
 
-export const Conversation = ({ className, ...props }: ConversationProps) => (
-  <StickToBottom
-    className={cn("relative flex-1 overflow-y-hidden", className)}
-    initial="instant"
-    resize="instant"
-    role="log"
-    {...props}
-  />
-);
+export const Conversation = ({ className, initial, resize, ...props }: ConversationProps) => {
+  const reduceMotion = useMediaQuery("(prefers-reduced-motion: reduce)");
+  return (
+    <StickToBottom
+      className={cn("relative flex-1 overflow-y-hidden", className)}
+      initial={initial ?? (reduceMotion ? "instant" : "smooth")}
+      resize={resize ?? (reduceMotion ? "instant" : "smooth")}
+      role="log"
+      {...props}
+    />
+  );
+};
 
 export type ConversationContentProps = ComponentProps<
   typeof StickToBottom.Content
@@ -30,7 +34,6 @@ export const ConversationContent = ({
 }: ConversationContentProps) => (
   <StickToBottom.Content
     className={cn("flex flex-col gap-8 p-4", className)}
-    scrollClassName="thin-scrollbar"
     {...props}
   />
 );

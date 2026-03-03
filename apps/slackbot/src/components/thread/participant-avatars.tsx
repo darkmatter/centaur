@@ -11,6 +11,7 @@ const FALLBACK_COLORS = [
   "bg-amber-500/20 text-amber-300",
   "bg-pink-500/20 text-pink-300",
 ] as const;
+const SLACK_USER_ID_RE = /^U[A-Z0-9]+$/;
 
 function initials(name: string): string {
   const parts = name.trim().split(/\s+/).filter(Boolean);
@@ -28,6 +29,15 @@ function colorForId(id: string): string {
   return FALLBACK_COLORS[Math.abs(hash) % FALLBACK_COLORS.length];
 }
 
+function participantLabel(participant: Participant): string {
+  const name = String(participant.name || "").trim();
+  if (name && !SLACK_USER_ID_RE.test(name)) return name;
+  const id = String(participant.id || "").trim();
+  if (!id) return "Participant";
+  if (SLACK_USER_ID_RE.test(id)) return `User ${id.slice(-4)}`;
+  return id;
+}
+
 export function ParticipantAvatars({
   participants,
   max = 3,
@@ -37,7 +47,7 @@ export function ParticipantAvatars({
   max?: number;
   size?: number;
 }) {
-  const resolved = (participants ?? []).filter((p) => p.name && !/^U[A-Z0-9]+$/.test(p.name));
+  const resolved = (participants ?? []).filter((p) => String(p.id || "").trim().length > 0);
   if (resolved.length === 0) return null;
   const visible = resolved.slice(0, max);
   const overflow = resolved.length - visible.length;
@@ -45,11 +55,14 @@ export function ParticipantAvatars({
   return (
     <div className="inline-flex items-center -space-x-1.5">
       {visible.map((participant) => {
-        const label = participant.name || participant.id;
+        const label = participantLabel(participant);
         return (
           <Tooltip key={participant.id}>
             <TooltipTrigger asChild>
-              <div
+              <span
+                tabIndex={0}
+                role="img"
+                aria-label={label}
                 className={cn(
                   "ring-2 ring-background rounded-full shrink-0 overflow-hidden flex items-center justify-center text-[10px] font-semibold",
                   !participant.avatar_url && colorForId(participant.id),
@@ -67,7 +80,7 @@ export function ParticipantAvatars({
                 ) : (
                   initials(label)
                 )}
-              </div>
+              </span>
             </TooltipTrigger>
             <TooltipContent>{label}</TooltipContent>
           </Tooltip>
@@ -76,13 +89,15 @@ export function ParticipantAvatars({
       {overflow > 0 && (
         <Tooltip>
           <TooltipTrigger asChild>
-            <div
+            <span
+              tabIndex={0}
+              role="img"
               aria-label={`${overflow} more participant${overflow === 1 ? "" : "s"}`}
               className="ring-2 ring-background rounded-full bg-secondary text-muted-foreground shrink-0 flex items-center justify-center text-[10px] font-semibold"
               style={{ width: size, height: size }}
             >
               +{overflow}
-            </div>
+            </span>
           </TooltipTrigger>
           <TooltipContent>{overflow} more participant{overflow === 1 ? "" : "s"}</TooltipContent>
         </Tooltip>

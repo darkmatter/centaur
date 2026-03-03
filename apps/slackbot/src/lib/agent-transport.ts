@@ -125,9 +125,10 @@ export class AgentThreadTransport<UI_MESSAGE extends UIMessage = UIMessage>
     return openUiStream(this.threadKey, options.abortSignal);
   }
 
-  async reconnectToStream(_options: {
+  async reconnectToStream(options: {
     chatId: string;
   } & ChatRequestOptions): Promise<ReadableStream<UIMessageChunk> | null> {
-    return openUiStream(this.threadKey, undefined);
+    const abortSignal = (options as { abortSignal?: AbortSignal }).abortSignal;
+    return openUiStream(this.threadKey, abortSignal);
   }
 }

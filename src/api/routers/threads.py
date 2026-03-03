@@ -9,16 +9,21 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 import re
+import time
 from typing import Annotated, Any
 
 import asyncpg
+import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 from starlette.responses import RedirectResponse, StreamingResponse
 
 from api.agent import get_session_state, record_thread_message, session_items_snapshot
 from api.deps import get_pool, verify_ui_or_api_key
+from api.thread_store import append_thread_event
+from shared.tool_sdk import _sm_read
 
 router = APIRouter(
     prefix="/api/threads",
@@ -31,7 +36,39 @@ _CONTEXT_HEADER = (
     "Additional Slack thread context since the last AI instruction "
     "(ambient discussion from humans):"
 )
-_SLACK_MENTION_RE = re.compile(r"<?@[A-Z0-9]{6,}>?")
+_SLACK_USER_ID_RE = re.compile(r"^U[A-Z0-9]+$")
+_SLACK_PROFILE_CACHE_TTL_S = 900.0
+_SLACK_PROFILE_CACHE_MAX_ENTRIES = 4000
+_SLACK_PROFILE_LOOKUP_TIMEOUT_S = 2.5
+_SLACK_PROFILE_LOOKUP_CONCURRENCY = 4
+_SLACK_PROFILE_LOOKUP_CAP_PER_REQUEST = 32
+_slack_profile_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+
+
+def _normalize_thread_key(thread_key: str) -> str:
+    raw = thread_key.strip()
+    parts = raw.split(":")
+    if len(parts) == 2 and parts[0] and parts[1]:
+        return f"{parts[0]}:{parts[1]}"
+    if len(parts) == 3 and parts[0].lower() == "slack" and parts[1] and parts[2]:
+        return f"{parts[1]}:{parts[2]}"
+    return raw
+
+
+def _thread_key_aliases(thread_key: str) -> list[str]:
+    aliases: list[str] = []
+    raw = thread_key.strip()
+    canonical = _normalize_thread_key(raw)
+    for key in (raw, canonical):
+        if key and key not in aliases:
+            aliases.append(key)
+    if canonical:
+        channel, _, thread_ts = canonical.partition(":")
+        if channel and thread_ts:
+            slack_key = f"slack:{channel}:{thread_ts}"
+            if slack_key not in aliases:
+                aliases.append(slack_key)
+    return aliases
 
 
 def _raw_item_call_digest(item: dict[str, Any]) -> str:
@@ -113,61 +150,194 @@ def _build_participants_from_turns(turns: list[dict[str, Any]]) -> list[dict[str
         for user_id in user_ids:
             if user_id not in seen:
                 seen[user_id] = {"id": user_id, "name": user_id, "avatar_url": None}
-    return list(seen.values())
+    return _normalize_participants(list(seen.values()))
 
 
-async def _enrich_participants(
-    pool: asyncpg.Pool,
+def _normalize_participants(
     participants: list[dict[str, Any]] | None,
 ) -> list[dict[str, Any]]:
     if not participants:
         return []
-    ids = [str(p.get("id") or "").strip() for p in participants]
-    ids = [item for item in ids if item]
-    if not ids:
-        return participants
-
-    rows = await pool.fetch(
-        """
-        SELECT DISTINCT ON (external_id)
-            external_id,
-            data
-        FROM raw_records
-        WHERE source = 'slack'
-          AND kind = 'user'
-          AND external_id = ANY($1::text[])
-        ORDER BY external_id, fetched_at DESC
-        """,
-        ids,
-    )
-    by_id: dict[str, dict[str, Any]] = {}
-    for row in rows:
-        data = row["data"] if isinstance(row["data"], dict) else {}
-        profile = data.get("profile") if isinstance(data.get("profile"), dict) else {}
-        display_name = (
-            profile.get("display_name")
-            or profile.get("real_name")
-            or data.get("real_name")
-            or data.get("name")
-            or row["external_id"]
-        )
-        avatar_url = profile.get("image_48") or profile.get("image_72") or profile.get("image_24")
-        by_id[str(row["external_id"])] = {
-            "name": str(display_name),
-            "avatar_url": str(avatar_url) if avatar_url else None,
-        }
-
-    enriched: list[dict[str, Any]] = []
+    normalized: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
     for participant in participants:
         pid = str(participant.get("id") or "").strip()
-        details = by_id.get(pid)
-        if not details:
-            enriched.append(participant)
+        if not pid or pid in seen_ids:
             continue
-        enriched.append(
-            {**participant, "name": details["name"], "avatar_url": details["avatar_url"]}
+        seen_ids.add(pid)
+
+        name = str(participant.get("name") or "").strip() or pid
+        avatar_raw = participant.get("avatar_url")
+        avatar_url = str(avatar_raw).strip() if isinstance(avatar_raw, str) else ""
+        normalized.append(
+            {
+                "id": pid,
+                "name": name,
+                "avatar_url": avatar_url or None,
+            }
         )
-    return enriched
+    return normalized
+
+
+def _is_slack_user_id(user_id: str) -> bool:
+    return bool(_SLACK_USER_ID_RE.match(user_id))
+
+
+def _participant_needs_slack_profile(participant: dict[str, Any]) -> bool:
+    pid = str(participant.get("id") or "").strip()
+    if not _is_slack_user_id(pid):
+        return False
+    name = str(participant.get("name") or "").strip()
+    avatar = participant.get("avatar_url")
+    has_avatar = isinstance(avatar, str) and bool(avatar.strip())
+    # Backfill when we only have ID placeholders or missing avatars.
+    return (not name or name == pid or _is_slack_user_id(name)) or not has_avatar
+
+
+def _slack_profile_cache_get(user_id: str) -> dict[str, Any] | None:
+    entry = _slack_profile_cache.get(user_id)
+    if not entry:
+        return None
+    expires_at, profile = entry
+    if expires_at < time.monotonic():
+        _slack_profile_cache.pop(user_id, None)
+        return None
+    return profile
+
+
+def _slack_profile_cache_put(user_id: str, profile: dict[str, Any]) -> None:
+    _slack_profile_cache[user_id] = (time.monotonic() + _SLACK_PROFILE_CACHE_TTL_S, profile)
+    if len(_slack_profile_cache) <= _SLACK_PROFILE_CACHE_MAX_ENTRIES:
+        return
+    now = time.monotonic()
+    expired_ids = [uid for uid, (expires_at, _) in _slack_profile_cache.items() if expires_at < now]
+    for uid in expired_ids:
+        _slack_profile_cache.pop(uid, None)
+    while len(_slack_profile_cache) > _SLACK_PROFILE_CACHE_MAX_ENTRIES:
+        _slack_profile_cache.pop(next(iter(_slack_profile_cache)), None)
+
+
+def _slack_bot_token() -> str:
+    token = (_sm_read("SLACK_BOT_TOKEN") or "").strip()
+    if token:
+        return token
+    return (os.getenv("SLACK_BOT_TOKEN") or "").strip()
+
+
+async def _fetch_slack_profile(
+    client: httpx.AsyncClient,
+    *,
+    token: str,
+    user_id: str,
+    semaphore: asyncio.Semaphore,
+) -> tuple[str, dict[str, Any] | None]:
+    async with semaphore:
+        try:
+            response = await client.get(
+                "https://slack.com/api/users.info",
+                headers={"Authorization": f"Bearer {token}"},
+                params={"user": user_id},
+            )
+            if response.status_code != 200:
+                return user_id, None
+            body = response.json()
+            if not isinstance(body, dict) or not body.get("ok"):
+                return user_id, None
+            user = body.get("user") if isinstance(body.get("user"), dict) else {}
+            profile = user.get("profile") if isinstance(user.get("profile"), dict) else {}
+            name = (
+                profile.get("display_name")
+                or profile.get("real_name")
+                or user.get("real_name")
+                or user.get("name")
+                or user_id
+            )
+            avatar_url = profile.get("image_72") or profile.get("image_48") or profile.get("image_24")
+            resolved = {
+                "name": str(name),
+                "avatar_url": str(avatar_url) if avatar_url else None,
+            }
+            return user_id, resolved
+        except Exception:
+            return user_id, None
+
+
+async def _slack_profiles_for_user_ids(user_ids: list[str]) -> dict[str, dict[str, Any]]:
+    unique_ids = list(dict.fromkeys(uid for uid in user_ids if _is_slack_user_id(uid)))
+    if not unique_ids:
+        return {}
+
+    profiles: dict[str, dict[str, Any]] = {}
+    missing: list[str] = []
+    for user_id in unique_ids:
+        cached = _slack_profile_cache_get(user_id)
+        if cached:
+            profiles[user_id] = cached
+        else:
+            missing.append(user_id)
+
+    if not missing:
+        return profiles
+
+    token = _slack_bot_token()
+    if not token:
+        return profiles
+
+    missing = missing[:_SLACK_PROFILE_LOOKUP_CAP_PER_REQUEST]
+    semaphore = asyncio.Semaphore(_SLACK_PROFILE_LOOKUP_CONCURRENCY)
+    timeout = httpx.Timeout(_SLACK_PROFILE_LOOKUP_TIMEOUT_S)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        results = await asyncio.gather(
+            *[
+                _fetch_slack_profile(
+                    client,
+                    token=token,
+                    user_id=user_id,
+                    semaphore=semaphore,
+                )
+                for user_id in missing
+            ]
+        )
+    for user_id, profile in results:
+        if not profile:
+            continue
+        _slack_profile_cache_put(user_id, profile)
+        profiles[user_id] = profile
+    return profiles
+
+
+def _apply_slack_profiles_to_participants(
+    participants: list[dict[str, Any]] | None,
+    profiles: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    normalized = _normalize_participants(participants)
+    if not normalized or not profiles:
+        return normalized
+
+    merged: list[dict[str, Any]] = []
+    for participant in normalized:
+        user_id = str(participant.get("id") or "").strip()
+        profile = profiles.get(user_id)
+        if not profile:
+            merged.append(participant)
+            continue
+        current_name = str(participant.get("name") or "").strip()
+        current_avatar = participant.get("avatar_url")
+        current_avatar_value = (
+            str(current_avatar).strip() if isinstance(current_avatar, str) and current_avatar.strip() else None
+        )
+        next_name = current_name
+        if not next_name or next_name == user_id or _is_slack_user_id(next_name):
+            next_name = str(profile.get("name") or user_id)
+        next_avatar = current_avatar_value or profile.get("avatar_url")
+        merged.append(
+            {
+                **participant,
+                "name": next_name,
+                "avatar_url": str(next_avatar) if isinstance(next_avatar, str) and next_avatar else None,
+            }
+        )
+    return merged
 
 
 def _extract_turn_user_ids(events: list[dict[str, Any]]) -> list[str]:
@@ -176,7 +346,7 @@ def _extract_turn_user_ids(events: list[dict[str, Any]]) -> list[str]:
         if not isinstance(event, dict):
             continue
         event_type = str(event.get("type") or "")
-        if event_type not in {"thread.user", "thread.message"}:
+        if event_type not in {"thread.user", "thread.message", "thread.context"}:
             continue
         user_id = str(event.get("user_id") or "").strip()
         if user_id and user_id not in seen:
@@ -190,6 +360,7 @@ def _build_live_detail(key: str, session: dict[str, Any]) -> dict[str, Any]:
     participants = session.get("participants")
     if not isinstance(participants, list) or len(participants) == 0:
         participants = _build_participants_from_turns(turns)
+    participants = _normalize_participants(participants)
     return {
         "slack_thread_key": key,
         "container_id": session["container_id"][:12],
@@ -230,6 +401,20 @@ def _latest_command_message_event(events: list[dict[str, Any]]) -> dict[str, Any
     return None
 
 
+def _ordered_turn_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not events:
+        return events
+    has_seq = any(isinstance(event, dict) and event.get("event_seq") is not None for event in events)
+    if not has_seq:
+        return events
+    return sorted(
+        events,
+        key=lambda event: (
+            int(event.get("event_seq") or 0) if isinstance(event, dict) else 0,
+        ),
+    )
+
+
 def _display_user_message(text: str) -> str:
     cleaned = text.strip()
     if not cleaned:
@@ -252,7 +437,6 @@ def _user_message_preview(text: str, *, max_chars: int = 200) -> str:
     cleaned = _display_user_message(text)
     if not cleaned:
         cleaned = text.strip()
-    cleaned = _SLACK_MENTION_RE.sub("", cleaned)
     compact = " ".join(cleaned.split())
     return compact[:max_chars]
 
@@ -309,14 +493,17 @@ async def list_threads(
     )
     pg_keys: set[str] = set()
     threads = []
-    participants_by_key: dict[str, list[dict[str, Any]]] = {}
-    all_participant_ids: set[str] = set()
-
-    # First pass: build thread list and collect all participant IDs
+    live_sessions = dict(session_items_snapshot())
+    pg_only_keys = [
+        str(row["slack_thread_key"])
+        for row in rows
+        if str(row["slack_thread_key"]) not in live_sessions
+    ]
+    pg_participants_by_key = await _fetch_pg_participants_map(pool, pg_only_keys)
     for r in rows:
         key = r["slack_thread_key"]
         pg_keys.add(key)
-        live = get_session_state(key)
+        live = live_sessions.get(key)
         live_turns = live.get("turns", []) if live else []
         live_first_message = ""
         live_last_result = ""
@@ -328,14 +515,10 @@ async def list_threads(
                 str(live_turns[-1].get("user_message") or "")
             )
         if live:
-            parts = live.get("participants") or _build_participants_from_turns(live_turns)
+            participants = live.get("participants") or _build_participants_from_turns(live_turns)
         else:
-            parts = await _fetch_pg_participants(pool, key)
-        participants_by_key[key] = parts
-        for p in parts:
-            pid = str(p.get("id") or "").strip()
-            if pid:
-                all_participant_ids.add(pid)
+            participants = pg_participants_by_key.get(key, [])
+        participants = _normalize_participants(participants)
         threads.append(
             {
                 "slack_thread_key": key,
@@ -360,10 +543,10 @@ async def list_threads(
                     else _user_message_preview(str(r["last_user_message"] or ""))
                 ),
                 "thread_name": live.get("thread_name") if live else r.get("thread_name"),
-                "participants": [],  # filled in after batch enrichment
+                "participants": participants,
             }
         )
-    for key, live in session_items_snapshot():
+    for key, live in live_sessions.items():
         if key not in pg_keys:
             first_msg = ""
             last_result = ""
@@ -374,14 +557,6 @@ async def list_threads(
                 last_user_message = _user_message_preview(
                     str(live["turns"][-1].get("user_message") or "")
                 )
-            parts = live.get("participants") or _build_participants_from_turns(
-                live.get("turns", [])
-            )
-            participants_by_key[key] = parts
-            for p in parts:
-                pid = str(p.get("id") or "").strip()
-                if pid:
-                    all_participant_ids.add(pid)
             threads.append(
                 {
                     "slack_thread_key": key,
@@ -396,57 +571,49 @@ async def list_threads(
                     "first_message": first_msg,
                     "last_user_message": last_user_message,
                     "thread_name": live.get("thread_name"),
-                    "participants": [],  # filled in after batch enrichment
+                    "participants": _normalize_participants(
+                        live.get("participants")
+                        or _build_participants_from_turns(live.get("turns", []))
+                    ),
                 }
             )
 
-    # Batch enrichment: single query for all participant IDs
-    enrichment_map: dict[str, dict[str, Any]] = {}
-    if all_participant_ids:
-        user_rows = await pool.fetch(
-            """
-            SELECT DISTINCT ON (external_id)
-                external_id, data
-            FROM raw_records
-            WHERE source = 'slack' AND kind = 'user'
-              AND external_id = ANY($1::text[])
-            ORDER BY external_id, fetched_at DESC
-            """,
-            list(all_participant_ids),
-        )
-        for row in user_rows:
-            data = row["data"] if isinstance(row["data"], dict) else {}
-            profile = data.get("profile") if isinstance(data.get("profile"), dict) else {}
-            display_name = (
-                profile.get("display_name")
-                or profile.get("real_name")
-                or data.get("real_name")
-                or data.get("name")
-                or row["external_id"]
-            )
-            avatar_url = (
-                profile.get("image_48") or profile.get("image_72") or profile.get("image_24")
-            )
-            enrichment_map[str(row["external_id"])] = {
-                "name": str(display_name),
-                "avatar_url": str(avatar_url) if avatar_url else None,
-            }
-
-    # Apply enrichment to all threads
+    profile_lookup_ids: list[str] = []
     for thread in threads:
-        key = thread["slack_thread_key"]
-        raw_parts = participants_by_key.get(key, [])
-        enriched: list[dict[str, Any]] = []
-        for p in raw_parts:
-            pid = str(p.get("id") or "").strip()
-            details = enrichment_map.get(pid)
-            if details:
-                enriched.append({**p, "name": details["name"], "avatar_url": details["avatar_url"]})
-            else:
-                enriched.append(p)
-        thread["participants"] = enriched
+        participants = thread.get("participants")
+        if not isinstance(participants, list):
+            continue
+        for participant in participants:
+            if not isinstance(participant, dict):
+                continue
+            if _participant_needs_slack_profile(participant):
+                user_id = str(participant.get("id") or "").strip()
+                if user_id:
+                    profile_lookup_ids.append(user_id)
+    slack_profiles = await _slack_profiles_for_user_ids(profile_lookup_ids)
+    if slack_profiles:
+        for thread in threads:
+            thread["participants"] = _apply_slack_profiles_to_participants(
+                thread.get("participants"),
+                slack_profiles,
+            )
 
-    threads.sort(key=lambda t: t.get("last_activity") or 0, reverse=True)
+    state_rank = {
+        "error": 0,
+        "stopping": 1,
+        "running": 2,
+        "working": 2,
+        "idle": 3,
+        "stopped": 4,
+    }
+    threads.sort(
+        key=lambda t: (
+            state_rank.get(str(t.get("state") or "").lower(), 99),
+            -float(t.get("last_activity") or 0),
+            -float(t.get("created_at") or 0),
+            str(t.get("slack_thread_key") or ""),
+        )
+    )
     return {"threads": threads, "count": len(threads)}
 
 
@@ -492,11 +659,7 @@ async def _fetch_pg_detail(pool: asyncpg.Pool, key: str) -> dict[str, Any]:
 
     turns = []
     for t in turn_rows:
-        events_raw = t["events"]
-        if isinstance(events_raw, str):
-            events_raw = json.loads(events_raw)
-        if not isinstance(events_raw, list):
-            events_raw = []
+        events_raw = _parse_turn_events_payload(t["events"])
         turns.append(
             {
                 "turn_id": t["turn_id"],
@@ -526,25 +689,64 @@ async def _fetch_pg_detail(pool: asyncpg.Pool, key: str) -> dict[str, Any]:
     }
 
 
-async def _fetch_pg_participants(pool: asyncpg.Pool, key: str) -> list[dict[str, Any]]:
-    turn_rows = await pool.fetch(
-        """
-        SELECT events
-        FROM agent_turns
-        WHERE slack_thread_key = $1
-        ORDER BY turn_id
-        """,
-        key,
-    )
-    turns: list[dict[str, Any]] = []
-    for row in turn_rows:
-        events_raw = row["events"]
-        if isinstance(events_raw, str):
+def _parse_turn_events_payload(events_raw: Any) -> list[dict[str, Any]]:
+    if isinstance(events_raw, str):
+        try:
             events_raw = json.loads(events_raw)
-        if not isinstance(events_raw, list):
-            events_raw = []
-        turns.append({"events": events_raw})
-    return _build_participants_from_turns(turns)
+        except Exception:
+            return []
+    if not isinstance(events_raw, list):
+        return []
+    return [event for event in events_raw if isinstance(event, dict)]
+
+
+async def _fetch_pg_participants_map(
+    pool: asyncpg.Pool,
+    keys: list[str],
+) -> dict[str, list[dict[str, Any]]]:
+    unique_keys = list(dict.fromkeys(keys))
+    if not unique_keys:
+        return {}
+    rows = await pool.fetch(
+        """
+        SELECT slack_thread_key, events
+        FROM agent_turns
+        WHERE slack_thread_key = ANY($1::text[])
+        ORDER BY slack_thread_key, turn_id
+        """,
+        unique_keys,
+    )
+    turns_by_key: dict[str, list[dict[str, Any]]] = {key: [] for key in unique_keys}
+    for row in rows:
+        key = str(row["slack_thread_key"])
+        turns_by_key.setdefault(key, []).append(
+            {"events": _parse_turn_events_payload(row["events"])}
+        )
+
+    participants_by_key: dict[str, list[dict[str, Any]]] = {}
+    for key in unique_keys:
+        participants_by_key[key] = _build_participants_from_turns(turns_by_key.get(key, []))
+    return participants_by_key
+
+
+async def _hydrate_detail_participants(detail: dict[str, Any]) -> dict[str, Any]:
+    participants = detail.get("participants")
+    if not isinstance(participants, list):
+        detail["participants"] = _normalize_participants(None)
+        return detail
+
+    lookup_ids: list[str] = []
+    for participant in participants:
+        if not isinstance(participant, dict):
+            continue
+        if _participant_needs_slack_profile(participant):
+            user_id = str(participant.get("id") or "").strip()
+            if user_id:
+                lookup_ids.append(user_id)
+
+    slack_profiles = await _slack_profiles_for_user_ids(lookup_ids)
+    detail["participants"] = _apply_slack_profiles_to_participants(participants, slack_profiles)
+    return detail
 
 
 @router.get("/detail")
@@ -561,29 +763,64 @@ async def get_thread(
 
     if session:
         detail = _build_live_detail(key, session)
-        detail["participants"] = await _enrich_participants(pool, detail.get("participants"))
-        return detail
+        return await _hydrate_detail_participants(detail)
 
     try:
         detail = await _fetch_pg_detail(pool, key)
-        detail["participants"] = await _enrich_participants(pool, detail.get("participants"))
-        return detail
+        return await _hydrate_detail_participants(detail)
     except HTTPException:
         if not key.startswith("slack:"):
             try:
                 detail = await _fetch_pg_detail(pool, f"slack:{key}")
-                detail["participants"] = await _enrich_participants(
-                    pool, detail.get("participants")
-                )
-                return detail
+                return await _hydrate_detail_participants(detail)
             except HTTPException:
                 pass
         raise
 
 
 @router.post("/context-message")
-async def post_context_message(payload: ContextMessageRequest) -> dict[str, Any]:
+async def post_context_message(
+    payload: ContextMessageRequest,
+    pool: Annotated[asyncpg.Pool, Depends(get_pool)],
+) -> dict[str, Any]:
     text = payload.text.strip()
+    normalized_message_id = str(payload.message_id or "").strip()
+    canonical_input_key = _normalize_thread_key(payload.thread_key)
+    if normalized_message_id:
+        aliases = _thread_key_aliases(payload.thread_key)
+        candidate_event_ids = [
+            f"{alias}:thread.context:{normalized_message_id}" for alias in aliases
+        ]
+        already_persisted = await pool.fetchval(
+            """
+            SELECT 1
+            FROM thread_events_ledger
+            WHERE event_id = ANY($1::text[])
+               OR (
+                    slack_thread_key = ANY($2::text[])
+                    AND COALESCE(payload->>'message_id', '') = $3
+                    AND (
+                        event_type = 'thread.context'
+                        OR (
+                            event_type = 'thread.message'
+                            AND COALESCE(payload->>'message_type', '') = 'context'
+                        )
+                    )
+               )
+            LIMIT 1
+            """,
+            candidate_event_ids,
+            aliases,
+            normalized_message_id,
+        )
+        if already_persisted:
+            return {
+                "status": "duplicate",
+                "thread_key": canonical_input_key,
+                "message_id": normalized_message_id,
+                "message_type": "context",
+            }
+
     if payload.attachments:
         lines = [
             f"- {item.name.strip()}: {item.url.strip()}"
@@ -592,7 +829,7 @@ async def post_context_message(payload: ContextMessageRequest) -> dict[str, Any]
         ]
         if lines:
             text = f"{text}\n\nAttachments:\n" + "\n".join(lines)
-    return record_thread_message(
+    result = record_thread_message(
         payload.thread_key,
         text,
         message_type="context",
@@ -600,6 +837,42 @@ async def post_context_message(payload: ContextMessageRequest) -> dict[str, Any]
         user_id=payload.user_id,
         message_id=payload.message_id,
     )
+    status = str(result.get("status") or "")
+    if status in {"ignored_empty", "duplicate"}:
+        return result
+    if status == "accepted":
+        return {**result, "persisted": True}
+    if status != "no_active_session":
+        return result
+
+    canonical_key = str(result.get("thread_key") or canonical_input_key)
+    event_id: str | None = None
+    if normalized_message_id:
+        event_id = f"{canonical_key}:thread.context:{normalized_message_id}"
+
+    event_payload = {
+        "source": payload.source or "unknown",
+        "user_id": payload.user_id,
+        "message_id": payload.message_id,
+        "text": text,
+        "attachments": [item.model_dump() for item in payload.attachments],
+    }
+    _, _seq = await append_thread_event(
+        pool,
+        slack_thread_key=canonical_key,
+        source="thread_viewer",
+        event_type="thread.context",
+        payload=event_payload,
+        event_id=event_id,
+    )
+    return {
+        **result,
+        "status": "accepted",
+        "thread_key": canonical_key,
+        "message_type": "context",
+        "message_id": normalized_message_id,
+        "persisted": True,
+    }
 
 
 def _resolve_model_costs_per_m(model_lower: str) -> tuple[float, float] | None:
@@ -681,9 +954,10 @@ def _extract_usage_from_payload(usage_payload: dict[str, Any]) -> dict[str, int]
         + _coerce_non_negative_int(usage_payload.get("cache_read_input_tokens"))
         + _coerce_non_negative_int(usage_payload.get("cache_creation_input_tokens"))
     )
-    output_tokens = _coerce_non_negative_int(
-        usage_payload.get("output_tokens")
-    ) + _coerce_non_negative_int(usage_payload.get("completion_tokens"))
+    output_tokens = (
+        _coerce_non_negative_int(usage_payload.get("output_tokens"))
+        + _coerce_non_negative_int(usage_payload.get("completion_tokens"))
+    )
     if input_tokens == 0 and output_tokens == 0:
         total = _coerce_non_negative_int(usage_payload.get("total_tokens"))
         if total > 0:
@@ -725,6 +999,24 @@ def _extract_usage_model(event: dict[str, Any]) -> str | None:
     return model or None
 
 
+def _tool_output_to_text(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        text_chunks = []
+        for item in value:
+            if isinstance(item, dict) and str(item.get("type") or "") == "text":
+                text = str(item.get("text") or "").strip()
+                if text:
+                    text_chunks.append(text)
+        if text_chunks:
+            return "\n".join(text_chunks)
+    try:
+        return json.dumps(value, default=str)
+    except Exception:
+        return str(value)
+
+
 def _ui_stream_chunks_for_event(
     turn_id: int,
     event_index: int,
@@ -734,20 +1026,28 @@ def _ui_stream_chunks_for_event(
 ) -> list[dict[str, Any]]:
     chunks: list[dict[str, Any]] = []
     event_type = event.get("type")
+    event_seq_raw = event.get("event_seq")
+    try:
+        event_seq = int(event_seq_raw) if event_seq_raw is not None else 0
+    except Exception:
+        event_seq = 0
+    seq_prefix = f"evt-{event_seq}-" if event_seq > 0 else ""
 
     if event_type == "assistant":
         content = (event.get("message") or {}).get("content") or []
         for content_index, block in enumerate(content):
             block_type = block.get("type")
             if block_type == "text" and (block.get("text") or "").strip():
-                text_id = f"turn-{turn_id}-text-{event_index}-{content_index}"
+                text_id = f"{seq_prefix}turn-{turn_id}-text-{event_index}-{content_index}"
                 chunks.append({"type": "text-start", "id": text_id})
                 chunks.append(
                     {"type": "text-delta", "id": text_id, "delta": str(block.get("text") or "")}
                 )
                 chunks.append({"type": "text-end", "id": text_id})
             elif block_type == "thinking" and (block.get("thinking") or "").strip():
-                reasoning_id = f"turn-{turn_id}-reasoning-{event_index}-{content_index}"
+                reasoning_id = (
+                    f"{seq_prefix}turn-{turn_id}-reasoning-{event_index}-{content_index}"
+                )
                 chunks.append({"type": "reasoning-start", "id": reasoning_id})
                 chunks.append(
                     {
@@ -759,7 +1059,7 @@ def _ui_stream_chunks_for_event(
                 chunks.append({"type": "reasoning-end", "id": reasoning_id})
             elif block_type == "tool_use":
                 tool_call_id = str(block.get("id") or "").strip() or (
-                    f"turn-{turn_id}-tool-{event_index}-{content_index}"
+                    f"{seq_prefix}turn-{turn_id}-tool-{event_index}-{content_index}"
                 )
                 chunks.append(
                     {
@@ -767,6 +1067,7 @@ def _ui_stream_chunks_for_event(
                         "toolCallId": tool_call_id,
                         "toolName": str(block.get("name") or "tool"),
                         "input": block.get("input") or {},
+                        "event_seq": event_seq or None,
                     }
                 )
     elif event_type == "tool":
@@ -774,15 +1075,28 @@ def _ui_stream_chunks_for_event(
             tool_call_id = str(block.get("tool_use_id") or "").strip()
             if not tool_call_id:
                 continue
-            chunks.append(
-                {
-                    "type": "tool-output-available",
-                    "toolCallId": tool_call_id,
-                    "output": block.get("content"),
-                }
-            )
+            is_error = bool(block.get("is_error"))
+            output = block.get("content")
+            if is_error:
+                chunks.append(
+                    {
+                        "type": "tool-output-error",
+                        "toolCallId": tool_call_id,
+                        "errorText": _tool_output_to_text(output),
+                        "event_seq": event_seq or None,
+                    }
+                )
+            else:
+                chunks.append(
+                    {
+                        "type": "tool-output-available",
+                        "toolCallId": tool_call_id,
+                        "output": output,
+                        "event_seq": event_seq or None,
+                    }
+                )
     elif event_type == "reasoning":
-        reasoning_id = f"turn-{turn_id}-reasoning-{event_index}"
+        reasoning_id = f"{seq_prefix}turn-{turn_id}-reasoning-{event_index}"
         chunks.append({"type": "reasoning-start", "id": reasoning_id})
         chunks.append(
             {"type": "reasoning-delta", "id": reasoning_id, "delta": str(event.get("text") or "")}
@@ -792,20 +1106,21 @@ def _ui_stream_chunks_for_event(
         chunks.append(
             {
                 "type": "data-file-changes",
-                "id": f"turn-{turn_id}-file-change-{event_index}",
-                "data": {"changes": event.get("changes") or []},
+                "id": f"{seq_prefix}turn-{turn_id}-file-change-{event_index}",
+                "data": {"changes": event.get("changes") or [], "event_seq": event_seq or None},
             }
         )
     elif event_type == "command_execution":
         chunks.append(
             {
                 "type": "data-shell-command",
-                "id": f"turn-{turn_id}-command-{event_index}",
+                "id": f"{seq_prefix}turn-{turn_id}-command-{event_index}",
                 "data": {
                     "command": event.get("command") or "",
                     "output": event.get("aggregated_output") or event.get("output") or "",
                     "exitCode": event.get("exit_code"),
                     "status": event.get("status"),
+                    "event_seq": event_seq or None,
                 },
             }
         )
@@ -821,12 +1136,13 @@ def _ui_stream_chunks_for_event(
             "source": str(event.get("source") or "unknown"),
             "user_id": str(event.get("user_id") or "").strip() or None,
             "created_at": str(event.get("created_at") or ""),
+            "event_seq": event_seq or None,
         }
         if message_type == "context":
             chunks.append(
                 {
                     "type": "data-context-message",
-                    "id": f"turn-{turn_id}-context-{event_index}",
+                    "id": f"{seq_prefix}turn-{turn_id}-context-{event_index}",
                     "data": base_data,
                 }
             )
@@ -834,7 +1150,7 @@ def _ui_stream_chunks_for_event(
             chunks.append(
                 {
                     "type": "data-user-message",
-                    "id": f"turn-{turn_id}-user-message-{event_index}",
+                    "id": f"{seq_prefix}turn-{turn_id}-user-message-{event_index}",
                     "data": base_data,
                 }
             )
@@ -847,10 +1163,14 @@ def _ui_stream_chunks_for_event(
         input_tokens_raw = event.get("input_tokens")
         output_tokens_raw = event.get("output_tokens")
         input_tokens = (
-            _coerce_non_negative_int(input_tokens_raw) if input_tokens_raw is not None else None
+            _coerce_non_negative_int(input_tokens_raw)
+            if input_tokens_raw is not None
+            else None
         )
         output_tokens = (
-            _coerce_non_negative_int(output_tokens_raw) if output_tokens_raw is not None else None
+            _coerce_non_negative_int(output_tokens_raw)
+            if output_tokens_raw is not None
+            else None
         )
         total_tokens_raw = event.get("total_tokens")
         if total_tokens_raw is not None:
@@ -895,17 +1215,24 @@ def _ui_stream_chunks_for_event(
                     "total_tokens": total_tokens,
                     "cost_usd": cost_usd,
                     "model": model_name,
+                    "event_seq": event_seq or None,
                 },
             }
         )
     elif event_type == "error":
+        error_id = f"{seq_prefix}turn-{turn_id}-error-{event_index}"
         chunks.append(
-            {"type": "error", "errorText": str(event.get("error") or event.get("message") or "")}
+            {
+                "type": "error",
+                "id": error_id,
+                "errorText": str(event.get("error") or event.get("message") or ""),
+                "event_seq": event_seq or None,
+            }
         )
     elif event_type == "result":
         text = str(event.get("result") or "")
         if text:
-            text_id = f"turn-{turn_id}-result-{event_index}"
+            text_id = f"{seq_prefix}turn-{turn_id}-result-{event_index}"
             chunks.append({"type": "text-start", "id": text_id})
             chunks.append({"type": "text-delta", "id": text_id, "delta": text})
             chunks.append({"type": "text-end", "id": text_id})
@@ -931,46 +1258,78 @@ def _ui_stream_chunks_for_event(
                         "toolCallId": item_id,
                         "toolName": tool_name,
                         "input": tool_input if isinstance(tool_input, dict) else {},
+                        "event_seq": event_seq or None,
                     }
                 )
             elif event_type == "item.completed":
                 output = item.get("result")
-                if output is None and item.get("error") is not None:
-                    output = item.get("error")
-                chunks.append(
-                    {
-                        "type": "tool-output-available",
-                        "toolCallId": item_id,
-                        "output": output,
-                    }
-                )
+                error_text = item.get("error")
+                if error_text is not None:
+                    chunks.append(
+                        {
+                            "type": "tool-output-error",
+                            "toolCallId": item_id,
+                            "errorText": _tool_output_to_text(error_text),
+                            "event_seq": event_seq or None,
+                        }
+                    )
+                else:
+                    chunks.append(
+                        {
+                            "type": "tool-output-available",
+                            "toolCallId": item_id,
+                            "output": output,
+                            "event_seq": event_seq or None,
+                        }
+                    )
         elif item_type == "command_execution" and event_type == "item.completed":
             chunks.append(
                 {
                     "type": "data-shell-command",
-                    "id": f"turn-{turn_id}-item-command-{event_index}",
+                    "id": f"{seq_prefix}turn-{turn_id}-item-command-{event_index}",
                     "data": {
                         "command": item.get("command") or "",
                         "output": item.get("aggregated_output") or item.get("output") or "",
                         "exitCode": item.get("exit_code"),
                         "status": item.get("status"),
+                        "event_seq": event_seq or None,
                     },
                 }
             )
         elif item_type == "reasoning" and event_type in {"item.updated", "item.completed"}:
             text = str(item.get("text") or item.get("thinking") or "")
             if text:
-                reasoning_id = f"turn-{turn_id}-item-reasoning-{event_index}"
+                reasoning_id = f"{seq_prefix}turn-{turn_id}-item-reasoning-{event_index}"
                 chunks.append({"type": "reasoning-start", "id": reasoning_id})
                 chunks.append({"type": "reasoning-delta", "id": reasoning_id, "delta": text})
                 chunks.append({"type": "reasoning-end", "id": reasoning_id})
         elif event_type == "item.completed":
             text = str(item.get("text") or "")
             if text:
-                text_id = f"turn-{turn_id}-item-result-{event_index}"
+                text_id = f"{seq_prefix}turn-{turn_id}-item-result-{event_index}"
                 chunks.append({"type": "text-start", "id": text_id})
                 chunks.append({"type": "text-delta", "id": text_id, "delta": text})
                 chunks.append({"type": "text-end", "id": text_id})
+    elif event_type in {"system", "status", "raw", "turn.completed"}:
+        detail = (
+            str(event.get("message") or "").strip()
+            or str(event.get("text") or "").strip()
+            or str(event.get("status") or "").strip()
+            or str(event.get("phase") or "").strip()
+            or str(event.get("type") or "system update")
+        )
+        chunks.append(
+            {
+                "type": "data-system-event",
+                "id": f"{seq_prefix}turn-{turn_id}-system-{event_index}",
+                "data": {
+                    "title": str(event_type).replace(".", " "),
+                    "text": detail,
+                    "tone": "warn" if event_type == "raw" else "info",
+                    "event_seq": event_seq or None,
+                },
+            }
+        )
 
     return chunks
 
@@ -1003,8 +1362,6 @@ async def stream_thread_ui(
         usage_seen = False
         usage_model: str | None = None
         initialized_live_cursor = False
-        turns_with_stream_chunks: set[int] = set()
-        turns_with_text_chunks: set[int] = set()
         emitted_turn_user_messages: set[str] = set()
         pending_tool_ids: dict[tuple[int, str], list[str]] = {}
         tool_call_counters: dict[tuple[int, str], int] = {}
@@ -1045,16 +1402,8 @@ async def stream_thread_ui(
                     if turn_id <= 0:
                         continue
                     events_raw = turn.get("events")
-                    if isinstance(events_raw, list):
-                        events = events_raw
-                    elif isinstance(events_raw, str):
-                        try:
-                            parsed = json.loads(events_raw)
-                            events = parsed if isinstance(parsed, list) else []
-                        except (json.JSONDecodeError, TypeError):
-                            events = []
-                    else:
-                        events = []
+                    events = events_raw if isinstance(events_raw, list) else []
+                    events = _ordered_turn_events(events)
                     last_event_indices[turn_id] = len(events)
                     if turn.get("result"):
                         last_event_indices[-turn_id] = 1
@@ -1078,16 +1427,8 @@ async def stream_thread_ui(
                     any_new_data = True
                     yield f"data: {json.dumps({'type': 'data-phase-progress', 'id': f'turn-{turn_id}-phase', 'data': {'phase': phase, 'turn_id': turn_id}})}\n\n"
                 events_raw = turn.get("events")
-                if isinstance(events_raw, list):
-                    events = events_raw
-                elif isinstance(events_raw, str):
-                    try:
-                        parsed = json.loads(events_raw)
-                        events = parsed if isinstance(parsed, list) else []
-                    except (json.JSONDecodeError, TypeError):
-                        events = []
-                else:
-                    events = []
+                events = events_raw if isinstance(events_raw, list) else []
+                events = _ordered_turn_events(events)
                 command_event = _latest_command_message_event(events)
                 if not command_event:
                     fallback_text = _display_user_message(str(turn.get("user_message") or ""))
@@ -1100,29 +1441,7 @@ async def stream_thread_ui(
                         yield f"data: {json.dumps({'type': 'data-user-message', 'id': fallback_id, 'data': {'id': fallback_id, 'turn_id': turn_id, 'text': fallback_text, 'source': 'unknown', 'user_id': str(turn.get('user_id') or '').strip() or None, 'created_at': ''}})}\n\n"
                         yield f"data: {json.dumps({'type': 'finish-step'})}\n\n"
                 start_index = last_event_indices.get(turn_id, 0)
-                turn_had_chunks = False
-                # Pre-scan: detect turns that already contain text-producing
-                # events so the per-event loop can skip duplicate result events.
-                if turn_id not in turns_with_text_chunks and events:
-                    for ev in events:
-                        if not isinstance(ev, dict):
-                            continue
-                        et = ev.get("type")
-                        if et == "assistant":
-                            content = (ev.get("message") or {}).get("content") or []
-                            if any(
-                                isinstance(b, dict)
-                                and b.get("type") == "text"
-                                and (b.get("text") or "").strip()
-                                for b in content
-                            ):
-                                turns_with_text_chunks.add(turn_id)
-                                break
-                        elif et == "item.completed":
-                            item = ev.get("item") if isinstance(ev.get("item"), dict) else {}
-                            if (item.get("text") or "").strip():
-                                turns_with_text_chunks.add(turn_id)
-                                break
+                turn_had_result_text = False
                 if start_index < len(events):
                     for index in range(start_index, len(events)):
                         event = events[index]
@@ -1157,9 +1476,6 @@ async def stream_thread_ui(
                         )
                         if not chunks:
                             continue
-                        event_type = event.get("type")
-                        if event_type == "result" and turn_id in turns_with_text_chunks:
-                            continue
                         filtered_chunks: list[dict[str, Any]] = []
                         for chunk in chunks:
                             chunk_type = str(chunk.get("type") or "")
@@ -1178,30 +1494,29 @@ async def stream_thread_ui(
                             filtered_chunks.append(chunk)
                         if not filtered_chunks:
                             continue
-                        turn_had_chunks = True
-                        turns_with_stream_chunks.add(turn_id)
                         any_new_data = True
                         yield f"data: {json.dumps({'type': 'start-step'})}\n\n"
                         for chunk in filtered_chunks:
                             chunk_type = str(chunk.get("type") or "")
                             any_new_data = True
                             yield f"data: {json.dumps(chunk, default=str)}\n\n"
+                            if chunk_type in {"text-delta", "text-end"}:
+                                turn_had_result_text = True
                             if chunk_type in {"reasoning-start", "reasoning-delta"}:
                                 yield f"data: {json.dumps({'type': 'data-agent-status', 'data': {'text': 'Thinking...'}, 'transient': True})}\n\n"
                             elif chunk_type == "tool-input-available":
                                 tool_name = str(chunk.get("toolName") or "tool")
                                 yield f"data: {json.dumps({'type': 'data-agent-status', 'data': {'text': f'Running {tool_name}...'}, 'transient': True})}\n\n"
                             elif chunk_type in {"text-start", "text-delta"}:
-                                turns_with_text_chunks.add(turn_id)
                                 yield f"data: {json.dumps({'type': 'data-agent-status', 'data': {'text': 'Writing response...'}, 'transient': True})}\n\n"
                         yield f"data: {json.dumps({'type': 'finish-step'})}\n\n"
                 last_event_indices[turn_id] = len(events)
+                if turn_had_result_text:
+                    last_event_indices[-turn_id] = 1
 
                 if (
                     turn.get("result")
-                    and not turn_had_chunks
-                    and turn_id not in turns_with_stream_chunks
-                    and turn_id not in turns_with_text_chunks
+                    and not turn_had_result_text
                 ):
                     result_id = f"turn-{turn_id}-turn-result"
                     if last_event_indices.get(-turn_id) != 1:
@@ -1211,7 +1526,6 @@ async def stream_thread_ui(
                         yield f"data: {json.dumps({'type': 'text-delta', 'id': result_id, 'delta': turn.get('result')})}\n\n"
                         yield f"data: {json.dumps({'type': 'text-end', 'id': result_id})}\n\n"
                         yield f"data: {json.dumps({'type': 'finish-step'})}\n\n"
-                        turns_with_stream_chunks.add(turn_id)
                         last_event_indices[-turn_id] = 1
 
             total_input_tokens = sum(item["input_tokens"] for item in usage_by_turn.values())

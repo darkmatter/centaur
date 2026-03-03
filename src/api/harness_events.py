@@ -37,8 +37,12 @@ def _parse_dictish(value: Any) -> dict[str, Any]:
     return {}
 
 
-def _stable_tool_call_id(name: str, tool_input: Any) -> str:
-    payload = {"name": name or "tool", "input": tool_input if isinstance(tool_input, dict) else {}}
+def _stable_tool_call_id(name: str, tool_input: Any, nonce: str = "") -> str:
+    payload = {
+        "name": name or "tool",
+        "input": tool_input if isinstance(tool_input, dict) else {},
+        "nonce": nonce or "",
+    }
     digest = hashlib.sha1(
         json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
     ).hexdigest()[:12]
@@ -195,7 +199,15 @@ def _codex_tool_call_id(item: dict[str, Any]) -> str:
     )
     if direct_id:
         return direct_id
-    return _stable_tool_call_id(_codex_tool_name(item), _codex_tool_input(item))
+    nonce = (
+        _as_text(item.get("index"))
+        or _as_text(item.get("position"))
+        or _as_text(item.get("ordinal"))
+        or _as_text(item.get("event_seq"))
+        or _as_text(item.get("timestamp"))
+        or _as_text(item.get("created_at"))
+    )
+    return _stable_tool_call_id(_codex_tool_name(item), _codex_tool_input(item), nonce)
 
 
 def _normalize_codex_item(item: dict[str, Any], phase: str) -> list[dict[str, Any]]:
@@ -348,8 +360,15 @@ def _normalize_pi_event(event: dict[str, Any]) -> list[dict[str, Any]]:
         tool_name = _as_text(event.get("toolName")) or "tool"
         tool_input = _as_dict(event.get("args"))
         tool_id = _as_text(event.get("toolCallId"))
+        if not tool_id:
+            nonce = (
+                _as_text(event.get("toolExecutionId"))
+                or _as_text(event.get("executionId"))
+                or _as_text(event.get("id"))
+            )
+            tool_id = _stable_tool_call_id(tool_name, tool_input, nonce)
         if tool_name.strip().lower() == "subagent":
-            fallback_id = tool_id or _stable_tool_call_id(tool_name, tool_input)
+            fallback_id = tool_id
             label = (
                 _as_text(tool_input.get("description"))
                 or _as_text(tool_input.get("name"))
@@ -361,7 +380,16 @@ def _normalize_pi_event(event: dict[str, Any]) -> list[dict[str, Any]]:
     if event_type == "tool_execution_end":
         tool_id = _as_text(event.get("toolCallId"))
         if not tool_id:
-            return []
+            tool_name = _as_text(event.get("toolName")) or "tool"
+            tool_input = _as_dict(event.get("args"))
+            nonce = (
+                _as_text(event.get("toolExecutionId"))
+                or _as_text(event.get("executionId"))
+                or _as_text(event.get("id"))
+            )
+            if not nonce:
+                return []
+            tool_id = _stable_tool_call_id(tool_name, tool_input, nonce)
         if _as_text(event.get("toolName")).strip().lower() == "subagent":
             if bool(event.get("isError")):
                 return [

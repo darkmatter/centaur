@@ -55,7 +55,7 @@ function ContextBar({ percent }: { percent: number }) {
   const color = percent > 80 ? "bg-destructive" : percent > 50 ? "bg-amber-500" : "bg-green-500";
   return (
     <div className="h-1.5 rounded-full bg-secondary mt-1 overflow-hidden">
-      <div className={cn("h-full rounded-full transition-all", color)} style={{ width: `${percent}%` }} />
+      <div className={cn("h-full rounded-full transition-[width] duration-200 ease-out", color)} style={{ width: `${percent}%` }} />
     </div>
   );
 }
@@ -73,24 +73,59 @@ export function ThreadInfoSheet({
   const sheetRef = useRef<HTMLDivElement>(null);
   const [dragY, setDragY] = useState(0);
   const dragStartRef = useRef<number | null>(null);
+  const dragRafRef = useRef<number>(0);
+  const dragPendingRef = useRef(0);
+  const draggingRef = useRef(false);
 
   const handleTouchStart = useCallback((e: React.TouchEvent) => {
-    dragStartRef.current = e.touches[0].clientY;
+    const sheet = sheetRef.current;
+    if (!sheet) return;
+    const touchY = e.touches[0].clientY;
+    const fromTop = touchY - sheet.getBoundingClientRect().top;
+    if (sheet.scrollTop > 0 || fromTop > 80) {
+      dragStartRef.current = null;
+      draggingRef.current = false;
+      return;
+    }
+    dragStartRef.current = touchY;
+    draggingRef.current = true;
   }, []);
 
   const handleTouchMove = useCallback((e: React.TouchEvent) => {
-    if (dragStartRef.current === null) return;
+    if (dragStartRef.current === null || !draggingRef.current) return;
     const delta = e.touches[0].clientY - dragStartRef.current;
-    if (delta > 0) setDragY(delta);
+    if (delta <= 0) return;
+    e.preventDefault();
+    dragPendingRef.current = delta;
+    if (dragRafRef.current) return;
+    dragRafRef.current = window.requestAnimationFrame(() => {
+      dragRafRef.current = 0;
+      setDragY(dragPendingRef.current);
+    });
   }, []);
 
   const handleTouchEnd = useCallback(() => {
-    if (dragY > 100) {
+    const finalDragY = Math.max(dragY, dragPendingRef.current);
+    if (dragRafRef.current) {
+      window.cancelAnimationFrame(dragRafRef.current);
+      dragRafRef.current = 0;
+    }
+    if (finalDragY > 100) {
       onClose();
     }
     setDragY(0);
     dragStartRef.current = null;
+    dragPendingRef.current = 0;
+    draggingRef.current = false;
   }, [dragY, onClose]);
+
+  useEffect(() => {
+    return () => {
+      if (dragRafRef.current) {
+        window.cancelAnimationFrame(dragRafRef.current);
+      }
+    };
+  }, []);
 
   useEffect(() => {
     if (!open) {
@@ -140,11 +175,18 @@ export function ThreadInfoSheet({
   }, [open, onClose]);
 
   const contextPercent = tokenUsage
-    ? Math.round((tokenUsage.total_tokens / 200_000) * 100)
+    ? Math.max(0, Math.min(100, Math.round((tokenUsage.total_tokens / 200_000) * 100)))
     : 0;
 
-  const [channelId, threadTs] = thread.slack_thread_key.split(":");
-  const slackUrl = `slack://app_redirect?channel=${channelId}&thread_ts=${threadTs}`;
+  const keyParts = thread.slack_thread_key.startsWith("slack:")
+    ? thread.slack_thread_key.replace(/^slack:/, "").split(":")
+    : [];
+  const channelId = keyParts[0] ?? "";
+  const threadTs = keyParts[1] ?? "";
+  const slackUrl =
+    channelId && threadTs
+      ? `slack://app_redirect?channel=${encodeURIComponent(channelId)}&thread_ts=${encodeURIComponent(threadTs)}`
+      : "";
 
   function copyLink() {
     if (typeof window === "undefined") return;
@@ -160,11 +202,14 @@ export function ThreadInfoSheet({
 
   return (
     <div className="fixed inset-0 z-50 md:hidden" aria-modal="true" role="dialog" aria-label="Thread details">
-      <div className="absolute inset-0 bg-black/40" onClick={onClose} />
+      <div className="absolute inset-0 bg-black/40 animate-in fade-in duration-200 motion-reduce:animate-none" onClick={onClose} />
       <div
         ref={sheetRef}
         tabIndex={-1}
-        className="absolute inset-x-0 bottom-0 bg-background border-t border-border rounded-t-2xl max-h-[70dvh] overflow-y-auto animate-in slide-in-from-bottom duration-250"
+        className={cn(
+          "absolute inset-x-0 bottom-0 bg-background border-t border-border rounded-t-2xl max-h-[70dvh] overflow-y-auto will-change-transform animate-in slide-in-from-bottom duration-250 ease-[cubic-bezier(0.22,1,0.36,1)] motion-reduce:animate-none",
+          dragY > 0 ? "transition-none" : "transition-transform duration-250 ease-[cubic-bezier(0.22,1,0.36,1)]",
+        )}
         style={{ transform: dragY > 0 ? `translateY(${dragY}px)` : undefined }}
         onTouchStart={handleTouchStart}
         onTouchMove={handleTouchMove}
@@ -174,7 +219,7 @@ export function ThreadInfoSheet({
           <div className="w-8 h-1 bg-border rounded-full" />
         </div>
 
-        <div className="px-5 pb-5">
+        <div className="px-5 pb-[max(1.25rem,env(safe-area-inset-bottom))]">
           <div className="flex items-center justify-between mt-2">
             <h2 className="text-lg font-semibold text-foreground">
               {thread.thread_name || thread.slack_thread_key}
@@ -254,13 +299,15 @@ export function ThreadInfoSheet({
               Copy link
             </button>
 
-            <a
-              href={slackUrl}
-              className="w-full flex items-center gap-3 py-3 px-2 rounded-lg text-sm text-foreground active:bg-accent transition-colors no-underline"
-            >
-              <ExternalLink className="size-5 text-muted-foreground" />
-              Open in Slack
-            </a>
+            {slackUrl ? (
+              <a
+                href={slackUrl}
+                className="w-full flex items-center gap-3 py-3 px-2 rounded-lg text-sm text-foreground active:bg-accent transition-colors no-underline"
+              >
+                <ExternalLink className="size-5 text-muted-foreground" />
+                Open in Slack
+              </a>
+            ) : null}
           </div>
         </div>
       </div>

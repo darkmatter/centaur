@@ -3,6 +3,7 @@
 import { usePathname } from "next/navigation";
 import {
   createContext,
+  Suspense,
   useCallback,
   useContext,
   useEffect,
@@ -14,6 +15,7 @@ import {
 import { X } from "lucide-react";
 import { ThreadSidebar, type ThreadSidebarHandle } from "@/components/thread/thread-sidebar";
 import { useMediaQuery } from "@/hooks/use-media-query";
+import { isTextInputTarget } from "@/lib/thread-utils";
 import { cn } from "@/lib/utils";
 
 export const THREAD_SIDEBAR_COLLAPSE_STORAGE_KEY = "threads.sidebar.collapsed.v1";
@@ -27,10 +29,6 @@ type ThreadLayoutContextValue = {
 };
 
 const ThreadLayoutContext = createContext<ThreadLayoutContextValue | null>(null);
-
-function isTextInputTarget(target: EventTarget | null): boolean {
-  return target instanceof HTMLElement && !!target.closest("input, textarea, select, [contenteditable='true']");
-}
 
 function readSidebarCollapsedSnapshot(): boolean {
   if (typeof document !== "undefined" && document.documentElement.classList.contains(THREAD_SIDEBAR_COLLAPSE_CLASS)) {
@@ -107,6 +105,7 @@ export function ThreadLayout({ children }: { children: React.ReactNode }) {
   const mobileSidebarRef = useRef<ThreadSidebarHandle>(null);
   const mobileSidebarReturnFocusRef = useRef<HTMLElement | null>(null);
   const panelRef = useRef<HTMLElement>(null);
+  const mobileDialogRef = useRef<HTMLElement>(null);
 
   const closeMobileSidebar = useCallback(() => {
     setMobileSidebarOpen(false);
@@ -139,7 +138,11 @@ export function ThreadLayout({ children }: { children: React.ReactNode }) {
         }
         if (mobileSidebarOpen) {
           event.preventDefault();
-          setMobileSidebarOpen(false);
+          closeMobileSidebar();
+          return;
+        }
+        if (selectedThreadKey) {
+          // Detail route owns Escape for Back/Up/transient-layer semantics.
           return;
         }
         if (isDesktop) {
@@ -192,7 +195,55 @@ export function ThreadLayout({ children }: { children: React.ReactNode }) {
 
     document.addEventListener("keydown", handleKeyDown);
     return () => document.removeEventListener("keydown", handleKeyDown);
-  }, [collapsed, isDesktop, mobileSidebarOpen, setCollapsed]);
+  }, [closeMobileSidebar, collapsed, isDesktop, mobileSidebarOpen, selectedThreadKey, setCollapsed]);
+
+  useEffect(() => {
+    const panel = panelRef.current;
+    if (isDesktop || !mobileSidebarOpen) {
+      panel?.removeAttribute("inert");
+      return;
+    }
+    panel?.setAttribute("inert", "");
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    const dialog = mobileDialogRef.current;
+    const collectFocusable = (): HTMLElement[] => {
+      if (!dialog) return [];
+      return Array.from(
+        dialog.querySelectorAll<HTMLElement>(
+          "button,[href],input,select,textarea,[tabindex]:not([tabindex='-1'])",
+        ),
+      ).filter((node) => !node.hasAttribute("disabled"));
+    };
+    const focusable = collectFocusable();
+    focusable[0]?.focus();
+    const trapTabFocus = (event: KeyboardEvent) => {
+      if (event.key !== "Tab") return;
+      const nodes = collectFocusable();
+      if (nodes.length === 0) return;
+      const first = nodes[0];
+      const last = nodes[nodes.length - 1];
+      const active = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+      const insideDialog = !!(active && dialog?.contains(active));
+      if (event.shiftKey) {
+        if (!insideDialog || active === first) {
+          event.preventDefault();
+          last.focus();
+        }
+        return;
+      }
+      if (!insideDialog || active === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+    document.addEventListener("keydown", trapTabFocus);
+    return () => {
+      document.removeEventListener("keydown", trapTabFocus);
+      panel?.removeAttribute("inert");
+      document.body.style.overflow = previousOverflow;
+    };
+  }, [isDesktop, mobileSidebarOpen]);
 
   const contextValue = useMemo<ThreadLayoutContextValue>(
     () => ({
@@ -205,15 +256,17 @@ export function ThreadLayout({ children }: { children: React.ReactNode }) {
 
   return (
     <ThreadLayoutContext.Provider value={contextValue}>
-      <div className="thread-shell flex h-[calc(100dvh-41px)]">
-        <aside className="thread-shell-sidebar hidden shrink-0 overflow-hidden border-r border-border bg-card/20 md:flex">
-          <ThreadSidebar
-            ref={desktopSidebarRef}
-            selectedThreadKey={selectedThreadKey}
-            collapsed={collapsed}
-            onCollapsedChange={setCollapsed}
-            active={isDesktop}
-          />
+      <div className="thread-shell flex h-full md:h-[calc(100dvh-41px)]">
+        <aside className="thread-shell-sidebar hidden w-[320px] shrink-0 border-r border-border bg-card/20 md:flex">
+          <Suspense fallback={<div className="h-full w-full bg-card/20" />}>
+            <ThreadSidebar
+              ref={desktopSidebarRef}
+              selectedThreadKey={selectedThreadKey}
+              collapsed={collapsed}
+              onCollapsedChange={setCollapsed}
+              active={isDesktop}
+            />
+          </Suspense>
         </aside>
         <section
           ref={panelRef}
@@ -224,53 +277,46 @@ export function ThreadLayout({ children }: { children: React.ReactNode }) {
         </section>
       </div>
 
-      <div
-        className={cn(
-          "fixed inset-0 z-50 md:hidden",
-          mobileSidebarOpen ? "pointer-events-auto" : "pointer-events-none",
-        )}
-        aria-hidden={!mobileSidebarOpen}
-      >
-        <button
-          type="button"
-          className={cn(
-            "absolute inset-0 border-0 bg-black/50 p-0 transition-opacity",
-            mobileSidebarOpen ? "opacity-100" : "opacity-0",
-          )}
-          aria-label="Close thread sidebar"
-          onClick={closeMobileSidebar}
-        />
-        <aside
-          role="dialog"
-          aria-modal="true"
-          aria-label="Threads"
-          className={cn(
-            "absolute inset-y-0 left-0 flex w-[320px] max-w-[88vw] flex-col overflow-y-auto overscroll-contain border-r border-border bg-background shadow-2xl transition-transform duration-200",
-            mobileSidebarOpen ? "translate-x-0" : "-translate-x-full",
-          )}
-        >
-          <div className="flex items-center justify-end border-b border-border px-2 py-2">
-            <button
-              type="button"
-              onClick={closeMobileSidebar}
-              aria-label="Close thread sidebar"
-              className="inline-flex size-8 items-center justify-center rounded-sm border border-border text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
-            >
-              <X className="size-4" />
-            </button>
-          </div>
-          <div className="min-h-0 flex-1">
-            <ThreadSidebar
-              ref={mobileSidebarRef}
-              selectedThreadKey={selectedThreadKey}
-              collapsed={false}
-              showCollapseToggle={false}
-              onNavigate={closeMobileSidebar}
-              active={!isDesktop && mobileSidebarOpen}
-            />
-          </div>
-        </aside>
-      </div>
+      {mobileSidebarOpen ? (
+        <div className="fixed inset-0 z-50 md:hidden">
+          <button
+            type="button"
+            className="absolute inset-0 border-0 bg-black/50 p-0 transition-opacity duration-200 ease-out motion-reduce:transition-none opacity-100"
+            aria-label="Close thread sidebar"
+            onClick={closeMobileSidebar}
+          />
+          <aside
+            ref={mobileDialogRef}
+            role="dialog"
+            aria-modal="true"
+            aria-label="Threads"
+            className="absolute inset-y-0 left-0 flex w-[320px] max-w-[88vw] flex-col overflow-y-auto overscroll-contain border-r border-border bg-background shadow-2xl transition-transform duration-250 ease-[cubic-bezier(0.22,1,0.36,1)] will-change-transform motion-reduce:transition-none motion-reduce:transform-none translate-x-0"
+          >
+            <div className="flex items-center justify-end border-b border-border px-2 py-2">
+              <button
+                type="button"
+                onClick={closeMobileSidebar}
+                aria-label="Close thread sidebar"
+                className="inline-flex size-8 items-center justify-center rounded-sm border border-border text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+              >
+                <X className="size-4" />
+              </button>
+            </div>
+            <div className="min-h-0 flex-1">
+              <Suspense fallback={<div className="h-full w-full bg-background" />}>
+                <ThreadSidebar
+                  ref={mobileSidebarRef}
+                  selectedThreadKey={selectedThreadKey}
+                  collapsed={false}
+                  showCollapseToggle={false}
+                  onNavigate={closeMobileSidebar}
+                  active={!isDesktop && mobileSidebarOpen}
+                />
+              </Suspense>
+            </div>
+          </aside>
+        </div>
+      ) : null}
     </ThreadLayoutContext.Provider>
   );
 }

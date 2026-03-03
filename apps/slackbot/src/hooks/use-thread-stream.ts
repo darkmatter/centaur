@@ -21,7 +21,192 @@ export type TokenUsage = {
 type SendRoute = "execute";
 
 function isActiveState(state: string | undefined): boolean {
-  return state === "running" || state === "working";
+  return state === "running" || state === "working" || state === "stopping";
+}
+
+function coerceNonNegativeInt(value: unknown): number {
+  if (typeof value === "number" && Number.isFinite(value) && value >= 0) {
+    return Math.trunc(value);
+  }
+  return 0;
+}
+
+function extractUsageFromPayload(payload: Record<string, unknown>): { input: number; output: number } {
+  let input =
+    coerceNonNegativeInt(payload.input_tokens) +
+    coerceNonNegativeInt(payload.prompt_tokens) +
+    coerceNonNegativeInt(payload.cached_input_tokens) +
+    coerceNonNegativeInt(payload.cache_read_input_tokens) +
+    coerceNonNegativeInt(payload.cache_creation_input_tokens);
+  let output =
+    coerceNonNegativeInt(payload.output_tokens) +
+    coerceNonNegativeInt(payload.completion_tokens);
+
+  if (input === 0 && output === 0) {
+    const total = coerceNonNegativeInt(payload.total_tokens);
+    if (total > 0) {
+      input = Math.floor(total / 2);
+      output = total - input;
+    }
+  }
+  return { input, output };
+}
+
+function deriveUsageFromTurns(turns: ThreadDetail["turns"] | undefined): TokenUsage | null {
+  if (!turns || turns.length === 0) return null;
+  const usageByTurn = new Map<number, { input: number; output: number; authoritative: boolean }>();
+  let model: string | null = null;
+
+  for (const turn of turns) {
+    const turnId = Number(turn.turn_id || 0);
+    if (!Number.isFinite(turnId) || turnId <= 0) continue;
+    for (const rawEvent of turn.events || []) {
+      const event = (rawEvent ?? {}) as Record<string, unknown>;
+      const eventType = String(event.type ?? "");
+      const messageUsage = (event.message as Record<string, unknown> | undefined)?.usage;
+      const usagePayload =
+        (typeof messageUsage === "object" && messageUsage
+          ? (messageUsage as Record<string, unknown>)
+          : typeof event.usage === "object" && event.usage
+            ? (event.usage as Record<string, unknown>)
+            : null);
+      if (!usagePayload) continue;
+
+      const usage = extractUsageFromPayload(usagePayload);
+      if (usage.input === 0 && usage.output === 0) continue;
+      const previous = usageByTurn.get(turnId) ?? { input: 0, output: 0, authoritative: false };
+      if (eventType === "turn.completed") {
+        usageByTurn.set(turnId, { input: usage.input, output: usage.output, authoritative: true });
+      } else if (!previous.authoritative) {
+        usageByTurn.set(turnId, {
+          input: previous.input + usage.input,
+          output: previous.output + usage.output,
+          authoritative: false,
+        });
+      }
+
+      const messageModel = String(
+        (event.message as Record<string, unknown> | undefined)?.model ?? event.model ?? "",
+      ).trim();
+      if (messageModel) {
+        model = messageModel;
+      }
+    }
+  }
+
+  let input = 0;
+  let output = 0;
+  let authoritative = usageByTurn.size > 0;
+  for (const usage of usageByTurn.values()) {
+    input += usage.input;
+    output += usage.output;
+    authoritative = authoritative && usage.authoritative;
+  }
+  const total = input + output;
+  if (total === 0) return null;
+  return {
+    input_tokens: input,
+    output_tokens: output,
+    total_tokens: total,
+    cost_usd: null,
+    estimated: !authoritative,
+    authoritative,
+    model,
+  };
+}
+
+function maxStepSequence(steps: Step[]): number | undefined {
+  let max = -1;
+  for (const step of steps) {
+    if (typeof step.eventSeq === "number" && step.eventSeq > max) {
+      max = step.eventSeq;
+    }
+  }
+  return max > 0 ? max : undefined;
+}
+
+function stepTurnId(step: Step): number | undefined {
+  if (typeof step.turnId === "number" && Number.isFinite(step.turnId)) {
+    return step.turnId;
+  }
+  const match = step.id.match(/turn-(\d+)/);
+  if (!match) return undefined;
+  const parsed = Number(match[1]);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function compactStepTextKey(text: string): string {
+  return text.trim().replace(/\s+/g, " ").slice(0, 240);
+}
+
+function toolGroupCallKey(step: Extract<Step, { type: "tool-group" }>): string {
+  const ids = step.calls
+    .map((call) => call.id.trim() || call.name.trim())
+    .filter((value) => value.length > 0);
+  if (ids.length > 0) return ids.join("|");
+  return compactStepTextKey(step.summary);
+}
+
+function semanticMergeKey(step: Step): string {
+  const turnId = stepTurnId(step);
+  const seq = step.eventSeq;
+  if (step.type === "phase" && turnId !== undefined) {
+    if (seq !== undefined) return `phase:${turnId}:${seq}:${step.phase}`;
+    return `phase:${turnId}:${step.phase}`;
+  }
+  if (step.type === "user-message" && turnId !== undefined) {
+    return `user:${turnId}:${step.text.trim()}`;
+  }
+  if (step.type === "result" && turnId !== undefined && seq !== undefined) {
+    return `result:${turnId}:${seq}:${compactStepTextKey(step.text)}`;
+  }
+  if (step.type === "thinking" && turnId !== undefined && seq !== undefined) {
+    return `thinking:${turnId}:${seq}:${compactStepTextKey(step.text)}`;
+  }
+  if (step.type === "terminal" && turnId !== undefined && seq !== undefined) {
+    return `terminal:${turnId}:${seq}`;
+  }
+  if (step.type === "error" && turnId !== undefined && seq !== undefined) {
+    return `error:${turnId}:${seq}`;
+  }
+  if (step.type === "system" && turnId !== undefined && seq !== undefined) {
+    return `system:${turnId}:${seq}`;
+  }
+  if (step.type === "file-changes" && turnId !== undefined && seq !== undefined) {
+    return `file:${turnId}:${seq}`;
+  }
+  if (step.type === "subagent" && turnId !== undefined && seq !== undefined) {
+    return `subagent:${turnId}:${seq}:${step.subagentId ?? step.id}`;
+  }
+  if (step.type === "diff" && turnId !== undefined && seq !== undefined) {
+    return `diff:${turnId}:${seq}`;
+  }
+  if (step.type === "tool-group" && turnId !== undefined && seq !== undefined) {
+    return `tool:${turnId}:${seq}:${toolGroupCallKey(step)}`;
+  }
+  if (step.type === "context-group") {
+    if (turnId !== undefined) return `context:${turnId}`;
+    return `context:${step.id}`;
+  }
+  return `id:${step.id}`;
+}
+
+function mergeStepsPreferLive(historical: Step[], live: Step[]): Step[] {
+  const mergedById = new Map<string, Step>();
+  for (const step of historical) {
+    mergedById.set(semanticMergeKey(step), step);
+  }
+  for (const step of live) {
+    mergedById.set(semanticMergeKey(step), step);
+  }
+  const indexed = Array.from(mergedById.values()).map((step, index) => ({ step, index }));
+  indexed.sort((a, b) => {
+    const seqA = a.step.eventSeq ?? Number.MAX_SAFE_INTEGER;
+    const seqB = b.step.eventSeq ?? Number.MAX_SAFE_INTEGER;
+    if (seqA !== seqB) return seqA - seqB;
+    return a.index - b.index;
+  });
+  return indexed.map((entry) => entry.step);
 }
 
 export function useThreadStream(threadKey: string, initialThread?: Partial<ThreadDetail> | null) {
@@ -36,10 +221,13 @@ export function useThreadStream(threadKey: string, initialThread?: Partial<Threa
   const [error, setError] = useState<string | null>(null);
   const [agentStatus, setAgentStatus] = useState<string | null>(null);
   const [tokenUsage, setTokenUsage] = useState<TokenUsage | null>(null);
-  // Whether we've connected (or decided not to connect) the SSE stream
-  const [sseConnected, setSseConnected] = useState(false);
+  const [isFetchingThread, setIsFetchingThread] = useState(false);
   const stopStreamRef = useRef<(() => void) | null>(null);
-  const resumeStreamRef = useRef<(() => void) | null>(null);
+  const streamAttachedRef = useRef(false);
+  const fetchInFlightRef = useRef(0);
+  const [reconnectExhausted, setReconnectExhausted] = useState(false);
+  const fetchAbortRef = useRef<AbortController | null>(null);
+  const fetchSeqRef = useRef(0);
   const transport = useMemo(() => new AgentThreadTransport(threadKey), [threadKey]);
 
   const chat = useChat({
@@ -47,11 +235,25 @@ export function useThreadStream(threadKey: string, initialThread?: Partial<Threa
     transport,
     // Don't auto-resume — we control when to connect based on thread state
     resume: false,
-    experimental_throttle: 50,
+    experimental_throttle: 80,
     dataPartSchemas: {
       "agent-status": z.object({ text: z.string() }),
-      "phase-progress": z.object({ phase: z.string(), turn_id: z.number() }),
-      "file-changes": z.object({ changes: z.array(z.object({ path: z.string(), kind: z.string() })) }),
+      "phase-progress": z.object({
+        phase: z.string(),
+        turn_id: z.number(),
+        event_seq: z.number().nullable().optional(),
+      }),
+      "file-changes": z.object({
+        changes: z.array(z.object({ path: z.string(), kind: z.string() })),
+        event_seq: z.number().nullable().optional(),
+      }),
+      "shell-command": z.object({
+        command: z.string(),
+        output: z.unknown().optional(),
+        exitCode: z.number().nullable().optional(),
+        status: z.string().nullable().optional(),
+        event_seq: z.number().nullable().optional(),
+      }),
       "subagent": z.object({
         subagent_id: z.string().nullable().optional(),
         phase: z.string().nullable().optional(),
@@ -77,6 +279,7 @@ export function useThreadStream(threadKey: string, initialThread?: Partial<Threa
         total_tokens: z.number().nullable().optional(),
         cost_usd: z.number().nullable().optional(),
         model: z.string().nullable().optional(),
+        event_seq: z.number().nullable().optional(),
       }),
       "user-message": z.object({
         id: z.string(),
@@ -85,6 +288,7 @@ export function useThreadStream(threadKey: string, initialThread?: Partial<Threa
         source: z.string().optional(),
         user_id: z.string().nullable().optional(),
         created_at: z.string().optional(),
+        event_seq: z.number().nullable().optional(),
       }),
       "context-message": z.object({
         id: z.string(),
@@ -93,6 +297,13 @@ export function useThreadStream(threadKey: string, initialThread?: Partial<Threa
         source: z.string().optional(),
         user_id: z.string().nullable().optional(),
         created_at: z.string().optional(),
+        event_seq: z.number().nullable().optional(),
+      }),
+      "system-event": z.object({
+        title: z.string(),
+        text: z.string(),
+        tone: z.enum(["info", "warn"]).optional(),
+        event_seq: z.number().nullable().optional(),
       }),
       "token-usage": z.object({
         input_tokens: z.number(),
@@ -114,7 +325,10 @@ export function useThreadStream(threadKey: string, initialThread?: Partial<Threa
         const data = part.data as Record<string, unknown>;
         setThread(prev => {
           if (Array.isArray(data.turns)) {
-            return { participants: [], ...data } as unknown as ThreadDetail;
+            const participants = Array.isArray(data.participants)
+              ? data.participants
+              : prev?.participants ?? [];
+            return { participants, ...data } as unknown as ThreadDetail;
           }
           if (prev) {
             return { ...prev, ...data } as ThreadDetail;
@@ -153,16 +367,32 @@ export function useThreadStream(threadKey: string, initialThread?: Partial<Threa
 
   useEffect(() => {
     const stop = (chat as { stop?: () => void }).stop;
-    const resume = (chat as { resumeStream?: () => void }).resumeStream;
     stopStreamRef.current = typeof stop === "function" ? stop : null;
-    resumeStreamRef.current = typeof resume === "function" ? resume : null;
   }, [chat]);
 
-  const fetchThread = useCallback(async (): Promise<boolean> => {
+  const fetchThread = useCallback(async (options?: { abortPrevious?: boolean }): Promise<boolean> => {
+    const abortPrevious = options?.abortPrevious ?? true;
+    fetchInFlightRef.current += 1;
+    setIsFetchingThread(true);
+    if (abortPrevious) {
+      fetchAbortRef.current?.abort();
+    } else if (fetchAbortRef.current) {
+      fetchInFlightRef.current = Math.max(0, fetchInFlightRef.current - 1);
+      if (fetchInFlightRef.current === 0) {
+        setIsFetchingThread(false);
+      }
+      return false;
+    }
+    const controller = new AbortController();
+    fetchAbortRef.current = controller;
+    const requestSeq = fetchSeqRef.current + 1;
+    fetchSeqRef.current = requestSeq;
     try {
       const res = await fetch(
-        `${BASE}/api/threads/detail?key=${encodeURIComponent(threadKey)}`
+        `${BASE}/api/threads/detail?key=${encodeURIComponent(threadKey)}`,
+        { signal: controller.signal },
       );
+      if (fetchSeqRef.current !== requestSeq) return false;
       if (!res.ok) {
         if (res.status === 404) {
           setThread(null);
@@ -173,6 +403,7 @@ export function useThreadStream(threadKey: string, initialThread?: Partial<Threa
         return false;
       }
       const data = await res.json();
+      if (fetchSeqRef.current !== requestSeq) return false;
       if (data.error) {
         const message = String(data.error);
         if (message.toLowerCase().includes("not found")) {
@@ -184,11 +415,36 @@ export function useThreadStream(threadKey: string, initialThread?: Partial<Threa
       setThread(data as ThreadDetail);
       setError(null);
       return true;
-    } catch {
+    } catch (error) {
+      if ((error as { name?: string }).name === "AbortError") {
+        return false;
+      }
       setError("Failed to fetch thread");
       return false;
+    } finally {
+      fetchInFlightRef.current = Math.max(0, fetchInFlightRef.current - 1);
+      if (fetchInFlightRef.current === 0) {
+        setIsFetchingThread(false);
+      }
+      if (fetchAbortRef.current === controller) {
+        fetchAbortRef.current = null;
+      }
     }
   }, [threadKey]);
+
+  useEffect(() => {
+    return () => {
+      fetchAbortRef.current?.abort();
+      fetchAbortRef.current = null;
+    };
+  }, []);
+
+  const resumeLiveStream = useCallback(() => {
+    const resume = (chat as { resumeStream?: () => Promise<void> | void }).resumeStream;
+    if (typeof resume === "function") {
+      void resume();
+    }
+  }, [chat]);
 
   // Reset state when threadKey changes; fetch full detail, then connect SSE only if running
   useEffect(() => {
@@ -200,31 +456,67 @@ export function useThreadStream(threadKey: string, initialThread?: Partial<Threa
     setError(null);
     setAgentStatus(null);
     setTokenUsage(null);
-    setSseConnected(false);
+    streamAttachedRef.current = false;
+    setReconnectExhausted(false);
 
     // Fetch full thread from Postgres, then decide on SSE
-    void fetchThread().then((ok) => {
-      // SSE connection is handled by the effect that watches thread.state
-      if (!ok) setSseConnected(true); // Don't try SSE if fetch failed
-    });
+    void fetchThread();
   }, [threadKey]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Connect SSE only when thread is running/working
-  // Narrow dependency to thread.state (rule: rerender-dependencies)
+  // Attach stream only when thread is active; re-attach on every active run.
   const threadState = thread?.state;
   useEffect(() => {
-    if (sseConnected) return;
     if (!threadState) return;
-
     if (isActiveState(threadState)) {
-      setSseConnected(true);
-      if (resumeStreamRef.current) {
-        resumeStreamRef.current();
-      }
-    } else {
-      setSseConnected(true);
+      if (streamAttachedRef.current) return;
+      streamAttachedRef.current = true;
+      setReconnectExhausted(false);
+      resumeLiveStream();
+      return;
     }
-  }, [threadState, sseConnected]);
+    streamAttachedRef.current = false;
+    setReconnectExhausted(false);
+  }, [resumeLiveStream, threadState]);
+
+  useEffect(() => {
+    if (chat.status !== "error" || !threadState || !isActiveState(threadState)) {
+      setReconnectExhausted(false);
+      return;
+    }
+    let attempt = 0;
+    let timeoutId = 0;
+    let cancelled = false;
+    const scheduleAttempt = () => {
+      if (cancelled) return;
+      if (attempt >= 3) {
+        setReconnectExhausted(true);
+        return;
+      }
+      attempt += 1;
+      const timeoutMs = Math.min(4000, attempt * 1000);
+      timeoutId = window.setTimeout(() => {
+        if (cancelled) return;
+        streamAttachedRef.current = false;
+        resumeLiveStream();
+        scheduleAttempt();
+      }, timeoutMs);
+    };
+    scheduleAttempt();
+    return () => {
+      cancelled = true;
+      if (timeoutId) {
+        window.clearTimeout(timeoutId);
+      }
+    };
+  }, [chat.status, resumeLiveStream, threadState]);
+
+  useEffect(() => {
+    if (!reconnectExhausted || chat.status !== "error" || !threadState || !isActiveState(threadState)) return;
+    const intervalId = window.setInterval(() => {
+      void fetchThread({ abortPrevious: false });
+    }, 4000);
+    return () => window.clearInterval(intervalId);
+  }, [chat.status, fetchThread, reconnectExhausted, threadState]);
 
   // Visibility handler: fetch once if tab was hidden >30s
   useEffect(() => {
@@ -236,11 +528,15 @@ export function useThreadStream(threadKey: string, initialThread?: Partial<Threa
       }
       if (Date.now() - disconnectTs >= 30_000) {
         void fetchThread();
+        if (threadState && isActiveState(threadState)) {
+          streamAttachedRef.current = false;
+          resumeLiveStream();
+        }
       }
     };
     document.addEventListener("visibilitychange", handleVisibility);
     return () => document.removeEventListener("visibilitychange", handleVisibility);
-  }, [fetchThread]);
+  }, [fetchThread, resumeLiveStream, threadState]);
 
   const sendThreadMessage = useCallback(
     async (message: string, route: SendRoute = "execute") => {
@@ -260,34 +556,36 @@ export function useThreadStream(threadKey: string, initialThread?: Partial<Threa
   // Steps from live SSE stream (only populated when connected)
   const liveStreamSteps = useMemo(() => stepsFromUiMessages(chat.messages), [chat.messages]);
 
-  // Merge: if SSE is streaming live data, use those; otherwise use historical.
-  // When a user submits a message, useChat instantly pushes it to chat.messages
-  // so liveStreamSteps includes the optimistic user message even before SSE data
-  // arrives. We append those optimistic steps to historical steps during the gap.
-  const steps: Step[] = useMemo(() => {
-    if (liveStreamSteps.length > 0) {
-      // Check if live steps contain only user-message steps (optimistic, no SSE data yet).
-      // In that case, append them to historical steps for a seamless transition.
-      const hasAssistantContent = liveStreamSteps.some(
-        (s) => s.type !== "user-message",
-      );
-      if (!hasAssistantContent && historicalSteps.length > 0) {
-        return [...historicalSteps, ...liveStreamSteps];
-      }
-      // SSE stream has assistant data — it replays history + live, so use it as primary
-      return liveStreamSteps;
-    }
-    // No SSE data — render from Postgres turns
-    return historicalSteps;
+  const shouldPreferLiveSteps = useMemo(() => {
+    if (liveStreamSteps.length === 0) return false;
+    const historicalMax = maxStepSequence(historicalSteps);
+    if (historicalMax === undefined) return true;
+    const liveMax = maxStepSequence(liveStreamSteps);
+    if (liveMax === undefined) return liveStreamSteps.length >= historicalSteps.length;
+    return liveMax >= historicalMax;
   }, [historicalSteps, liveStreamSteps]);
+
+  // Merge: prefer live stream only once replay catches up.
+  const steps: Step[] = useMemo(() => {
+    if (shouldPreferLiveSteps) {
+      return mergeStepsPreferLive(historicalSteps, liveStreamSteps);
+    }
+    return historicalSteps;
+  }, [historicalSteps, liveStreamSteps, shouldPreferLiveSteps]);
+
+  const derivedTokenUsage = useMemo(() => {
+    if (tokenUsage) return tokenUsage;
+    return deriveUsageFromTurns(thread?.turns);
+  }, [thread?.turns, tokenUsage]);
 
   return {
     thread,
     error,
     fetchThread,
-    isReconnecting: chat.status === "error",
+    isReconnecting: chat.status === "error" && isActiveState(thread?.state),
     agentStatus,
-    tokenUsage,
+    tokenUsage: derivedTokenUsage,
+    isFetchingThread,
     chatStatus: chat.status,
     sendThreadMessage,
     liveSteps: steps,

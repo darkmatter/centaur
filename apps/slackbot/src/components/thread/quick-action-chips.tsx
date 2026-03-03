@@ -1,11 +1,13 @@
 "use client";
 
+import { useEffect, useState } from "react";
+import { Suggestions, Suggestion } from "@/components/ai-elements/suggestion";
 import { cn } from "@/lib/utils";
 
 type ChipAction = {
   label: string;
   value: string;
-  variant?: "default" | "destructive" | "primary";
+  variant?: "default" | "destructive" | "outline";
 };
 
 type QuickActionChipsProps = {
@@ -15,57 +17,58 @@ type QuickActionChipsProps = {
 };
 
 const CHIP_SETS: Record<string, ChipAction[]> = {
-  waiting: [
-    { label: "Yes, continue", value: "yes" },
-    { label: "No", value: "no" },
-    { label: "Explain more", value: "explain" },
-  ],
   error: [
-    { label: "Retry", value: "retry", variant: "primary" },
-    { label: "Retry with context", value: "retry-context", variant: "primary" },
+    { label: "Retry", value: "retry", variant: "default" },
+    { label: "Retry with context", value: "retry-context", variant: "default" },
   ],
   stopped: [
-    { label: "Resume", value: "resume", variant: "primary" },
+    { label: "Resume", value: "resume", variant: "default" },
   ],
-};
-
-const VARIANT_CLASSES: Record<string, string> = {
-  default: "bg-secondary text-secondary-foreground border-border/50",
-  destructive: "bg-destructive/10 text-destructive border-destructive/20",
-  primary: "bg-primary/10 text-primary border-primary/20",
 };
 
 export function QuickActionChips({ threadState, onAction, className }: QuickActionChipsProps) {
   const normalizedState = threadState === "working" ? "running" : threadState;
   const chips = CHIP_SETS[normalizedState];
-  if (!chips || chips.length === 0) return null;
+  const [renderedChips, setRenderedChips] = useState<ChipAction[] | null>(chips ?? null);
+  const [visibility, setVisibility] = useState<"open" | "closed">(chips?.length ? "open" : "closed");
+
+  useEffect(() => {
+    if (chips && chips.length > 0) {
+      setRenderedChips(chips);
+      setVisibility("open");
+      return;
+    }
+    if (!renderedChips) return;
+    setVisibility("closed");
+    const timer = window.setTimeout(() => setRenderedChips(null), 180);
+    return () => window.clearTimeout(timer);
+  }, [chips, renderedChips]);
+
+  if (!renderedChips || renderedChips.length === 0) return null;
 
   return (
     <div
+      data-state={visibility}
       className={cn(
-        "flex gap-2 overflow-x-auto px-3 py-1.5 border-t border-border/50",
-        "scrollbar-none md:hidden",
-        "animate-in slide-in-from-bottom-2 duration-200",
+        "border-t border-border/50 px-3 py-1.5 md:hidden",
+        "data-[state=open]:animate-in data-[state=open]:slide-in-from-bottom-2 data-[state=open]:fade-in data-[state=open]:duration-200",
+        "data-[state=closed]:animate-out data-[state=closed]:slide-out-to-bottom-2 data-[state=closed]:fade-out data-[state=closed]:duration-150",
         className,
       )}
-      style={{ WebkitOverflowScrolling: "touch" }}
     >
-      {chips.map((chip) => (
-        <button
-          key={chip.value}
-          type="button"
-          onClick={() => onAction(chip.value)}
-          className={cn(
-            "inline-flex items-center whitespace-nowrap",
-            "px-3 py-1.5 rounded-full text-xs font-medium",
-            "border min-h-[44px] transition-colors",
-            "active:opacity-80",
-            VARIANT_CLASSES[chip.variant ?? "default"],
-          )}
-        >
-          {chip.label}
-        </button>
-      ))}
+      <Suggestions>
+        {renderedChips.map((chip) => (
+          <Suggestion
+            key={chip.value}
+            suggestion={chip.value}
+            variant={chip.variant ?? "outline"}
+            onClick={onAction}
+            className="min-h-[44px]"
+          >
+            {chip.label}
+          </Suggestion>
+        ))}
+      </Suggestions>
     </div>
   );
 }

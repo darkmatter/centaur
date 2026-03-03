@@ -65,34 +65,6 @@ textarea {
   caret-color: oklch(0.866 0.295 142);
 }
 
-.step-item {
-  opacity: 1;
-  transform: translateY(0);
-  transition: opacity 300ms ease, transform 300ms ease;
-  content-visibility: auto;
-  contain-intrinsic-size: auto 40px;
-  @starting-style {
-    opacity: 0;
-    transform: translateY(8px);
-  }
-}
-
-@media (prefers-reduced-motion: reduce) {
-  *,
-  *::before,
-  *::after {
-    animation-duration: 0.01ms !important;
-    animation-iteration-count: 1 !important;
-    transition-duration: 0.01ms !important;
-    scroll-behavior: auto !important;
-  }
-
-  .streaming-cursor::after,
-  .reconnect-bar::after {
-    animation: none;
-  }
-}
-
 @layer base {
   * {
     border-color: var(--border);
@@ -105,16 +77,26 @@ textarea {
 }
 
 html {
+  color-scheme: dark;
+  scroll-behavior: smooth;
   touch-action: manipulation;
 }
 
-* {
+a,
+button,
+[role="button"],
+summary,
+input,
+textarea,
+select {
   -webkit-tap-highlight-color: transparent;
 }
 
 .thread-shell {
   padding-top: env(safe-area-inset-top);
   padding-bottom: env(safe-area-inset-bottom);
+  padding-left: env(safe-area-inset-left);
+  padding-right: env(safe-area-inset-right);
 }
 
 .thread-shell-sidebar {
@@ -130,9 +112,9 @@ html {
   max-width: 48px;
 }
 
-[data-thread-feed-scroll],
 .thread-sidebar-list,
-.thread-shell [data-thread-list-scroll="true"] {
+.thread-shell [data-thread-list-scroll="true"],
+.thread-shell [data-thread-feed-scroll="true"] {
   overscroll-behavior: contain;
   -webkit-overflow-scrolling: touch;
 }
@@ -162,19 +144,33 @@ html {
   content: "";
   position: absolute;
   top: 0;
-  left: 0;
   width: 40%;
   height: 100%;
   background: var(--primary);
+  transform: translate3d(-100%, 0, 0);
+  will-change: transform;
   animation: reconnect-indeterminate 1.5s ease-in-out infinite;
 }
 
 @keyframes reconnect-indeterminate {
   0% {
-    left: -40%;
+    transform: translate3d(-120%, 0, 0);
   }
   100% {
-    left: 100%;
+    transform: translate3d(260%, 0, 0);
+  }
+}
+
+.ai-shimmer {
+  animation: ai-shimmer var(--shimmer-duration, 2s) linear infinite;
+}
+
+@keyframes ai-shimmer {
+  from {
+    background-position: 100% center;
+  }
+  to {
+    background-position: 0% center;
   }
 }
 
@@ -187,17 +183,30 @@ html {
   outline: none;
 }
 
-.step-item .prose-console,
-.step-item pre,
-.step-item .whitespace-pre-wrap {
-  user-select: text;
-}
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
 
-.step-item summary,
-.step-item button,
-.step-item [data-slot="badge"],
-.copy-btn {
-  user-select: none;
+  .streaming-cursor::after,
+  .reconnect-bar::after,
+  .ai-shimmer {
+    animation: none;
+  }
+
+  .animate-spin,
+  .animate-pulse,
+  .animate-in,
+  .animate-out {
+    animation: none;
+  }
+
+  .transition-all,
+  .transition-colors,
+  .transition-transform,
+  .transition-opacity {
+    transition-duration: 0ms;
+  }
 }
 
 .thin-scrollbar {
@@ -227,101 +236,5 @@ html {
   [tabindex="0"] {
     min-height: 44px;
     min-width: 44px;
-  }
-
-  .step-item summary {
-    min-height: 44px;
-    display: flex;
-    align-items: center;
-  }
-}
-
-.pill-expand {
-  display: grid;
-  grid-template-rows: 0fr;
-  transition: grid-template-rows 200ms ease-out;
-}
-
-.pill-expand[data-open="true"] {
-  grid-template-rows: 1fr;
-}
-
-.pill-expand > div {
-  overflow: hidden;
-}
-
-.pill-expand[data-open="true"] > div {
-  opacity: 1;
-  transition: opacity 150ms ease-out 50ms;
-}
-
-.pill-expand[data-open="false"] > div {
-  opacity: 0;
-}
-
-@layer components {
-  .prose-console {
-    font-size: 0.875rem;
-    line-height: 1.6;
-    color: var(--foreground);
-  }
-
-  .prose-console :where(p, ul, ol, blockquote, pre) {
-    margin: 0.35rem 0;
-  }
-
-  .prose-console :where(code) {
-    background: var(--card);
-    border-radius: calc(var(--radius) - 2px);
-    color: var(--foreground);
-    padding: 0.1rem 0.3rem;
-  }
-
-  .prose-console :where(pre) {
-    background: var(--background);
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    padding: 0.75rem;
-    position: relative;
-  }
-
-  .prose-console :where(pre code) {
-    background: transparent;
-    border-radius: 0;
-    padding: 0;
-  }
-
-  @media (max-width: 767px) {
-    .prose-console {
-      font-size: 0.875rem;
-      line-height: 1.7;
-    }
-
-    .prose-console :where(pre) {
-      overflow-x: hidden;
-      white-space: pre-wrap;
-      word-break: break-word;
-      tab-size: 2;
-      font-size: 0.75rem;
-      border-radius: 8px;
-    }
-
-    .prose-console :where(pre) .copy-btn {
-      display: flex;
-    }
-  }
-
-  @media (min-width: 768px) {
-    .prose-console :where(pre) {
-      overflow: auto;
-    }
-
-    .prose-console :where(pre) .copy-btn {
-      display: none;
-    }
-
-    .prose-console :where(pre):hover .copy-btn {
-      display: flex;
-    }
   }
 }

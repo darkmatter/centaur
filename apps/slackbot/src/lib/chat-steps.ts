@@ -7,37 +7,73 @@ import {
   type Step,
   type ToolCall,
 } from "@/lib/describe";
-
-function asString(value: unknown): string {
-  return typeof value === "string" ? value : "";
-}
-
-function asRecord(value: unknown): Record<string, unknown> {
-  return value && typeof value === "object" ? (value as Record<string, unknown>) : {};
-}
-
-function asNumber(value: unknown): number | null {
-  if (typeof value === "number" && Number.isFinite(value)) return value;
-  if (typeof value === "string" && value.trim()) {
-    const parsed = Number(value);
-    if (Number.isFinite(parsed)) return parsed;
-  }
-  return null;
-}
-
-function asBoolean(value: unknown): boolean | null {
-  if (typeof value === "boolean") return value;
-  return null;
-}
+import { asString, asRecord, asNumber, asBoolean } from "@/lib/parse-utils";
+import { dedupeSources, extractSourcesFromUnknown, type StepSource } from "@/lib/source-utils";
 
 function outputToText(output: unknown): string | undefined {
   if (output === undefined || output === null) return undefined;
   if (typeof output === "string") return output;
+  if (Array.isArray(output)) {
+    const textParts = output
+      .map((item) => asRecord(item))
+      .filter((item) => asString(item.type) === "text" && asString(item.text))
+      .map((item) => asString(item.text));
+    if (textParts.length > 0) {
+      return textParts.join("\n");
+    }
+  }
   try {
     return JSON.stringify(output, null, 2);
   } catch {
     return String(output);
   }
+}
+
+function asEventSeq(value: unknown): number | undefined {
+  if (typeof value === "number" && Number.isFinite(value) && value > 0) {
+    return value;
+  }
+  if (typeof value === "string" && value.trim()) {
+    const parsed = Number(value);
+    if (Number.isFinite(parsed) && parsed > 0) return parsed;
+  }
+  return undefined;
+}
+
+function eventSeqFromId(id: string): number | undefined {
+  const match = id.match(/(?:event|evt)[-_]?(\d{1,12})/i);
+  if (!match) return undefined;
+  const parsed = Number(match[1]);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined;
+}
+
+function extractPartEventSeq(part: Record<string, unknown>): number | undefined {
+  const direct = asEventSeq(part.event_seq ?? part.eventSeq);
+  if (direct !== undefined) return direct;
+  const data = asRecord(part.data);
+  const nested = asEventSeq(data.event_seq ?? data.eventSeq);
+  if (nested !== undefined) return nested;
+  const id = asString(part.id);
+  if (!id) return undefined;
+  return eventSeqFromId(id);
+}
+
+function parseTurnIdFromText(value: string): number | undefined {
+  const match = value.match(/turn-(\d+)/);
+  if (!match) return undefined;
+  const parsed = Number(match[1]);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function extractPartTurnId(part: Record<string, unknown>): number | undefined {
+  const direct = asNumber(part.turn_id ?? part.turnId);
+  if (direct !== null && Number.isFinite(direct)) return direct;
+  const data = asRecord(part.data);
+  const nested = asNumber(data.turn_id ?? data.turnId);
+  if (nested !== null && Number.isFinite(nested)) return nested;
+  const id = asString(part.id);
+  if (!id) return undefined;
+  return parseTurnIdFromText(id);
 }
 
 function toolNameFromPart(part: Record<string, unknown>): string | null {
@@ -47,10 +83,66 @@ function toolNameFromPart(part: Record<string, unknown>): string | null {
   return null;
 }
 
+function collectMessageSources(parts: unknown[]): StepSource[] {
+  const sources: StepSource[] = [];
+  for (const rawPart of parts) {
+    const part = asRecord(rawPart);
+    const type = asString(part.type);
+    if (type === "source-url") {
+      const url = asString(part.url);
+      if (!url) continue;
+      sources.push({
+        url,
+        title: asString(part.title) || url,
+        snippet: asString(part.description) || undefined,
+      });
+      continue;
+    }
+    if (type === "source-document") {
+      const url = asString(part.sourceId);
+      const title = asString(part.title);
+      if (!url) continue;
+      sources.push({
+        url,
+        title: title || url,
+        snippet: asString(part.mediaType) || undefined,
+      });
+    }
+  }
+  return dedupeSources(sources);
+}
+
+function normalizeToolUiState(
+  partState: string,
+  hasError: boolean,
+  hasOutput: boolean,
+): NonNullable<ToolCall["uiState"]> {
+  if (partState === "approval-requested") return "approval-requested";
+  if (partState === "approval-responded") return "approval-responded";
+  if (partState === "input-streaming") return "input-streaming";
+  if (partState === "output-denied") return "output-denied";
+  if (partState === "output-error" || hasError) return "output-error";
+  if (partState === "output-available") return "output-available";
+  if (partState === "input-available") return "input-available";
+  return hasOutput ? "output-available" : "input-available";
+}
+
+function legacyToolState(state: NonNullable<ToolCall["uiState"]>): ToolCall["state"] {
+  if (state === "output-error" || state === "output-denied") return "error";
+  if (state === "output-available" || state === "approval-responded") return "done";
+  return "loading";
+}
+
 export function stepsFromUiMessages(messages: UIMessage[]): Step[] {
   const steps: Step[] = [];
-  let pendingGroup: { id: string; category: string; icon: LucideIcon; calls: ToolCall[] } | null =
-    null;
+  const contextGroupsById = new Map<string, number>();
+  let pendingGroup: {
+    id: string;
+    category: string;
+    icon: LucideIcon;
+    calls: ToolCall[];
+    turnId?: number;
+  } | null = null;
 
   const flushGroup = () => {
     if (!pendingGroup || pendingGroup.calls.length === 0) return;
@@ -61,36 +153,29 @@ export function stepsFromUiMessages(messages: UIMessage[]): Step[] {
       category: pendingGroup.category,
       summary: summarizeGroup(pendingGroup.category, pendingGroup.calls),
       calls: pendingGroup.calls,
+      turnId: pendingGroup.turnId,
     });
     pendingGroup = null;
   };
 
   for (const [messageIndex, message] of messages.entries()) {
-    if (message.role === "user") {
-      const text = (message.parts ?? [])
-        .filter((p) => (p as Record<string, unknown>).type === "text")
-        .map((p) => asString((p as Record<string, unknown>).text))
-        .join("\n")
-        .trim();
-      if (text) {
-        flushGroup();
-        steps.push({
-          id: `user:chat-${String(message.id ?? messageIndex)}`,
-          type: "user-message",
-          text,
-          source: "thread_ui",
-        });
-      }
-      continue;
-    }
-    if (message.role !== "assistant") continue;
-    const messageId = `${String(message.id ?? "message")}-${messageIndex}`;
-    for (const [partIndex, rawPart] of (message.parts ?? []).entries()) {
+    const messageId = String(message.id ?? `message-${messageIndex}`);
+    const messageParts = message.parts ?? [];
+    const messageSources = collectMessageSources(messageParts);
+    let lastSeenTurnId: number | undefined;
+    for (const [partIndex, rawPart] of messageParts.entries()) {
       const part = rawPart as Record<string, unknown>;
       const partType = asString(part.type);
-      const partId = `${messageId}:${partIndex}`;
+      const partId = asString(part.id) || `${messageId}:${partIndex}`;
+      const eventSeq = extractPartEventSeq(part);
+      const explicitTurnId = extractPartTurnId(part);
+      if (explicitTurnId !== undefined) {
+        lastSeenTurnId = explicitTurnId;
+      }
+      const turnId = explicitTurnId ?? lastSeenTurnId;
 
       if (partType === "text") {
+        if (message.role !== "assistant") continue;
         const text = asString(part.text).trim();
         if (!text) continue;
         flushGroup();
@@ -99,15 +184,26 @@ export function stepsFromUiMessages(messages: UIMessage[]): Step[] {
           type: "result",
           text,
           streaming: asString(part.state) === "streaming",
+          sources: messageSources.length > 0 ? messageSources : undefined,
+          eventSeq,
+          turnId,
         });
         continue;
       }
 
       if (partType === "reasoning") {
+        if (message.role !== "assistant") continue;
         const text = asString(part.text).trim();
         if (!text) continue;
         flushGroup();
-        steps.push({ id: `thinking:${partId}`, type: "thinking", text });
+        steps.push({
+          id: `thinking:${partId}`,
+          type: "thinking",
+          text,
+          streaming: asString(part.state) === "streaming",
+          eventSeq,
+          turnId,
+        });
         continue;
       }
 
@@ -124,7 +220,13 @@ export function stepsFromUiMessages(messages: UIMessage[]): Step[] {
           }))
           .filter((item) => item.path);
         if (changes.length > 0) {
-          steps.push({ id: streamId || `file-changes:${partId}`, type: "file-changes", changes });
+          steps.push({
+            id: streamId || `file-changes:${partId}`,
+            type: "file-changes",
+            changes,
+            eventSeq,
+            turnId,
+          });
         }
         continue;
       }
@@ -134,8 +236,15 @@ export function stepsFromUiMessages(messages: UIMessage[]): Step[] {
         const phase = asString(data.phase);
         if (!phase) continue;
         flushGroup();
-        const turnId = data.turn_id === undefined || data.turn_id === null ? "" : String(data.turn_id);
-        steps.push({ id: `phase:${turnId || partId}:${phase}`, type: "phase", phase });
+        const turnIdValue = data.turn_id === undefined || data.turn_id === null ? "" : String(data.turn_id);
+        const resolvedTurnId = asNumber(data.turn_id) ?? turnId;
+        steps.push({
+          id: `phase:${turnIdValue || partId}:${phase}`,
+          type: "phase",
+          phase,
+          eventSeq,
+          turnId: resolvedTurnId ?? undefined,
+        });
         continue;
       }
 
@@ -152,6 +261,8 @@ export function stepsFromUiMessages(messages: UIMessage[]): Step[] {
         steps.push({
           id: stepId,
           type: "subagent",
+          eventSeq,
+          turnId,
           subagentId: subagentId || undefined,
           phase,
           status,
@@ -186,7 +297,13 @@ export function stepsFromUiMessages(messages: UIMessage[]): Step[] {
         flushGroup();
         const errorText = asString(part.errorText).trim();
         if (!errorText) continue;
-        steps.push({ id: `error:${asString(part.id) || partId}`, type: "error", message: errorText });
+        steps.push({
+          id: `error:${asString(part.id) || partId}`,
+          type: "error",
+          message: errorText,
+          eventSeq,
+          turnId,
+        });
         continue;
       }
       if (partType === "data-shell-command") {
@@ -200,6 +317,8 @@ export function stepsFromUiMessages(messages: UIMessage[]): Step[] {
           command: asString(data.command),
           output: outputToText(data.output),
           exitCode: typeof data.exitCode === "number" ? data.exitCode : undefined,
+          eventSeq,
+          turnId,
         });
         continue;
       }
@@ -216,6 +335,7 @@ export function stepsFromUiMessages(messages: UIMessage[]): Step[] {
           source: asString(data.source) || undefined,
           userId: asString(data.user_id) || undefined,
           turnId: asNumber(data.turn_id) ?? undefined,
+          eventSeq,
         });
         continue;
       }
@@ -225,8 +345,9 @@ export function stepsFromUiMessages(messages: UIMessage[]): Step[] {
         const data = asRecord(part.data);
         const text = asString(data.text).trim();
         if (!text) continue;
-        const turnId = data.turn_id === undefined || data.turn_id === null ? "" : String(data.turn_id);
-        const groupId = turnId ? `context-group:${turnId}` : "context-group:thread";
+        const turnIdKey = data.turn_id === undefined || data.turn_id === null ? "" : String(data.turn_id);
+        const groupId = turnIdKey ? `context-group:turn-${turnIdKey}` : "context-group:thread";
+        const contextTurnId = asNumber(data.turn_id) ?? turnId;
         const item: ContextMessageItem = {
           id: asString(data.id) || `context:${partId}`,
           text,
@@ -234,12 +355,15 @@ export function stepsFromUiMessages(messages: UIMessage[]): Step[] {
           userId: asString(data.user_id) || undefined,
           createdAt: asString(data.created_at) || undefined,
         };
-        const existingIndex = steps.findIndex((step) => step.id === groupId);
-        if (existingIndex >= 0) {
+        const existingIndex = contextGroupsById.get(groupId);
+        if (existingIndex !== undefined) {
           const existing = steps[existingIndex];
           if (existing.type === "context-group") {
             if (!existing.items.some((contextItem) => contextItem.id === item.id)) {
               existing.items.push(item);
+            }
+            if (eventSeq !== undefined) {
+              existing.eventSeq = Math.max(existing.eventSeq ?? 0, eventSeq);
             }
           }
         } else {
@@ -248,12 +372,33 @@ export function stepsFromUiMessages(messages: UIMessage[]): Step[] {
             type: "context-group",
             title: "Thread discussion",
             items: [item],
+            eventSeq,
+            turnId: contextTurnId,
           });
+          contextGroupsById.set(groupId, steps.length - 1);
         }
         continue;
       }
 
+      if (partType === "data-system-event") {
+        flushGroup();
+        const data = asRecord(part.data);
+        const text = asString(data.text).trim();
+        if (!text) continue;
+        steps.push({
+          id: asString(part.id) || `system:${partId}`,
+          type: "system",
+          title: asString(data.title) || "System",
+          text,
+          tone: asString(data.tone) === "warn" ? "warn" : "info",
+          eventSeq,
+          turnId,
+        });
+        continue;
+      }
+
       if (partType === "dynamic-tool" || partType.startsWith("tool-")) {
+        if (message.role !== "assistant") continue;
         const toolName = toolNameFromPart(part);
         if (!toolName) continue;
         const toolInput = asRecord(part.input);
@@ -261,17 +406,24 @@ export function stepsFromUiMessages(messages: UIMessage[]): Step[] {
         const outputText = outputToText(part.output);
         const errorText = asString(part.errorText);
         const partState = asString(part.state);
+        const hasError = Boolean(errorText) || partState === "output-error";
+        const sourceCandidates = extractSourcesFromUnknown(part.output);
+        if (toolName === "web_fetch") {
+          const toolUrl = asString(toolInput.url);
+          if (toolUrl) {
+            sourceCandidates.push({ url: toolUrl, title: toolUrl });
+          }
+        }
+        const uiState = normalizeToolUiState(partState, hasError, Boolean(outputText));
         const call: ToolCall = {
           id: toolCallId,
           name: toolName,
           input: toolInput,
-          output: outputText ?? (errorText || undefined),
-          state:
-            partState === "output-error"
-              ? "error"
-              : partState === "output-available"
-                ? "done"
-                : "loading",
+          output: hasError ? undefined : outputText,
+          errorText: errorText || undefined,
+          uiState,
+          state: legacyToolState(uiState),
+          sources: sourceCandidates.length > 0 ? dedupeSources(sourceCandidates) : undefined,
         };
 
         if (toolName === "str_replace") {
@@ -285,7 +437,9 @@ export function stepsFromUiMessages(messages: UIMessage[]): Step[] {
             lang: ext || "txt",
             oldStr: asString(toolInput.old ?? toolInput.old_str),
             newStr: asString(toolInput.new ?? toolInput.new_str),
-            result: call.output,
+            result: call.output ?? call.errorText,
+            eventSeq,
+            turnId,
           });
           continue;
         }
@@ -297,23 +451,33 @@ export function stepsFromUiMessages(messages: UIMessage[]): Step[] {
             type: "terminal",
             description: "Ran shell command",
             command: asString(toolInput.command),
-            output: call.output,
+            output: call.output ?? call.errorText,
+            streaming: uiState === "input-available" || uiState === "input-streaming",
+            eventSeq,
+            turnId,
           });
           continue;
         }
 
         const { icon, category } = categorizeToolCall(toolName);
-        if (pendingGroup && pendingGroup.category === category) {
+        if (pendingGroup && pendingGroup.category === category && pendingGroup.turnId === turnId) {
           pendingGroup.calls.push(call);
         } else {
           flushGroup();
-          pendingGroup = { id: `tool-group:${toolCallId}:${category}`, category, icon, calls: [call] };
+          pendingGroup = {
+            id: `tool-group:${toolCallId}:${category}`,
+            category,
+            icon,
+            calls: [call],
+            turnId,
+          };
         }
       }
     }
   }
 
   flushGroup();
+  stableSortStepsBySequence(steps);
   const byId = new Map<string, number>();
   const stable: Step[] = [];
   for (const step of steps) {
@@ -346,17 +510,18 @@ export function stepsFromUiMessages(messages: UIMessage[]): Step[] {
     stable[existingIndex] = step;
   }
 
-  const deduped: Step[] = [];
-  const seenResultTexts = new Set<string>();
-  for (const step of stable) {
-    if (step.type === "result") {
-      const trimmed = step.text.trim();
-      if (seenResultTexts.has(trimmed)) {
-        continue;
-      }
-      seenResultTexts.add(trimmed);
-    }
-    deduped.push(step);
+  return stable;
+}
+
+function stableSortStepsBySequence(steps: Step[]): void {
+  const indexed = steps.map((step, index) => ({ step, index }));
+  indexed.sort((a, b) => {
+    const seqA = a.step.eventSeq ?? Number.MAX_SAFE_INTEGER;
+    const seqB = b.step.eventSeq ?? Number.MAX_SAFE_INTEGER;
+    if (seqA !== seqB) return seqA - seqB;
+    return a.index - b.index;
+  });
+  for (let i = 0; i < indexed.length; i += 1) {
+    steps[i] = indexed[i].step;
   }
-  return deduped;
 }

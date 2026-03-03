@@ -4,6 +4,7 @@ import { useEffect, useMemo, useState, type ComponentType } from "react";
 import Link from "next/link";
 import {
   ArrowLeft,
+  ArrowUp,
   Bot,
   Brain,
   CircleStop,
@@ -31,6 +32,7 @@ type TokenUsage = {
   total_tokens: number;
   cost_usd: number | null;
   estimated: boolean;
+  authoritative?: boolean;
   model: string | null;
 };
 
@@ -38,11 +40,11 @@ type ThreadDetailHeaderProps = {
   thread: ThreadDetail;
   humanName: string;
   tokenUsage: TokenUsage | null;
-  tokenTicker: string | null;
+  tokenTicker: string;
   liveElapsed: string;
   stableStatus: string | null;
   isRunning: boolean;
-  isEng: boolean;
+  isEngineer: boolean;
   phases: string[];
   isReconnecting: boolean;
   error: string | null;
@@ -53,6 +55,9 @@ type ThreadDetailHeaderProps = {
   onRefresh: () => void;
   onOpenInfo: () => void;
   onOpenDrawer: () => void;
+  sourceLabel: string;
+  onBack: () => void;
+  upHref: string;
 };
 
 function normalizeStatusLabel(text: string): string {
@@ -83,7 +88,7 @@ export function ThreadDetailHeader({
   liveElapsed,
   stableStatus,
   isRunning,
-  isEng,
+  isEngineer,
   phases,
   isReconnecting,
   error,
@@ -94,13 +99,22 @@ export function ThreadDetailHeader({
   onRefresh,
   onOpenInfo,
   onOpenDrawer,
+  sourceLabel,
+  onBack,
+  upHref,
 }: ThreadDetailHeaderProps) {
   const [showReconnectBar, setShowReconnectBar] = useState(false);
+  const usageConfidenceLabel = tokenUsage
+    ? (tokenUsage.authoritative ?? !tokenUsage.estimated)
+      ? "authoritative"
+      : "estimated"
+    : "--";
   const showError = !!error && !(thread.state === "error" && error.startsWith("Stream disconnected."));
   const statusSummary = useMemo(() => {
     if (thread.state === "error") return { icon: Bot, text: error || "Agent encountered an error" };
-    if (!isRunning) return { icon: Bot, text: "Idle" };
-    return categorizeStatus(stableStatus);
+  if (thread.state === "stopping") return { icon: Bot, text: "Stopping run…" };
+    if (isRunning) return categorizeStatus(stableStatus);
+    return { icon: Bot, text: "Idle" };
   }, [error, isRunning, stableStatus, thread.state]);
 
   useEffect(() => {
@@ -113,7 +127,7 @@ export function ThreadDetailHeader({
   }, [isReconnecting, thread.state]);
 
   return (
-    <div className="relative shrink-0 border-b border-border bg-background/95 backdrop-blur-xl">
+    <div className="relative shrink-0 border-b border-border bg-background/90 backdrop-blur-md">
       {showReconnectBar ? <div className="reconnect-bar" aria-hidden="true" /> : null}
       <div className="h-[48px] px-3 flex items-center gap-2">
         <button
@@ -125,13 +139,22 @@ export function ThreadDetailHeader({
           <Menu className="size-5" />
         </button>
 
-        <Link
-          href="/"
-          scroll={false}
-          aria-label="Back to threads"
-          className="hidden md:flex text-muted-foreground text-xs hover:text-foreground transition-colors mr-1 rounded-sm"
+        <button
+          type="button"
+          onClick={onBack}
+          aria-label="Back to source"
+          className="inline-flex items-center text-muted-foreground text-xs hover:text-foreground transition-colors mr-1 rounded-sm"
         >
           <ArrowLeft className="size-4" />
+        </button>
+
+        <Link
+          href={upHref}
+          scroll={false}
+          aria-label="Up to threads"
+          className="hidden md:inline-flex items-center text-muted-foreground text-xs hover:text-foreground transition-colors rounded-sm"
+        >
+          <ArrowUp className="size-3.5" />
         </Link>
 
         <HarnessBadge harness={thread.harness} className="flex-shrink-0" />
@@ -147,20 +170,21 @@ export function ThreadDetailHeader({
         <span className="text-[11px] text-muted-foreground hidden md:inline">
           {thread.turns.length} turn{thread.turns.length === 1 ? "" : "s"}
         </span>
-        {tokenTicker && (
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <span className="text-[11px] text-muted-foreground font-mono hidden md:inline">{tokenTicker}</span>
-            </TooltipTrigger>
-            <TooltipContent>
-              <div className="space-y-0.5 text-xs">
-                <div>Input: {tokenUsage?.input_tokens?.toLocaleString() ?? "--"}</div>
-                <div>Output: {tokenUsage?.output_tokens?.toLocaleString() ?? "--"}</div>
-                <div>Model: {tokenUsage?.model ?? "--"}</div>
-              </div>
-            </TooltipContent>
-          </Tooltip>
-        )}
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <span className="text-[11px] text-muted-foreground font-mono hidden md:inline">
+              {tokenTicker}
+            </span>
+          </TooltipTrigger>
+          <TooltipContent>
+            <div className="space-y-0.5 text-xs">
+              <div>Input: {tokenUsage?.input_tokens?.toLocaleString() ?? "--"}</div>
+              <div>Output: {tokenUsage?.output_tokens?.toLocaleString() ?? "--"}</div>
+              <div>Model: {tokenUsage?.model ?? "--"}</div>
+              <div>Usage: {usageConfidenceLabel}</div>
+            </div>
+          </TooltipContent>
+        </Tooltip>
         <span className="text-[11px] text-muted-foreground items-center gap-1 hidden md:inline-flex">
           <Timer className="size-3.5" />
           {liveElapsed}
@@ -209,7 +233,7 @@ export function ThreadDetailHeader({
                 className="hidden md:inline-flex items-center gap-1 text-[11px] text-destructive hover:opacity-80 disabled:opacity-60 transition-colors cursor-pointer bg-transparent border-none p-0 rounded-sm"
               >
                 <CircleStop className={isInterrupting ? "size-3.5 animate-pulse" : "size-3.5"} />
-                {isInterrupting ? "Stopping..." : "Stop"}
+                {isInterrupting ? "Stopping…" : "Stop"}
               </button>
             </TooltipTrigger>
             <TooltipContent>Stop S</TooltipContent>
@@ -230,25 +254,33 @@ export function ThreadDetailHeader({
         </Tooltip>
       </div>
 
-      <div className="h-[24px] px-3 text-[11px] border-t border-border/50 flex items-center gap-2 animate-in fade-in duration-200">
+      <div className="h-[24px] px-3 text-[11px] border-t border-border/50 flex items-center gap-2 animate-in fade-in duration-200 motion-reduce:animate-none">
+        <span className="rounded bg-secondary px-1.5 py-0.5 text-[10px] text-muted-foreground">
+          {sourceLabel}
+        </span>
         <statusSummary.icon className="size-3.5 text-muted-foreground" />
         <span className={thread.state === "error" ? "text-destructive truncate" : "text-muted-foreground truncate"}>
           {statusSummary.text}
         </span>
+        {isReconnecting ? (
+          <span className="ml-auto text-[10px] text-amber-500">Reconnecting…</span>
+        ) : null}
         {isRunning && tokenUsage?.model ? (
-          <span className="ml-auto hidden sm:inline text-[10px] font-mono text-muted-foreground">{tokenUsage.model}</span>
+          <span className="hidden sm:inline text-[10px] font-mono text-muted-foreground">
+            {tokenUsage.model}
+          </span>
         ) : null}
       </div>
 
       {(showError || !!interruptError) && (
-        <div className="px-3 py-1.5 text-[11px] text-amber-300 inline-flex items-center gap-1.5 border-t border-border/50">
+        <div role="alert" className="px-3 py-1.5 text-[11px] text-amber-700 dark:text-amber-300 inline-flex items-center gap-1.5 border-t border-border/50">
           <RefreshCw className="size-3.5" />
           {interruptError ??
             (thread.state === "error" && error?.startsWith("Stream disconnected.") ? null : error)}
         </div>
       )}
 
-      {isEng && phases.length > 0 && (
+      {isEngineer && phases.length > 0 && (
         <div className="px-3 py-1.5 border-t border-border/50">
           <PhaseProgress phases={phases} />
         </div>

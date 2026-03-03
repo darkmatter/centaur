@@ -8,20 +8,43 @@ export function useKeyboardHeight(): number {
   useEffect(() => {
     if (typeof window === "undefined" || !window.visualViewport) return;
     const vv = window.visualViewport;
+    let frame = 0;
+    let baselineHeight = vv.height + vv.offsetTop;
 
     const update = () => {
-      const viewportHeight = vv.height + vv.offsetTop;
-      const keyboard = Math.max(0, window.innerHeight - viewportHeight);
-      // Ignore small viewport shifts from browser chrome changes.
-      setKeyboardHeight(keyboard > 100 ? keyboard : 0);
+      if (frame) {
+        cancelAnimationFrame(frame);
+      }
+      frame = requestAnimationFrame(() => {
+        const viewportHeight = vv.height + vv.offsetTop;
+        if (viewportHeight > baselineHeight) {
+          baselineHeight = viewportHeight;
+        }
+        const keyboard = Math.max(0, baselineHeight - viewportHeight);
+        const nextHeight = keyboard > 100 ? keyboard : 0;
+        if (nextHeight === 0) {
+          baselineHeight = Math.max(baselineHeight, viewportHeight);
+        }
+        setKeyboardHeight((prev) => (prev === nextHeight ? prev : nextHeight));
+      });
+    };
+
+    const resetBaseline = () => {
+      baselineHeight = vv.height + vv.offsetTop;
+      update();
     };
 
     update();
     vv.addEventListener("resize", update);
     vv.addEventListener("scroll", update);
+    window.addEventListener("orientationchange", resetBaseline);
     return () => {
+      if (frame) {
+        cancelAnimationFrame(frame);
+      }
       vv.removeEventListener("resize", update);
       vv.removeEventListener("scroll", update);
+      window.removeEventListener("orientationchange", resetBaseline);
     };
   }, []);
 

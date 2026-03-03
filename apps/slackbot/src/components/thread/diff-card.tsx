@@ -1,9 +1,11 @@
 "use client";
 
 import { useMemo, useState } from "react";
-import { Check, Copy } from "lucide-react";
 import { diffLines } from "diff";
 import { Badge } from "@/components/ui/badge";
+import { MessageAction, MessageActions } from "@/components/ai-elements/message";
+import { CopyIcon } from "lucide-react";
+import { toast } from "sonner";
 
 const LANGUAGE_CLASSES: Record<string, string> = {
   ts: "bg-blue-500/10 text-blue-400",
@@ -22,14 +24,16 @@ export function DiffCard({
   lang,
   oldStr,
   newStr,
+  result,
 }: {
   file: string;
   lang: string;
   oldStr: string;
   newStr: string;
+  result?: string;
 }) {
+  const didFail = result != null && result.toLowerCase().includes("error");
   const [expanded, setExpanded] = useState(false);
-  const [copied, setCopied] = useState(false);
   const chunks = useMemo(() => diffLines(oldStr, newStr), [oldStr, newStr]);
   const rows = useMemo(() => {
     const collected: Array<{
@@ -65,29 +69,27 @@ export function DiffCard({
   const visibleRows = expanded ? rows : rows.slice(0, 80);
   const hiddenCount = Math.max(0, rows.length - visibleRows.length);
 
-  async function copyDiff() {
-    try {
-      await navigator.clipboard.writeText(`--- old\n${oldStr}\n+++ new\n${newStr}`);
-      setCopied(true);
-      setTimeout(() => setCopied(false), 1200);
-    } catch {
-      setCopied(false);
-    }
-  }
-
   return (
-    <div className="group step-item rounded-sm border border-border bg-card overflow-hidden">
-      <div className="px-3 py-2 border-b border-border flex items-center gap-2">
-        <Badge className={LANGUAGE_CLASSES[lang] ?? "bg-secondary text-muted-foreground"}>{lang}</Badge>
-        <span className="font-mono text-xs text-foreground truncate">{file}</span>
-        <button
-          type="button"
-          onClick={() => void copyDiff()}
-          className="ml-auto hidden md:inline-flex items-center gap-1 rounded border border-border px-1.5 py-0.5 text-[10px] text-muted-foreground opacity-0 transition-opacity group-hover:opacity-100"
-        >
-          {copied ? <Check className="size-3 text-green-500" /> : <Copy className="size-3" />}
-          {copied ? "Copied" : "Copy"}
-        </button>
+    <div className={`overflow-hidden rounded-md border ${didFail ? "border-destructive/30" : ""}`}>
+      <div className="flex items-center justify-between border-b bg-muted/50 px-3 py-2">
+        <div className="flex items-center gap-2 min-w-0">
+          <Badge className={LANGUAGE_CLASSES[lang] ?? "bg-secondary text-muted-foreground"}>{lang}</Badge>
+          <span className="font-mono text-xs text-foreground truncate">{file}</span>
+          {didFail && <Badge variant="destructive" className="text-[10px]">failed</Badge>}
+        </div>
+        <MessageActions>
+          <MessageAction
+            tooltip="Copy diff"
+            onClick={() => {
+              void navigator.clipboard
+                ?.writeText(`--- old\n${oldStr}\n+++ new\n${newStr}`)
+                .then(() => toast("Diff copied"))
+                .catch(() => {});
+            }}
+          >
+            <CopyIcon className="size-3.5" />
+          </MessageAction>
+        </MessageActions>
       </div>
       <pre className="p-3 text-[11px] font-mono overflow-auto overscroll-contain max-h-[360px]">
         {visibleRows.map((row, i) => (

@@ -43,3 +43,10 @@ tools/agent/repos/*/
 # OS
 .DS_Store
 Thumbs.db
+
+# Local runtime artifacts
+logs/
+*.log
+
+# TypeScript incremental build state
+*.tsbuildinfo

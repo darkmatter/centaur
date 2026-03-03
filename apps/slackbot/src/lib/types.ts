@@ -1,5 +1,5 @@
-export type Harness = "amp" | "claude-code" | "codex" | "pi-mono" | "engineer";
-export type ThreadState = "running" | "idle" | "stopped" | "stopping" | "working" | "waiting" | "error";
+export type Harness = "amp" | "claude-code" | "codex" | "pi-mono" | "eng" | "engineer";
+export type ThreadState = "running" | "idle" | "stopped" | "stopping" | "working" | "error";
 
 export type Turn = {
   turn_id: number;
@@ -24,6 +24,8 @@ export type ThreadDetail = {
   slack_thread_key: string;
   container_id: string;
   harness: Harness;
+  engine?: "amp" | "claude-code" | "codex" | "pi-mono";
+  persona?: string | null;
   agent_thread_id: string | null;
   state: ThreadState;
   created_at: number;
@@ -37,6 +39,8 @@ export type ThreadSummary = {
   slack_thread_key: string;
   container_id: string;
   harness: Harness;
+  engine?: "amp" | "claude-code" | "codex" | "pi-mono";
+  persona?: string | null;
   agent_thread_id: string | null;
   state: ThreadState;
   created_at: number;

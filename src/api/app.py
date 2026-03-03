@@ -22,7 +22,7 @@ from starlette.responses import JSONResponse, Response, StreamingResponse
 from api.agent import reap_stale_running_sessions, session_items_snapshot, signal_shutdown
 from api.deps import _TRUSTED_PREFIXES
 from api.mcp_server import mcp, set_pool, set_tool_manager
-from api.routers import admin, health, query, search, secrets, slack_events, threads
+from api.routers import admin, health, query, search, secrets, threads
 from api.routers import agent as agent_router_mod
 from shared.config import settings
 from shared.db import close_pool, create_pool
@@ -171,7 +171,6 @@ app.include_router(secrets.router)
 app.include_router(threads.router)
 app.include_router(agent_router_mod.router)
 app.include_router(admin.router)
-app.include_router(slack_events.router)
 
 # Load tools before creating MCP starlette app
 _app_root = Path(__file__).resolve().parent.parent.parent

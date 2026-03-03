@@ -1,8 +1,6 @@
 import type { ChatRequestOptions, ChatTransport, UIMessage, UIMessageChunk } from "ai";
 import { BASE } from "@/lib/constants";
 
-type ReplyAttachment = { url: string; name: string };
-
 function extractMessageText(message: UIMessage): string {
   if (typeof (message as { text?: unknown }).text === "string") {
     return ((message as { text?: string }).text ?? "").trim();
@@ -12,18 +10,6 @@ function extractMessageText(message: UIMessage): string {
     .filter((part) => part.type === "text" && typeof part.text === "string")
     .map((part) => part.text ?? "");
   return textParts.join("\n").trim();
-}
-
-function normalizeAttachments(value: unknown): ReplyAttachment[] {
-  if (!Array.isArray(value)) return [];
-  return value
-    .map((item) => {
-      const raw = item as { url?: unknown; name?: unknown };
-      const url = typeof raw.url === "string" ? raw.url.trim() : "";
-      const name = typeof raw.name === "string" ? raw.name.trim() : "";
-      return { url, name };
-    })
-    .filter((item) => item.url && item.name);
 }
 
 async function readErrorMessage(response: Response, fallback: string): Promise<string> {
@@ -111,61 +97,28 @@ export class AgentThreadTransport<UI_MESSAGE extends UIMessage = UIMessage>
     const lastMessage = options.messages[options.messages.length - 1];
     const text = lastMessage ? extractMessageText(lastMessage) : "";
     const body = (options.body ?? {}) as Record<string, unknown>;
-    const route = String(body.route ?? "execute");
     const harness =
       typeof body.harness === "string" && body.harness.trim().length > 0
         ? body.harness.trim()
         : undefined;
-    const attachments = normalizeAttachments(body.attachments);
-
     if (text) {
-      if (route === "reply") {
-        const replyRes = await fetch(`${BASE}/api/slack/reply`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          signal: options.abortSignal,
-          body: JSON.stringify({
-            thread_key: this.threadKey,
-            reply: text,
-            ...(attachments.length > 0 ? { attachments } : {}),
-            source: "thread_ui",
-            ...(options.messageId ? { message_id: options.messageId } : {}),
-          }),
-        });
-        if (!replyRes.ok) {
-          throw new Error(await readErrorMessage(replyRes, `Reply failed (${replyRes.status})`));
-        }
-        const replyData = (await replyRes.json().catch(() => ({}))) as { status?: string; error?: string };
-        if (replyData.error) {
-          throw new Error(String(replyData.error));
-        }
-        if (replyData.status === "ignored_empty") {
-          throw new Error("Reply is empty.");
-        }
-        if (replyData.status === "no_active_session") {
-          throw new Error("No active engineer session for this thread.");
-        }
-        if (replyData.status === "not_waiting_for_reply") {
-          throw new Error("Engineer is not currently waiting for a reply.");
-        }
-      } else {
-        const executeRes = await fetch(`${BASE}/api/agent/execute`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          signal: options.abortSignal,
-          body: JSON.stringify({
-            slack_thread_key: this.threadKey,
-            message: text,
-            ...(harness ? { harness } : {}),
-          }),
-        });
-        if (!executeRes.ok) {
-          throw new Error(await readErrorMessage(executeRes, `Execute failed (${executeRes.status})`));
-        }
-        const executeData = (await executeRes.json().catch(() => ({}))) as { error?: string };
-        if (executeData.error) {
-          throw new Error(String(executeData.error));
-        }
+      const executeRes = await fetch(`${BASE}/api/agent/execute`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        signal: options.abortSignal,
+        body: JSON.stringify({
+          slack_thread_key: this.threadKey,
+          message: text,
+          source: "thread_ui",
+          ...(harness ? { harness } : {}),
+        }),
+      });
+      if (!executeRes.ok) {
+        throw new Error(await readErrorMessage(executeRes, `Execute failed (${executeRes.status})`));
+      }
+      const executeData = (await executeRes.json().catch(() => ({}))) as { error?: string };
+      if (executeData.error) {
+        throw new Error(String(executeData.error));
       }
     }
 

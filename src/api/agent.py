@@ -26,13 +26,63 @@ import structlog
 from docker.errors import NotFound
 
 from api.harness_events import normalize_harness_event
-from shared.engineer.session import has_active_session as has_active_engineer_session
 from shared.tool_sdk import _sm_read
 
 log = structlog.get_logger()
 
-HARNESSES = ("amp", "claude-code", "codex", "pi-mono")
+ENGINES = ("amp", "claude-code", "codex", "pi-mono")
+HARNESSES = (*ENGINES, "eng")
+
+HARNESS_CONFIG: dict[str, dict[str, str]] = {
+    "eng": {
+        "engine": "claude-code",
+        "persona": "eng",
+        "repo": os.getenv("ENGINEER_DEFAULT_REPO", "paradigmxyz/ai_v2"),
+    },
+}
+
+MODEL_SHORTCUTS: dict[str, str] = {
+    "opus": "claude-opus-4-6",
+    "sonnet": "claude-sonnet-4-6",
+    "haiku": "claude-haiku-3-5",
+}
 _DEFAULT_CODEX_MODEL = os.getenv("AGENT_CODEX_MODEL", "gpt-5.3-codex").strip() or "gpt-5.3-codex"
+
+
+def _is_valid_engine(value: str | None) -> bool:
+    return bool(value) and value in ENGINES
+
+
+def _resolve_run_profile(
+    harness: str,
+    engine: str | None = None,
+    repo: str | None = None,
+) -> tuple[str, str | None, str | None]:
+    """Resolve (engine, persona, repo) for a requested harness run."""
+    if harness not in HARNESSES:
+        raise RuntimeError(f"Unknown harness: {harness}. Use one of {HARNESSES}")
+
+    config = HARNESS_CONFIG.get(harness, {})
+    persona = config.get("persona")
+    default_engine = config.get("engine", harness)
+    default_repo = config.get("repo")
+
+    normalized_engine = (engine or "").strip() or None
+    if normalized_engine and not _is_valid_engine(normalized_engine):
+        raise RuntimeError(f"Unknown engine: {normalized_engine}. Use one of {ENGINES}")
+
+    if harness in HARNESS_CONFIG:
+        effective_engine = normalized_engine or default_engine
+    else:
+        if normalized_engine and normalized_engine != harness:
+            raise RuntimeError(
+                f"Engine override is only supported for persona harnesses. "
+                f"Use harness='{normalized_engine}' directly."
+            )
+        effective_engine = harness
+
+    effective_repo = (repo or "").strip() or default_repo
+    return effective_engine, persona, effective_repo
 
 # Max seconds of *idle* time (no output) before killing a hung exec.
 # Active agents that keep producing output are never killed by this timeout.
@@ -78,7 +128,6 @@ _exec_active_total = 0
 _exec_active_by_actor: dict[str, int] = {}
 _exec_ticket_counter = 0
 
-# Active states that prevent engineer from overwriting a non-engineer session
 _ACTIVE_SESSION_STATES = ("working", "idle", "running", "stopping")
 
 # Graceful shutdown: set by the API lifespan on SIGTERM so active executions
@@ -235,10 +284,7 @@ def reap_stale_running_sessions(
                 if not session:
                     continue
 
-                harness = session.get("harness", "")
-
-                # Prune sessions whose container is gone (skip engineer — no container)
-                if client and harness != "engineer":
+                if client:
                     container_id = session.get("container_id", "")
                     if container_id:
                         try:
@@ -642,24 +688,6 @@ def drain_pending_context_messages(thread_key: str) -> list[dict[str, Any]]:
     return items
 
 
-def has_active_non_engineer_session(thread_key: str) -> tuple[bool, str | None]:
-    """Return (True, harness) if an active non-engineer session would be overwritten."""
-    for candidate in _thread_key_aliases(thread_key):
-        session = get_session_state(candidate)
-        if not session:
-            continue
-        harness = session.get("harness")
-        if harness == "engineer":
-            continue
-        if harness not in HARNESSES:
-            continue
-        state = session.get("state", "")
-        if state not in _ACTIVE_SESSION_STATES:
-            continue
-        return (True, harness)
-    return (False, None)
-
-
 # Pool of pre-warmed, unclaimed containers (LIFO)
 _pool: list[str] = []  # container IDs
 _pool_lock = threading.Lock()
@@ -883,6 +911,7 @@ def _create_container(
     repo: str | None = None,
     extra_labels: dict[str, str] | None = None,
     slack_thread_key: str | None = None,
+    persona: str | None = None,
 ) -> tuple[Any, dict[str, float]]:
     """Create a ready-to-use agent container.
 
@@ -893,6 +922,8 @@ def _create_container(
     env = _container_env()
     if repo:
         env.append(f"AGENT_REPO={repo}")
+    if persona:
+        env.append(f"AGENT_PERSONA={persona}")
     if slack_thread_key:
         parts = _slack_thread_parts(slack_thread_key)
         if parts:
@@ -1038,31 +1069,53 @@ def _container_env() -> list[str]:
     return env
 
 
-def _build_command(harness: str, message: str, thread_id: str | None) -> list[str]:
-    if harness == "claude-code":
+def _resolve_engine(harness: str) -> str:
+    """Map a harness name to its underlying CLI engine."""
+    if harness in ENGINES:
+        return harness
+    config = HARNESS_CONFIG.get(harness)
+    return config["engine"] if config else harness
+
+
+def _resolve_model(model: str | None) -> str | None:
+    """Resolve model shortcuts (opus → claude-opus-4-6) or pass through raw IDs."""
+    if not model:
+        return None
+    return MODEL_SHORTCUTS.get(model.lower(), model)
+
+
+def _build_command(
+    harness: str, message: str, thread_id: str | None, model: str | None = None
+) -> list[str]:
+    engine = _resolve_engine(harness)
+    resolved_model = _resolve_model(model)
+
+    if engine == "claude-code":
         return [
             "claude",
             "--dangerously-skip-permissions",
             "--output-format",
             "stream-json",
             "--verbose",
+            *(["--model", resolved_model] if resolved_model else []),
             *(["--session-id", thread_id] if thread_id else []),
             "-p",
             message,
         ]
-    if harness == "codex":
+    if engine == "codex":
+        codex_model = resolved_model or _DEFAULT_CODEX_MODEL
         return [
             "codex",
             "exec",
             "--model",
-            _DEFAULT_CODEX_MODEL,
+            codex_model,
             "--json",
             "--full-auto",
             "--skip-git-repo-check",
             *(["resume", thread_id] if thread_id else []),
             message,
         ]
-    if harness == "pi-mono":
+    if engine == "pi-mono":
         return [
             "pi",
             "--mode",
@@ -1090,6 +1143,7 @@ def _extract_result(
 
     Returns (result_text, agent_thread_id).
     """
+    engine = _resolve_engine(harness)
     result_text = ""
     agent_thread_id: str | None = None
 
@@ -1103,7 +1157,7 @@ def _extract_result(
             continue
 
         # Codex normalization
-        if harness == "codex":
+        if engine == "codex":
             etype = event.get("type", "")
             if etype == "thread.started":
                 agent_thread_id = event.get("thread_id")
@@ -1121,7 +1175,7 @@ def _extract_result(
             continue
 
         # Pi-mono normalization
-        if harness == "pi-mono":
+        if engine == "pi-mono":
             etype = event.get("type", "")
             if etype == "session":
                 agent_thread_id = event.get("id")
@@ -1229,34 +1283,53 @@ class AgentClient:
     def spawn(
         self,
         slack_thread_key: str,
-        harness: str = "amp",
+        harness: str | None = None,
         repo: str | None = None,
         request_id: str | None = None,
+        engine: str | None = None,
     ) -> dict[str, Any]:
         """Spawn a new sandbox container for a Slack thread.
 
         Args:
             slack_thread_key: Unique thread ID (e.g. "C04ABC:1234567890.123456")
-            harness: Agent CLI to use — amp, claude-code, or codex
+            harness: Agent harness — amp, claude-code, codex, pi-mono, eng
             repo: Optional repo path to set as working directory
             request_id: Correlation ID for end-to-end latency tracing
+            engine: Optional engine override (persona harnesses only)
         """
         rid = request_id or ""
-        log.info("spawn_start", request_id=rid, thread=slack_thread_key, harness=harness)
+        requested_harness = (harness or "amp").strip() or "amp"
+        log.info("spawn_start", request_id=rid, thread=slack_thread_key, harness=requested_harness)
+        try:
+            effective_engine, persona, effective_repo = _resolve_run_profile(
+                requested_harness,
+                engine=engine,
+                repo=repo,
+            )
+        except RuntimeError as exc:
+            return {"error": str(exc)}
 
-        if harness not in HARNESSES:
-            raise RuntimeError(f"Unknown harness: {harness}. Use one of {HARNESSES}")
-
-        # Reuse existing container if alive
         existing = get_session_state(slack_thread_key)
         if existing:
-            if existing.get("harness") == "engineer":
-                return {
-                    "session_id": slack_thread_key,
-                    "container_id": existing["container_id"],
-                    "status": "already_running",
-                    "harness": existing["harness"],
-                }
+            existing_harness = str(existing.get("harness") or "amp")
+            existing_engine = str(existing.get("engine") or _resolve_engine(existing_harness))
+            existing_persona = existing.get("persona")
+            if (
+                existing_harness != requested_harness
+                or existing_engine != effective_engine
+                or existing_persona != persona
+            ):
+                with contextlib.suppress(Exception):
+                    client = _docker_client()
+                    container = client.containers.get(existing["container_id"])
+                    container.stop(timeout=5)
+                    container.remove()
+                pop_session_state(slack_thread_key)
+                _delete_session(slack_thread_key)
+                existing = None
+
+        # Reuse existing container if alive
+        if existing:
             try:
                 client = _docker_client()
                 container = client.containers.get(existing["container_id"])
@@ -1272,6 +1345,8 @@ class AgentClient:
                         "container_id": existing["container_id"],
                         "status": "already_running",
                         "harness": existing["harness"],
+                        "engine": existing.get("engine") or _resolve_engine(existing["harness"]),
+                        "persona": existing.get("persona"),
                     }
                 container.start()
                 existing["state"] = "running"
@@ -1281,6 +1356,8 @@ class AgentClient:
                     "container_id": existing["container_id"],
                     "status": "restarted",
                     "harness": existing["harness"],
+                    "engine": existing.get("engine") or _resolve_engine(existing["harness"]),
+                    "persona": existing.get("persona"),
                 }
             except NotFound:
                 pop_session_state(slack_thread_key)
@@ -1288,7 +1365,7 @@ class AgentClient:
         # Try to claim a pre-warmed container from the pool (skip if repo needed)
         container = None
         status = "started"
-        if not repo:
+        if not effective_repo and not persona:
             container = _claim_from_pool()
             if container:
                 status = "claimed_from_pool"
@@ -1301,12 +1378,15 @@ class AgentClient:
             container, create_timings = _create_container(
                 client,
                 name=f"agent2-{slack_thread_key.replace(':', '-').replace('.', '-')[:40]}",
-                repo=repo,
+                repo=effective_repo,
                 extra_labels={
                     "ai2.thread": slack_thread_key,
-                    "ai2.harness": harness,
+                    "ai2.harness": requested_harness,
+                    "ai2.engine": effective_engine,
+                    **({"ai2.persona": persona} if persona else {}),
                 },
                 slack_thread_key=slack_thread_key,
+                persona=persona,
             )
             log.info(
                 "spawn_container_created", request_id=rid, thread=slack_thread_key, **create_timings
@@ -1317,7 +1397,9 @@ class AgentClient:
 
         session = {
             "container_id": container.id,
-            "harness": harness,
+            "harness": requested_harness,
+            "engine": effective_engine,
+            "persona": persona,
             "agent_thread_id": None,
             "state": "running",
             "created_at": time.time(),
@@ -1334,7 +1416,9 @@ class AgentClient:
             "session_id": slack_thread_key,
             "container_id": container.id,
             "status": status,
-            "harness": harness,
+            "harness": requested_harness,
+            "engine": effective_engine,
+            "persona": persona,
         }
 
     def pool(self) -> dict[str, Any]:
@@ -1348,13 +1432,15 @@ class AgentClient:
         self,
         slack_thread_key: str,
         message: str,
-        harness: str = "amp",
+        harness: str | None = None,
         source: str | None = None,
         repo: str | None = None,
         request_id: str | None = None,
         files: list[dict[str, str]] | None = None,
         emit: Callable[[dict[str, Any]], None] | None = None,
         user_id: str | None = None,
+        model: str | None = None,
+        engine: str | None = None,
     ) -> dict[str, Any]:
         """Execute a message in a sandbox, spawning one if needed.
 
@@ -1376,25 +1462,41 @@ class AgentClient:
             }
 
         try:
-            if has_active_engineer_session(slack_thread_key):
-                return {
-                    "error": (
-                        "Active engineer session in progress for this thread. "
-                        "Complete or stop it before running harness execution."
-                    )
-                }
             session = get_session_state(slack_thread_key)
-            if session and session.get("harness") == "engineer":
-                return {
-                    "error": (
-                        "Active engineer session in progress for this thread. "
-                        "Complete or stop it before running harness execution."
-                    )
-                }
             if session and session.get("state") == "working":
                 return {
                     "error": "A run is already in progress for this thread. Wait for it to finish first."
                 }
+
+            requested_harness = (harness or "").strip() or (
+                str(session.get("harness") or "amp") if session else "amp"
+            )
+            try:
+                effective_engine, effective_persona, _effective_repo = _resolve_run_profile(
+                    requested_harness,
+                    engine=engine,
+                    repo=repo,
+                )
+            except RuntimeError as exc:
+                return {"error": str(exc)}
+
+            if session:
+                current_harness = str(session.get("harness") or "amp")
+                current_engine = str(session.get("engine") or _resolve_engine(current_harness))
+                current_persona = session.get("persona")
+                if (
+                    current_harness != requested_harness
+                    or current_engine != effective_engine
+                    or current_persona != effective_persona
+                ):
+                    with contextlib.suppress(Exception):
+                        client = _docker_client()
+                        container = client.containers.get(session["container_id"])
+                        container.stop(timeout=5)
+                        container.remove()
+                    pop_session_state(slack_thread_key)
+                    _delete_session(slack_thread_key)
+                    session = None
 
             slot_acquired, queue_wait_s, queue_position = _acquire_execution_slot(
                 actor_key=actor_key,
@@ -1439,17 +1541,15 @@ class AgentClient:
                     session = None
 
             if not session:
-                # Re-check right before spawn to avoid racing engineer startup.
-                if has_active_engineer_session(slack_thread_key):
-                    return {
-                        "error": (
-                            "Active engineer session in progress for this thread. "
-                            "Complete or stop it before running harness execution."
-                        )
-                    }
                 log.info("exec_auto_spawn", request_id=rid, thread=slack_thread_key)
                 _emit({"type": "status", "stage": "container.creating"})
-                self.spawn(slack_thread_key, harness, repo, request_id)
+                self.spawn(
+                    slack_thread_key,
+                    requested_harness,
+                    repo,
+                    request_id,
+                    engine=engine,
+                )
                 _emit({"type": "status", "stage": "container.ready"})
                 session = get_session_state(slack_thread_key)
                 if session is None:
@@ -1473,7 +1573,12 @@ class AgentClient:
                     f"{message.rstrip()}\n\n{_THREAD_CONTEXT_DELIMITER}\n{pending_context}"
                 )
 
-            cmd = _build_command(session["harness"], command_message, session["agent_thread_id"])
+            cmd = _build_command(
+                str(session.get("engine") or session["harness"]),
+                command_message,
+                session["agent_thread_id"],
+                model,
+            )
 
             started_ts = time.time()
             with _sessions_lock:
@@ -1522,7 +1627,14 @@ class AgentClient:
                 stderr=True,
             )["Id"]
 
-            _emit({"type": "status", "stage": "exec.start", "harness": session["harness"]})
+            _emit(
+                {
+                    "type": "status",
+                    "stage": "exec.start",
+                    "harness": session["harness"],
+                    "engine": str(session.get("engine") or _resolve_engine(session["harness"])),
+                }
+            )
             output = api.exec_start(exec_id, stream=True, demux=True)
 
             # Collect stdout and stderr separately
@@ -1580,7 +1692,7 @@ class AgentClient:
                                 evt = json.loads(stripped)
                                 if isinstance(evt, dict):
                                     normalized_events = normalize_harness_event(
-                                        session["harness"], evt
+                                        str(session.get("engine") or session["harness"]), evt
                                     )
                                     if not normalized_events:
                                         normalized_events = [evt]
@@ -1623,7 +1735,10 @@ class AgentClient:
                 try:
                     evt = json.loads(stripped)
                     if isinstance(evt, dict):
-                        normalized_events = normalize_harness_event(session["harness"], evt)
+                        normalized_events = normalize_harness_event(
+                            str(session.get("engine") or session["harness"]),
+                            evt,
+                        )
                         if not normalized_events:
                             normalized_events = [evt]
                         for normalized in normalized_events:
@@ -1650,12 +1765,17 @@ class AgentClient:
             # If timed out, kill the exec process
             if timed_out:
                 with contextlib.suppress(Exception):
-                    container.exec_run(["pkill", "-TERM", "-f", session["harness"]], detach=True)
+                    kill_target = str(session.get("engine") or _resolve_engine(session["harness"]))
+                    container.exec_run(["pkill", "-TERM", "-f", kill_target], detach=True)
 
             # Check exec exit code
             exit_code = api.exec_inspect(exec_id).get("ExitCode")
 
-            result_text, agent_thread_id = _extract_result(lines, session["harness"], stderr_lines)
+            result_text, agent_thread_id = _extract_result(
+                lines,
+                str(session.get("engine") or session["harness"]),
+                stderr_lines,
+            )
 
             if timed_out and not result_text:
                 elapsed_total = round(time.monotonic() - started)
@@ -1729,6 +1849,7 @@ class AgentClient:
                 request_id=rid,
                 thread=slack_thread_key,
                 harness=session["harness"],
+                engine=str(session.get("engine") or _resolve_engine(session["harness"])),
                 exit_code=exit_code,
                 timed_out=timed_out,
                 duration_s=live_turn["duration_s"],
@@ -1744,6 +1865,8 @@ class AgentClient:
                 "result": result_text,
                 "agent_thread_id": session["agent_thread_id"],
                 "harness": session["harness"],
+                "engine": str(session.get("engine") or _resolve_engine(session["harness"])),
+                "persona": session.get("persona"),
             }
             if mirror_to_slack and result_text:
                 _post_slack_thread_message(
@@ -1779,14 +1902,6 @@ class AgentClient:
         session = get_session_state(slack_thread_key)
         if not session:
             return {"error": f"No session for '{slack_thread_key}'"}
-        if session.get("harness") == "engineer":
-            # Engineer runs are in-process asyncio tasks, not Docker containers. @todo: move it.
-            from shared.engineer.session import remove_session
-
-            remove_session(slack_thread_key)
-            pop_session_state(slack_thread_key)
-            _delete_session(slack_thread_key)
-            return {"session_id": slack_thread_key, "status": "stopped"}
 
         client = _docker_client()
         try:
@@ -1821,6 +1936,8 @@ class AgentClient:
                     "slack_thread_key": key,
                     "container_id": session["container_id"][:12],
                     "harness": session["harness"],
+                    "engine": str(session.get("engine") or _resolve_engine(session["harness"])),
+                    "persona": session.get("persona"),
                     "agent_thread_id": session.get("agent_thread_id"),
                     "state": session["state"],
                     "created_at": session["created_at"],
@@ -1840,6 +1957,8 @@ class AgentClient:
             "slack_thread_key": slack_thread_key,
             "container_id": session["container_id"][:12],
             "harness": session["harness"],
+            "engine": str(session.get("engine") or _resolve_engine(session["harness"])),
+            "persona": session.get("persona"),
             "agent_thread_id": session.get("agent_thread_id"),
             "state": session["state"],
             "created_at": session["created_at"],
@@ -1863,12 +1982,6 @@ class AgentClient:
         for row in rows:
             key = row["slack_thread_key"]
             if get_session_state(key):
-                continue
-
-            harness = row.get("harness", "amp")
-            if harness == "engineer":
-                # Engineer sessions use run_id as container_id, not a Docker container.
-                # They cannot be resumed; leave PG state as-is (idle/error).
                 continue
 
             container_id = row["container_id"]
@@ -1918,9 +2031,14 @@ class AgentClient:
 
             created = row.get("created_at")
             last_act = row.get("last_activity")
+            recovered_harness = row.get("harness", "amp")
+            recovered_engine = _resolve_engine(recovered_harness)
+            recovered_persona = HARNESS_CONFIG.get(recovered_harness, {}).get("persona")
             recovered_session = {
                 "container_id": container_id,
-                "harness": row.get("harness", "amp"),
+                "harness": recovered_harness,
+                "engine": recovered_engine,
+                "persona": recovered_persona,
                 "agent_thread_id": row.get("agent_thread_id"),
                 "state": "idle",
                 "created_at": created.timestamp() if created else time.time(),
@@ -1939,9 +2057,17 @@ class AgentClient:
             for container in containers:
                 key = container.labels.get("ai2.thread", "")
                 if key and not get_session_state(key):
+                    discovered_harness = container.labels.get("ai2.harness", "amp")
+                    discovered_engine = container.labels.get(
+                        "ai2.engine",
+                        _resolve_engine(discovered_harness),
+                    )
+                    discovered_persona = container.labels.get("ai2.persona")
                     recovered_session = {
                         "container_id": container.id,
-                        "harness": container.labels.get("ai2.harness", "amp"),
+                        "harness": discovered_harness,
+                        "engine": discovered_engine,
+                        "persona": discovered_persona,
                         "agent_thread_id": None,
                         "state": "idle",
                         "created_at": time.time(),
@@ -2027,14 +2153,6 @@ class AgentClient:
         session = get_session_state(slack_thread_key)
         if not session:
             return {"error": f"No session for '{slack_thread_key}'"}
-        if session.get("harness") == "engineer":
-            # Engineer has no signal-based interrupt; best-effort cancel equals stop.
-            from shared.engineer.session import remove_session
-
-            remove_session(slack_thread_key)
-            pop_session_state(slack_thread_key)
-            _delete_session(slack_thread_key)
-            return {"session_id": slack_thread_key, "status": "interrupted"}
 
         previous_state = str(session.get("state") or "")
         if previous_state not in {"running", "working", "stopping"}:
@@ -2066,13 +2184,13 @@ class AgentClient:
         client = _docker_client()
         try:
             container = client.containers.get(session["container_id"])
-            harness = session["harness"]
+            engine = str(session.get("engine") or _resolve_engine(session["harness"]))
             target = {
                 "amp": "amp",
                 "claude-code": "claude",
                 "codex": "codex",
                 "pi-mono": "pi",
-            }.get(harness, "amp")
+            }.get(engine, "amp")
             result = container.exec_run(["pkill", "-INT", "-f", target], detach=False)
             exit_code = result.exit_code if hasattr(result, "exit_code") else None
             if exit_code not in (0,):

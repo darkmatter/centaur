@@ -49,7 +49,7 @@ export default function ThreadsPage() {
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [query, setQuery] = useState("");
-  const [stateFilter, setStateFilter] = useState<"all" | "running" | "waiting" | "error">("all");
+  const [stateFilter, setStateFilter] = useState<"all" | "running" | "error">("all");
   const searchRef = useRef<HTMLInputElement>(null);
 
   async function fetchThreads(showRefreshIndicator = true) {
@@ -112,7 +112,6 @@ export default function ThreadsPage() {
     () => ({
       all: searchedThreads.length,
       running: searchedThreads.filter((thread) => thread.state === "working" || thread.state === "running").length,
-      waiting: searchedThreads.filter((thread) => thread.state === "waiting").length,
       error: searchedThreads.filter((thread) => thread.state === "error").length,
     }),
     [searchedThreads],
@@ -151,9 +150,8 @@ export default function ThreadsPage() {
     const running = [...threads]
       .filter((thread) => thread.state === "working" || thread.state === "running")
       .sort(byRecent)[0];
-    const waiting = [...threads].filter((thread) => thread.state === "waiting").sort(byRecent)[0];
     const recent = [...threads].sort(byRecent)[0];
-    const candidate = running ?? waiting ?? recent;
+    const candidate = running ?? recent;
     return candidate ? `/${encodeURIComponent(candidate.slack_thread_key)}` : undefined;
   }, [threads]);
 
@@ -231,17 +229,6 @@ export default function ThreadsPage() {
             }`}
           >
             Running {counts.running}
-          </button>
-          <button
-            type="button"
-            onClick={() => setStateFilter("waiting")}
-            className={`rounded-full px-3 min-h-[36px] text-xs font-medium border transition-colors ${
-              stateFilter === "waiting"
-                ? "bg-primary text-primary-foreground border-primary"
-                : "bg-secondary text-secondary-foreground border-border/50"
-            }`}
-          >
-            Waiting {counts.waiting}
           </button>
           <button
             type="button"

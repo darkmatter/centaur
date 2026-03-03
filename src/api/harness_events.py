@@ -441,4 +441,5 @@ def normalize_harness_event(harness: str, event: dict[str, Any]) -> list[dict[st
         return _normalize_codex_event(event)
     if normalized_harness == "pi-mono":
         return _normalize_pi_event(event)
+    # eng uses claude-code under the hood, same event format as amp/claude-code
     return _normalize_amp_like_event(event)

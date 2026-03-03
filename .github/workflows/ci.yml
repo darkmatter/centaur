@@ -35,22 +35,14 @@ jobs:
           uv run ruff check \
             src/api/agent.py \
             src/api/harness_events.py \
-            src/api/routers/threads.py \
-            src/shared/engineer/agent_loop.py \
-            src/shared/engineer/git_ops.py \
-            src/shared/engineer/orchestrator.py \
-            src/shared/engineer/settings.py
+            src/api/routers/threads.py
 
       - name: Compile critical runtime modules
         run: |
           uv run python -m py_compile \
             src/api/agent.py \
             src/api/harness_events.py \
-            src/api/routers/threads.py \
-            src/shared/engineer/agent_loop.py \
-            src/shared/engineer/git_ops.py \
-            src/shared/engineer/orchestrator.py \
-            src/shared/engineer/settings.py
+            src/api/routers/threads.py
 
       - name: Run runtime smoke checks
         run: |

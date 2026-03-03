@@ -6,11 +6,7 @@ import os
 import shlex
 import sqlite3
 import sys
-import threading
-import time
 from pathlib import Path
-from typing import Literal, cast
-
 import click
 import structlog
 import uvicorn
@@ -24,10 +20,6 @@ from etl.pipeline import run_continuous, run_sync
 from shared.cli_tables import render_text_table
 from shared.config import Settings
 from shared.db import close_pool, create_pool, fetch
-from shared.engineer.models import Phase
-from shared.engineer.orchestrator import EngineerOrchestrator
-from shared.engineer.session import EngineerSession
-from shared.engineer.settings import engineer_settings
 from shared.models import EmbeddingRecord
 from shared.tool_manager import ToolManager
 from shared.tool_sdk import _sm_read
@@ -400,99 +392,6 @@ def continuous(interval: int | None) -> None:
     """Run continuous sync loop."""
     settings = ETLSettings()
     asyncio.run(run_continuous(settings, interval))
-
-
-@cli.group("engineer")
-def engineer_group() -> None:
-    """Engineer automation commands."""
-
-
-@engineer_group.command("run")
-@click.argument("task")
-@click.option("--dry-run", is_flag=True, help="Run full loop but skip push/PR.")
-@click.option("--skip-clarify", is_flag=True, help="Skip interactive clarification.")
-@click.option(
-    "--engine",
-    type=click.Choice(["amp", "claude-code", "codex", "pi-mono"], case_sensitive=False),
-    default=None,
-    help="Engine preference alias (maps to model selection hints).",
-)
-@click.option(
-    "--model",
-    default=None,
-    help="Explicit model id (e.g. claude-opus-4-6, claude-sonnet-4-6). Overrides --engine.",
-)
-@click.option(
-    "--mode",
-    "budget_mode",
-    type=click.Choice(["simple", "auto", "complex"], case_sensitive=False),
-    default=None,
-    help="Budget mode: simple (fast lane), auto (adaptive), or complex (deep lane).",
-)
-def engineer_run(
-    task: str,
-    dry_run: bool,
-    skip_clarify: bool,
-    engine: str | None,
-    model: str | None,
-    budget_mode: str | None,
-) -> None:
-    """Run engineer workflow from CLI."""
-
-    model_preference = (model or engine or "").strip() or None
-    selected_budget_mode = (budget_mode or "").strip().lower() or None
-    if selected_budget_mode not in {None, "simple", "auto", "complex"}:
-        raise click.BadParameter(f"Invalid mode: {selected_budget_mode}")
-    normalized_budget_mode = cast(Literal["simple", "auto", "complex"] | None, selected_budget_mode)
-
-    async def _run() -> None:
-        session = EngineerSession(
-            thread_key="cli",
-            task=task,
-            source="cli",
-            model_preference=model_preference,
-            budget_mode=normalized_budget_mode,
-        )
-        orchestrator = EngineerOrchestrator(
-            settings=engineer_settings,
-            dry_run=dry_run,
-            skip_clarify=skip_clarify,
-            model_preference=model_preference,
-        )
-
-        if not skip_clarify:
-            _start_stdin_reader(session)
-
-        async def _print(msg: str) -> None:
-            click.echo(f"  {msg}")
-
-        result = await orchestrator.run(session, post_message=_print)
-        if result.success:
-            click.echo(f"\nEngineer completed: {result.pr_url or result.summary}")
-            return
-        click.echo(f"\nEngineer failed: {result.error}", err=True)
-        sys.exit(1)
-
-    asyncio.run(_run())
-
-
-def _start_stdin_reader(session: EngineerSession) -> None:
-    """Feed stdin replies into an active clarification phase."""
-
-    def _reader() -> None:
-        while session.phase not in (Phase.DONE, Phase.FAILED):
-            if session.phase != Phase.CLARIFY:
-                time.sleep(0.5)
-                continue
-            try:
-                line = input()
-            except EOFError:
-                break
-            if line.strip():
-                session.receive_user_reply(line.strip())
-
-    thread = threading.Thread(target=_reader, daemon=True)
-    thread.start()
 
 
 # ---------------------------------------------------------------------------

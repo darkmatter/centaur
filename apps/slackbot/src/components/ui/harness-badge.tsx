@@ -12,6 +12,7 @@ const HARNESS_STYLES: Record<string, string> = {
   "claude-code": "bg-violet-500/10 text-violet-400",
   codex: "bg-emerald-500/10 text-emerald-400",
   "pi-mono": "bg-blue-500/10 text-blue-400",
+  eng: "bg-primary/10 text-primary",
   engineer: "bg-primary/10 text-primary",
 };
 

@@ -64,8 +64,9 @@ COPY --chmod=755 slack-upload.sh /usr/local/bin/slack-upload
 # COPY --chown=agent:agent pi-plugins/tool-harness.ts /home/agent/.pi/agent/extensions/tool-harness.ts
 # COPY --chown=agent:agent pi-plugins/tools/ /home/agent/.pi/agent/extensions/tools/
 
-# ── System prompt (changes most often — last for best caching) ──────────────
+# ── System prompts (changes most often — last for best caching) ─────────────
 COPY --chown=agent:agent SYSTEM_PROMPT.md /home/agent/AGENTS.md
+COPY --chown=agent:agent SYSTEM_PROMPT_ENG.md /home/agent/AGENTS_ENG.md
 
 WORKDIR /home/agent/workspace
 ENTRYPOINT ["/entrypoint.sh"]

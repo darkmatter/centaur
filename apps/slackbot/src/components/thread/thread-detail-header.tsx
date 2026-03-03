@@ -42,8 +42,7 @@ type ThreadDetailHeaderProps = {
   liveElapsed: string;
   stableStatus: string | null;
   isRunning: boolean;
-  isWaiting: boolean;
-  isEngineer: boolean;
+  isEng: boolean;
   phases: string[];
   isReconnecting: boolean;
   error: string | null;
@@ -84,8 +83,7 @@ export function ThreadDetailHeader({
   liveElapsed,
   stableStatus,
   isRunning,
-  isWaiting,
-  isEngineer,
+  isEng,
   phases,
   isReconnecting,
   error,
@@ -101,10 +99,9 @@ export function ThreadDetailHeader({
   const showError = !!error && !(thread.state === "error" && error.startsWith("Stream disconnected."));
   const statusSummary = useMemo(() => {
     if (thread.state === "error") return { icon: Bot, text: error || "Agent encountered an error" };
-    if (isWaiting) return { icon: Bot, text: "Waiting for your reply" };
     if (!isRunning) return { icon: Bot, text: "Idle" };
     return categorizeStatus(stableStatus);
-  }, [error, isRunning, isWaiting, stableStatus, thread.state]);
+  }, [error, isRunning, stableStatus, thread.state]);
 
   useEffect(() => {
     if (!isReconnecting || thread.state === "error") {
@@ -251,7 +248,7 @@ export function ThreadDetailHeader({
         </div>
       )}
 
-      {isEngineer && phases.length > 0 && (
+      {isEng && phases.length > 0 && (
         <div className="px-3 py-1.5 border-t border-border/50">
           <PhaseProgress phases={phases} />
         </div>

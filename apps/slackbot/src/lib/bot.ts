@@ -9,13 +9,11 @@ import {
   interrupt,
   normalizeThreadKey,
   postThreadContextMessage,
-  replyEngineerFlow,
   spawn,
   splitThreadKey,
-  startEngineerFlow,
   watchProgress,
-  type AgentMode,
   type BudgetMode,
+  type Engine,
   type FileAttachment,
   type Harness,
 } from "./harness";
@@ -45,18 +43,14 @@ const MAX_TRACKED_THREAD_MODES = 500;
 const SLACK_BOT_USERNAME = process.env.SLACK_BOT_USERNAME || "paradigm-ai";
 
 type MarkdownNode = Root | Root["children"][number];
-type ThreadModeConfig = {
-  mode: AgentMode;
-  modelPreference: string | null;
+type ThreadConfig = {
+  harness: Harness;
+  engine: Engine | null;
+  model: string | null;
   budgetMode: BudgetMode | null;
 };
 
 const SLACK_BOT_TOKEN = process.env.SLACK_BOT_TOKEN || "";
-const HARNESSES: readonly Harness[] = ["amp", "claude-code", "codex", "pi-mono"] as const;
-
-function isHarness(value: string | null | undefined): value is Harness {
-  return HARNESSES.includes((value ?? "") as Harness);
-}
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -92,7 +86,6 @@ async function fetchThreadHistory(
     };
     if (!data.ok || !data.messages || data.messages.length <= 1) return "";
 
-    // Exclude the last message (the mention itself) and any bot messages
     const prior = data.messages.slice(0, -1).filter((m) => {
       if (m.bot_id) return false;
       if (botUserId && m.user === botUserId) return false;
@@ -142,37 +135,13 @@ function isBusyRunError(message: string): boolean {
   return normalized.includes("already in progress") || normalized.includes("run is already in progress");
 }
 
-/**
- * Convert Slack-style links to markdown before AST parsing.
- * LLMs sometimes output `<url|text>` or `&lt;url|text&gt;` despite being
- * told to use markdown — this catches those and converts them so
- * the markdown parser produces proper link nodes.
- */
 function preprocessSlackLinks(text: string): string {
   let result = text;
-  // HTML-encoded Slack links: &lt;https://...|text&gt; → [text](url)
   result = result.replace(/&lt;(https?:\/\/[^|&]+)\|([^&]+)&gt;/g, "[$2]($1)");
-  // Raw Slack links: <https://...|text> → [text](url)
-  // Only matches URLs (not Slack mentions like <@U...> or <#C...>)
   result = result.replace(/<(https?:\/\/[^|>]+)\|([^>]+)>/g, "[$2]($1)");
   return result;
 }
 
-/**
- * Convert markdown tables to a Slack-friendly list format.
- * Slack mrkdwn doesn't support tables, so we render each row as a
- * bold-header section with labeled bullet points.
- *
- * Example input:
- *   | Area | v1 | v2 |
- *   |------|----|----|
- *   | Secrets | flat .env | 1Password vault |
- *
- * Output:
- *   *Secrets*
- *   • *v1:* flat .env
- *   • *v2:* 1Password vault
- */
 function preprocessMarkdownTables(text: string): string {
   const lines = text.split("\n");
   const result: string[] = [];
@@ -180,16 +149,13 @@ function preprocessMarkdownTables(text: string): string {
 
   while (i < lines.length) {
     const line = lines[i];
-    // Detect a table row: starts and ends with |, contains at least 2 pipes
     if (/^\s*\|.*\|.*\|\s*$/.test(line)) {
-      // Collect all consecutive table lines
       const tableLines: string[] = [];
       while (i < lines.length && /^\s*\|.*\|\s*$/.test(lines[i])) {
         tableLines.push(lines[i]);
         i++;
       }
 
-      // Parse cells from each line
       const parseRow = (row: string): string[] =>
         row
           .replace(/^\s*\|/, "")
@@ -197,7 +163,6 @@ function preprocessMarkdownTables(text: string): string {
           .split("|")
           .map((c) => c.trim());
 
-      // Filter out separator rows (all dashes/colons/spaces)
       const dataRows = tableLines.filter(
         (l) => !/^\s*\|[\s:|-]+\|\s*$/.test(l)
       );
@@ -210,13 +175,11 @@ function preprocessMarkdownTables(text: string): string {
       const bodyRows = dataRows.slice(1);
 
       if (bodyRows.length === 0) {
-        // Header-only table, just render as bold items
         result.push(headers.map((h) => `*${h}*`).join("  ·  "));
         result.push("");
       } else {
         for (const row of bodyRows) {
           const cells = parseRow(row);
-          // First cell is the row label
           const label = cells[0] || "";
           result.push(`*${label}*`);
           for (let c = 1; c < cells.length; c++) {
@@ -244,7 +207,6 @@ function renderSlackMessage(markdown: string) {
     const insideDelete = inDelete || node.type === "delete";
 
     if (node.type === "text" && !insideDelete) {
-      // Slack treats paired single tildes as strikethrough; escape literal tildes.
       node.value = node.value.replace(/~/g, "\\~");
     }
 
@@ -273,17 +235,17 @@ function createBot() {
     adapters: hasSlackCreds ? { slack: createSlackAdapter() } : {},
     state: process.env.REDIS_URL ? createRedisState() : createMemoryState(),
   });
-  const threadModes = new Map<string, ThreadModeConfig>();
+  const threadConfigs = new Map<string, ThreadConfig>();
 
-  function setThreadMode(threadKey: string, config: ThreadModeConfig): void {
-    if (threadModes.has(threadKey)) {
-      threadModes.delete(threadKey);
+  function setThreadConfig(threadKey: string, config: ThreadConfig): void {
+    if (threadConfigs.has(threadKey)) {
+      threadConfigs.delete(threadKey);
     }
-    if (!threadModes.has(threadKey) && threadModes.size >= MAX_TRACKED_THREAD_MODES) {
-      const oldestKey = threadModes.keys().next().value as string | undefined;
-      if (oldestKey) threadModes.delete(oldestKey);
+    if (!threadConfigs.has(threadKey) && threadConfigs.size >= MAX_TRACKED_THREAD_MODES) {
+      const oldestKey = threadConfigs.keys().next().value as string | undefined;
+      if (oldestKey) threadConfigs.delete(oldestKey);
     }
-    threadModes.set(threadKey, config);
+    threadConfigs.set(threadKey, config);
   }
 
   function buildSessionContext(threadId: string): string {
@@ -321,162 +283,57 @@ function createBot() {
     const requestId = crypto.randomUUID().slice(0, 8);
     const rawThreadKey = thread.id;
     const threadKey = normalizeThreadKey(rawThreadKey);
-    const previous = threadModes.get(threadKey);
+    const previous = threadConfigs.get(threadKey);
     const files: FileAttachment[] = (attachments || [])
       .filter((a): a is { url: string; name: string } => !!a.url && !!a.name)
       .map((a) => ({ url: a.url, name: a.name }));
 
-    const ampEngRequested =
-      parsed.mode === "eng" &&
-      (parsed.modelPreference === "amp" || parsed.harness === "amp");
-    const requestedMode: AgentMode = ampEngRequested ? "default" : parsed.mode;
-    const mode: AgentMode = isFirstMessage
-      ? requestedMode
-      : (previous?.mode ?? requestedMode);
+    const harness: Harness = isFirstMessage
+      ? parsed.harness
+      : (previous?.harness ?? parsed.harness);
+    const engine = parsed.engine ?? previous?.engine ?? null;
+    const model = parsed.model ?? previous?.model ?? null;
+    const budgetMode = parsed.budgetMode ?? previous?.budgetMode ?? null;
 
     if (
       !isFirstMessage &&
       previous &&
-      parsed.modeExplicit &&
-      requestedMode !== previous.mode
+      parsed.harnessExplicit &&
+      parsed.harness !== previous.harness
     ) {
       await thread.post(
         toSlackMessage(
-          "This thread is already running in a different mode. Start a new thread to switch modes."
+          "This thread is already running with a different harness. Start a new thread to switch."
         )
       );
       return;
     }
-
-    if (ampEngRequested && isFirstMessage) {
+    if (
+      !isFirstMessage &&
+      previous &&
+      parsed.engineExplicit &&
+      parsed.engine &&
+      parsed.engine !== previous.engine
+    ) {
       await thread.post(
         toSlackMessage(
-          "Routing `--eng --amp` through standard `--amp` mode for reliability."
+          "This thread is already running with a different engine. Start a new thread to switch."
         )
       );
+      return;
     }
 
     if (!parsed.cleanedText) {
       await thread.post(
         toSlackMessage(
-          "Please provide a prompt after flags. Example: `--eng --claude implement retry logic` (after mentioning the bot)."
+          "Please provide a prompt after flags. Example: `--eng implement retry logic` (after mentioning the bot)."
         )
       );
       return;
     }
 
-    // Recovery path: after bot restarts we may lose in-memory mode state,
-    // so probe the API for an active engineer session before default routing.
-    if (
-      !isFirstMessage &&
-      !previous &&
-      !parsed.modeExplicit &&
-      !parsed.harnessExplicit &&
-      !parsed.budgetExplicit
-    ) {
-      try {
-        const reply = await replyEngineerFlow(threadKey, parsed.cleanedText);
-        if (reply.status === "accepted") {
-          setThreadMode(threadKey, {
-            mode: "eng",
-            modelPreference: null,
-            budgetMode: null,
-          });
-          return;
-        }
-      } catch (error) {
-        console.warn("engineer_recovery_probe_failed", {
-          thread: threadKey,
-          error: error instanceof Error ? error.message : String(error),
-        });
-        await thread.post(
-          toSlackMessage(
-            "Couldn't verify the existing engineer session right now. Please retry in this thread."
-          )
-        );
-        return;
-      }
-    }
+    setThreadConfig(threadKey, { harness, engine, model, budgetMode });
 
-    if (mode === "eng") {
-      const modelPreference =
-        parsed.modelPreference ?? parsed.harness ?? previous?.modelPreference ?? null;
-      const budgetMode = parsed.budgetMode ?? previous?.budgetMode ?? null;
-
-      try {
-        if (isFirstMessage) {
-          await thread.startTyping("Starting engineer flow...");
-          const { channel: engChannel, threadTs: engThreadTs } = splitThreadKey(threadKey);
-          const engHistory = await fetchThreadHistory(engChannel, engThreadTs);
-          const engTask = engHistory ? engHistory + parsed.cleanedText : parsed.cleanedText;
-          const result = await startEngineerFlow(
-            threadKey,
-            engTask,
-            modelPreference,
-            budgetMode,
-            files.length > 0 ? files : undefined
-          );
-          const viewerUrl = `${THREAD_VIEWER_URL}/${encodeURIComponent(normalizeThreadKey(threadKey))}`;
-          const preferenceLine = modelPreference
-            ? `\nModel preference: \`${modelPreference}\``
-            : "";
-          const modeLine = budgetMode ? `\nMode: \`${budgetMode}\`` : "";
-          const statusLine = (() => {
-            if (result.status === "already_running") {
-              setThreadMode(threadKey, { mode: "eng", modelPreference, budgetMode });
-              return "Engineer flow is already running for this thread.";
-            }
-            if (result.status === "rejected") {
-              return (
-                result.error ??
-                "Engineer flow could not start because another harness session is active in this thread."
-              );
-            }
-            setThreadMode(threadKey, { mode: "eng", modelPreference, budgetMode });
-            return "Engineer flow started.";
-          })();
-          await thread.post(
-            toSlackMessage(
-              `[🔗 Thread Viewer](${viewerUrl})\n\n${statusLine}${preferenceLine}${modeLine}`
-            )
-          );
-          return;
-        }
-
-        const reply = await replyEngineerFlow(
-          threadKey,
-          parsed.cleanedText,
-          files.length > 0 ? files : undefined
-        );
-        if (reply.status === "no_active_session") {
-          threadModes.delete(threadKey);
-          await thread.post(
-            toSlackMessage(
-              "No active engineer session for this thread. Start a new run with `--eng`."
-            )
-          );
-        } else if (reply.status === "not_waiting_for_reply") {
-          await thread.post(
-            toSlackMessage("Engineer is not currently waiting for a reply.")
-          );
-        } else if (reply.status === "accepted") {
-          setThreadMode(threadKey, { mode: "eng", modelPreference, budgetMode });
-        }
-        return;
-      } catch (error) {
-        await thread.post(
-          toSlackMessage(formatErrorForSlack(error, "Engineer flow request failed"))
-        );
-        return;
-      }
-    }
-
-    const previousHarness =
-      previous?.mode === "default" && isHarness(previous.modelPreference)
-        ? previous.modelPreference
-        : null;
-    const harness = parsed.harness ?? previousHarness ?? "amp";
-    setThreadMode(threadKey, { mode: "default", modelPreference: harness, budgetMode: null });
     try {
       const instruction = parsed.cleanedText;
       if (!isFirstMessage) {
@@ -491,7 +348,7 @@ function createBot() {
       }
 
       await thread.startTyping("Spawning agent...");
-      await spawn(threadKey, harness, undefined, requestId);
+      await spawn(threadKey, harness, engine, undefined, requestId);
 
       await thread.startTyping("Running...");
       let threadHistory = "";
@@ -499,9 +356,14 @@ function createBot() {
         const { channel, threadTs } = splitThreadKey(threadKey);
         threadHistory = await fetchThreadHistory(channel, threadTs);
       }
-      const message = isFirstMessage
+
+      let message = isFirstMessage
         ? buildSessionContext(threadKey) + threadHistory + instruction
         : instruction;
+
+      if (budgetMode) {
+        message = `[budget: ${budgetMode}]\n\n${message}`;
+      }
 
       const stopProgress = watchProgress(threadKey, (status) => {
         thread.startTyping(status).catch(() => {});
@@ -520,6 +382,8 @@ function createBot() {
               files.length > 0 ? files : undefined,
               userId,
               "slack",
+              model,
+              engine,
             );
             break;
           } catch (error) {
@@ -537,7 +401,7 @@ function createBot() {
       let finalMessage = result;
       if (isFirstMessage) {
         const viewerUrl = `${THREAD_VIEWER_URL}/${encodeURIComponent(normalizeThreadKey(threadKey))}`;
-        finalMessage = `[🔗 Thread Viewer](${viewerUrl})\n\n` + finalMessage;
+        finalMessage = `[Thread Viewer](${viewerUrl})\n\n` + finalMessage;
       }
       if (finalMessage.trim()) {
         await thread.post(toSlackMessage(finalMessage));
@@ -564,7 +428,6 @@ function createBot() {
     if (!message.isMention) {
       const text = (message.text || "").trim();
       const threadKey = normalizeThreadKey(thread.id);
-      const knownMode = threadModes.get(threadKey)?.mode;
       const files: FileAttachment[] = (attachments || [])
         .filter((a): a is { url: string; name: string } => !!a.url && !!a.name)
         .map((a) => ({ url: a.url, name: a.name }));
@@ -575,44 +438,6 @@ function createBot() {
         text,
         threadId: thread.id,
       });
-
-      try {
-        const reply = await replyEngineerFlow(
-          threadKey,
-          text,
-          files.length > 0 ? files : undefined,
-          {
-            source: "slack_subscribed_message",
-            userId: message.author.userId,
-            messageId,
-          },
-        );
-        if (reply.status === "accepted") return;
-        if (reply.status === "not_waiting_for_reply") {
-          if (knownMode === "eng") {
-            await thread.post(
-              toSlackMessage("Engineer is not currently waiting for a reply.")
-            );
-          }
-          return;
-        }
-        if (reply.status === "no_active_session" && knownMode === "eng") {
-          threadModes.delete(threadKey);
-          await thread.post(
-            toSlackMessage("No active engineer session for this thread. Start a new run with `--eng`.")
-          );
-        }
-      } catch (error) {
-        console.warn("engineer_plain_reply_failed", {
-          thread: threadKey,
-          error: error instanceof Error ? error.message : String(error),
-        });
-        if (knownMode === "eng") {
-          await thread.post(
-            toSlackMessage("Could not deliver your reply to engineer right now. Please retry.")
-          );
-        }
-      }
 
       const contextText = text || "Shared attachment in thread.";
       try {

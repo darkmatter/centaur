@@ -5,7 +5,7 @@ import { ArrowUp, Loader2, Square } from "lucide-react";
 import { useHasHover } from "@/hooks/use-media-query";
 import { cn } from "@/lib/utils";
 
-type InputMode = "idle" | "running" | "waiting" | "error";
+type InputMode = "idle" | "running" | "error";
 
 type MessageInputProps = {
   mode: InputMode;
@@ -22,7 +22,6 @@ const MAX_HEIGHT = MAX_ROWS * LINE_HEIGHT + PADDING_Y;
 const PLACEHOLDERS: Record<InputMode, string> = {
   idle: "Send a message\u2026",
   running: "Agent is working\u2026",
-  waiting: "Reply to engineer\u2026",
   error: "Retry with new instructions\u2026",
 };
 
@@ -175,11 +174,6 @@ export function MessageInput({ mode, onSend, onStop, className }: MessageInputPr
               <span className="size-1.5 rounded-full bg-primary animate-pulse" />
               Working…
               {onStop && <span className="ml-1 text-muted-foreground/40">Press <kbd className="px-1 py-0.5 rounded border border-border/50 text-[9px] font-mono">S</kbd> to stop</span>}
-            </span>
-          ) : mode === "waiting" ? (
-            <span className="inline-flex items-center gap-1.5">
-              <span className="size-1.5 rounded-full bg-amber-400" />
-              Awaiting reply
             </span>
           ) : mode === "error" ? (
             <span className="inline-flex items-center gap-1.5">

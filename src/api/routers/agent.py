@@ -24,8 +24,9 @@ router = APIRouter(
 
 class SpawnRequest(BaseModel):
     slack_thread_key: str
-    harness: str = "amp"
+    harness: str | None = None
     repo: str | None = None
+    engine: str | None = None
     request_id: str | None = None
 
 
@@ -37,11 +38,13 @@ class FileAttachment(BaseModel):
 class ExecuteRequest(BaseModel):
     slack_thread_key: str
     message: str
-    harness: str = "amp"
+    harness: str | None = None
     source: str | None = None
     repo: str | None = None
     request_id: str | None = None
     user_id: str | None = None
+    model: str | None = None
+    engine: str | None = None
     files: list[FileAttachment] = []
 
 
@@ -57,7 +60,7 @@ class InterruptRequest(BaseModel):
 async def spawn(req: SpawnRequest) -> dict[str, Any]:
     """Spawn a sandbox container for a Slack thread."""
     agent = get_agent()
-    return agent.spawn(req.slack_thread_key, req.harness, req.repo, req.request_id)
+    return agent.spawn(req.slack_thread_key, req.harness, req.repo, req.request_id, req.engine)
 
 
 @router.post("/execute")
@@ -76,6 +79,8 @@ async def execute(req: ExecuteRequest) -> dict[str, Any]:
         files,
         None,
         req.user_id,
+        req.model,
+        req.engine,
     )
 
 
@@ -98,6 +103,8 @@ async def execute_stream(req: ExecuteRequest) -> StreamingResponse:
                 files,
                 emit=q.put,
                 user_id=req.user_id,
+                model=req.model,
+                engine=req.engine,
             )
         except Exception as e:
             q.put({"type": "error", "message": str(e)})

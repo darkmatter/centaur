@@ -32,7 +32,27 @@ if [ -n "${AGENT_REPO:-}" ] && [ -d "$HOME_DIR/github/$AGENT_REPO/.git" ]; then
     BRANCH="agent-$(date +%s)"
     git -C "$HOME_DIR/github/$AGENT_REPO" worktree add "$HOME_DIR/workspace" -b "$BRANCH" HEAD --quiet
 fi
-[ -f "$HOME_DIR/AGENTS.md" ] && [ -d "$HOME_DIR/workspace" ] && cp "$HOME_DIR/AGENTS.md" "$HOME_DIR/workspace/AGENTS.md" 2>/dev/null || true
+
+# ── Select system prompt based on persona ────────────────────────────────────
+PERSONA_UPPER="$(echo "${AGENT_PERSONA:-}" | tr '[:lower:]' '[:upper:]')"
+BASE_PROMPT="$HOME_DIR/AGENTS.md"
+PERSONA_PROMPT="$HOME_DIR/AGENTS_${PERSONA_UPPER}.md"
+TARGET_PROMPT="$HOME_DIR/workspace/AGENTS.md"
+if [ -d "$HOME_DIR/workspace" ] && [ -f "$BASE_PROMPT" ]; then
+    if [ -n "$PERSONA_UPPER" ] && [ -f "$PERSONA_PROMPT" ]; then
+        {
+            echo "# Persona Overlay: ${PERSONA_UPPER}"
+            echo
+            cat "$PERSONA_PROMPT"
+            echo
+            echo "---"
+            echo
+            cat "$BASE_PROMPT"
+        } > "$TARGET_PROMPT" 2>/dev/null || true
+    else
+        cp "$BASE_PROMPT" "$TARGET_PROMPT" 2>/dev/null || true
+    fi
+fi
 
 # Signal readiness
 touch "$HOME_DIR/.ready"

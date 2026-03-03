@@ -1,49 +1,67 @@
-import { apiPost, apiGet, ApiError, API_URL, API_KEY } from "./api-client";
+import { apiPost, ApiError, API_URL, API_KEY } from "./api-client";
 
-export type Harness = "amp" | "claude-code" | "codex" | "pi-mono";
-export type AgentMode = "default" | "eng";
+export type Engine = "amp" | "claude-code" | "codex" | "pi-mono";
+export type Harness = Engine | "eng";
 export type BudgetMode = "simple" | "auto" | "complex";
 export type FileAttachment = { url: string; name: string };
 export type ExecuteSource = "slack" | "thread_ui" | "api";
 
 export type RunOptions = {
-  mode: AgentMode;
-  harness: Harness | null;
-  modelPreference: string | null;
+  harness: Harness;
+  engine: Engine | null;
+  model: string | null;
   budgetMode: BudgetMode | null;
   cleanedText: string;
-  modeExplicit: boolean;
   harnessExplicit: boolean;
+  engineExplicit: boolean;
   budgetExplicit: boolean;
 };
 
 export function extractRunOptions(text: string): RunOptions {
   let cleaned = text;
-  let mode: AgentMode = "default";
-  let harness: Harness | null = null;
-  let modelPreference: string | null = null;
+  let harness: Harness = "amp";
+  let engine: Engine | null = null;
+  let model: string | null = null;
   let budgetMode: BudgetMode | null = null;
-  let modeExplicit = false;
   let harnessExplicit = false;
+  let engineExplicit = false;
   let budgetExplicit = false;
 
-  const modeRegex = /(^|\s)--eng(?=\s|$)/i;
-  if (modeRegex.test(cleaned)) {
-    mode = "eng";
-    modeExplicit = true;
-    cleaned = cleaned.replace(/(^|\s)--eng(?=\s|$)/gi, " ");
+  const applyHarness = (value: Harness): void => {
+    if (value === "eng") {
+      harness = "eng";
+      harnessExplicit = true;
+      return;
+    }
+    if (harness === "eng") {
+      engine = value;
+      engineExplicit = true;
+      return;
+    }
+    harness = value;
+    harnessExplicit = true;
+    engine = null;
+    engineExplicit = false;
+  };
+
+  // --eng flag → harness="eng"
+  const engRegex = /(^|\s)--eng(?=\s|$)/gi;
+  if (engRegex.test(cleaned)) {
+    applyHarness("eng");
+    cleaned = cleaned.replace(engRegex, " ");
+    engRegex.lastIndex = 0;
   }
 
-  const kvMatch = cleaned.match(/\bharness\s*=\s*(amp|claude-code|codex|pi-mono)\b/i);
+  // harness=<value> key-value
+  const kvMatch = cleaned.match(/\bharness\s*=\s*(amp|claude-code|codex|pi-mono|eng)\b/i);
   if (kvMatch) {
-    harness = kvMatch[1].toLowerCase() as Harness;
-    modelPreference = harness;
-    harnessExplicit = true;
+    applyHarness(kvMatch[1].toLowerCase() as Harness);
     cleaned = (
       cleaned.slice(0, kvMatch.index) + cleaned.slice(kvMatch.index! + kvMatch[0].length)
     ).trim();
   }
 
+  // Harness flags: --amp, --claude, --codex, --pi
   const harnessFlags: Array<{ regex: RegExp; value: Harness }> = [
     { regex: /(^|\s)--amp(?=\s|$)/gi, value: "amp" },
     { regex: /(^|\s)--claude(?=\s|$)/gi, value: "claude-code" },
@@ -56,39 +74,62 @@ export function extractRunOptions(text: string): RunOptions {
     const matched = regex.test(cleaned);
     regex.lastIndex = 0;
     if (matched) {
-      harness = value;
-      modelPreference = value;
-      harnessExplicit = true;
+      applyHarness(value);
       cleaned = cleaned.replace(regex, " ");
       regex.lastIndex = 0;
     }
   }
 
+  // --engine <harness> flag
   const engineFlagMatch = cleaned.match(
     /(^|\s)--engine\s+(amp|claude-code|codex|pi-mono)(?=\s|$)/i
   );
   if (engineFlagMatch) {
-    harness = engineFlagMatch[2].toLowerCase() as Harness;
-    modelPreference = harness;
-    harnessExplicit = true;
+    const parsedEngine = engineFlagMatch[2].toLowerCase() as Engine;
+    if ((harness as Harness) === "eng") {
+      engine = parsedEngine;
+      engineExplicit = true;
+    } else {
+      harness = parsedEngine;
+      harnessExplicit = true;
+    }
     cleaned = cleaned.replace(engineFlagMatch[0], " ");
   }
 
+  // Model shortcuts: --opus, --sonnet, --haiku
+  const modelShortcuts: Array<{ regex: RegExp; value: string }> = [
+    { regex: /(^|\s)--opus(?=\s|$)/gi, value: "opus" },
+    { regex: /(^|\s)--sonnet(?=\s|$)/gi, value: "sonnet" },
+    { regex: /(^|\s)--haiku(?=\s|$)/gi, value: "haiku" },
+  ];
+  for (const { regex, value } of modelShortcuts) {
+    const matched = regex.test(cleaned);
+    regex.lastIndex = 0;
+    if (matched) {
+      model = value;
+      cleaned = cleaned.replace(regex, " ");
+      regex.lastIndex = 0;
+    }
+  }
+
+  // model=<value> key-value
   const modelEqMatch = cleaned.match(/\bmodel\s*=\s*([A-Za-z0-9._-]+)\b/i);
   if (modelEqMatch) {
-    modelPreference = modelEqMatch[1];
+    model = modelEqMatch[1];
     cleaned = (
       cleaned.slice(0, modelEqMatch.index) +
       cleaned.slice(modelEqMatch.index! + modelEqMatch[0].length)
     ).trim();
   }
 
+  // --model <value> flag
   const modelFlagMatch = cleaned.match(/(^|\s)--model\s+([A-Za-z0-9._-]+)(?=\s|$)/i);
   if (modelFlagMatch) {
-    modelPreference = modelFlagMatch[2];
+    model = modelFlagMatch[2];
     cleaned = cleaned.replace(modelFlagMatch[0], " ");
   }
 
+  // Budget mode: mode=<value>
   const modeEqMatch = cleaned.match(/\bmode\s*=\s*(simple|auto|complex)\b/i);
   if (modeEqMatch) {
     budgetMode = modeEqMatch[1].toLowerCase() as BudgetMode;
@@ -98,6 +139,7 @@ export function extractRunOptions(text: string): RunOptions {
     ).trim();
   }
 
+  // Budget flags: --simple, --fast, --auto, --complex, --deep
   const budgetFlags: Array<{ regex: RegExp; value: BudgetMode }> = [
     { regex: /(^|\s)--simple(?=\s|$)/gi, value: "simple" },
     { regex: /(^|\s)--fast(?=\s|$)/gi, value: "simple" },
@@ -119,13 +161,13 @@ export function extractRunOptions(text: string): RunOptions {
 
   cleaned = cleaned.replace(/\s+/g, " ").trim();
   return {
-    mode,
     harness,
-    modelPreference,
+    engine,
+    model,
     budgetMode,
     cleanedText: cleaned,
-    modeExplicit,
     harnessExplicit,
+    engineExplicit,
     budgetExplicit,
   };
 }
@@ -133,12 +175,14 @@ export function extractRunOptions(text: string): RunOptions {
 export async function spawn(
   threadKey: string,
   harness: Harness = "amp",
+  engine?: Engine | null,
   repo?: string,
   requestId?: string
 ): Promise<{ sessionId: string; status: string }> {
   const result = await apiPost("/agent/spawn", {
     slack_thread_key: threadKey,
     harness,
+    ...(engine ? { engine } : {}),
     ...(repo ? { repo } : {}),
     ...(requestId ? { request_id: requestId } : {}),
   }, { timeoutMs: 30_000 });
@@ -151,19 +195,23 @@ export async function spawn(
 export async function execute(
   threadKey: string,
   message: string,
-  harness: Harness = "amp",
+  harness?: Harness | null,
   requestId?: string,
   files?: FileAttachment[],
   userId?: string,
   source: ExecuteSource = "slack",
+  model?: string | null,
+  engine?: Engine | null,
 ): Promise<string> {
   const result = await apiPost("/agent/execute", {
     slack_thread_key: threadKey,
     message,
-    harness,
+    ...(harness ? { harness } : {}),
+    ...(engine ? { engine } : {}),
     ...(requestId ? { request_id: requestId } : {}),
     ...(files && files.length > 0 ? { files } : {}),
     ...(userId ? { user_id: userId } : {}),
+    ...(model ? { model } : {}),
     source,
   });
   if (typeof result.error === "string" && result.error.trim()) {
@@ -212,53 +260,6 @@ export async function postThreadContextMessage(
   };
   const result = await apiPost("/api/threads/context-message", payload, { timeoutMs: 30_000 });
   return { status: String(result.status ?? "accepted") };
-}
-
-export async function startEngineerFlow(
-  threadKey: string,
-  task: string,
-  modelPreference?: string | null,
-  budgetMode?: BudgetMode | null,
-  attachments?: FileAttachment[]
-): Promise<{ status: string; runId?: string; error?: string }> {
-  const normalizedThreadKey = normalizeThreadKey(threadKey);
-  const { channel, threadTs } = splitThreadKey(normalizedThreadKey);
-  const result = await apiPost("/slack/start", {
-    thread_key: normalizedThreadKey,
-    channel,
-    thread_ts: threadTs,
-    task,
-    model_preference: modelPreference ?? null,
-    budget_mode: budgetMode ?? null,
-    ...(attachments && attachments.length > 0 ? { attachments } : {}),
-  }, { timeoutMs: 30_000 });
-  return {
-    status: (result.status as string) || "started",
-    runId: result.run_id as string | undefined,
-    error: result.error as string | undefined,
-  };
-}
-
-export async function replyEngineerFlow(
-  threadKey: string,
-  reply: string,
-  attachments?: FileAttachment[],
-  options?: {
-    source?: string;
-    userId?: string;
-    messageId?: string;
-  },
-): Promise<{ status: string }> {
-  const normalizedThreadKey = normalizeThreadKey(threadKey);
-  const result = await apiPost("/slack/reply", {
-    thread_key: normalizedThreadKey,
-    reply,
-    ...(attachments && attachments.length > 0 ? { attachments } : {}),
-    ...(options?.source ? { source: options.source } : {}),
-    ...(options?.userId ? { user_id: options.userId } : {}),
-    ...(options?.messageId ? { message_id: options.messageId } : {}),
-  }, { timeoutMs: 30_000 });
-  return { status: (result.status as string) || "accepted" };
 }
 
 export function splitThreadKey(threadKey: string): { channel: string; threadTs: string } {

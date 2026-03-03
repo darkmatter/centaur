@@ -18,7 +18,7 @@ export type TokenUsage = {
   model: string | null;
 };
 
-type SendRoute = "reply" | "execute";
+type SendRoute = "execute";
 
 function isActiveState(state: string | undefined): boolean {
   return state === "running" || state === "working";

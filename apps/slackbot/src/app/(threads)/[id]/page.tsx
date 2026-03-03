@@ -52,11 +52,9 @@ export default function ThreadDetailPage() {
   const [sidebarThreads, setSidebarThreads] = useState<ThreadSummary[]>([]);
   const closeInfoSheet = useCallback(() => setInfoOpen(false), []);
   const closeDrawer = useCallback(() => setDrawerOpen(false), []);
-  const isEngineer = thread?.harness === "engineer";
-  const isWaiting = thread?.state === "waiting";
   const isRunning = thread?.state === "running" || thread?.state === "working";
   const isStreaming = chatStatus === "submitted" || chatStatus === "streaming";
-  const canInterrupt = !!thread && !isEngineer && isRunning;
+  const canInterrupt = !!thread && isRunning;
   const activeTurnStartedAt =
     thread && thread.turns.length > 0 ? thread.turns[thread.turns.length - 1]?.started_at : null;
   const elapsedAnchor = isRunning ? activeTurnStartedAt : thread?.last_activity;
@@ -72,7 +70,6 @@ export default function ThreadDetailPage() {
   const retryMessage = latestUserMessage || "Please retry the previous request.";
 
   const inputMode = isRunning ? "running" as const
-    : isWaiting ? "waiting" as const
     : thread?.state === "error" ? "error" as const
     : "idle" as const;
 
@@ -104,14 +101,13 @@ export default function ThreadDetailPage() {
 
   const handleSendMessage = useCallback(
     async (text: string) => {
-      const route = isEngineer && isWaiting ? "reply" : "execute";
-      if (route === "execute" && canInterrupt) {
+      if (canInterrupt) {
         const interrupted = await interruptRun();
         if (!interrupted) return;
       }
-      await sendThreadMessage(text, route);
+      await sendThreadMessage(text, "execute");
     },
-    [canInterrupt, interruptRun, isEngineer, isWaiting, sendThreadMessage],
+    [canInterrupt, interruptRun, sendThreadMessage],
   );
 
   const handleStopAgent = useCallback(async () => {
@@ -183,8 +179,6 @@ export default function ThreadDetailPage() {
     const previousTitle = document.title;
     if (threadState === "working" || threadState === "running") {
       document.title = `Working - ${humanName}`;
-    } else if (threadState === "waiting") {
-      document.title = `Input needed - ${humanName}`;
     } else if (threadState === "error") {
       document.title = `Error - ${humanName}`;
     } else {
@@ -244,8 +238,7 @@ export default function ThreadDetailPage() {
         liveElapsed={liveElapsed}
         stableStatus={stableStatus}
         isRunning={isRunning}
-        isWaiting={isWaiting}
-        isEngineer={isEngineer}
+        isEng={thread?.harness === "eng" || thread?.harness === "engineer"}
         phases={phases}
         isReconnecting={isReconnecting}
         error={error}

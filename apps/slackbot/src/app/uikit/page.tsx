@@ -82,7 +82,7 @@ const SAMPLE_DASHBOARD: DashboardSpec = {
         { label: "Strategy", value: "Multi-Asset Crypto" },
         { label: "AUM", value: "1250000000", format: "compact-currency" as const },
         { label: "Inception Date", value: "2021-06-15", format: "date" as const },
-        { label: "Management Fee", value: "0.02", format: "percent" as const },
+        { label: "Management Fee", value: "2", format: "percent" as const },
         { label: "Status", value: "Active" },
       ],
     },

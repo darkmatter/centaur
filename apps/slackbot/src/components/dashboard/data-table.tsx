@@ -105,9 +105,8 @@ function cellAlignClass(col: ColumnDef) {
 
 function cellValueClass(col: ColumnDef, value: unknown) {
   if (col.format === "percent" && typeof value === "number") {
-    const n = Math.abs(value) < 1 ? value * 100 : value;
-    if (n > 0) return "text-primary";
-    if (n < 0) return "text-destructive";
+    if (value > 0) return "text-primary";
+    if (value < 0) return "text-destructive";
   }
   return "";
 }
@@ -220,7 +219,7 @@ export function DataTable({
   const renderRow = (row: Record<string, unknown>, idx: number, style?: React.CSSProperties) => (
     <tr
       key={idx}
-      className={`border-b border-border last:border-0 ${striped && idx % 2 === 1 ? "bg-muted/30" : ""}`}
+      className={`border-b border-border last:border-0 ${striped && idx % 2 === 1 ? "bg-muted/50" : ""}`}
       style={style}
     >
       {visibleCols.map((col) => (

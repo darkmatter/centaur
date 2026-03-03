@@ -16,7 +16,7 @@ export const Timeline = memo(function Timeline({
       {entries.length === 0 ? (
         <p className="py-6 text-center text-xs text-muted-foreground">No timeline items found</p>
       ) : (
-        <ol className="relative border-l border-border ml-2">
+        <ol className="relative border-l border-border ml-2 pt-1.5">
           {entries.map((entry, i) => (
             <li key={i} className="mb-4 ml-4 last:mb-0">
               <div className="absolute -left-1.5 mt-1.5 h-3 w-3 rounded-full border-2 border-background bg-muted-foreground" />

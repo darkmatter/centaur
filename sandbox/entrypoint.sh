@@ -2,8 +2,6 @@
 set -e
 
 HOME_DIR="$(eval echo ~)"
-MCP_URL="${AI_V2_API_URL:-http://localhost:8000}/mcp/"
-MCP_KEY="${AI_V2_API_KEY:-}"
 
 # ── Write harness configs (no MCP — adds ~10s startup overhead) ───────────────
 cat > "$HOME_DIR/.config/amp/settings.json" <<EOF
@@ -21,10 +19,26 @@ cat > "$HOME_DIR/.pi/agent/settings.json" <<EOF
 }
 EOF
 
-# ── Writable worktree ────────────────────────────────────────────────────────
-if [ -n "${AGENT_REPO:-}" ] && [ -d "$HOME_DIR/github/$AGENT_REPO/.git" ]; then
-    BRANCH="agent-$(date +%s)"
-    git -C "$HOME_DIR/github/$AGENT_REPO" worktree add "$HOME_DIR/workspace" -b "$BRANCH" HEAD --quiet
+# ── Per-session workspace clone (no shared worktree metadata) ────────────────
+WORKSPACE_DIR="$HOME_DIR/workspace"
+if [ -n "${AGENT_REPO:-}" ]; then
+    REPO_PATH="$HOME_DIR/github/$AGENT_REPO"
+    if ! git -C "$REPO_PATH" rev-parse --git-dir >/dev/null 2>&1; then
+        echo "AGENT_REPO is not a valid git repository: $REPO_PATH" >&2
+        exit 1
+    fi
+
+    rm -rf "$WORKSPACE_DIR"
+    if ! git clone --quiet --shared "$REPO_PATH" "$WORKSPACE_DIR"; then
+        echo "shared clone failed for $REPO_PATH; retrying with regular clone" >&2
+        rm -rf "$WORKSPACE_DIR"
+        git clone --quiet "$REPO_PATH" "$WORKSPACE_DIR"
+    fi
+
+    BRANCH="agent-$(date +%s)-${RANDOM}-${RANDOM}"
+    git -C "$WORKSPACE_DIR" checkout -q -b "$BRANCH" || true
+else
+    mkdir -p "$WORKSPACE_DIR"
 fi
 
 # ── Select system prompt based on persona ────────────────────────────────────

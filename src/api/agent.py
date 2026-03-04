@@ -12,7 +12,6 @@ import json
 import os
 import re
 import socket
-import subprocess
 import tarfile
 import threading
 import time
@@ -40,13 +39,15 @@ HARNESS_CONFIG: dict[str, dict[str, str]] = {
     "eng": {
         "engine": "claude-code",
         "persona": "eng",
-        "repo": os.getenv("ENGINEER_DEFAULT_REPO", "paradigmxyz/ai_v2"),
     },
     "legal": {
         "engine": "claude-code",
         "persona": "legal",
-        "repo": os.getenv("LEGAL_DEFAULT_REPO", "paradigmxyz/ai_v2"),
     },
+}
+HARNESS_DEFAULT_REPOS: dict[str, str] = {
+    # Eng defaults into the main repo for code-oriented workflows.
+    "eng": os.getenv("ENGINEER_DEFAULT_REPO", "paradigmxyz/ai_v2"),
 }
 
 MODEL_SHORTCUTS: dict[str, str] = {
@@ -66,6 +67,20 @@ def _is_valid_engine(value: str | None) -> bool:
     return bool(value) and value in ENGINES
 
 
+def _normalize_repo_path(value: str | None) -> str | None:
+    """Normalize a repo path relative to REPOS_HOST_DIR."""
+    raw = (value or "").strip().replace("\\", "/")
+    if not raw:
+        return None
+
+    parts = [part for part in raw.split("/") if part and part != "."]
+    if not parts or any(part == ".." for part in parts):
+        raise RuntimeError(
+            "Invalid repo path. Use a relative path like 'org/repo' inside REPOS_HOST_DIR."
+        )
+    return "/".join(parts)
+
+
 def _resolve_run_profile(
     harness: str,
     engine: str | None = None,
@@ -78,7 +93,7 @@ def _resolve_run_profile(
     config = HARNESS_CONFIG.get(harness, {})
     persona = config.get("persona")
     default_engine = config.get("engine", harness)
-    default_repo = config.get("repo")
+    default_repo = HARNESS_DEFAULT_REPOS.get(harness)
 
     normalized_engine = (engine or "").strip() or None
     if normalized_engine and not _is_valid_engine(normalized_engine):
@@ -94,7 +109,8 @@ def _resolve_run_profile(
             )
         effective_engine = harness
 
-    effective_repo = (repo or "").strip() or default_repo
+    requested_repo = (repo or "").strip() or default_repo
+    effective_repo = _normalize_repo_path(requested_repo)
     return effective_engine, persona, effective_repo
 
 # Max seconds of *idle* time (no output) before killing a hung exec.
@@ -1126,20 +1142,69 @@ def _docker_client() -> docker.DockerClient:
     return docker.from_env()
 
 
+def _container_recent_logs(container: Any, tail: int = 40, max_chars: int = 2000) -> str:
+    """Best-effort recent container logs for startup diagnostics."""
+    try:
+        raw = container.logs(tail=tail)
+    except Exception:
+        return ""
+    if isinstance(raw, (bytes, bytearray)):
+        text = raw.decode("utf-8", errors="replace")
+    else:
+        text = str(raw)
+    text = text.strip()
+    if not text:
+        return ""
+    if len(text) > max_chars:
+        text = text[-max_chars:]
+    return text
+
+
 def _wait_ready(container: Any, timeout: int = 15) -> float:
     """Wait for the entrypoint to signal readiness (touch ~/.ready).
 
-    Returns the number of seconds waited.
+    Returns the number of seconds waited. Raises if container exits before ready.
     """
     t0 = time.monotonic()
     deadline = t0 + timeout
     while time.monotonic() < deadline:
-        exit_code, _ = container.exec_run(["test", "-f", "/home/agent/.ready"], demux=False)
+        with contextlib.suppress(Exception):
+            container.reload()
+        status = str(getattr(container, "status", "") or "")
+        if status and status not in {"created", "running"}:
+            logs = _container_recent_logs(container)
+            detail = f"sandbox exited before ready (status={status})"
+            if logs:
+                detail += f"; last logs: {logs}"
+            raise RuntimeError(detail)
+        try:
+            exit_code, _ = container.exec_run(["test", "-f", "/home/agent/.ready"], demux=False)
+        except Exception as exc:
+            with contextlib.suppress(Exception):
+                container.reload()
+            status = str(getattr(container, "status", "") or "")
+            if status and status != "running":
+                logs = _container_recent_logs(container)
+                detail = f"sandbox unavailable before ready (status={status}); probe error: {exc}"
+                if logs:
+                    detail += f"; last logs: {logs}"
+                raise RuntimeError(detail) from exc
+            time.sleep(0.1)
+            continue
         if exit_code == 0:
             return round(time.monotonic() - t0, 3)
         time.sleep(0.1)
-    log.warning("container_ready_timeout", timeout=timeout)
-    return round(time.monotonic() - t0, 3)
+    with contextlib.suppress(Exception):
+        container.reload()
+    status = str(getattr(container, "status", "") or "")
+    logs = _container_recent_logs(container)
+    log.warning("container_ready_timeout", timeout=timeout, status=status)
+    detail = f"sandbox readiness timed out after {timeout}s"
+    if status:
+        detail += f" (status={status})"
+    if logs:
+        detail += f"; last logs: {logs}"
+    raise TimeoutError(detail)
 
 
 def _image() -> str:
@@ -1163,9 +1228,16 @@ def _create_container(
     Returns (container, timings_dict).
     """
     t0 = time.monotonic()
-    workdir = "/home/agent/workspace" if repo else "/home/agent/github"
+    # Keep container startup cwd stable; workspace is prepared in entrypoint.
+    workdir = "/home/agent"
     env = _container_env()
+    repos_dir = os.path.abspath(_repos_host_dir())
     if repo:
+        repo_host_path = os.path.abspath(os.path.join(repos_dir, repo))
+        if os.path.commonpath([repo_host_path, repos_dir]) != repos_dir:
+            raise RuntimeError(
+                f"Invalid repo path '{repo}'. Repo must be within REPOS_HOST_DIR ({repos_dir})."
+            )
         env.append(f"AGENT_REPO={repo}")
     if persona:
         env.append(f"AGENT_PERSONA={persona}")
@@ -1180,15 +1252,8 @@ def _create_container(
         **(extra_labels or {}),
     }
     volumes = {
-        _repos_host_dir(): {"bind": "/home/agent/github", "mode": "ro"},
+        repos_dir: {"bind": "/home/agent/github", "mode": "ro"},
     }
-    # When a repo is specified, the entrypoint creates a writable worktree
-    # from the read-only bare repo.  Mount just that repo rw so git worktree
-    # can write back (lock files, refs).  Everything else stays read-only.
-    if repo:
-        repo_host_path = os.path.join(_repos_host_dir(), repo)
-        if os.path.isdir(repo_host_path):
-            volumes[repo_host_path] = {"bind": f"/home/agent/github/{repo}", "mode": "rw"}
     vol = os.getenv("FIREWALL_CERTS_VOLUME", "firewall-certs")
     volumes[vol] = {"bind": "/firewall-certs", "mode": "ro"}
     container = client.containers.run(
@@ -1767,6 +1832,15 @@ class AgentClient:
                     persona=persona,
                 )
             except Exception as exc:
+                error_text = str(exc)
+                lower_error = error_text.lower()
+                hint = ""
+                if "mounts denied" in lower_error or "is not shared from the host" in lower_error:
+                    hint = " Check REPOS_HOST_DIR mount and Docker host path sharing."
+                elif "is not a valid git repository" in lower_error:
+                    hint = " Check the requested repo path and REPOS_HOST_DIR contents."
+                elif "is not running" in lower_error or "exited before ready" in lower_error:
+                    hint = " Sandbox exited during startup; check sandbox entrypoint workspace bootstrap."
                 log.warning(
                     "spawn_container_create_failed",
                     request_id=rid,
@@ -1774,13 +1848,13 @@ class AgentClient:
                     harness=requested_harness,
                     engine=effective_engine,
                     repo=effective_repo,
-                    error=str(exc),
+                    error=error_text,
                 )
                 return {
                     "error": (
-                        "Failed to start sandbox container. "
-                        "Check REPOS_HOST_DIR mount and Docker host path sharing. "
-                        f"Details: {exc}"
+                        "Failed to start sandbox container."
+                        f"{hint} "
+                        f"Details: {error_text}"
                     )
                 }
             log.info(
@@ -2075,6 +2149,7 @@ class AgentClient:
                 cmd,
                 stdout=True,
                 stderr=True,
+                workdir="/home/agent/workspace",
             )["Id"]
 
             _emit(
@@ -2454,17 +2529,6 @@ class AgentClient:
         client = _docker_client()
         try:
             container = client.containers.get(session["container_id"])
-            # Clean up git worktree before removing the container
-            repo = container.labels.get("ai2.repo", "")
-            if repo:
-                repos_dir = _repos_host_dir()
-                repo_path = os.path.join(repos_dir, repo)
-                if os.path.isdir(repo_path):
-                    subprocess.run(
-                        ["git", "-C", repo_path, "worktree", "prune"],
-                        capture_output=True,
-                        timeout=10,
-                    )
             container.stop(timeout=5)
             container.remove()
         except Exception:

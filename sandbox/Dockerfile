@@ -75,6 +75,6 @@ COPY --chown=agent:agent SYSTEM_PROMPT.md /home/agent/AGENTS.md
 COPY --chown=agent:agent SYSTEM_PROMPT_ENG.md /home/agent/AGENTS_ENG.md
 COPY --chown=agent:agent SYSTEM_PROMPT_LEGAL.md /home/agent/AGENTS_LEGAL.md
 
-WORKDIR /home/agent/workspace
+WORKDIR /home/agent
 ENTRYPOINT ["/entrypoint.sh"]
 CMD ["bash"]

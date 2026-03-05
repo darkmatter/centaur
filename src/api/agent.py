@@ -2223,9 +2223,12 @@ class AgentClient:
         slot_acquired = False
         execute_lock = get_execute_lock(resolved_thread_key)
         if not execute_lock.acquire(blocking=False):
-            return {
-                "error": "A run is already in progress for this thread. Wait for it to finish first."
-            }
+            log.info("exec_interrupt_existing", thread=resolved_thread_key, request_id=rid)
+            self.interrupt(resolved_thread_key)
+            if not execute_lock.acquire(blocking=True, timeout=60):
+                return {
+                    "error": "Failed to interrupt the running execution in time."
+                }
 
         try:
             found = _find_session_for_thread(resolved_thread_key) or _rehydrate_session_for_thread(
@@ -2236,9 +2239,9 @@ class AgentClient:
                 resolved_thread_key, session = found
                 actor_key = _execution_actor_key(user_id, source_tag, resolved_thread_key)
             if session and session.get("state") == "working":
-                return {
-                    "error": "A run is already in progress for this thread. Wait for it to finish first."
-                }
+                log.warning("exec_stale_working_state", thread=resolved_thread_key, request_id=rid)
+                with _sessions_lock:
+                    session["state"] = "idle"
 
             requested_harness = (harness or "").strip() or (
                 str(session.get("harness") or "amp") if session else "amp"

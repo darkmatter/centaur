@@ -41,6 +41,8 @@ const RETRY_DEFAULTS_MAX = 4;
 
 const THREAD_VIEWER_URL = process.env.THREAD_VIEWER_URL || "https://svc-ai.paradigm.xyz";
 const MAX_TRACKED_THREAD_MODES = 500;
+const MAX_TRACKED_MENTION_DELIVERIES = 5000;
+const MENTION_DELIVERY_TTL_MS = 10 * 60 * 1000;
 const SLACK_BOT_USERNAME = process.env.SLACK_BOT_USERNAME || "paradigm-ai";
 
 type MarkdownNode = Root | Root["children"][number];
@@ -330,6 +332,37 @@ function createBot() {
     state: process.env.REDIS_URL ? createRedisState() : createMemoryState(),
   });
   const threadConfigs = new Map<string, ThreadConfig>();
+  const recentMentionDeliveries = new Map<string, number>();
+
+  function claimMentionDelivery(
+    threadId: string,
+    message: { ts?: string; id?: string },
+  ): boolean {
+    const ts = String(message.ts || "").trim();
+    const deliveryId = ts || String(message.id || "").trim();
+    if (!deliveryId) return true;
+    const threadKey = normalizeThreadKey(threadId);
+    const claimKey = `${threadKey}:${deliveryId}`;
+    const now = Date.now();
+
+    for (const [key, seenAt] of recentMentionDeliveries) {
+      if (now - seenAt > MENTION_DELIVERY_TTL_MS) {
+        recentMentionDeliveries.delete(key);
+      }
+    }
+
+    if (recentMentionDeliveries.has(claimKey)) {
+      return false;
+    }
+
+    if (recentMentionDeliveries.size >= MAX_TRACKED_MENTION_DELIVERIES) {
+      const oldestKey = recentMentionDeliveries.keys().next().value as string | undefined;
+      if (oldestKey) recentMentionDeliveries.delete(oldestKey);
+    }
+
+    recentMentionDeliveries.set(claimKey, now);
+    return true;
+  }
 
   function setThreadConfig(threadKey: string, config: ThreadConfig): void {
     if (threadConfigs.has(threadKey)) {
@@ -525,6 +558,17 @@ function createBot() {
   bot.onNewMention(async (thread, message) => {
     if (message.author.isMe) return;
     if (message.author.isBot) return;
+    if (!claimMentionDelivery(thread.id, {
+      ts: (message as { ts?: string }).ts,
+      id: (message as { id?: string }).id,
+    })) {
+      console.info("duplicate_mention_ignored", {
+        thread: normalizeThreadKey(thread.id),
+        handler: "onNewMention",
+        ts: (message as { ts?: string }).ts || "",
+      });
+      return;
+    }
     await thread.subscribe();
     const attachments = message.attachments?.map((a) => ({ url: a.url, name: a.name }));
     await handleMessage(thread, message.text, true, attachments, message.author.userId);
@@ -562,6 +606,17 @@ function createBot() {
           error: error instanceof Error ? error.message : String(error),
         });
       }
+      return;
+    }
+    if (!claimMentionDelivery(thread.id, {
+      ts: (message as { ts?: string }).ts,
+      id: (message as { id?: string }).id,
+    })) {
+      console.info("duplicate_mention_ignored", {
+        thread: normalizeThreadKey(thread.id),
+        handler: "onSubscribedMessage",
+        ts: (message as { ts?: string }).ts || "",
+      });
       return;
     }
     await handleMessage(thread, message.text, false, attachments, message.author.userId);

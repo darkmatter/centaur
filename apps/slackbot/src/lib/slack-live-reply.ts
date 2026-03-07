@@ -4,6 +4,22 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+type SlackBlock = Record<string, unknown>;
+
+function viewerActionBlock(viewerUrl: string): SlackBlock {
+  return {
+    type: "actions",
+    elements: [
+      {
+        type: "button",
+        text: { type: "plain_text", text: "Thread Viewer", emoji: true },
+        url: viewerUrl,
+        action_id: "open_thread_viewer",
+      },
+    ],
+  };
+}
+
 export class SlackLiveReply {
   private channel: string;
   private threadTs: string;
@@ -13,6 +29,7 @@ export class SlackLiveReply {
   private flushTimer: ReturnType<typeof setTimeout> | null = null;
   private inFlightFlush: Promise<void> | null = null;
   private disposed = false;
+  private viewerUrl: string | null = null;
 
   constructor(channel: string, threadTs: string, opts?: { flushIntervalMs?: number }) {
     this.channel = channel;
@@ -21,26 +38,17 @@ export class SlackLiveReply {
   }
 
   async start(initialText: string, opts?: { viewerUrl?: string }): Promise<void> {
+    if (opts?.viewerUrl) this.viewerUrl = opts.viewerUrl;
     const payload: Record<string, unknown> = {
       channel: this.channel,
       thread_ts: this.threadTs,
       text: initialText,
       unfurl_links: false,
     };
-    if (opts?.viewerUrl) {
+    if (this.viewerUrl) {
       payload.blocks = [
         { type: "section", text: { type: "mrkdwn", text: initialText } },
-        {
-          type: "actions",
-          elements: [
-            {
-              type: "button",
-              text: { type: "plain_text", text: "Thread Viewer", emoji: true },
-              url: opts.viewerUrl,
-              action_id: "open_thread_viewer",
-            },
-          ],
-        },
+        viewerActionBlock(this.viewerUrl),
       ];
     }
     const res = await this.slackApi("chat.postMessage", payload);
@@ -97,18 +105,21 @@ export class SlackLiveReply {
   }
 
   private async updateMessage(text: string): Promise<void> {
-    const res = await this.slackApi("chat.update", {
+    const payload: Record<string, unknown> = {
       channel: this.channel,
       ts: this.messageTs,
       text,
-    });
+    };
+    if (this.viewerUrl) {
+      payload.blocks = [
+        { type: "section", text: { type: "mrkdwn", text } },
+        viewerActionBlock(this.viewerUrl),
+      ];
+    }
+    const res = await this.slackApi("chat.update", payload);
     if (!res.ok && res.error === "ratelimited") {
       await sleep(2000);
-      await this.slackApi("chat.update", {
-        channel: this.channel,
-        ts: this.messageTs,
-        text,
-      });
+      await this.slackApi("chat.update", payload);
     }
   }
 

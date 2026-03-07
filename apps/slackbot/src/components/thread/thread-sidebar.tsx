@@ -12,7 +12,7 @@ import {
   useRef,
   useState,
 } from "react";
-import { ChevronLeft, ChevronRight, Plus, Search } from "lucide-react";
+import { ChevronLeft, ChevronRight, Plus, Search, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
@@ -264,40 +264,37 @@ export const ThreadSidebar = forwardRef<ThreadSidebarHandle, ThreadSidebarProps>
   return (
     <div className="flex h-full min-h-0 w-full flex-col" onKeyDown={handleListKeyDown}>
       <div className="border-b border-border/40 px-3 py-3">
-        <div className="flex items-center justify-between gap-2">
-          <h2 className="text-sm font-semibold tracking-tight text-foreground">Threads</h2>
-          <div className="flex items-center gap-1.5">
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <Button
-                  asChild
-                  variant="ghost"
-                  size="icon-sm"
-                  className="size-7"
-                  data-touch-target
-                >
-                  <Link href="/" onClick={() => onNavigate?.()}>
-                    <Plus className="size-4" />
-                  </Link>
-                </Button>
-              </TooltipTrigger>
-              <TooltipContent>New Session</TooltipContent>
-            </Tooltip>
-            {canToggle ? (
+        <div className="flex items-center gap-1.5">
+          <Tooltip>
+            <TooltipTrigger asChild>
               <Button
-                ref={toggleRef}
-                type="button"
-                onClick={() => onCollapsedChange?.(true)}
-                aria-label="Collapse sidebar"
+                asChild
                 variant="ghost"
                 size="icon-sm"
                 className="size-7"
                 data-touch-target
               >
-                <ChevronLeft className="size-4" />
+                <Link href="/" onClick={() => onNavigate?.()}>
+                  <Plus className="size-4" />
+                </Link>
               </Button>
-            ) : null}
-          </div>
+            </TooltipTrigger>
+            <TooltipContent>New Session</TooltipContent>
+          </Tooltip>
+          {canToggle ? (
+            <Button
+              ref={toggleRef}
+              type="button"
+              onClick={() => onCollapsedChange?.(true)}
+              aria-label="Collapse sidebar"
+              variant="ghost"
+              size="icon-sm"
+              className="size-7"
+              data-touch-target
+            >
+              <X className="size-4" />
+            </Button>
+          ) : null}
         </div>
         <div className="mt-2 relative">
           <label htmlFor={filterId} className="sr-only">

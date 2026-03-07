@@ -210,7 +210,7 @@ export async function execute(
   _continueSession: boolean = true,
 ): Promise<string> {
   const normalizedKey = normalizeThreadKey(threadKey);
-  const res = await resilientFetch(`${API_URL}/pipe/execute`, {
+  const res = await resilientFetch(`${API_URL}/agent/execute`, {
     method: "POST",
     body: JSON.stringify({
       thread_key: normalizedKey,
@@ -281,7 +281,7 @@ export async function interrupt(
   _requestId?: string,
 ): Promise<{ sessionId: string; status: string }> {
   const normalizedKey = normalizeThreadKey(threadKey);
-  const result = await apiPost("/pipe/stop", {
+  const result = await apiPost("/agent/stop", {
     thread_key: normalizedKey,
   }, { timeoutMs: 30_000 });
   return {

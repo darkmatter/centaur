@@ -13,8 +13,8 @@ from api.deps import verify_api_key
 from api.pipe_agent import get_or_spawn, get_status, stop_session, stream_exec
 
 router = APIRouter(
-    prefix="/pipe",
-    tags=["pipe"],
+    prefix="/agent",
+    tags=["agent"],
     dependencies=[Depends(verify_api_key)],
 )
 

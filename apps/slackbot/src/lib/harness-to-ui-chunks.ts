@@ -32,6 +32,27 @@ export function createConversionState(): ConversionState {
 // Helpers
 // ---------------------------------------------------------------------------
 
+function extractHandoffThreadKey(text: string): string {
+  try {
+    const parsed = JSON.parse(text);
+    if (typeof parsed === "object" && parsed !== null) {
+      const key =
+        parsed.newThreadID ||
+        parsed.new_thread_key ||
+        parsed.thread_key ||
+        parsed.slack_thread_key ||
+        parsed.newThreadId;
+      if (typeof key === "string" && key) return key;
+    }
+  } catch {
+    // not JSON, fall through
+  }
+  const match = text.match(
+    /(?:new_thread_key|thread_key|slack_thread_key|newThreadID|newThreadId)\s*[:=]\s*["']?([^\s"',}]+)/,
+  );
+  return match?.[1] || "";
+}
+
 function coerceNonNegativeInt(value: unknown): number {
   if (typeof value === "boolean") return 0;
   if (typeof value === "number" && value >= 0) return Math.floor(value);
@@ -95,10 +116,7 @@ export function canonicalEventToStreamChunks(
             typeof block.content === "string"
               ? block.content
               : JSON.stringify(block.content ?? "");
-          const keyMatch = resultText.match(
-            /(?:new_thread_key|thread_key|slack_thread_key)\s*[:=]\s*["']?([^\s"',}]+)/,
-          );
-          const newThreadKey = keyMatch?.[1] || "";
+          const newThreadKey = extractHandoffThreadKey(resultText);
           if (newThreadKey) {
             chunks.push({
               type: "data-handoff",

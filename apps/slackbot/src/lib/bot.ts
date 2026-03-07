@@ -7,21 +7,21 @@ import { createMemoryState } from "@chat-adapter/state-memory";
 import {
   extractRunOptions,
   fetchThreadRuntimeConfig,
-  
   normalizeThreadKey,
   postThreadContextMessage,
-  
   splitThreadKey,
-  watchProgress,
   type BudgetMode,
   type Engine,
   type FileAttachment,
   type Harness,
 } from "./harness";
 import { ApiError } from "./api-client";
-import { runModeExecution } from "./modes";
+import { executeStreamingWithBusyRetries } from "./modes";
 import { truncateSlackText } from "./slack-text";
 import { postRichReplyToSlack } from "./slack-post";
+import { SlackLiveReply } from "./slack-live-reply";
+import { ProgressTracker } from "./progress-tracker";
+import { HandoffDetector } from "./handoff-detection";
 import { getPool } from "@/lib/db";
 
 function formatErrorForSlack(error: unknown, context: string): string {
@@ -41,6 +41,17 @@ function formatErrorForSlack(error: unknown, context: string): string {
 }
 
 const RETRY_DEFAULTS_MAX = 4;
+
+const LOW_VALUE_PATTERNS = [
+  /^i('ve| have) (handed off|delegated)/i,
+  /^(handing off|delegating)/i,
+  /^continuing in/i,
+];
+
+function isLowValueResult(text: string): boolean {
+  if (!text) return true;
+  return LOW_VALUE_PATTERNS.some((p) => p.test(text.trim()));
+}
 
 const THREAD_VIEWER_URL = process.env.THREAD_VIEWER_URL || "https://svc-ai.paradigm.xyz";
 const MAX_TRACKED_THREAD_MODES = 500;
@@ -428,8 +439,8 @@ function createBot() {
       const instruction = parsed.cleanedText || "hey";
       await thread.startTyping("Running...");
       let threadHistory = "";
+      const { channel, threadTs } = splitThreadKey(threadKey);
       if (isFirstMessage) {
-        const { channel, threadTs } = splitThreadKey(threadKey);
         threadHistory = await fetchThreadHistory(channel, threadTs);
       }
 
@@ -443,67 +454,112 @@ function createBot() {
         message = `[budget: ${budgetMode}]\n\n${message}`;
       }
 
-      const stopProgress = watchProgress(threadKey, (status) => {
-        thread.startTyping(status).catch(() => {});
-      });
-
-      let result = "";
+      const liveReply = new SlackLiveReply(channel, threadTs);
+      await liveReply.start("⏳ Working...");
+      const tracker = new ProgressTracker();
       const executionStartedAt = Date.now();
-      try {
-        result = await runModeExecution({
-          harness,
-          instruction,
-          message,
-          threadKey,
-          requestId,
-          files,
-          userId,
-          model,
-          engine,
-        });
-      } finally {
-        stopProgress();
-      }
-      const finalMessage = result.trim();
 
-        // Persist user + assistant messages to chat_messages for thread viewer
+      let streamReturn = "";
+
+      try {
+        let currentMessage = message;
+        let followedHandoff = true;
+
+        // Loop: each iteration is one turn in the same container.
+        // After a follow=true handoff, amp internally navigates to the new
+        // thread, so the next turn.start on stdin is handled by that thread.
+        // From our perspective it's all one session — same threadKey, same
+        // Slack message, same container. No timeout — this is the long-running
+        // agent abstraction; amp can chain handoffs indefinitely.
+        while (followedHandoff) {
+          followedHandoff = false;
+          const handoffDetector = new HandoffDetector();
+
+          const gen = executeStreamingWithBusyRetries({
+            threadKey,
+            message: currentMessage,
+            harness,
+            engine,
+          });
+
+          // Use manual iteration to capture the generator's return value
+          while (true) {
+            const { done, value } = await gen.next();
+            if (done) {
+              // Only capture the return value if we're NOT about to follow a handoff.
+              // After a handoff, the return value is stale ("Handed off to...").
+              if (!followedHandoff) streamReturn = value || "";
+              break;
+            }
+
+            // Once we've committed to following a handoff, ignore the remaining
+            // events in this turn (the post-handoff assistant text and result
+            // event would overwrite the tracker with stale "Handed off..." text).
+            if (followedHandoff) continue;
+
+            if (tracker.update(value)) {
+              liveReply.queueUpdate(tracker.toSlackBullets());
+            }
+
+            const handoff = handoffDetector.processEvent(value);
+            if (handoff && handoff.follow) {
+              tracker.addHandoff(handoff.goal, handoff.newThreadKey);
+              liveReply.queueUpdate(tracker.toSlackBullets());
+              currentMessage = "continue";
+              followedHandoff = true;
+            }
+          }
+        }
+      } catch (error) {
+        liveReply.dispose();
+        throw error;
+      }
+
+      const finalMessage = (tracker.resultText || tracker.lastAssistantText || streamReturn).trim();
+
+      // Persist user + assistant messages to chat_messages for thread viewer
+      try {
+        const pool = getPool();
+        const dbClient = await pool.connect();
         try {
-          const pool = getPool();
-          const dbClient = await pool.connect();
-          try {
-            const userMsgId = `slack-user-${threadKey}-${Date.now()}`;
-            const assistantMsgId = `slack-asst-${threadKey}-${Date.now()}`;
-            await dbClient.query("BEGIN");
+          const userMsgId = `slack-user-${threadKey}-${Date.now()}`;
+          const assistantMsgId = `slack-asst-${threadKey}-${Date.now()}`;
+          await dbClient.query("BEGIN");
+          await dbClient.query(
+            `INSERT INTO chat_messages (id, thread_key, role, parts, metadata)
+             VALUES ($1, $2, 'user', $3::jsonb, '{}'::jsonb)
+             ON CONFLICT (id) DO NOTHING`,
+            [userMsgId, threadKey, JSON.stringify([{ type: "text", text: instruction }])],
+          );
+          if (finalMessage) {
             await dbClient.query(
               `INSERT INTO chat_messages (id, thread_key, role, parts, metadata)
-               VALUES ($1, $2, 'user', $3::jsonb, '{}'::jsonb)
+               VALUES ($1, $2, 'assistant', $3::jsonb, $4::jsonb)
                ON CONFLICT (id) DO NOTHING`,
-              [userMsgId, threadKey, JSON.stringify([{ type: "text", text: instruction }])],
+              [
+                assistantMsgId,
+                threadKey,
+                JSON.stringify([{ type: "text", text: finalMessage }]),
+                JSON.stringify({ harness, thread_name: finalMessage.slice(0, 60) }),
+              ],
             );
-            if (finalMessage) {
-              await dbClient.query(
-                `INSERT INTO chat_messages (id, thread_key, role, parts, metadata)
-                 VALUES ($1, $2, 'assistant', $3::jsonb, $4::jsonb)
-                 ON CONFLICT (id) DO NOTHING`,
-                [
-                  assistantMsgId,
-                  threadKey,
-                  JSON.stringify([{ type: "text", text: finalMessage }]),
-                  JSON.stringify({ harness, thread_name: finalMessage.slice(0, 60) }),
-                ],
-              );
-            }
-            await dbClient.query("COMMIT");
-          } catch {
-            await dbClient.query("ROLLBACK");
-          } finally {
-            dbClient.release();
           }
+          await dbClient.query("COMMIT");
         } catch {
-          // Best-effort — don't block Slack reply
+          await dbClient.query("ROLLBACK");
+        } finally {
+          dbClient.release();
         }
+      } catch {
+        // Best-effort — don't block Slack reply
+      }
 
-      if (finalMessage) {
+      // Single Slack message — update the live reply in-place with the final result.
+      // For substantial results, also post a rich-formatted reply.
+      if (isLowValueResult(finalMessage)) {
+        await liveReply.finish(tracker.toSlackBullets());
+      } else {
+        await liveReply.finish(tracker.toSlackBullets());
         await postThreadRichReply(threadKey, finalMessage, {
           harness,
           durationSeconds: Math.max(0, (Date.now() - executionStartedAt) / 1000),

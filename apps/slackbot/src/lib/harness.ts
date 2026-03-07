@@ -1,5 +1,6 @@
 import { apiPost, resilientFetch, ApiError, API_URL } from "./api-client";
 import { getPool } from "@/lib/db";
+import { normalizeHarnessEvent, type CanonicalEvent } from "@/lib/normalize-harness-event";
 
 export type Engine = "amp" | "claude-code" | "codex" | "pi-mono";
 export type Harness = Engine | "eng" | "legal";
@@ -198,25 +199,19 @@ export function extractRunOptions(text: string, context: RunOptionContext = {}):
   };
 }
 
-export async function execute(
+export async function* executeStreaming(
   threadKey: string,
   message: string,
   harness?: Harness | null,
-  _requestId?: string,
-  _files?: FileAttachment[],
-  _userId?: string,
-  _source: ExecuteSource = "slack",
-  _model?: string | null,
-  _engine?: Engine | null,
-  _continueSession: boolean = true,
-): Promise<string> {
+): AsyncGenerator<CanonicalEvent, string, undefined> {
   const normalizedKey = normalizeThreadKey(threadKey);
+  const harnessName = harness || "amp";
   const res = await resilientFetch(`${API_URL}/agent/execute`, {
     method: "POST",
     body: JSON.stringify({
       thread_key: normalizedKey,
       message,
-      harness: harness || "amp",
+      harness: harnessName,
     }),
     timeoutMs: 10 * 60_000,
     maxAttempts: 1,
@@ -236,6 +231,7 @@ export async function execute(
   const decoder = new TextDecoder();
   let buf = "";
   let lastAssistantText = "";
+  let resultText = "";
 
   while (true) {
     const { done, value } = await reader.read();
@@ -257,24 +253,56 @@ export async function execute(
 
       try {
         const evt = JSON.parse(payload);
-        // Collect assistant text from harness events
-        if (evt.type === "result" && typeof evt.result === "string") {
-          lastAssistantText = evt.result;
-        } else if (evt.type === "assistant" && evt.message?.content) {
-          for (const block of evt.message.content) {
-            if (block?.type === "text" && typeof block.text === "string") {
-              lastAssistantText = block.text;
+        const canonical = normalizeHarnessEvent(String(harnessName), evt);
+        for (const ce of canonical) {
+          if (ce.type === "result" && "text" in ce) {
+            resultText = ce.text;
+          } else if (ce.type === "assistant" && ce.message?.content) {
+            for (const block of ce.message.content) {
+              if (block.type === "text" && block.text) {
+                lastAssistantText = block.text;
+              }
             }
           }
+          yield ce;
         }
       } catch {
-        // Non-JSON line — could be plain text result
         if (payload.trim()) lastAssistantText = payload.trim();
       }
     }
   }
 
-  return lastAssistantText;
+  return resultText || lastAssistantText;
+}
+
+export async function execute(
+  threadKey: string,
+  message: string,
+  harness?: Harness | null,
+  _requestId?: string,
+  _files?: FileAttachment[],
+  _userId?: string,
+  _source: ExecuteSource = "slack",
+  _model?: string | null,
+  _engine?: Engine | null,
+  _continueSession: boolean = true,
+): Promise<string> {
+  let lastText = "";
+  const gen = executeStreaming(threadKey, message, harness);
+  while (true) {
+    const { done, value } = await gen.next();
+    if (done) {
+      return value;
+    }
+    const event = value;
+    if (event.type === "assistant" && event.message?.content) {
+      for (const block of event.message.content) {
+        if (block.type === "text" && block.text) {
+          lastText = block.text;
+        }
+      }
+    }
+  }
 }
 
 export async function interrupt(

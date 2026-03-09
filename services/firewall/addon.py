@@ -740,8 +740,10 @@ class CredentialInjector:
         # Re-read host after potential provider rewrite
         host = flow.request.pretty_host.lower().rstrip(".")
 
-        # 5. HTTP method filtering: restrict non-LLM hosts to safe methods
-        #    Skip if we just rewrote the request (it's now targeting an LLM host)
+        # 5. HTTP method filtering: hosts not in the unrestricted set are
+        #    limited to safe methods only (GET/HEAD/OPTIONS).  LLM API hosts
+        #    and essential services (github, ampcode) are unrestricted.
+        #    Skip if we just rewrote the request (it's now targeting an LLM host).
         if not rewritten and host not in SECRET_INJECTION_HOSTS and host not in UNRESTRICTED_METHOD_HOSTS:
             method = flow.request.method.upper()
             if method not in SAFE_METHODS:
@@ -753,12 +755,12 @@ class CredentialInjector:
                 log.warning("method_blocked: %s not allowed for %s", method, host)
                 return
 
-        # 6. Secret injection: only inject for allowlisted hosts
-        if host in SECRET_INJECTION_HOSTS:
-            self._replace_in_headers(flow)
-        else:
-            # Strip any key placeholders from headers for non-allowlisted hosts
-            self._strip_key_placeholders(flow)
+        # 6. Secret injection: replace known key placeholders in ALL outbound
+        #    requests.  Security is enforced by method filtering (step 5) and
+        #    SSRF protection (step 3), not by restricting which hosts receive
+        #    real credentials.  This avoids maintaining a static host allowlist
+        #    that breaks whenever a new provider or tool API is added.
+        self._replace_in_headers(flow)
 
         # 7. Audit-only body inspection for prompt injection patterns
         self._inspect_request_body(flow)

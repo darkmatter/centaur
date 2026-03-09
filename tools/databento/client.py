@@ -5,6 +5,8 @@ from typing import Any
 
 import httpx
 
+from shared.tool_sdk import secret
+
 BASE_URL = "https://hist.databento.com/v0"
 
 
@@ -96,6 +98,4 @@ class DatabentoClient:
 
 
 def _client() -> DatabentoClient:
-    from shared.tool_sdk import secret
-
-    return DatabentoClient(api_key=secret("DATABENTO_API_KEY"))
+    return DatabentoClient(api_key=secret("DATABENTO_API_KEY", ""))

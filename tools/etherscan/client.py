@@ -2,6 +2,7 @@
 
 
 import httpx
+
 from shared.tool_sdk import secret
 
 
@@ -41,7 +42,8 @@ class EtherscanClient:
             The 'result' field from the API response
         """
         params["apikey"] = self._get_api_key()
-        url = f"https://api.etherscan.io/v2/api?chainid={chain_id}"
+        params["chainid"] = chain_id
+        url = "https://api.etherscan.io/v2/api"
         try:
             response = self.client.get(url, params=params)
             response.raise_for_status()

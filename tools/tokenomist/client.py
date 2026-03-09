@@ -2,6 +2,7 @@
 
 
 import httpx
+
 from shared.tool_sdk import secret
 
 
@@ -16,7 +17,7 @@ class TokenomistClient:
         self._api_key = api_key or secret("TOKENOMIST_API_KEY", "")
         if not self._api_key:
             raise RuntimeError("TOKENOMIST_API_KEY not set.")
-        self.base_url = "https://api.tokenomist.ai/v1"
+        self.base_url = "https://api.unlocks.app"
         self.timeout = timeout
         self._client: httpx.Client | None = None
 
@@ -30,7 +31,7 @@ class TokenomistClient:
         """Make an API request."""
         headers = {
             "accept": "application/json",
-            "authorization": f"Bearer {self._api_key}",
+            "x-api-key": self._api_key,
         }
         url = f"{self.base_url}{endpoint}"
         try:
@@ -51,51 +52,55 @@ class TokenomistClient:
         Returns:
             List of tokens with id, name, symbol
         """
-        return self._request("/token/list", params={"limit": limit})
+        result = self._request("/v1/token/list")
+        data = result.get("data", result) if isinstance(result, dict) else result
+        if isinstance(data, list):
+            return data[:limit]
+        return data
 
-    def get_allocations(self, token_id: str) -> list[dict]:
+    def get_allocations(self, token_id: str) -> dict | list:
         """Get token allocation breakdown.
 
         Args:
-            token_id: The token identifier
+            token_id: The token identifier (from list_tokens)
 
         Returns:
-            List of allocation entries
+            Allocation data with breakdown
         """
-        return self._request(f"/token/{token_id}/allocations")
+        return self._request("/v1/allocations", params={"tokenId": token_id})
 
-    def get_unlock_events(self, token_id: str) -> list[dict]:
+    def get_unlock_events(self, token_id: str) -> dict | list:
         """Get scheduled unlock events with timestamps.
 
         Args:
-            token_id: The token identifier
+            token_id: The token identifier (from list_tokens)
 
         Returns:
             List of unlock events
         """
-        return self._request(f"/token/{token_id}/unlocks")
+        return self._request("/v1/unlock/events", params={"tokenId": token_id})
 
-    def get_daily_emissions(self, token_id: str) -> list[dict]:
+    def get_daily_emissions(self, token_id: str) -> dict | list:
         """Get daily emission data.
 
         Args:
-            token_id: The token identifier
+            token_id: The token identifier (from list_tokens)
 
         Returns:
-            List of daily emission entries
+            Daily emission entries
         """
-        return self._request(f"/token/{token_id}/emissions")
+        return self._request("/v1/daily-emission", params={"tokenId": token_id})
 
-    def get_fundraising(self, token_id: str) -> list[dict]:
+    def get_fundraising(self, token_id: str) -> dict | list:
         """Get fundraising rounds and investors.
 
         Args:
-            token_id: The token identifier
+            token_id: The token identifier (from list_tokens)
 
         Returns:
-            List of fundraising rounds
+            Fundraising round data
         """
-        return self._request(f"/token/{token_id}/fundraising")
+        return self._request(f"/v1/fundraising/token/{token_id}")
 
     def close(self):
         """Close the HTTP client."""

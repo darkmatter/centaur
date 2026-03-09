@@ -7,7 +7,7 @@ class CoinDeskClient:
     """Client for CoinDesk RSS feed."""
 
     RSS_URL = "https://www.coindesk.com/arc/outboundfeeds/rss/"
-    USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 
     def __init__(self, timeout: float = 30.0):
         self.timeout = timeout
@@ -22,6 +22,11 @@ class CoinDeskClient:
             "Accept-Language": "en-US,en;q=0.9",
             "Accept-Encoding": "gzip, deflate, br",
             "Referer": "https://www.coindesk.com/",
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "same-origin",
         }
         try:
             with httpx.Client(timeout=self.timeout, follow_redirects=True) as client:

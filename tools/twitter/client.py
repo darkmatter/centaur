@@ -16,9 +16,10 @@ class PTwitterClient:
         base_url: str | None = None,
     ):
         self._api_key = api_key or secret("SYNOPTIC_API_KEY", "")
-        self._base_url = base_url or secret(
-            "SYNOPTIC_BASE_URL", "https://api.synoptic.com"
-        )
+        url = base_url or secret("SYNOPTIC_BASE_URL", "https://api.synoptic.com")
+        if url and not url.startswith(("http://", "https://")):
+            url = f"https://{url}"
+        self._base_url = url
 
     def _make_client(self) -> TwitterClient:
         return TwitterClient(api_key=self._api_key, base_url=self._base_url)

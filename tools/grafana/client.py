@@ -34,7 +34,10 @@ class GrafanaClient:
 
     @property
     def base_url(self) -> str:
-        return (self._url or secret("GRAFANA_URL", "URL")).rstrip("/")
+        url = (self._url or secret("GRAFANA_URL", "")).rstrip("/")
+        if url and not url.startswith(("http://", "https://")):
+            url = f"http://{url}"
+        return url
 
     def _auth_headers(self) -> dict[str, str]:
         key = self._api_key or secret("GRAFANA_API_KEY", "")

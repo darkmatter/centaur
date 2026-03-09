@@ -135,6 +135,7 @@ services:
       SECRET_MANAGER_URL: http://firewall:8081
       SLACKBOT_URL: http://slackbot:3001
       AI_V2_LOG_LEVEL: info
+      TOOL_DIRS: /app/tools:/app/tools-paradigm
       REPOS_HOST_DIR: ${HOME}/github
       FIREWALL_HOST: firewall
       AGENT_NETWORK: ai_v2_agent_net

@@ -26,18 +26,23 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 
 # 3. Install tool dependencies via bind mount (doesn't create a layer from tools/)
 #    The uv cache mount means even on rebuild this is fast.
+#    Scans both tools/ and tools-paradigm/ for pyproject.toml deps.
 RUN --mount=type=cache,target=/root/.cache/uv \
     --mount=type=bind,source=tools,target=/tmp/tools \
+    --mount=type=bind,source=tools-paradigm,target=/tmp/tools-paradigm \
     python -c "\
 import tomllib, pathlib; \
 deps = set(); \
 [deps.update(tomllib.load(open(p,'rb')).get('project',{}).get('dependencies',[])) \
- for p in pathlib.Path('/tmp/tools').glob('*/pyproject.toml')]; \
+ for p in list(pathlib.Path('/tmp/tools').glob('*/pyproject.toml')) + \
+          list(pathlib.Path('/tmp/tools-paradigm').glob('*/pyproject.toml'))]; \
 open('/tmp/pd.txt','w').write('\n'.join(sorted(deps)))" \
     && uv pip install -r /tmp/pd.txt --quiet \
     && rm /tmp/pd.txt
 
-# 4. Copy tool source
+# 4. Copy tool source (bind-mounted at runtime via docker-compose.yml,
+#    but baked in for standalone image usage). Tool directories are
+#    configured at runtime via TOOL_DIRS env var (colon-separated).
 COPY tools/ tools/
 
 # 5. Copy legal policy/docs used by tools

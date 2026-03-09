@@ -22,7 +22,10 @@ class VictoriaLogsClient:
 
     @property
     def base_url(self) -> str:
-        return (self._url or secret("VICTORIALOGS_URL", "http://victorialogs:9428")).rstrip("/")
+        url = (self._url or secret("VICTORIALOGS_URL", "http://victorialogs:9428")).rstrip("/")
+        if url and not url.startswith(("http://", "https://")):
+            url = f"http://{url}"
+        return url
 
     @property
     def client(self) -> httpx.Client:

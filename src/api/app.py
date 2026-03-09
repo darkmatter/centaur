@@ -151,12 +151,18 @@ app.include_router(internal.router)
 
 
 # Load tools
+# Resolution order: TOOL_DIRS env var (colon-separated) → tools.toml → PLUGINS_DIR fallback
 _app_root = Path(__file__).resolve().parent.parent.parent
-_tools_dir = Path(os.environ.get("PLUGINS_DIR", _app_root / "tools"))
 
-_plugins_config = _app_root / "tools.toml"
-_plugin_dirs = load_plugins_config(_plugins_config)
-_tools_dirs: list[Path] = _plugin_dirs if _plugin_dirs else [_tools_dir]
+_tool_dirs_env = os.environ.get("TOOL_DIRS", "")
+if _tool_dirs_env:
+    _tools_dirs = [Path(d.strip()) for d in _tool_dirs_env.split(":") if d.strip()]
+else:
+    _plugins_config = _app_root / "tools.toml"
+    _plugin_dirs = load_plugins_config(_plugins_config)
+    _tools_dirs = _plugin_dirs if _plugin_dirs else [
+        Path(os.environ.get("PLUGINS_DIR", _app_root / "tools"))
+    ]
 
 tool_manager = ToolManager(_tools_dirs)
 tool_manager.discover()

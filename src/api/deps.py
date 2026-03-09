@@ -10,6 +10,7 @@ import secrets
 import socket
 import threading
 import time
+from collections.abc import Callable
 from typing import Annotated
 
 import structlog
@@ -270,6 +271,26 @@ def get_key_info(request: Request) -> APIKeyInfo:
             created_by="system", source="unknown",
         )
     return info
+
+
+def require_scope(scope: str) -> Callable:
+    """Return a FastAPI dependency that checks the caller has the given scope.
+
+    Usage::
+
+        @router.post("/execute", dependencies=[Depends(require_scope("agent:execute"))])
+        async def execute(...): ...
+    """
+
+    async def _check(request: Request) -> None:
+        key_info = get_key_info(request)
+        if not check_scope(key_info, scope):
+            raise HTTPException(
+                status_code=403,
+                detail=f"API key scope does not permit '{scope}'",
+            )
+
+    return _check
 
 
 async def verify_operator_api_key(

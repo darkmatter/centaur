@@ -241,16 +241,23 @@ def check_scope(key_info: APIKeyInfo, required: str, resource: str = "") -> bool
     """Check if a key's scopes permit the requested action.
 
     Scope format examples:
-      - "*"              → everything
-      - "admin"          → /admin routes
-      - "tools:*"        → all tools
-      - "tools:slack"    → only the slack tool
-      - "tools:slack,twitter" → slack and twitter
-      - "agent"          → sandbox/agent routes
-      - "threads"        → thread viewer routes
+      - "*"                    → everything
+      - "admin"                → /admin routes
+      - "agent"                → all /agent routes
+      - "agent:execute"        → only /agent/execute
+      - "agent:execute,status" → /agent/execute and /agent/status
+      - "tools:*"              → all tools
+      - "tools:slack"          → only the slack tool
+      - "tools:slack,twitter"  → slack and twitter
+      - "threads"              → all thread viewer routes
+      - "threads:read"         → read-only thread access
+
+    The `required` argument uses "category" or "category:action" format.
+    A scope of "agent" grants access to all agent sub-actions.
+    A scope of "agent:execute" only grants the execute sub-action.
 
     Arguments:
-      required: the scope category ("tools", "admin", "agent", "threads")
+      required: the scope to check, e.g. "agent:execute", "admin", "tools"
       resource: for tools scope, the tool name being accessed
     """
     scopes = key_info.scopes
@@ -259,16 +266,14 @@ def check_scope(key_info: APIKeyInfo, required: str, resource: str = "") -> bool
     if "*" in scopes:
         return True
 
-    if required == "admin":
-        return "admin" in scopes or "*" in scopes
+    # Parse required into category + optional action
+    if ":" in required and not required.startswith("tools:"):
+        category, action = required.split(":", 1)
+    else:
+        category = required
+        action = ""
 
-    if required == "agent":
-        return "agent" in scopes or "*" in scopes
-
-    if required == "threads":
-        return "threads" in scopes or "*" in scopes
-
-    if required == "tools":
+    if category == "tools":
         for scope in scopes:
             if scope == "tools:*":
                 return True
@@ -277,5 +282,21 @@ def check_scope(key_info: APIKeyInfo, required: str, resource: str = "") -> bool
                 if resource in allowed:
                     return True
         return False
+
+    # For all other categories (admin, agent, threads, etc.):
+    # - Bare category scope (e.g. "agent") grants all sub-actions
+    # - Sub-scoped (e.g. "agent:execute") grants only that action
+    for scope in scopes:
+        # Exact match: "agent" matches required "agent" or "agent:execute"
+        if scope == category:
+            return True
+        # Sub-scope match: "agent:execute" matches required "agent:execute"
+        if action and scope == required:
+            return True
+        # Comma-delimited sub-scope: "agent:execute,status" matches "agent:execute"
+        if action and scope.startswith(f"{category}:"):
+            allowed = {a.strip() for a in scope[len(category) + 1 :].split(",")}
+            if action in allowed:
+                return True
 
     return False

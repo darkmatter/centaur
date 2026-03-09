@@ -7,7 +7,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from api.agent import get_or_spawn, get_status, stop_session, stream_exec, stream_reconnect
-from api.deps import verify_api_key
+from api.deps import require_scope, verify_api_key
 from api.warm_pool import pool_status
 from api.warm_pool import replenish as replenish_pool
 
@@ -24,7 +24,7 @@ class ExecuteRequest(BaseModel):
     harness: str = "amp"
 
 
-@router.post("/execute")
+@router.post("/execute", dependencies=[Depends(require_scope("agent:execute"))])
 async def execute(req: ExecuteRequest):
     session = await get_or_spawn(req.thread_key, req.harness)
 
@@ -41,7 +41,7 @@ class ReconnectRequest(BaseModel):
     harness: str = "amp"
 
 
-@router.post("/reconnect")
+@router.post("/reconnect", dependencies=[Depends(require_scope("agent:execute"))])
 async def reconnect(req: ReconnectRequest):
     """Re-attach to a running container's stdout without sending a new turn.
 
@@ -62,24 +62,24 @@ class StopRequest(BaseModel):
     thread_key: str
 
 
-@router.post("/stop")
+@router.post("/stop", dependencies=[Depends(require_scope("agent:stop"))])
 async def stop(req: StopRequest):
     ok = await stop_session(req.thread_key)
     return {"ok": ok}
 
 
-@router.get("/status")
+@router.get("/status", dependencies=[Depends(require_scope("agent:status"))])
 async def status(key: str):
     return await get_status(key)
 
 
-@router.get("/pool")
+@router.get("/pool", dependencies=[Depends(require_scope("admin"))])
 async def pool():
     """Return warm pool diagnostics."""
     return pool_status()
 
 
-@router.post("/pool/replenish")
+@router.post("/pool/replenish", dependencies=[Depends(require_scope("admin"))])
 async def pool_replenish():
     """Manually trigger pool replenishment."""
     spawned = await replenish_pool()

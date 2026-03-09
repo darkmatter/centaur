@@ -1,5 +1,6 @@
 import { after } from "next/server";
 import { NextRequest, NextResponse } from "next/server";
+import { log } from "@/lib/logger";
 import { verifySlackSignature } from "@/lib/bot/slack-client";
 import { getBot, getSlackBootstrapState } from "@/lib/bot/bot";
 
@@ -25,16 +26,13 @@ export async function POST(request: NextRequest) {
   // HMAC verification (previously done by Python proxy)
   const { valid, reason } = verifySlackSignature(SIGNING_SECRET, signature, timestamp, rawBody);
   if (!valid) {
-    console.error(
-      "slack_webhook_rejected",
-      JSON.stringify({
-        reason,
-        request_id: requestId,
-        retry_num: retryNum,
-        has_signature: Boolean(signature),
-        has_timestamp: Boolean(timestamp),
-      }),
-    );
+    log.error("slack_webhook_rejected", {
+      reason,
+      request_id: requestId,
+      retry_num: retryNum,
+      has_signature: Boolean(signature),
+      has_timestamp: Boolean(timestamp),
+    });
     return NextResponse.json({ error: "Invalid Slack signature" }, { status: 401 });
   }
 
@@ -55,14 +53,11 @@ export async function POST(request: NextRequest) {
   const handler = bot.webhooks.slack;
   if (!handler) {
     const bootstrap = getSlackBootstrapState();
-    console.error(
-      "slack_webhook_unavailable",
-      JSON.stringify({
-        request_id: requestId,
-        retry_num: retryNum,
-        missing_env_keys: bootstrap.missingEnvKeys,
-      }),
-    );
+    log.error("slack_webhook_unavailable", {
+      request_id: requestId,
+      retry_num: retryNum,
+      missing_env_keys: bootstrap.missingEnvKeys,
+    });
     return NextResponse.json(
       { error: "slack webhook unavailable", missing_env_keys: bootstrap.missingEnvKeys },
       { status: 503 },
@@ -81,14 +76,11 @@ export async function POST(request: NextRequest) {
       waitUntil: (task) => after(() => task),
     });
   } catch (error) {
-    console.error(
-      "slack_events_handler_failed",
-      JSON.stringify({
-        request_id: requestId,
-        retry_num: retryNum,
-        error: error instanceof Error ? error.message : String(error),
-      }),
-    );
+    log.error("slack_events_handler_failed", {
+      request_id: requestId,
+      retry_num: retryNum,
+      error: error instanceof Error ? error.message : String(error),
+    });
     return NextResponse.json({ error: "Internal error" }, { status: 500 });
   }
 }

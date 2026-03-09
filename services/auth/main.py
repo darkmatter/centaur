@@ -16,12 +16,33 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import logging
 import os
 import secrets
 import sys
+from datetime import datetime, timezone
 from urllib.parse import quote
 from urllib.request import Request as URLRequest
 from urllib.request import urlopen
+
+
+class _JsonFormatter(logging.Formatter):
+    def format(self, record):
+        return json.dumps({
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "level": record.levelname.lower(),
+            "service": "auth",
+            "event": getattr(record, "event", record.funcName or record.name),
+            "msg": record.getMessage(),
+        }, default=str)
+
+
+_handler = logging.StreamHandler(sys.stdout)
+_handler.setFormatter(_JsonFormatter())
+log = logging.getLogger("auth")
+log.handlers = [_handler]
+log.setLevel(logging.INFO)
+log.propagate = False
 
 from starlette.applications import Starlette
 from starlette.requests import Request
@@ -39,7 +60,7 @@ def _fetch_secret(key: str) -> str:
         req = URLRequest(f"{_SECRET_MANAGER_URL}/secrets/{quote(key, safe='')}")
         with urlopen(req, timeout=5) as resp:
             if resp.status == 200:
-                return json.loads(resp.read()).get("value", "")
+                return _json.loads(resp.read()).get("value", "")
     except Exception:
         pass
     return ""
@@ -52,7 +73,7 @@ _COOKIE_MAX_AGE = 60 * 60 * 24 * 30  # 30 days
 _COOKIE_SECURE = os.environ.get("AUTH_COOKIE_INSECURE", "") != "1"
 
 if not _SECRET_KEY and _PASSWORD:
-    print("FATAL: API_SECRET_KEY is required when UI_PASSWORD is set", file=sys.stderr)
+    log.critical("API_SECRET_KEY is required when UI_PASSWORD is set", extra={"event": "startup_misconfig"})
     sys.exit(1)
 
 

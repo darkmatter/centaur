@@ -15,7 +15,6 @@ Requires ``OP_SERVICE_ACCOUNT_TOKEN`` in the environment.
 from __future__ import annotations
 
 import asyncio
-import logging
 import os
 import re
 import secrets as _secrets_mod
@@ -26,11 +25,9 @@ from typing import Any
 from fastapi import Depends, FastAPI, Header, HTTPException
 from onepassword.client import Client
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-)
-log = logging.getLogger("secret_manager")
+from shared.json_logging import configure_json_logger
+
+log = configure_json_logger("secret_manager", "secret_manager")
 
 # ---------------------------------------------------------------------------
 # Configuration

@@ -1,3 +1,4 @@
+import { log } from "@/lib/logger";
 import { apiPost, resilientFetch, ApiError, API_URL } from "./api-client";
 import { getPool } from "@/lib/db";
 import { normalizeHarnessEvent, type CanonicalEvent } from "@/lib/normalize-harness-event";
@@ -335,11 +336,10 @@ export async function* executeStreaming(
   } catch (err) {
     if (!isStreamNetworkError(err)) throw err;
     // Mid-stream network error — fall through to reconnect
-    console.log(JSON.stringify({
-      event: "stream_disconnect",
+    log.warn("stream_disconnect", {
       thread: normalizedKey,
       reason: err instanceof Error ? err.message : String(err),
-    }));
+    });
   }
 
   // Reconnect loop: the container is still running, just re-attach to stdout.
@@ -350,13 +350,12 @@ export async function* executeStreaming(
       RECONNECT_BASE_MS * Math.pow(2, attempt),
       RECONNECT_MAX_MS,
     );
-    console.log(JSON.stringify({
-      event: "stream_reconnect",
+    log.info("stream_reconnect", {
       thread: normalizedKey,
       attempt: attempt + 1,
       delay_ms: delay,
       skipping: yieldedCount,
-    }));
+    });
     await new Promise((r) => setTimeout(r, delay));
 
     let reconnRes: Response;

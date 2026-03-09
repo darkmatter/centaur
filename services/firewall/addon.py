@@ -23,15 +23,47 @@ import json
 import logging
 import os
 import socket
+import sys
 import threading
 import time
 import urllib.parse
 import urllib.request
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from mitmproxy import http
 
+
+class _JsonFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        payload: dict[str, object] = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "level": record.levelname.lower(),
+            "service": "firewall",
+            "event": getattr(record, "event", record.funcName or record.name),
+            "msg": record.getMessage(),
+        }
+        for k, v in record.__dict__.items():
+            if k not in _RESERVED_LOG_KEYS and k not in payload:
+                payload[k] = v
+        if record.exc_info and record.exc_info[0] is not None:
+            payload["stack"] = self.formatException(record.exc_info)
+        return json.dumps(payload, default=str)
+
+
+_RESERVED_LOG_KEYS = {
+    "name", "msg", "args", "created", "relativeCreated", "exc_info", "exc_text",
+    "stack_info", "lineno", "funcName", "pathname", "filename", "module",
+    "levelno", "levelname", "msecs", "thread", "threadName", "process",
+    "processName", "taskName", "message", "asctime",
+}
+
+_log_handler = logging.StreamHandler(sys.stdout)
+_log_handler.setFormatter(_JsonFormatter())
 log = logging.getLogger("firewall")
+log.handlers = [_log_handler]
+log.setLevel(logging.INFO)
+log.propagate = False
 
 SECRET_MANAGER_URL = os.environ.get("SECRET_MANAGER_URL", "http://secrets:8100")
 CACHE_TTL = int(os.environ.get("FIREWALL_CACHE_TTL", "30"))
@@ -474,13 +506,16 @@ class CredentialInjector:
         resp = flow.response
         content_length = len(resp.content) if resp and resp.content else 0
         log.info(
-            "proxy_audit method=%s host=%s path=%s status=%s resp_bytes=%s req_content_length=%s",
-            req.method,
-            req.pretty_host,
-            req.path[:200],
-            resp.status_code if resp else 0,
-            content_length,
-            len(req.content) if req.content else 0,
+            "proxy_audit",
+            extra={
+                "event": "proxy_audit",
+                "method": req.method,
+                "host": req.pretty_host,
+                "path": req.path[:200],
+                "status": resp.status_code if resp else 0,
+                "resp_bytes": content_length,
+                "req_bytes": len(req.content) if req.content else 0,
+            },
         )
 
 

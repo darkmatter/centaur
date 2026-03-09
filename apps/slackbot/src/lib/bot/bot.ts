@@ -15,6 +15,7 @@ import {
   type FileAttachment,
   type Harness,
 } from "./harness";
+import { log } from "@/lib/logger";
 import { ApiError } from "./api-client";
 import { executeStreamingWithBusyRetries, reconnectStreamingWithRetries } from "./modes";
 import { truncateSlackText } from "./slack-text";
@@ -151,7 +152,7 @@ async function fetchThreadHistory(
       "",
     ].join("\n");
   } catch (error) {
-    console.warn("fetch_thread_history_failed", {
+    log.warn("fetch_thread_history_failed", {
       channel,
       threadTs,
       error: error instanceof Error ? error.message : String(error),
@@ -308,7 +309,7 @@ function createBot() {
 
   function setThreadConfig(threadKey: string, config: ThreadConfig): void {
     setThreadConfigRedis(threadKey, config).catch((err) => {
-      console.warn("setThreadConfig_redis_failed", { threadKey, error: String(err) });
+      log.warn("setThreadConfig_redis_failed", { threadKey, error: String(err) });
     });
   }
 
@@ -362,7 +363,7 @@ function createBot() {
       try {
         recovered = await fetchThreadRuntimeConfig(threadKey);
       } catch (error) {
-        console.warn("thread_runtime_config_recovery_failed", {
+        log.warn("thread_runtime_config_recovery_failed", {
           thread: threadKey,
           error: error instanceof Error ? error.message : String(error),
         });
@@ -644,7 +645,7 @@ function createBot() {
       ts: (message as { ts?: string }).ts,
       id: (message as { id?: string }).id,
     })) {
-      console.info("duplicate_mention_ignored", {
+      log.info("duplicate_mention_ignored", {
         thread: normalizeThreadKey(thread.id),
         handler: "onNewMention",
         ts: (message as { ts?: string }).ts || "",
@@ -686,7 +687,7 @@ function createBot() {
           attachments: files.length > 0 ? files : undefined,
         });
       } catch (error) {
-        console.warn("thread_context_post_failed", {
+        log.warn("thread_context_post_failed", {
           thread: threadKey,
           error: error instanceof Error ? error.message : String(error),
         });
@@ -697,7 +698,7 @@ function createBot() {
       ts: (message as { ts?: string }).ts,
       id: (message as { id?: string }).id,
     })) {
-      console.info("duplicate_mention_ignored", {
+      log.info("duplicate_mention_ignored", {
         thread: normalizeThreadKey(thread.id),
         handler: "onSubscribedMessage",
         ts: (message as { ts?: string }).ts || "",

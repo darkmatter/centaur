@@ -1,4 +1,5 @@
 import { after } from "next/server";
+import { log } from "@/lib/logger";
 import { getBot, getSlackBootstrapState } from "@/lib/bot/bot";
 
 export async function POST(
@@ -15,15 +16,12 @@ export async function POST(
       const bootstrap = getSlackBootstrapState();
       const requestId = request.headers.get("x-slack-request-id") ?? "";
       const retryNum = request.headers.get("x-slack-retry-num") ?? "";
-      console.error(
-        "slack_webhook_unavailable",
-        JSON.stringify({
-          platform,
-          request_id: requestId,
-          retry_num: retryNum,
-          missing_env_keys: bootstrap.missingEnvKeys,
-        })
-      );
+      log.error("slack_webhook_unavailable", {
+        platform,
+        request_id: requestId,
+        retry_num: retryNum,
+        missing_env_keys: bootstrap.missingEnvKeys,
+      });
       return Response.json(
         {
           error: "slack webhook unavailable",
@@ -42,15 +40,12 @@ export async function POST(
       waitUntil: (task) => after(() => task),
     });
   } catch (error) {
-    console.error(
-      "webhook_handler_failed",
-      JSON.stringify({
-        platform,
-        request_id: request.headers.get("x-slack-request-id") ?? "",
-        retry_num: request.headers.get("x-slack-retry-num") ?? "",
-        error: error instanceof Error ? error.message : String(error),
-      })
-    );
+    log.error("webhook_handler_failed", {
+      platform,
+      request_id: request.headers.get("x-slack-request-id") ?? "",
+      retry_num: request.headers.get("x-slack-retry-num") ?? "",
+      error: error instanceof Error ? error.message : String(error),
+    });
     return new Response("webhook handler failed", { status: 500 });
   }
 }

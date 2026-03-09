@@ -30,21 +30,24 @@ from shared.tool_manager import ToolManager, load_plugins_config
 # Structlog configuration — JSON in prod (non-tty), console in dev
 # ---------------------------------------------------------------------------
 _LOG_LEVELS = {"critical": 50, "error": 40, "warning": 30, "info": 20, "debug": 10}
-_log_level = _LOG_LEVELS.get(os.getenv("AI_V2_LOG_LEVEL", "warning").lower(), 30)
+_log_level = _LOG_LEVELS.get(
+    (os.getenv("AI_V2_LOG_LEVEL") or os.getenv("LOG_LEVEL") or "info").lower(), 20
+)
 
 structlog.configure(
+    logger_factory=structlog.PrintLoggerFactory(file=sys.stdout),
     wrapper_class=structlog.make_filtering_bound_logger(_log_level),
     processors=[
         structlog.contextvars.merge_contextvars,
         structlog.processors.add_log_level,
-        structlog.processors.TimeStamper(fmt="iso"),
+        structlog.processors.TimeStamper(fmt="iso", key="timestamp"),
         structlog.dev.ConsoleRenderer()
         if sys.stderr.isatty()
         else structlog.processors.JSONRenderer(),
     ],
 )
 
-log = structlog.get_logger()
+log = structlog.get_logger().bind(service="api")
 
 
 def _warm_tool_caches() -> None:

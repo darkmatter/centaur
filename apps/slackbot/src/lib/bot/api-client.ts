@@ -1,3 +1,5 @@
+import { log } from "@/lib/logger";
+
 const API_URL = process.env.AI_V2_API_URL || "http://api:8000";
 const API_KEY = process.env.AI_V2_API_KEY || "";
 
@@ -105,13 +107,12 @@ export async function resilientFetch(
           true,
         );
         const wait = delayMs(attempt);
-        console.log(JSON.stringify({
-          event: "api_retry",
+        log.warn("api_retry", {
           url,
           status: res.status,
           attempt: attempt + 1,
           next_delay_ms: Math.round(wait),
-        }));
+        });
         await sleep(wait);
         continue;
       }
@@ -123,13 +124,12 @@ export async function resilientFetch(
       if (isNetworkError(err) && attempt + 1 < maxAttempts) {
         lastError = err;
         const wait = delayMs(attempt);
-        console.log(JSON.stringify({
-          event: "api_retry",
+        log.warn("api_retry", {
           url,
           error: err instanceof Error ? err.message : String(err),
           attempt: attempt + 1,
           next_delay_ms: Math.round(wait),
-        }));
+        });
         await sleep(wait);
         continue;
       }
@@ -179,12 +179,11 @@ export async function apiPost(
 
   const data = await res.json();
   const elapsed = Math.round(performance.now() - t0);
-  console.log(JSON.stringify({
-    event: "api_call",
+  log.info("api_call", {
     path,
     thread: payload.slack_thread_key ?? payload.thread_key ?? null,
     elapsed_ms: elapsed,
-  }));
+  });
 
   return data;
 }

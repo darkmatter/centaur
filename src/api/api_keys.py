@@ -178,17 +178,11 @@ async def list_keys(pool: asyncpg.Pool) -> list[dict]:
 SERVICE_KEYS: dict[str, dict] = {
     "slackbot": {
         "secret_name": "SLACKBOT_API_KEY",
-        "scopes": ["agent:execute", "agent:status", "agent:stop", "threads:read", "tools:*"],
+        "scopes": ["agent:execute", "agent:status", "agent:stop"],
     },
     "web": {
         "secret_name": "WEB_API_KEY",
-        "scopes": [
-            "agent:execute",
-            "agent:status",
-            "agent:stop",
-            "threads:read",
-            "tools:paradigmdb",
-        ],
+        "scopes": ["agent:execute", "agent:status", "agent:stop", "threads:read"],
     },
 }
 

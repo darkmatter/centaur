@@ -66,6 +66,33 @@ SENSITIVE_INBOUND_HEADERS: frozenset[str] = frozenset(
     {"x-api-key", "x-forwarded-user"}
 )
 
+# HTTP method restrictions: hosts not in this set are limited to safe methods only.
+# LLM API hosts (SECRET_INJECTION_HOSTS) are always allowed all methods.
+UNRESTRICTED_METHOD_HOSTS: frozenset[str] = frozenset(
+    h.strip().lower()
+    for h in os.environ.get(
+        "FIREWALL_UNRESTRICTED_METHOD_HOSTS", ""
+    ).split(",")
+    if h.strip()
+)
+
+SAFE_METHODS: frozenset[str] = frozenset({"GET", "HEAD", "OPTIONS"})
+
+# Allowed outbound request headers — anything not in this set is stripped.
+ALLOWED_OUTBOUND_HEADERS: frozenset[str] = frozenset({
+    "host", "content-type", "content-length", "accept", "accept-encoding",
+    "accept-language", "authorization", "x-api-key", "anthropic-version",
+    "anthropic-beta", "openai-organization", "openai-project",
+    "x-request-id", "x-stainless-arch", "x-stainless-os",
+    "x-stainless-lang", "x-stainless-runtime", "x-stainless-runtime-version",
+    "x-stainless-package-version", "x-stainless-retry-count",
+    "connection", "transfer-encoding", "te",
+    "cache-control", "pragma", "if-none-match", "if-modified-since",
+    "range", "cookie",
+})
+
+FIXED_USER_AGENT = "ai-v2-sandbox/1.0"
+
 # Amp provider proxy rewriting: ampcode.com/api/provider/{provider}/...
 # is rewritten to call the real API directly with key-name placeholders.
 # prefix_to_strip → (real_host, header_name, header_value_template)
@@ -351,6 +378,23 @@ class CredentialInjector:
         return False
 
     # ------------------------------------------------------------------
+    # Outbound header sanitization
+    # ------------------------------------------------------------------
+
+    def _sanitize_outbound_headers(self, flow: http.HTTPFlow) -> None:
+        """Strip non-whitelisted headers and force a fixed User-Agent."""
+        flow.request.headers["user-agent"] = FIXED_USER_AGENT
+
+        to_remove = []
+        for header_name in flow.request.headers:
+            if header_name.lower() not in ALLOWED_OUTBOUND_HEADERS and header_name.lower() != "user-agent":
+                to_remove.append(header_name)
+
+        for header_name in to_remove:
+            log.debug("stripped outbound header: %s", header_name)
+            del flow.request.headers[header_name]
+
+    # ------------------------------------------------------------------
     # mitmproxy request hook
     # ------------------------------------------------------------------
 
@@ -362,17 +406,32 @@ class CredentialInjector:
             if h in flow.request.headers:
                 del flow.request.headers[h]
 
-        # 2. SSRF protection: resolve destination IP, block if private/internal
+        # 2. Sanitize outbound headers: strip non-whitelisted, fix User-Agent
+        self._sanitize_outbound_headers(flow)
+
+        # 3. SSRF protection: resolve destination IP, block if private/internal
         if self._block_private_ip(flow, host):
             return
 
-        # 3. Check for amp provider proxy rewrite
+        # 4. HTTP method filtering: restrict non-LLM hosts to safe methods
+        if host not in SECRET_INJECTION_HOSTS and host not in UNRESTRICTED_METHOD_HOSTS:
+            method = flow.request.method.upper()
+            if method not in SAFE_METHODS:
+                flow.response = http.Response.make(
+                    403,
+                    f"Blocked by method filter: {method} not allowed for {host}".encode(),
+                    {"content-type": "text/plain"},
+                )
+                log.warning("method_blocked: %s not allowed for %s", method, host)
+                return
+
+        # 5. Check for amp provider proxy rewrite
         self._try_provider_rewrite(flow, host)
 
         # Re-read host after potential provider rewrite
         host = flow.request.pretty_host.lower().rstrip(".")
 
-        # 4. Secret injection: only inject for allowlisted hosts
+        # 6. Secret injection: only inject for allowlisted hosts
         if host in SECRET_INJECTION_HOSTS:
             self._replace_in_headers(flow)
         else:
@@ -384,7 +443,7 @@ class CredentialInjector:
     # ------------------------------------------------------------------
 
     def response(self, flow: http.HTTPFlow) -> None:
-        """Block redirects to internal/private IPs."""
+        """Block redirects to internal/private IPs and audit-log every request."""
         if flow.response and flow.response.status_code in (301, 302, 303, 307, 308):
             location = flow.response.headers.get("location", "")
             if location:
@@ -400,6 +459,20 @@ class CredentialInjector:
                         log.warning("blocked redirect to %s", parsed.hostname)
                 except Exception:
                     pass
+
+        # Audit log: record every proxied request (no secret values)
+        req = flow.request
+        resp = flow.response
+        content_length = len(resp.content) if resp and resp.content else 0
+        log.info(
+            "proxy_audit method=%s host=%s path=%s status=%s resp_bytes=%s req_content_length=%s",
+            req.method,
+            req.pretty_host,
+            req.path[:200],
+            resp.status_code if resp else 0,
+            content_length,
+            len(req.content) if req.content else 0,
+        )
 
 
 addons = [CredentialInjector()]

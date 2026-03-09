@@ -128,6 +128,9 @@ async def _list_items(client: Client, vault_id: str) -> list[Any]:
 # Preferred field IDs to extract a secret value from a full Item, in priority order.
 _FIELD_IDS = ("password", "credential", "api_key", "key", "token", "secret", "value", "notesPlain")
 
+# Built-in field IDs that should not be treated as named sub-fields.
+_BUILTIN_FIELD_IDS = frozenset(_FIELD_IDS) | frozenset(("username", "url"))
+
 # items.get_all() supports up to 50 items per call.
 _GET_ALL_BATCH = 50
 
@@ -149,6 +152,26 @@ def _extract_value(item: Any) -> str | None:
     if notes:
         return notes
     return None
+
+
+def _extract_named_fields(item: Any) -> dict[str, str]:
+    """Extract individually-named fields from a multi-field item.
+
+    Returns a dict of {field_title: field_value} for custom fields that have
+    meaningful titles (not built-in IDs like "password" or "notesPlain").
+    """
+    fields = getattr(item, "fields", []) or []
+    result: dict[str, str] = {}
+    for f in fields:
+        field_title = getattr(f, "title", "").strip()
+        field_value = getattr(f, "value", "")
+        field_id = getattr(f, "id", "")
+        if not field_title or not field_value:
+            continue
+        if field_id in _BUILTIN_FIELD_IDS or field_title.lower() in _BUILTIN_FIELD_IDS:
+            continue
+        result[field_title] = field_value
+    return result
 
 
 async def _load_all() -> int:
@@ -187,14 +210,26 @@ async def _load_all() -> int:
     new_cache: dict[str, str] = {}
     for item in full_items:
         title = getattr(item, "title", "")
+
+        # Multi-field items: each named field becomes its own cache key.
+        named = _extract_named_fields(item)
+        if named:
+            for field_name, field_value in named.items():
+                new_cache[field_name] = field_value
+                norm = _normalize(field_name)
+                if norm != field_name:
+                    new_cache[norm] = field_value
+
+        # Single-value fallback: store under item title.
         value = _extract_value(item)
-        if not value:
+        if not value and not named:
             log.debug("skipping item %s — no resolvable field", title)
             continue
-        new_cache[title] = value
-        norm = _normalize(title)
-        if norm != title:
-            new_cache[norm] = value
+        if value:
+            new_cache[title] = value
+            norm = _normalize(title)
+            if norm != title:
+                new_cache[norm] = value
 
     # Apply aliases: if a canonical env var name is missing, resolve it
     # from known 1Password item names.
@@ -318,4 +353,3 @@ async def get_secret(key: str) -> dict:
     if value is None:
         raise HTTPException(status_code=404, detail="not found")
     return {"value": value}
-

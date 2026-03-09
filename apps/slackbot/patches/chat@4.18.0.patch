@@ -1,19 +1,18 @@
 diff --git a/dist/index.js b/dist/index.js
-index f81f54e25db8dbe3a6ce337571e5686f21eddba8..357db1a04e321673519ee16fc29f93b123362702 100644
 --- a/dist/index.js
 +++ b/dist/index.js
-@@ -1391,6 +1391,7 @@ var Chat = class {
+@@ -1553,6 +1553,7 @@
    constructor(config) {
      this.userName = config.userName;
      this._stateAdapter = config.state;
 +    this._onLockConflict = config.onLockConflict ?? "drop";
      this.adapters = /* @__PURE__ */ new Map();
      this._streamingUpdateIntervalMs = config.streamingUpdateIntervalMs ?? 500;
-     if (typeof config.logger === "string") {
-@@ -2300,15 +2301,25 @@ var Chat = class {
+     this._fallbackStreamingPlaceholderText = config.fallbackStreamingPlaceholderText !== void 0 ? config.fallbackStreamingPlaceholderText : "...";
+@@ -2489,15 +2490,25 @@
+       });
        return;
      }
-     await this._stateAdapter.set(dedupeKey, true, DEDUPE_TTL_MS);
 -    const lock = await this._stateAdapter.acquireLock(
 +    let lock = await this._stateAdapter.acquireLock(
        threadId,

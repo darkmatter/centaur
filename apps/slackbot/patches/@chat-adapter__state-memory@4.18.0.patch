@@ -1,8 +1,7 @@
 diff --git a/dist/index.js b/dist/index.js
-index 475738a984834e21c4ea190ba79e1f41d2b97c22..7b229e12435bd2921dfab73274b33a4a18285af9 100644
 --- a/dist/index.js
 +++ b/dist/index.js
-@@ -61,6 +61,10 @@ var MemoryStateAdapter = class {
+@@ -61,6 +61,10 @@
        this.locks.delete(lock.threadId);
      }
    }

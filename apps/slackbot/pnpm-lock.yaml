@@ -5,15 +5,15 @@ settings:
   excludeLinksFromLockfile: false
 
 patchedDependencies:
-  '@chat-adapter/state-memory@4.14.0':
-    hash: 5f7242168c5ef6bb86e644768c173a16562000b9619c51625136f98a1ea9f58e
-    path: patches/@chat-adapter__state-memory@4.14.0.patch
-  '@chat-adapter/state-redis@4.14.0':
-    hash: 701850d19849154dd4ade7d8b2977b1c6a11ac5dafce456f6b1cc95148185b18
-    path: patches/@chat-adapter__state-redis@4.14.0.patch
-  chat@4.14.0:
-    hash: c2202e28072a5f146a50c030c44dff34eb5655c279b1836651b89277b9264029
-    path: patches/chat@4.14.0.patch
+  '@chat-adapter/state-memory@4.18.0':
+    hash: a9d6710070bd81a0343ba1abe2b4fe392c097f00ab6f50ed3fe7e85bf5abe052
+    path: patches/@chat-adapter__state-memory@4.18.0.patch
+  '@chat-adapter/state-redis@4.18.0':
+    hash: 6d861e190d12695ba2b588117563146fd51368041b003543257a1d481e603ce5
+    path: patches/@chat-adapter__state-redis@4.18.0.patch
+  chat@4.18.0:
+    hash: 499e8281a8840ffbd6691d4d17d473a27eaa732cdad152588e94536e13c228fd
+    path: patches/chat@4.18.0.patch
 
 importers:
 
@@ -23,14 +23,14 @@ importers:
         specifier: ^3.0.107
         version: 3.0.107(react@19.2.4)(zod@4.3.6)
       '@chat-adapter/slack':
-        specifier: 4.14.0
-        version: 4.14.0
+        specifier: 4.18.0
+        version: 4.18.0
       '@chat-adapter/state-memory':
-        specifier: 4.14.0
-        version: 4.14.0(patch_hash=5f7242168c5ef6bb86e644768c173a16562000b9619c51625136f98a1ea9f58e)
+        specifier: 4.18.0
+        version: 4.18.0(patch_hash=a9d6710070bd81a0343ba1abe2b4fe392c097f00ab6f50ed3fe7e85bf5abe052)
       '@chat-adapter/state-redis':
-        specifier: 4.14.0
-        version: 4.14.0(patch_hash=701850d19849154dd4ade7d8b2977b1c6a11ac5dafce456f6b1cc95148185b18)
+        specifier: 4.18.0
+        version: 4.18.0(patch_hash=6d861e190d12695ba2b588117563146fd51368041b003543257a1d481e603ce5)
       '@pierre/diffs':
         specifier: ^1.0.11
         version: 1.0.11(react-dom@19.2.4(react@19.2.4))(react@19.2.4)
@@ -77,8 +77,8 @@ importers:
         specifier: 10.4.27
         version: 10.4.27(postcss@8.5.6)
       chat:
-        specifier: 4.14.0
-        version: 4.14.0(patch_hash=c2202e28072a5f146a50c030c44dff34eb5655c279b1836651b89277b9264029)
+        specifier: 4.18.0
+        version: 4.18.0(patch_hash=499e8281a8840ffbd6691d4d17d473a27eaa732cdad152588e94536e13c228fd)
       class-variance-authority:
         specifier: 0.7.1
         version: 0.7.1
@@ -250,17 +250,17 @@ packages:
   '@braintree/sanitize-url@7.1.2':
     resolution: {integrity: sha512-jigsZK+sMF/cuiB7sERuo9V7N9jx+dhmHHnQyDSVdpZwVutaBu7WvNYqMDLSgFgfB30n452TP3vjDAvFC973mA==}
 
-  '@chat-adapter/shared@4.14.0':
-    resolution: {integrity: sha512-D6OCFlO7g8Tvq6YJ06c0KkEtR4XKFx0FLCGV93AtRrww9mE9MBKEgeQwJosFRMt7y21n6XJK1n/BPZDnTveNZg==}
+  '@chat-adapter/shared@4.18.0':
+    resolution: {integrity: sha512-tVmiOHJM1P/eTwAnG0/7vSM/z8cKDrEH/7mUNglApYymtzDTOMc2j/cikM+s+eIE2fXoHEBqly8Bf+bf+zw+3g==}
 
-  '@chat-adapter/slack@4.14.0':
-    resolution: {integrity: sha512-IJ0cJ3QC1f/inieA12VIhoJCap59kQbT4xovt52OU9WtTy4zGkxKIgEem7jA+KcbxeepoypmNIpTy8QSUMZBnQ==}
+  '@chat-adapter/slack@4.18.0':
+    resolution: {integrity: sha512-9/dj6CQLOCf1YUhEz3PKE2NWMJAikgnv04NZL81+FjsCH0ghYdo6p8WpazSsnNJdPwXS3Urz1BhKNeOzmYU1Jg==}
 
-  '@chat-adapter/state-memory@4.14.0':
-    resolution: {integrity: sha512-6YWMok5/1tS81lXspXhObmXVN+Zaopdd4ZMMh3r2WVeCCLCvbRYz9X9tqA+QuI2XCWxUcAPuWavFATgn+PdkLw==}
+  '@chat-adapter/state-memory@4.18.0':
+    resolution: {integrity: sha512-48iHdHu1H83LFPTO0csdNrNczNgnVtMovPXrfrR7u24s+JBigF+igTX7P6y4jE4OY/6+KAnk0tHteNiv9zTyrw==}
 
-  '@chat-adapter/state-redis@4.14.0':
-    resolution: {integrity: sha512-JammJeUWsh14Lk6egFI05aVx9FHvcAmvOwpNw6HRh56vff54kfCeBt+S07FnTkd2FSNUy7Jvo4bnVGHjF+cUWg==}
+  '@chat-adapter/state-redis@4.18.0':
+    resolution: {integrity: sha512-WoChPLfcnTi7dDPUYoyu82G+T+FDi9yTczLPVSx7AETXcIqRRAl6n+IgdZ6GfVqClaU/rj+cml4c6iuDX3YnNA==}
 
   '@chevrotain/cst-dts-gen@11.1.2':
     resolution: {integrity: sha512-XTsjvDVB5nDZBQB8o0o/0ozNelQtn2KrUVteIHSlPd2VAV2utEb6JzyCJaJ8tGxACR4RiBNWy5uYUHX2eji88Q==}
@@ -1275,9 +1275,24 @@ packages:
     peerDependencies:
       '@redis/client': ^1.0.0
 
+  '@redis/bloom@5.11.0':
+    resolution: {integrity: sha512-KYiVilAhAFN3057afUb/tfYJpsEyTkQB+tQcn5gVVA7DgcNOAj8lLxe4j8ov8BF6I9C1Fe/kwlbuAICcTMX8Lw==}
+    engines: {node: '>= 18'}
+    peerDependencies:
+      '@redis/client': ^5.11.0
+
   '@redis/client@1.6.0':
     resolution: {integrity: sha512-aR0uffYI700OEEH4gYnitAnv3vzVGXCFvYfdpu/CJKvk4pHfLPEy/JSZyrpQ+15WhXe1yJRXLtfQ84s4mEXnPg==}
     engines: {node: '>=14'}
+
+  '@redis/client@5.11.0':
+    resolution: {integrity: sha512-GHoprlNQD51Xq2Ztd94HHV94MdFZQ3CVrpA04Fz8MVoHM0B7SlbmPEVIjwTbcv58z8QyjnrOuikS0rWF03k5dQ==}
+    engines: {node: '>= 18'}
+    peerDependencies:
+      '@node-rs/xxhash': ^1.1.0
+    peerDependenciesMeta:
+      '@node-rs/xxhash':
+        optional: true
 
   '@redis/graph@1.1.1':
     resolution: {integrity: sha512-FEMTcTHZozZciLRl6GiiIB4zGm5z5F3F6a6FZCyrfxdKOhFlGkiAqlexWMBzCi4DcRoyiOsuLfW+cjlGWyExOw==}
@@ -1289,15 +1304,33 @@ packages:
     peerDependencies:
       '@redis/client': ^1.0.0
 
+  '@redis/json@5.11.0':
+    resolution: {integrity: sha512-1iAy9kAtcD0quB21RbPTbUqqy+T2Uu2JxucwE+B4A+VaDbIRvpZR6DMqV8Iqaws2YxJYB3GC5JVNzPYio2ErUg==}
+    engines: {node: '>= 18'}
+    peerDependencies:
+      '@redis/client': ^5.11.0
+
   '@redis/search@1.2.0':
     resolution: {integrity: sha512-tYoDBbtqOVigEDMAcTGsRlMycIIjwMCgD8eR2t0NANeQmgK/lvxNAvYyb6bZDD4frHRhIHkJu2TBRvB0ERkOmw==}
     peerDependencies:
       '@redis/client': ^1.0.0
 
+  '@redis/search@5.11.0':
+    resolution: {integrity: sha512-g1l7f3Rnyk/xI99oGHIgWHSKFl45Re5YTIcO8j/JE8olz389yUFyz2+A6nqVy/Zi031VgPDWscbbgOk8hlhZ3g==}
+    engines: {node: '>= 18'}
+    peerDependencies:
+      '@redis/client': ^5.11.0
+
   '@redis/time-series@1.1.0':
     resolution: {integrity: sha512-c1Q99M5ljsIuc4YdaCwfUEXsofakb9c8+Zse2qxTadu8TalLXuAESzLvFAvNVbkmSlvlzIQOLpBCmWI9wTOt+g==}
     peerDependencies:
       '@redis/client': ^1.0.0
+
+  '@redis/time-series@5.11.0':
+    resolution: {integrity: sha512-TWFeOcU4xkj0DkndnOyhtxvX1KWD+78UHT3XX3x3XRBUGWeQrKo3jqzDsZwxbggUgf9yLJr/akFHXru66X5UQA==}
+    engines: {node: '>= 18'}
+    peerDependencies:
+      '@redis/client': ^5.11.0
 
   '@reduxjs/toolkit@2.11.2':
     resolution: {integrity: sha512-Kd6kAHTA6/nUpp8mySPqj3en3dm0tdMIgbttnQ1xFMVpufoj+ADi8pXLBsd4xzTRHQa7t/Jv8W5UnCuW4kuWMQ==}
@@ -1808,8 +1841,8 @@ packages:
   character-reference-invalid@2.0.1:
     resolution: {integrity: sha512-iBZ4F4wRbyORVsu0jPV7gXkOsGYjGHPmAyv+HiHG8gi5PtC9KI2j1+v8/tlibRvjoWX027ypmG/n0HtO5t7unw==}
 
-  chat@4.14.0:
-    resolution: {integrity: sha512-gVod4FBptr4ewPEdY2zo1GnegI8/O0aC5F+IvFMIjimqmQjW0txhQbgI/DgmD48pwXJhxUGpvNrqzMrChx8GWw==}
+  chat@4.18.0:
+    resolution: {integrity: sha512-SrBPE+MjsHEc1DFS77IYftFw4IDgrQt7khZU5WQ4QIGI5I4DdOr+KZkRrwWLIyVCuEZjduEgHq1eHWtLCHH6YQ==}
 
   chevrotain-allstar@0.3.1:
     resolution: {integrity: sha512-b7g+y9A0v4mxCW1qUhf3BSVPg+/NvGErk/dOkrDaHA0nQIQGAtrOjlX//9OQtRlSCy+x9rfB5N8yC71lH1nvMw==}
@@ -3160,6 +3193,10 @@ packages:
   redis@4.7.0:
     resolution: {integrity: sha512-zvmkHEAdGMn+hMRXuMBtu4Vo5P6rHQjLoHftu+lBqq8ZTA3RCVC/WzD790bkKKiNFp7d5/9PcSD19fJyyRvOdQ==}
 
+  redis@5.11.0:
+    resolution: {integrity: sha512-YwXjATVDT+AuxcyfOwZn046aml9jMlQPvU1VXIlLDVAExe0u93aTfPYSeRgG4p9Q/Jlkj+LXJ1XEoFV+j2JKcQ==}
+    engines: {node: '>= 18'}
+
   redux-thunk@3.1.0:
     resolution: {integrity: sha512-NW2r5T6ksUKXCabzhL9z+h206HQw/NJkcLm1GPImRQ8IzfXwRGqjVhKJGauHirT0DAuyy6hjdnMZaRoAcy0Klw==}
     peerDependencies:
@@ -3621,32 +3658,33 @@ snapshots:
 
   '@braintree/sanitize-url@7.1.2': {}
 
-  '@chat-adapter/shared@4.14.0':
+  '@chat-adapter/shared@4.18.0':
     dependencies:
-      chat: 4.14.0(patch_hash=c2202e28072a5f146a50c030c44dff34eb5655c279b1836651b89277b9264029)
+      chat: 4.18.0(patch_hash=499e8281a8840ffbd6691d4d17d473a27eaa732cdad152588e94536e13c228fd)
     transitivePeerDependencies:
       - supports-color
 
-  '@chat-adapter/slack@4.14.0':
+  '@chat-adapter/slack@4.18.0':
     dependencies:
-      '@chat-adapter/shared': 4.14.0
+      '@chat-adapter/shared': 4.18.0
       '@slack/web-api': 7.14.1
-      chat: 4.14.0(patch_hash=c2202e28072a5f146a50c030c44dff34eb5655c279b1836651b89277b9264029)
+      chat: 4.18.0(patch_hash=499e8281a8840ffbd6691d4d17d473a27eaa732cdad152588e94536e13c228fd)
     transitivePeerDependencies:
       - debug
       - supports-color
 
-  '@chat-adapter/state-memory@4.14.0(patch_hash=5f7242168c5ef6bb86e644768c173a16562000b9619c51625136f98a1ea9f58e)':
+  '@chat-adapter/state-memory@4.18.0(patch_hash=a9d6710070bd81a0343ba1abe2b4fe392c097f00ab6f50ed3fe7e85bf5abe052)':
     dependencies:
-      chat: 4.14.0(patch_hash=c2202e28072a5f146a50c030c44dff34eb5655c279b1836651b89277b9264029)
+      chat: 4.18.0(patch_hash=499e8281a8840ffbd6691d4d17d473a27eaa732cdad152588e94536e13c228fd)
     transitivePeerDependencies:
       - supports-color
 
-  '@chat-adapter/state-redis@4.14.0(patch_hash=701850d19849154dd4ade7d8b2977b1c6a11ac5dafce456f6b1cc95148185b18)':
+  '@chat-adapter/state-redis@4.18.0(patch_hash=6d861e190d12695ba2b588117563146fd51368041b003543257a1d481e603ce5)':
     dependencies:
-      chat: 4.14.0(patch_hash=c2202e28072a5f146a50c030c44dff34eb5655c279b1836651b89277b9264029)
-      redis: 4.7.0
+      chat: 4.18.0(patch_hash=499e8281a8840ffbd6691d4d17d473a27eaa732cdad152588e94536e13c228fd)
+      redis: 5.11.0
     transitivePeerDependencies:
+      - '@node-rs/xxhash'
       - supports-color
 
   '@chevrotain/cst-dts-gen@11.1.2':
@@ -4662,11 +4700,19 @@ snapshots:
     dependencies:
       '@redis/client': 1.6.0
 
+  '@redis/bloom@5.11.0(@redis/client@5.11.0)':
+    dependencies:
+      '@redis/client': 5.11.0
+
   '@redis/client@1.6.0':
     dependencies:
       cluster-key-slot: 1.1.2
       generic-pool: 3.9.0
       yallist: 4.0.0
+
+  '@redis/client@5.11.0':
+    dependencies:
+      cluster-key-slot: 1.1.2
 
   '@redis/graph@1.1.1(@redis/client@1.6.0)':
     dependencies:
@@ -4676,13 +4722,25 @@ snapshots:
     dependencies:
       '@redis/client': 1.6.0
 
+  '@redis/json@5.11.0(@redis/client@5.11.0)':
+    dependencies:
+      '@redis/client': 5.11.0
+
   '@redis/search@1.2.0(@redis/client@1.6.0)':
     dependencies:
       '@redis/client': 1.6.0
 
+  '@redis/search@5.11.0(@redis/client@5.11.0)':
+    dependencies:
+      '@redis/client': 5.11.0
+
   '@redis/time-series@1.1.0(@redis/client@1.6.0)':
     dependencies:
       '@redis/client': 1.6.0
+
+  '@redis/time-series@5.11.0(@redis/client@5.11.0)':
+    dependencies:
+      '@redis/client': 5.11.0
 
   '@reduxjs/toolkit@2.11.2(react-redux@9.2.0(@types/react@19.2.14)(react@19.2.4)(redux@5.0.1))(react@19.2.4)':
     dependencies:
@@ -5272,13 +5330,14 @@ snapshots:
 
   character-reference-invalid@2.0.1: {}
 
-  chat@4.14.0(patch_hash=c2202e28072a5f146a50c030c44dff34eb5655c279b1836651b89277b9264029):
+  chat@4.18.0(patch_hash=499e8281a8840ffbd6691d4d17d473a27eaa732cdad152588e94536e13c228fd):
     dependencies:
       '@workflow/serde': 4.1.0-beta.2
       mdast-util-to-string: 4.0.0
       remark-gfm: 4.0.1
       remark-parse: 11.0.0
       remark-stringify: 11.0.0
+      remend: 1.2.1
       unified: 11.0.5
     transitivePeerDependencies:
       - supports-color
@@ -6983,6 +7042,16 @@ snapshots:
       '@redis/json': 1.0.7(@redis/client@1.6.0)
       '@redis/search': 1.2.0(@redis/client@1.6.0)
       '@redis/time-series': 1.1.0(@redis/client@1.6.0)
+
+  redis@5.11.0:
+    dependencies:
+      '@redis/bloom': 5.11.0(@redis/client@5.11.0)
+      '@redis/client': 5.11.0
+      '@redis/json': 5.11.0(@redis/client@5.11.0)
+      '@redis/search': 5.11.0(@redis/client@5.11.0)
+      '@redis/time-series': 5.11.0(@redis/client@5.11.0)
+    transitivePeerDependencies:
+      - '@node-rs/xxhash'
 
   redux-thunk@3.1.0(redux@5.0.1):
     dependencies:

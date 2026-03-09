@@ -11,9 +11,9 @@
   },
   "dependencies": {
     "@ai-sdk/react": "^3.0.107",
-    "@chat-adapter/slack": "4.14.0",
-    "@chat-adapter/state-memory": "4.14.0",
-    "@chat-adapter/state-redis": "4.14.0",
+    "@chat-adapter/slack": "4.18.0",
+    "@chat-adapter/state-memory": "4.18.0",
+    "@chat-adapter/state-redis": "4.18.0",
     "@pierre/diffs": "^1.0.11",
     "@radix-ui/react-scroll-area": "^1.2.10",
     "@radix-ui/react-use-controllable-state": "^1.2.2",
@@ -29,7 +29,7 @@
     "ai": "^6.0.105",
     "ansi-to-react": "^6.2.6",
     "autoprefixer": "10.4.27",
-    "chat": "4.14.0",
+    "chat": "4.18.0",
     "class-variance-authority": "0.7.1",
     "clsx": "2.1.1",
     "cmdk": "^1.1.1",
@@ -76,9 +76,9 @@
   },
   "pnpm": {
     "patchedDependencies": {
-      "chat@4.14.0": "patches/chat@4.14.0.patch",
-      "@chat-adapter/state-redis@4.14.0": "patches/@chat-adapter__state-redis@4.14.0.patch",
-      "@chat-adapter/state-memory@4.14.0": "patches/@chat-adapter__state-memory@4.14.0.patch"
+      "chat@4.18.0": "patches/chat@4.18.0.patch",
+      "@chat-adapter/state-redis@4.18.0": "patches/@chat-adapter__state-redis@4.18.0.patch",
+      "@chat-adapter/state-memory@4.18.0": "patches/@chat-adapter__state-memory@4.18.0.patch"
     }
   }
 }

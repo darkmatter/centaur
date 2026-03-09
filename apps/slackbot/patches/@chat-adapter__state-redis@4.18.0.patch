@@ -1,8 +1,7 @@
 diff --git a/dist/index.js b/dist/index.js
-index 58aae7167a910753e9b59483cb79ae9634431b7d..f4281c0580ab5149ead171479346bae73c534160 100644
 --- a/dist/index.js
 +++ b/dist/index.js
-@@ -83,6 +83,11 @@ var RedisStateAdapter = class {
+@@ -87,6 +87,11 @@
        arguments: [lock.token]
      });
    }

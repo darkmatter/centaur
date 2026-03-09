@@ -201,6 +201,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      firewall:
+        condition: service_healthy
     restart: unless-stopped
 
   web:
@@ -217,6 +219,8 @@ services:
       - data_net
     depends_on:
       api:
+        condition: service_healthy
+      firewall:
         condition: service_healthy
     restart: unless-stopped
 

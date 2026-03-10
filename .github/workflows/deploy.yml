@@ -3,9 +3,6 @@ name: Deploy
 on:
   push:
     branches: [main]
-  pull_request:
-    branches: [main]
-    types: [closed]
   workflow_dispatch:
 
 concurrency:
@@ -14,12 +11,6 @@ concurrency:
 
 jobs:
   deploy:
-    if: >
-      github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'pull_request' &&
-       github.event.pull_request.merged == true &&
-       github.event.pull_request.base.ref == 'main') ||
-      (github.event_name == 'push' && github.event.pusher.name != 'web-flow')
     runs-on: [self-hosted, linux, x64, docker]
     env:
       OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}

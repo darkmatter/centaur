@@ -2,13 +2,13 @@
 
 import type { ComponentType } from "react";
 import { Command } from "cmdk";
-import { ExternalLink, Keyboard, Link2, RefreshCw, Search, Square } from "lucide-react";
+import { Search } from "lucide-react";
 import { useHaptics } from "@/components/haptics-provider";
 import {
   CommandSurfaceIcon,
-  CompactDensityIcon,
   ThreadContextIcon,
 } from "@/components/thread/icons/thread-icons";
+import { buildThreadActionItems } from "@/lib/thread-actions";
 import { threadName } from "@/lib/viewer/thread-name";
 import type { ThreadSummary } from "@/lib/types";
 import { cn } from "@/lib/utils";
@@ -74,62 +74,19 @@ export function CommandPalette({
 }: CommandPaletteProps) {
   const { trigger } = useHaptics();
   const navigationItems = threads
-    .filter((thread) => thread.slack_thread_key !== currentThreadKey)
-    .slice(0, 8);
+    .filter((thread) => thread.slack_thread_key !== currentThreadKey);
 
-  const actions: PaletteAction[] = [
-    {
-      id: "stop",
-      label: "Stop agent",
-      icon: Square,
-      shortcut: "S",
-      disabled: !canInterrupt,
-      keywords: "interrupt cancel halt",
-      run: onStop,
-    },
-    {
-      id: "refresh",
-      label: isRefreshing ? "Refreshing thread…" : "Refresh thread",
-      icon: RefreshCw,
-      shortcut: "R",
-      disabled: isRefreshing,
-      keywords: "reload sync",
-      run: onRefresh,
-    },
-    {
-      id: "copy-url",
-      label: "Copy thread URL",
-      icon: Link2,
-      keywords: "copy link share",
-      run: onCopyUrl,
-    },
-    {
-      id: "toggle-compact",
-      label: compactMode ? "Disable compact mode" : "Toggle compact mode",
-      icon: CompactDensityIcon,
-      shortcut: "Cmd+.",
-      keywords: "density compact collapse",
-      run: onToggleCompact,
-    },
-    {
-      id: "shortcuts",
-      label: "Show keyboard shortcuts",
-      icon: Keyboard,
-      shortcut: "Shift+?",
-      keywords: "help hotkeys",
-      run: onOpenShortcuts,
-    },
-  ];
-
-  if (onOpenSlack) {
-    actions.push({
-      id: "open-slack",
-      label: "Open in Slack",
-      icon: ExternalLink,
-      keywords: "slack thread",
-      run: onOpenSlack,
-    });
-  }
+  const actions: PaletteAction[] = buildThreadActionItems({
+    canInterrupt,
+    isRefreshing,
+    compactMode,
+    onRefresh,
+    onStop,
+    onCopyUrl,
+    onToggleCompact,
+    onOpenSlack,
+    onOpenShortcuts,
+  });
 
   return (
     <Command.Dialog

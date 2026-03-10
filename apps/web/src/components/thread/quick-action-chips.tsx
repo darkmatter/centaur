@@ -53,13 +53,13 @@ export function QuickActionChips({ threadState, onAction, className }: QuickActi
     <SurfaceBar
       data-state={visibility}
       className={cn(
-        "border-t border-border/70 px-2.5 py-1.5 md:hidden",
+        "border-t border-border/70 px-2.5 py-1.5",
         "data-[state=open]:animate-in data-[state=open]:slide-in-from-bottom-2 data-[state=open]:fade-in data-[state=open]:duration-base",
         "data-[state=closed]:animate-out data-[state=closed]:slide-out-to-bottom-2 data-[state=closed]:fade-out data-[state=closed]:duration-fast",
         className,
       )}
     >
-      <Suggestions className="rounded-lg border border-border/70 bg-card/45 p-1 shadow-chips">
+      <Suggestions className="mx-auto max-w-[960px] rounded-lg border border-border/70 bg-card/45 p-1 shadow-chips">
         {renderedChips.map((chip) => (
           <Suggestion
             key={chip.value}

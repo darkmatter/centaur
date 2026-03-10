@@ -22,41 +22,25 @@ import { Shimmer } from "@/components/ai-elements/shimmer";
 import { useMediaQuery } from "@/hooks/use-media-query";
 import { categorizeToolCall } from "@/lib/describe";
 import type { SubagentActivity, SubagentStep } from "@/lib/describe";
+import { formatCompactCount, formatDurationShort } from "@/lib/formatting";
 import {
   getSubagentPreviewText,
   isSubagentTerminal,
-  normalizeSubagentStatus,
   subagentSelectionKey,
-  subagentStatusLabel,
 } from "@/lib/viewer/subagent-steps";
 import { subagentIdentityIcon } from "@/components/thread/subagent-card";
+import { normalizeSubagentStatus, subagentStatusLabel, subagentTone } from "@/lib/status-semantics";
 import { cn } from "@/lib/utils";
 
 function StatusBadge({ status }: { status: string }) {
-  const normalized = normalizeSubagentStatus(status);
-  const isDone = normalized === "completed" || normalized === "selected";
-  const isFailed = normalized === "failed";
   return (
     <Badge
-      variant={isFailed ? "destructive" : isDone ? "default" : "secondary"}
+      variant={subagentTone(status)}
       className="text-3xs"
     >
       {subagentStatusLabel(status)}
     </Badge>
   );
-}
-
-function formatDuration(seconds: number): string {
-  if (seconds < 60) return `${Math.round(seconds)}s`;
-  const minutes = Math.floor(seconds / 60);
-  const remaining = Math.round(seconds % 60);
-  return remaining > 0 ? `${minutes}m ${remaining}s` : `${minutes}m`;
-}
-
-function formatTokens(count: number): string {
-  if (count >= 1_000_000) return `${(count / 1_000_000).toFixed(1)}M`;
-  if (count >= 1_000) return `${(count / 1_000).toFixed(1)}k`;
-  return count.toLocaleString();
 }
 
 function StatCard({ label, value }: { label: string; value: string }) {
@@ -166,12 +150,12 @@ const SubagentDetailContent = memo(function SubagentDetailContent({
               Overview
             </div>
             <div className="grid grid-cols-2 gap-2">
-              {step.durationS !== undefined && <StatCard label="Duration" value={formatDuration(step.durationS)} />}
+              {step.durationS !== undefined && <StatCard label="Duration" value={formatDurationShort(step.durationS)} />}
               {step.toolCalls !== undefined && <StatCard label="Tools" value={String(step.toolCalls)} />}
               {step.turns !== undefined && <StatCard label="Turns" value={String(step.turns)} />}
-              {step.totalTokens !== undefined && <StatCard label="Tokens" value={formatTokens(step.totalTokens)} />}
-              {step.inputTokens !== undefined && <StatCard label="Input" value={formatTokens(step.inputTokens)} />}
-              {step.outputTokens !== undefined && <StatCard label="Output" value={formatTokens(step.outputTokens)} />}
+              {step.totalTokens !== undefined && <StatCard label="Tokens" value={formatCompactCount(step.totalTokens)} />}
+              {step.inputTokens !== undefined && <StatCard label="Input" value={formatCompactCount(step.inputTokens)} />}
+              {step.outputTokens !== undefined && <StatCard label="Output" value={formatCompactCount(step.outputTokens)} />}
               {step.costUsd != null && <StatCard label="Cost" value={`$${step.costUsd.toFixed(4)}`} />}
               {step.maxParallel !== undefined && step.maxParallel > 1 && (
                 <StatCard label="Parallel" value={`${step.maxParallel}x`} />

@@ -1,11 +1,13 @@
 "use client";
 
 import { memo, useMemo, useState } from "react";
-import { CheckCircle, ChevronRight, CircleX, LoaderCircle } from "lucide-react";
+import { ChevronRight } from "lucide-react";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { useHaptics } from "@/components/haptics-provider";
 import { describeToolCall, type ToolCall } from "@/lib/describe";
 import { summarizeToolOutput } from "@/lib/viewer/tool-output-detect";
+import { toolGroupStatusIcon, toolGroupStatusIconClassName } from "@/lib/status-semantics";
+import { cn } from "@/lib/utils";
 import {
   Tool,
   ToolHeader,
@@ -13,6 +15,8 @@ import {
   ToolInput,
   ToolOutput,
 } from "@/components/ai-elements/tool";
+import { AnimatedNumber } from "@/components/ui/animated-number";
+import { StatusTitle } from "@/components/thread/status-title";
 import {
   Sources,
   SourcesTrigger,
@@ -161,9 +165,8 @@ function isToolError(call: ToolCall): boolean {
 }
 
 function GroupStatusIcon({ loading, error }: { loading: number; error: number }) {
-  if (error > 0) return <CircleX className="size-3.5 text-destructive shrink-0" />;
-  if (loading > 0) return <LoaderCircle className="size-3.5 text-muted-foreground animate-spin shrink-0" />;
-  return <CheckCircle className="size-3.5 text-primary shrink-0" />;
+  const Icon = toolGroupStatusIcon(loading, error);
+  return <Icon className={cn("size-3.5 shrink-0", toolGroupStatusIconClassName(loading, error))} />;
 }
 
 export function StepGroup({
@@ -201,15 +204,17 @@ export function StepGroup({
       : calls.length === 1
         ? ""
         : `${calls.length}`;
+  const activeTitle = errorCount > 0 ? "Tool issue" : "Running";
+  const doneTitle = errorCount > 0 ? "Issue" : "Complete";
 
   return (
     <Collapsible
       open={isOpen}
       onOpenChange={handleToggle}
-      className="group rounded-md border border-border/50 bg-card/30"
+      className="thread-surface-soft group rounded-md"
     >
       <CollapsibleTrigger
-        className="flex w-full cursor-pointer items-center gap-1.5 px-2.5 py-1.5 transition-colors hover:bg-accent/40 active:bg-accent/60 min-h-input-min md:min-h-0"
+        className="flex min-h-[40px] w-full cursor-pointer items-center gap-1.5 px-3 py-2 transition-colors hover:bg-accent/40 active:bg-accent/60 md:min-h-0"
         data-touch-target
       >
         <ChevronRight className="size-3 text-muted-foreground/60 shrink-0 transition-transform duration-fast group-data-[state=open]:rotate-90" />
@@ -217,14 +222,31 @@ export function StepGroup({
         <span className="truncate flex-1 min-w-0 text-left text-label text-foreground/80">
           {summary}
         </span>
+        <span className="hidden md:inline-flex text-[11px] text-muted-foreground shrink-0">
+          <StatusTitle active={loadingCount > 0} activeText={activeTitle} doneText={doneTitle} />
+        </span>
         {statusLabel && (
-          <span className="text-detail font-mono text-muted-foreground tabular-nums shrink-0">
-            {statusLabel}
+          <span className="text-[11px] font-mono text-muted-foreground tabular-nums shrink-0 inline-flex items-center gap-1">
+            {loadingCount > 0 ? (
+              <>
+                <AnimatedNumber value={doneCount} />
+                <span>of</span>
+                <AnimatedNumber value={calls.length} />
+              </>
+            ) : errorCount > 0 ? (
+              <>
+                <AnimatedNumber value={doneCount} />
+                <span>/</span>
+                <AnimatedNumber value={calls.length} />
+              </>
+            ) : (
+              <AnimatedNumber value={calls.length} />
+            )}
           </span>
         )}
         <GroupStatusIcon loading={loadingCount} error={errorCount} />
       </CollapsibleTrigger>
-      <CollapsibleContent className="space-y-0.5 pb-1.5 pl-2 md:pl-3">
+      <CollapsibleContent className="space-y-0.5 px-2 pb-2 md:px-3">
         {calls.map((call) => (
           <ToolCallItem key={call.id} call={call} />
         ))}

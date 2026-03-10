@@ -36,8 +36,8 @@ jobs:
       - name: Compile
         run: uv run python -m compileall -q src/
 
-  slackbot-contract:
-    name: Slackbot TS contract checks
+  web-contract:
+    name: Web TS contract checks
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -49,11 +49,13 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
+          cache: pnpm
+          cache-dependency-path: apps/web/pnpm-lock.yaml
 
       - name: Install workspace dependencies
         run: |
           corepack enable
-          pnpm --dir apps/slackbot install
+          pnpm --dir apps/web install --frozen-lockfile
 
-      - name: Type-check slackbot stream contracts
-        run: pnpm --dir apps/slackbot exec tsc --noEmit
+      - name: Type-check web stream contracts
+        run: pnpm --dir apps/web exec tsc --noEmit

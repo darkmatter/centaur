@@ -1,4 +1,4 @@
-/** Proxy POST /api/agent/interrupt -> FastAPI /agent/stop */
+/** Proxy POST /api/agent/interrupt -> FastAPI /pipe/stop */
 
 import { resilientFetch, API_URL, ApiError } from "@/lib/api-client";
 

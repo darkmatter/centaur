@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { useState, useMemo, useCallback, useRef } from "react";
 import { Textarea } from "@/components/ui/textarea";
 import { DashboardLayout } from "@/components/dashboard/layout";
@@ -261,15 +262,15 @@ const MOCK_PARTICIPANTS: Participant[] = [
   { id: "U04JKL", name: "Mike Johnson", username: "mike", avatar_url: null },
 ];
 
-const now = Date.now() / 1000;
+const FIXTURE_NOW_S = Date.UTC(2026, 2, 9, 18, 0, 0) / 1000;
 
 const MOCK_THREADS: ThreadSummary[] = [
   {
     slack_thread_key: "demo:running-1",
     harness: "amp",
     state: "running",
-    created_at: now - 300,
-    last_activity: now - 10,
+    created_at: FIXTURE_NOW_S - 300,
+    last_activity: FIXTURE_NOW_S - 10,
     turn_count: 5,
     first_message: "Analyze the top DeFi protocols by TVL and summarize risk metrics",
     last_user_message: "Now compare Aave vs Compound lending rates",
@@ -280,8 +281,8 @@ const MOCK_THREADS: ThreadSummary[] = [
     slack_thread_key: "demo:stopped-1",
     harness: "claude-code",
     state: "stopped",
-    created_at: now - 3600,
-    last_activity: now - 1200,
+    created_at: FIXTURE_NOW_S - 3600,
+    last_activity: FIXTURE_NOW_S - 1200,
     turn_count: 12,
     first_message: "Refactor the authentication system to support JWT",
     thread_name: "Auth Refactor",
@@ -291,19 +292,19 @@ const MOCK_THREADS: ThreadSummary[] = [
     slack_thread_key: "demo:error-1",
     harness: "amp",
     state: "error",
-    created_at: now - 7200,
-    last_activity: now - 6000,
+    created_at: FIXTURE_NOW_S - 7200,
+    last_activity: FIXTURE_NOW_S - 6000,
     turn_count: 3,
     first_message: "Process the 2GB transaction log and extract anomalies",
-    thread_name: null,
+    thread_name: "Anomaly Extraction Failure",
     participants: MOCK_PARTICIPANTS.slice(0, 1),
   },
   {
     slack_thread_key: "demo:working-1",
     harness: "codex",
     state: "working",
-    created_at: now - 600,
-    last_activity: now - 5,
+    created_at: FIXTURE_NOW_S - 600,
+    last_activity: FIXTURE_NOW_S - 5,
     turn_count: 2,
     first_message: "Write unit tests for the portfolio calculation module",
     last_user_message: "Write unit tests for the portfolio calculation module",
@@ -314,8 +315,8 @@ const MOCK_THREADS: ThreadSummary[] = [
     slack_thread_key: "demo:idle-1",
     harness: "amp",
     state: "idle",
-    created_at: now - 86400,
-    last_activity: now - 43200,
+    created_at: FIXTURE_NOW_S - 86400,
+    last_activity: FIXTURE_NOW_S - 43200,
     turn_count: 8,
     first_message: "Build the portfolio dashboard components",
     thread_name: "Dashboard UI",
@@ -448,46 +449,46 @@ const MANY_THREADS: ThreadSummary[] = [
   ...MOCK_THREADS,
   {
     slack_thread_key: "demo:stopped-2", harness: "amp",
-    state: "stopped", created_at: now - 5400, last_activity: now - 4800, turn_count: 7,
+    state: "stopped", created_at: FIXTURE_NOW_S - 5400, last_activity: FIXTURE_NOW_S - 4800, turn_count: 7,
     first_message: "Set up Slack webhook event processing",
     thread_name: "Slack Webhooks", participants: MOCK_PARTICIPANTS.slice(0, 2),
   },
   {
     slack_thread_key: "demo:stopped-3", harness: "claude-code",
-    state: "stopped", created_at: now - 10800, last_activity: now - 9000, turn_count: 15,
+    state: "stopped", created_at: FIXTURE_NOW_S - 10800, last_activity: FIXTURE_NOW_S - 9000, turn_count: 15,
     first_message: "Migrate the database schema to add token_usage columns",
     thread_name: "DB Migration", participants: MOCK_PARTICIPANTS.slice(1, 4),
   },
   {
     slack_thread_key: "demo:idle-2", harness: "amp",
-    state: "idle", created_at: now - 172800, last_activity: now - 86400, turn_count: 4,
+    state: "idle", created_at: FIXTURE_NOW_S - 172800, last_activity: FIXTURE_NOW_S - 86400, turn_count: 4,
     first_message: "Generate a summary of Q4 trading activity",
     thread_name: "Q4 Trading Summary", participants: MOCK_PARTICIPANTS.slice(0, 1),
   },
   {
     slack_thread_key: "demo:stopped-4", harness: "codex",
-    state: "stopped", created_at: now - 14400, last_activity: now - 12000, turn_count: 9,
+    state: "stopped", created_at: FIXTURE_NOW_S - 14400, last_activity: FIXTURE_NOW_S - 12000, turn_count: 9,
     first_message: "Debug the rate limiter — it's dropping valid requests under load",
-    thread_name: null, participants: MOCK_PARTICIPANTS.slice(2, 4),
+    thread_name: "Rate Limiter Debug", participants: MOCK_PARTICIPANTS.slice(2, 4),
   },
   {
     slack_thread_key: "demo:running-2", harness: "amp",
-    state: "running", created_at: now - 120, last_activity: now - 3, turn_count: 1,
+    state: "running", created_at: FIXTURE_NOW_S - 120, last_activity: FIXTURE_NOW_S - 3, turn_count: 1,
     first_message: "Review the latest PR for the firewall addon",
     last_user_message: "Review the latest PR for the firewall addon",
     thread_name: "PR Review: Firewall", participants: MOCK_PARTICIPANTS.slice(0, 3),
   },
   {
     slack_thread_key: "demo:stopped-5", harness: "amp",
-    state: "stopped", created_at: now - 28800, last_activity: now - 25200, turn_count: 6,
+    state: "stopped", created_at: FIXTURE_NOW_S - 28800, last_activity: FIXTURE_NOW_S - 25200, turn_count: 6,
     first_message: "Write an incident report for yesterday's API outage",
     thread_name: "Incident Report", participants: MOCK_PARTICIPANTS.slice(0, 2),
   },
   {
     slack_thread_key: "demo:error-2", harness: "claude-code",
-    state: "error", created_at: now - 3600, last_activity: now - 3000, turn_count: 2,
+    state: "error", created_at: FIXTURE_NOW_S - 3600, last_activity: FIXTURE_NOW_S - 3000, turn_count: 2,
     first_message: "Fetch and analyze on-chain governance proposals",
-    thread_name: null, participants: MOCK_PARTICIPANTS.slice(1, 3),
+    thread_name: "Governance Proposal Fetch", participants: MOCK_PARTICIPANTS.slice(1, 3),
   },
 ];
 
@@ -644,6 +645,26 @@ function ThreadViewerShowcase() {
 
   return (
     <div className="space-y-8">
+      <Section
+        title="Dedicated Thread Viewer Fixture"
+        description="End-to-end showcase of the refreshed thread viewer with live feed fixtures, overlays, shell states, and footer surfaces."
+      >
+        <div className="thread-surface flex flex-wrap items-center justify-between gap-3 rounded-xl p-4">
+          <div className="space-y-1">
+            <div className="text-sm font-medium text-foreground">Use the full fixture screen for motion and interaction review.</div>
+            <div className="text-sm text-muted-foreground">
+              It now reflects the current header, banner, feed, shell, subagent, overlay, and composer behavior.
+            </div>
+          </div>
+          <Link
+            href="/uikit/thread-viewer"
+            className="inline-flex items-center rounded-lg border border-border/70 bg-card/60 px-3 py-2 text-sm text-foreground thread-action-transition hover:bg-accent/70"
+          >
+            Open fixture screen
+          </Link>
+        </div>
+      </Section>
+
       <Section title="ThreadStatusTabs" description="Filter tabs for thread list — All / Active / Error with counts.">
         <div className="space-y-4">
           <div className="space-y-1.5">

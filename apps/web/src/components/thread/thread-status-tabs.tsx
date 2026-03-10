@@ -3,6 +3,7 @@
 import React from "react";
 import { useHaptics } from "@/components/haptics-provider";
 import { Button } from "@/components/ui/button";
+import { AnimatedNumber } from "@/components/ui/animated-number";
 import { cn } from "@/lib/utils";
 import { THREAD_STATUS_FILTER_OPTIONS, type VisibleThreadStatusFilter } from "@/components/thread/thread-ui-constants";
 
@@ -26,7 +27,7 @@ export function ThreadStatusTabs({
 
   return (
     <div
-      role="tablist"
+      role="group"
       aria-label="Thread filters"
       className={cn(
         "flex w-full items-center gap-0.5",
@@ -43,13 +44,12 @@ export function ThreadStatusTabs({
               if (!active) trigger("selection");
               onChange(option.id);
             }}
-            role="tab"
-            aria-selected={active}
             variant="ghost"
+            aria-pressed={active}
             className={cn(
-              "inline-flex flex-1 items-center justify-center gap-1 py-1.5 text-xs font-medium transition-colors duration-fast",
+              "inline-flex flex-1 items-center justify-center gap-1 rounded-md py-1.5 text-xs font-medium transition-colors duration-[var(--dur-fast)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1",
               active
-                ? "text-foreground"
+                ? "bg-accent/70 text-foreground"
                 : "text-muted-foreground hover:text-foreground",
             )}
           >
@@ -58,7 +58,7 @@ export function ThreadStatusTabs({
               "text-3xs tabular-nums",
               active ? "text-foreground/60" : "text-muted-foreground/60",
             )}>
-              {counts[option.id]}
+              <AnimatedNumber value={counts[option.id]} />
             </span>
           </Button>
         );

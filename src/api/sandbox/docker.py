@@ -46,7 +46,12 @@ def _get_injection_key_names() -> list[str]:
         return []
 
 
-def _container_env(thread_key: str, container_name: str) -> list[str]:
+def _container_env(
+    thread_key: str,
+    container_name: str,
+    harness: str,
+    engine: str,
+) -> list[str]:
     """Build env vars for sandbox containers."""
     local_dev = os.getenv("AGENT_LOCAL_DEV", "").lower() in ("1", "true")
 
@@ -61,7 +66,12 @@ def _container_env(thread_key: str, container_name: str) -> list[str]:
     env = [
         f"AI_V2_API_URL={os.getenv('AGENT_API_URL', 'http://api:8000')}",
         f"AI_V2_API_KEY={api_key}",
+        f"AGENT_ENGINE={engine}",
     ]
+    if harness in ("eng", "engineer"):
+        env.append("AGENT_PERSONA=engineer")
+    elif harness == "legal":
+        env.append("AGENT_PERSONA=legal")
 
     if local_dev:
         # In local dev mode, real secrets come from environment
@@ -166,7 +176,7 @@ class DockerSandboxBackend(SandboxBackend):
         repos_dir = os.path.abspath(_repos_host_dir())
 
         container_name = f"pipe-{thread_key.replace(':', '-').replace('.', '-')[:40]}"
-        env = _container_env(thread_key, container_name)
+        env = _container_env(thread_key, container_name, harness, engine)
 
         # Remove stale container with same name
         with contextlib.suppress(Exception):

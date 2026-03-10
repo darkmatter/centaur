@@ -1,4 +1,1 @@
-patchedDependencies:
-  '@chat-adapter/state-memory@4.14.0': patches/@chat-adapter__state-memory@4.14.0.patch
-  '@chat-adapter/state-redis@4.14.0': patches/@chat-adapter__state-redis@4.14.0.patch
-  chat@4.14.0: patches/chat@4.14.0.patch
+# No package-local patched dependencies.

@@ -75,7 +75,8 @@ export const PeopleList = memo(function PeopleList({
           return (
             <li key={i} className="flex items-center gap-3 px-4 py-2.5">
               {person.avatar ? (
-                <img src={person.avatar} alt={person.name} className="h-8 w-8 rounded-full object-cover" />
+                // eslint-disable-next-line @next/next/no-img-element
+                <img src={person.avatar} alt={person.name} loading="lazy" className="h-8 w-8 rounded-full object-cover" />
               ) : (
                 <div
                   className="flex h-8 w-8 items-center justify-center rounded-full text-xs font-medium text-white"

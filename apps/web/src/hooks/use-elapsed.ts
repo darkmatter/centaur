@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 import { timeAgo } from "@/lib/format";
 
 const tickListeners = new Set<() => void>();
@@ -41,11 +41,10 @@ export function useElapsed(startedAt: number | null | undefined, isRunning: bool
     return subscribeSharedTick(() => setTick((value) => value + 1));
   }, [isRunning, startedAt]);
 
-  return useMemo(() => {
-    if (!startedAt || !Number.isFinite(startedAt)) return "unknown";
-    if (!isRunning) return timeAgo(startedAt);
-    const nowSeconds = Math.floor(Date.now() / 1000);
-    const elapsed = Math.max(0, nowSeconds - Math.floor(startedAt));
-    return formatElapsed(elapsed);
-  }, [isRunning, startedAt, tick]);
+  if (!startedAt || !Number.isFinite(startedAt)) return "unknown";
+  if (!isRunning) return timeAgo(startedAt);
+  const nowSeconds = Math.floor(Date.now() / 1000);
+  const elapsed = Math.max(0, nowSeconds - Math.floor(startedAt));
+  void tick;
+  return formatElapsed(elapsed);
 }

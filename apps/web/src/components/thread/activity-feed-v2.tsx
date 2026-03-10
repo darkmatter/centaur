@@ -82,16 +82,6 @@ export const ActivityFeedV2 = memo(function ActivityFeedV2({
     return () => observer.disconnect();
   }, [hasOlderMessages, isLoadingOlder]);
 
-  // Filter to only assistant messages that have parts (skip empty)
-  const assistantMessages = useMemo(
-    () =>
-      messages.filter(
-        (msg) =>
-          msg.role === "assistant" && msg.parts && msg.parts.length > 0,
-      ),
-    [messages],
-  );
-
   return (
     <Conversation
       className="relative flex-1 min-w-0"
@@ -150,7 +140,11 @@ export const ActivityFeedV2 = memo(function ActivityFeedV2({
             <Message
               key={message.id}
               from={message.role === "user" ? "user" : "assistant"}
-              className="group max-w-full rounded-md border border-border/40 bg-card/20 content-auto"
+              className={
+                message.role === "user"
+                  ? "group max-w-full rounded-md border border-border/40 bg-card/20 content-auto"
+                  : "group max-w-full content-auto"
+              }
             >
               <MessageContent
                 className={

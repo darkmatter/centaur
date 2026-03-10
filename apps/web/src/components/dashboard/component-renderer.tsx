@@ -13,6 +13,7 @@ import { PeopleList } from "./people-list";
 import { formatValue } from "./format-value";
 import { LiveDataWrapper } from "./live-data-wrapper";
 import { Button } from "@/components/ui/button";
+import { dashboardStatusDotClassName } from "@/lib/status-semantics";
 
 const AVATAR_COLORS = [
   "var(--chart-1)", "var(--chart-2)", "var(--chart-3)", "var(--chart-4)", "var(--chart-5)",
@@ -128,7 +129,8 @@ export const RenderNode = memo(function RenderNode({ node }: { node: ComponentNo
       const size = sizes[node.size ?? "md"];
       const bg = AVATAR_COLORS[hashCode(node.name) % AVATAR_COLORS.length];
       if (node.src) {
-        return <img src={node.src} alt={node.name} className={`${size} rounded-full object-cover`} />;
+        // eslint-disable-next-line @next/next/no-img-element
+        return <img src={node.src} alt={node.name} loading="lazy" className={`${size} rounded-full object-cover`} />;
       }
       return (
         <div
@@ -141,13 +143,9 @@ export const RenderNode = memo(function RenderNode({ node }: { node: ComponentNo
     }
 
     case "status-dot": {
-      const colors: Record<string, string> = {
-        success: "bg-primary", warning: "bg-yellow-500", error: "bg-destructive",
-        idle: "bg-muted-foreground", running: "bg-primary animate-pulse",
-      };
       return (
         <span className="inline-flex items-center gap-1.5">
-          <span className={`h-2 w-2 rounded-full ${colors[node.status]}`} />
+          <span className={`h-2 w-2 rounded-full ${dashboardStatusDotClassName(node.status)}`} />
           {node.label && <span className="text-xs text-muted-foreground">{node.label}</span>}
         </span>
       );

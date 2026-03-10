@@ -1,5 +1,5 @@
 const API_URL = process.env.AI_V2_API_URL || "http://api:8000";
-const API_KEY = process.env.SLACKBOT_API_KEY || "";
+const API_KEY = process.env.AI_V2_API_KEY || "";
 
 const RETRY_DEFAULTS = {
   maxAttempts: 4,

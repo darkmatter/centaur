@@ -9,24 +9,28 @@ import {
   CollapsibleTrigger,
 } from "@/components/ui/collapsible";
 import { cn } from "@/lib/utils";
-import { cjk } from "@streamdown/cjk";
-import { createCodePlugin } from "@streamdown/code";
-import { math } from "@streamdown/math";
-import { mermaid } from "@streamdown/mermaid";
 import { BrainIcon, ChevronDownIcon } from "lucide-react";
 import {
   createContext,
   memo,
+  lazy,
+  Suspense,
   useCallback,
   useContext,
   useEffect,
   useMemo,
   useRef,
-  useState,
 } from "react";
-import { Streamdown } from "streamdown";
 
 import { Shimmer } from "./shimmer";
+import { TextReveal } from "./text-reveal";
+
+const LazyStreamdownRenderer = lazy(
+  () =>
+    import("./reasoning-renderer").then((module) => ({
+      default: module.StreamdownRenderer,
+    })),
+);
 
 interface ReasoningContextValue {
   isStreaming: boolean;
@@ -53,7 +57,6 @@ export type ReasoningProps = ComponentProps<typeof Collapsible> & {
   duration?: number;
 };
 
-const AUTO_CLOSE_DELAY = 1000;
 const MS_IN_S = 1000;
 
 export const Reasoning = memo(
@@ -82,7 +85,6 @@ export const Reasoning = memo(
     });
 
     const hasEverStreamedRef = useRef(isStreaming);
-    const [hasAutoClosed, setHasAutoClosed] = useState(false);
     const userClosedRef = useRef(false);
     const startTimeRef = useRef<number | null>(null);
 
@@ -105,23 +107,6 @@ export const Reasoning = memo(
         setIsOpen(true);
       }
     }, [isStreaming, isOpen, setIsOpen, isExplicitlyClosed]);
-
-    // Auto-close when streaming ends (once only, and only if it ever streamed)
-    useEffect(() => {
-      if (
-        hasEverStreamedRef.current &&
-        !isStreaming &&
-        isOpen &&
-        !hasAutoClosed
-      ) {
-        const timer = setTimeout(() => {
-          setIsOpen(false);
-          setHasAutoClosed(true);
-        }, AUTO_CLOSE_DELAY);
-
-        return () => clearTimeout(timer);
-      }
-    }, [isStreaming, isOpen, setIsOpen, hasAutoClosed]);
 
     const handleOpenChange = useCallback(
       (newOpen: boolean) => {
@@ -161,12 +146,12 @@ export type ReasoningTriggerProps = ComponentProps<
 
 const defaultGetThinkingMessage = (isStreaming: boolean, duration?: number) => {
   if (isStreaming || duration === 0) {
-    return <Shimmer duration={1}>Thinking...</Shimmer>;
+    return <Shimmer duration={1} active>Thinking...</Shimmer>;
   }
   if (duration === undefined) {
-    return <p>Thought for a few seconds</p>;
+    return <TextReveal text="Thought for a few seconds" />;
   }
-  return <p>Thought for {duration} seconds</p>;
+  return <TextReveal text={`Thought for ${duration} seconds`} />;
 };
 
 export const ReasoningTrigger = memo(
@@ -209,24 +194,27 @@ export type ReasoningContentProps = ComponentProps<
   children: string;
 };
 
-const code = createCodePlugin({ themes: ["github-light", "github-dark-default"] });
-const streamdownPlugins = { cjk, code, math, mermaid };
-
 export const ReasoningContent = memo(
-  ({ className, children, ...props }: ReasoningContentProps) => (
-    <CollapsibleContent
-      className={cn(
-        "mt-2 text-sm",
-        "data-[state=closed]:fade-out-0 data-[state=closed]:slide-out-to-top-2 data-[state=open]:slide-in-from-top-2 text-muted-foreground outline-none data-[state=closed]:animate-out data-[state=open]:animate-in",
-        className
-      )}
-      {...props}
-    >
-      <Streamdown plugins={streamdownPlugins} {...props}>
-        {children}
-      </Streamdown>
-    </CollapsibleContent>
-  )
+  ({ className, children, ...props }: ReasoningContentProps) => {
+    const { isOpen } = useReasoning();
+
+    return (
+      <CollapsibleContent
+        className={cn(
+          "mt-2 text-sm",
+          "data-[state=closed]:fade-out-0 data-[state=closed]:slide-out-to-top-2 data-[state=open]:slide-in-from-top-2 text-muted-foreground outline-none data-[state=closed]:animate-out data-[state=open]:animate-in",
+          className
+        )}
+        {...props}
+      >
+        {isOpen ? (
+          <Suspense fallback={<div className="whitespace-pre-wrap text-sm text-muted-foreground/90">{children}</div>}>
+            <LazyStreamdownRenderer>{children}</LazyStreamdownRenderer>
+          </Suspense>
+        ) : null}
+      </CollapsibleContent>
+    );
+  }
 );
 
 Reasoning.displayName = "Reasoning";

@@ -12,7 +12,7 @@ import {
   useRef,
   useState,
 } from "react";
-import { ChevronLeft, ChevronRight, Palette, Plus, Search, X } from "lucide-react";
+import { ChevronLeft, ChevronRight, Plus, Search, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
@@ -263,7 +263,7 @@ export const ThreadSidebar = forwardRef<ThreadSidebarHandle, ThreadSidebarProps>
 
   return (
     <div className="flex h-full min-h-0 w-full flex-col" onKeyDown={handleListKeyDown}>
-      <div className="px-3 py-3">
+      <div className="px-3 py-2.5 md:px-4 md:py-3">
         <div className="flex items-center gap-1.5">
           <Tooltip>
             <TooltipTrigger asChild>
@@ -281,22 +281,6 @@ export const ThreadSidebar = forwardRef<ThreadSidebarHandle, ThreadSidebarProps>
             </TooltipTrigger>
             <TooltipContent>New Session</TooltipContent>
           </Tooltip>
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <Button
-                asChild
-                variant="ghost"
-                size="icon-sm"
-                className="size-7"
-                data-touch-target
-              >
-                <Link href="/uikit">
-                  <Palette className="size-4" />
-                </Link>
-              </Button>
-            </TooltipTrigger>
-            <TooltipContent>UI Kit</TooltipContent>
-          </Tooltip>
           {canToggle ? (
             <Button
               ref={toggleRef}
@@ -312,7 +296,7 @@ export const ThreadSidebar = forwardRef<ThreadSidebarHandle, ThreadSidebarProps>
             </Button>
           ) : null}
         </div>
-        <div className="mt-2 relative">
+        <div className="relative mt-2.5">
           <label htmlFor={filterId} className="sr-only">
             Filter threads
           </label>
@@ -346,9 +330,9 @@ export const ThreadSidebar = forwardRef<ThreadSidebarHandle, ThreadSidebarProps>
         data-thread-list-scroll="true"
       >
         {loading ? (
-          <div className="divide-y divide-border/40">
+          <div className="divide-y divide-border/50">
             {[0, 1, 2].map((index) => (
-              <div key={index} className="px-3 py-3">
+              <div key={index} className="px-3 py-2.5 md:px-4">
                 <div className="h-3.5 w-5/6 rounded bg-secondary animate-pulse" />
                 <div className="mt-1.5 h-3 w-2/3 rounded bg-secondary animate-pulse" />
                 <div className="mt-1.5 h-3 w-4/5 rounded bg-secondary animate-pulse" />
@@ -373,7 +357,7 @@ export const ThreadSidebar = forwardRef<ThreadSidebarHandle, ThreadSidebarProps>
             No threads match your filter.
           </div>
         ) : (
-          <ul className="divide-y divide-border/40" role="list">
+          <ul className="divide-y divide-border/50" role="list">
             {sortedThreads.map((thread) => {
               const href = detailHrefWithEntrySource(thread.slack_thread_key, {
                 source: "threads",

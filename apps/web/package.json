@@ -7,6 +7,7 @@
     "dev": "next dev --port 3001 --turbopack",
     "build": "next build",
     "start": "next start --port 3001",
+    "typecheck": "tsc --noEmit",
     "lint": "eslint src/"
   },
   "dependencies": {
@@ -59,13 +60,15 @@
     "zod": "^4.3.6"
   },
   "devDependencies": {
+    "@eslint/eslintrc": "^3.3.1",
     "@types/node": "22.19.13",
     "@types/pg": "^8.18.0",
     "@types/react": "19.2.14",
     "@types/react-grid-layout": "^2.1.0",
     "@typescript-eslint/parser": "^8.56.1",
     "babel-plugin-react-compiler": "^1.0.0",
-    "eslint": "^10.0.3",
+    "eslint": "^9.35.0",
+    "eslint-config-next": "^15.5.4",
     "eslint-plugin-tailwindcss": "4.0.0-beta.0",
     "typescript": "5.9.3"
   },

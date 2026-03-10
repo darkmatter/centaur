@@ -1,27 +1,21 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
-import {
-  CircleStop,
-  Copy,
-  ExternalLink,
-  RefreshCw,
-  X,
-} from "lucide-react";
-import { Button } from "@/components/ui/button";
+import { X } from "lucide-react";
 import { HarnessBadge } from "@/components/ui/harness-badge";
-import { OverlayBackdrop } from "@/components/ui/overlay-backdrop";
-import { SheetAction } from "@/components/ui/sheet-action";
 import { StateDot } from "@/components/ui/state-dot";
 import { ParticipantAvatars } from "@/components/thread/participant-avatars";
+import { ResponsivePanel } from "@/components/ui/responsive-panel";
+import { useMediaQuery } from "@/hooks/use-media-query";
 import { cn } from "@/lib/utils";
 import {
-  tokenUsageBreakdownLabel,
   formatTokenUsageCost,
   formatTokenUsageCount,
+  tokenUsageBreakdownLabel,
   tokenUsageConfidenceLabel,
   tokenUsageModelsList,
 } from "@/lib/token-usage";
+import { buildThreadActionItems } from "@/lib/thread-actions";
+import { threadStateLabel } from "@/lib/status-semantics";
 import type { ThreadDetail, ThreadTokenUsage } from "@/lib/types";
 
 type ThreadInfoSheetProps = {
@@ -33,21 +27,165 @@ type ThreadInfoSheetProps = {
   onRefresh: () => void;
   onStop?: () => void;
   canStop: boolean;
+  mobileOnly?: boolean;
 };
 
-function getFocusableElements(container: HTMLElement): HTMLElement[] {
-  const candidates = container.querySelectorAll<HTMLElement>(
-    "a[href], button:not([disabled]), textarea:not([disabled]), input:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex='-1'])",
-  );
-  return Array.from(candidates).filter((el) => !el.hasAttribute("disabled") && el.tabIndex >= 0);
-}
+type ThreadInfoContentProps = {
+  thread: ThreadDetail;
+  tokenUsage: ThreadTokenUsage | null;
+  elapsed: string;
+  onClose: () => void;
+  actions: ReturnType<typeof buildThreadActionItems>;
+  showHandle: boolean;
+};
 
-function Stat({ label, children }: { label: string; children: React.ReactNode }) {
+function Stat({
+  label,
+  children,
+}: {
+  label: string;
+  children: React.ReactNode;
+}) {
   return (
     <div>
       <dt className="text-xs text-muted-foreground">{label}</dt>
-      <dd className="text-sm font-mono tabular-nums text-foreground mt-0.5">{children}</dd>
+      <dd className="mt-0.5 text-sm font-mono tabular-nums text-foreground">
+        {children}
+      </dd>
     </div>
+  );
+}
+
+function ThreadInfoContent({
+  thread,
+  tokenUsage,
+  elapsed,
+  actions,
+  onClose,
+  showHandle,
+}: ThreadInfoContentProps) {
+  const modelList = tokenUsageModelsList(tokenUsage);
+  const breakdownLabel = tokenUsageBreakdownLabel(tokenUsage);
+  const usageConfidence = tokenUsageConfidenceLabel(tokenUsage);
+
+  return (
+    <>
+      {showHandle ? (
+        <div className="flex justify-center pb-2 pt-3">
+          <div className="h-1 w-8 rounded-full bg-border/80" />
+        </div>
+      ) : null}
+      <div className="px-4 pb-[max(1.25rem,env(safe-area-inset-bottom))] sm:px-5">
+        <div className="mt-1 flex items-start justify-between gap-3">
+          <div className="min-w-0">
+            <h2
+              id="thread-info-title"
+              className="text-lg font-semibold text-foreground"
+            >
+              {thread.thread_name || thread.slack_thread_key}
+            </h2>
+            <div className="mt-1.5 flex flex-wrap items-center gap-2 text-sm text-muted-foreground">
+              <HarnessBadge harness={thread.harness} />
+              <span className="text-border/60">·</span>
+              <span className="inline-flex items-center gap-1">
+                <StateDot state={thread.state} />
+                <span>{threadStateLabel(thread.state)}</span>
+              </span>
+              <span className="text-border/60">·</span>
+              <span>{elapsed}</span>
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={onClose}
+            className="flex size-11 items-center justify-center rounded-lg ui-control-icon text-muted-foreground"
+            aria-label="Close"
+            data-touch-target
+          >
+            <X className="size-4" />
+          </button>
+        </div>
+
+        <section className="thread-surface-soft mt-4 rounded-xl px-4 py-4">
+          <dl className="grid grid-cols-1 gap-4 sm:grid-cols-2 sm:gap-x-5">
+            <Stat label="Total tokens">
+              {formatTokenUsageCount(tokenUsage?.total_tokens ?? null)}
+            </Stat>
+            <Stat label="Tokens in">
+              {formatTokenUsageCount(tokenUsage?.input_tokens ?? null)}
+            </Stat>
+            <Stat label="Tokens out">
+              {formatTokenUsageCount(tokenUsage?.output_tokens ?? null)}
+            </Stat>
+            <Stat label="Cost">{formatTokenUsageCost(tokenUsage) ?? "--"}</Stat>
+            <Stat label="Model">{modelList}</Stat>
+            <Stat label="Usage">{usageConfidence}</Stat>
+            <Stat label="Split">{breakdownLabel}</Stat>
+            <Stat label="Messages">{thread.message_count}</Stat>
+          </dl>
+        </section>
+
+        {thread.participants && thread.participants.length > 0 && (
+          <section className="thread-surface-soft mt-4 rounded-xl px-4 py-4">
+            <h3 className="mb-3 text-[11px] font-medium uppercase tracking-[0.14em] text-muted-foreground">
+              Participants
+            </h3>
+            <ParticipantAvatars
+              participants={thread.participants}
+              size={28}
+              max={10}
+              decorative={false}
+            />
+          </section>
+        )}
+
+        <section className="thread-surface-soft mt-4 rounded-xl px-4 py-4">
+          <h3 className="mb-3 text-[11px] font-medium uppercase tracking-[0.14em] text-muted-foreground">
+            Details
+          </h3>
+          <div className="space-y-2 text-xs text-muted-foreground">
+            <div>
+              <span className="font-medium text-foreground">Thread key</span>
+              <div className="mt-1 break-all font-mono text-[11px] text-muted-foreground">
+                {thread.slack_thread_key}
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section className="thread-surface-soft mt-4 rounded-xl px-3 py-3">
+          <h3 className="mb-2 px-1 text-[11px] font-medium uppercase tracking-[0.14em] text-muted-foreground">
+            Actions
+          </h3>
+          <div className="space-y-1">
+            {actions.map((action) => (
+              <button
+                key={action.id}
+                type="button"
+                onClick={action.run}
+                disabled={action.disabled}
+                className={cn(
+                  "thread-action-transition flex min-h-11 w-full items-center gap-3 rounded-lg px-3 py-3 text-left text-sm active:bg-accent",
+                  action.tone === "destructive"
+                    ? "text-destructive hover:bg-destructive/10"
+                    : "text-foreground hover:bg-accent/70",
+                  action.disabled && "opacity-60",
+                )}
+                data-touch-target
+              >
+                <action.icon
+                  className={cn(
+                    "size-5",
+                    action.tone === "destructive" ? "" : "text-muted-foreground",
+                  )}
+                />
+                {action.label}
+              </button>
+            ))}
+          </div>
+        </section>
+      </div>
+    </>
   );
 }
 
@@ -60,114 +198,9 @@ export function ThreadInfoSheet({
   onRefresh,
   onStop,
   canStop,
+  mobileOnly = true,
 }: ThreadInfoSheetProps) {
-  const sheetRef = useRef<HTMLDivElement>(null);
-  const [dragY, setDragY] = useState(0);
-  const dragStartRef = useRef<number | null>(null);
-  const dragRafRef = useRef<number>(0);
-  const dragPendingRef = useRef(0);
-  const draggingRef = useRef(false);
-
-  const handleTouchStart = useCallback((e: React.TouchEvent) => {
-    const sheet = sheetRef.current;
-    if (!sheet) return;
-    const touchY = e.touches[0].clientY;
-    const fromTop = touchY - sheet.getBoundingClientRect().top;
-    if (sheet.scrollTop > 0 || fromTop > 80) {
-      dragStartRef.current = null;
-      draggingRef.current = false;
-      return;
-    }
-    dragStartRef.current = touchY;
-    draggingRef.current = true;
-  }, []);
-
-  const handleTouchMove = useCallback((e: React.TouchEvent) => {
-    if (dragStartRef.current === null || !draggingRef.current) return;
-    const delta = e.touches[0].clientY - dragStartRef.current;
-    if (delta <= 0) return;
-    e.preventDefault();
-    dragPendingRef.current = delta;
-    if (dragRafRef.current) return;
-    dragRafRef.current = window.requestAnimationFrame(() => {
-      dragRafRef.current = 0;
-      setDragY(dragPendingRef.current);
-    });
-  }, []);
-
-  const handleTouchEnd = useCallback(() => {
-    const finalDragY = Math.max(dragY, dragPendingRef.current);
-    if (dragRafRef.current) {
-      window.cancelAnimationFrame(dragRafRef.current);
-      dragRafRef.current = 0;
-    }
-    if (finalDragY > 100) {
-      onClose();
-    }
-    setDragY(0);
-    dragStartRef.current = null;
-    dragPendingRef.current = 0;
-    draggingRef.current = false;
-  }, [dragY, onClose]);
-
-  useEffect(() => {
-    return () => {
-      if (dragRafRef.current) {
-        window.cancelAnimationFrame(dragRafRef.current);
-      }
-    };
-  }, []);
-
-  useEffect(() => {
-    if (!open) {
-      setDragY(0);
-      return;
-    }
-    const sheet = sheetRef.current;
-    const previousFocused = document.activeElement instanceof HTMLElement ? document.activeElement : null;
-    if (sheet) {
-      const focusable = getFocusableElements(sheet);
-      (focusable[0] ?? sheet).focus();
-    }
-
-    const onKey = (e: KeyboardEvent) => {
-      if (!sheet) return;
-      if (e.key === "Escape") {
-        e.preventDefault();
-        e.stopPropagation();
-        onClose();
-        return;
-      }
-      if (e.key !== "Tab") return;
-      const focusable = getFocusableElements(sheet);
-      if (focusable.length === 0) {
-        e.preventDefault();
-        sheet.focus();
-        return;
-      }
-      const first = focusable[0];
-      const last = focusable[focusable.length - 1];
-      const active = document.activeElement;
-      if (e.shiftKey) {
-        if (active === first || !sheet.contains(active)) {
-          e.preventDefault();
-          last.focus();
-        }
-      } else if (active === last || !sheet.contains(active)) {
-        e.preventDefault();
-        first.focus();
-      }
-    };
-    document.addEventListener("keydown", onKey);
-    return () => {
-      document.removeEventListener("keydown", onKey);
-      previousFocused?.focus();
-    };
-  }, [open, onClose]);
-  const modelList = tokenUsageModelsList(tokenUsage);
-  const breakdownLabel = tokenUsageBreakdownLabel(tokenUsage);
-  const usageConfidence = tokenUsageConfidenceLabel(tokenUsage);
-
+  const isDesktop = useMediaQuery("(min-width: 768px)");
   const keyParts = thread.slack_thread_key.startsWith("slack:")
     ? thread.slack_thread_key.replace(/^slack:/, "").split(":")
     : [];
@@ -175,117 +208,74 @@ export function ThreadInfoSheet({
   const threadTs = keyParts[1] ?? "";
   const slackUrl =
     channelId && threadTs
-      ? `slack://app_redirect?channel=${encodeURIComponent(channelId)}&thread_ts=${encodeURIComponent(threadTs)}`
+      ? `slack://app_redirect?channel=${encodeURIComponent(
+          channelId,
+        )}&thread_ts=${encodeURIComponent(threadTs)}`
       : "";
 
   function copyLink() {
     if (typeof window === "undefined") return;
     if (!navigator.clipboard?.writeText) return;
-    const viewerUrl = `${window.location.origin}/${encodeURIComponent(thread.slack_thread_key)}`;
+    const viewerUrl = `${window.location.origin}/${encodeURIComponent(
+      thread.slack_thread_key,
+    )}`;
     void navigator.clipboard
       .writeText(viewerUrl)
       .then(() => onClose())
       .catch(() => {});
   }
 
-  if (!open) return null;
+  const actions = buildThreadActionItems({
+    canInterrupt: canStop,
+    isRefreshing: false,
+    compactMode: false,
+    onRefresh: () => {
+      onRefresh();
+      onClose();
+    },
+    onStop: () => {
+      onStop?.();
+      onClose();
+    },
+    onCopyUrl: copyLink,
+    onToggleCompact: () => {},
+    onOpenSlack: slackUrl
+      ? () => {
+          window.open(slackUrl, "_blank");
+        }
+      : null,
+    onOpenShortcuts: () => {},
+  }).filter(
+    (item) =>
+      item.id === "refresh" ||
+      (item.id === "stop" && canStop) ||
+      item.id === "copy-url" ||
+      item.id === "open-slack",
+  );
 
   return (
-    <div className="fixed inset-0 z-50 md:hidden" aria-modal="true" role="dialog" aria-label="Thread details">
-      <OverlayBackdrop className="absolute inset-0 animate-in fade-in duration-base motion-reduce:animate-none" onClick={onClose} />
-      <div
-        ref={sheetRef}
-        tabIndex={-1}
-        className={cn(
-          "absolute inset-x-0 bottom-0 max-h-dvh-82 overflow-y-auto overscroll-contain rounded-t-2xl border-t border-border/80 bg-card shadow-sheet will-change-transform animate-in slide-in-from-bottom duration-slow ease-emphasized motion-reduce:animate-none",
-          dragY > 0 ? "transition-none" : "transition-transform duration-slow ease-emphasized",
-        )}
-        style={{ transform: dragY > 0 ? `translateY(${dragY}px)` : undefined }}
-        onTouchStart={handleTouchStart}
-        onTouchMove={handleTouchMove}
-        onTouchEnd={handleTouchEnd}
-      >
-        <div className="flex justify-center pt-3 pb-1">
-          <div className="w-8 h-1 bg-border rounded-full" />
-        </div>
-
-        <div className="px-4 sm:px-5 safe-area-bottom">
-          <div className="flex items-center justify-between mt-2">
-            <h2 className="text-lg font-semibold text-foreground">
-              {thread.thread_name || thread.slack_thread_key}
-            </h2>
-            <Button
-              variant="ghost"
-              size="icon-lg"
-              className="size-11 text-muted-foreground"
-              onClick={onClose}
-              aria-label="Close"
-              data-touch-target
-            >
-              <X className="size-4" />
-            </Button>
-          </div>
-
-          <div className="mt-1 flex items-center gap-2 text-sm text-muted-foreground">
-            <HarnessBadge harness={thread.harness} />
-            <span>·</span>
-            <StateDot state={thread.state} />
-            <span>{thread.state}</span>
-            <span>·</span>
-            <span>{elapsed}</span>
-          </div>
-
-          <dl className="mt-5 grid grid-cols-1 gap-3 sm:grid-cols-2 sm:gap-x-4 sm:gap-y-4">
-            <Stat label="Total tokens">{formatTokenUsageCount(tokenUsage?.total_tokens ?? null)}</Stat>
-            <Stat label="Tokens in">{formatTokenUsageCount(tokenUsage?.input_tokens ?? null)}</Stat>
-            <Stat label="Tokens out">{formatTokenUsageCount(tokenUsage?.output_tokens ?? null)}</Stat>
-            <Stat label="Cost">
-              {formatTokenUsageCost(tokenUsage) ?? "--"}
-            </Stat>
-            <Stat label="Model">{modelList}</Stat>
-            <Stat label="Usage">{usageConfidence}</Stat>
-            <Stat label="Split">{breakdownLabel}</Stat>
-            <Stat label="Messages">{thread.message_count}</Stat>
-          </dl>
-
-          {thread.participants && thread.participants.length > 0 && (
-            <div className="mt-5 border-t border-border pt-4">
-              <h3 className="mb-2 text-xs font-medium text-muted-foreground">Participants</h3>
-              <ParticipantAvatars participants={thread.participants} size={28} max={10} decorative={false} />
-            </div>
-          )}
-
-          <div className="mt-5 space-y-2 border-t border-border pt-4">
-            <h3 className="mb-2 text-xs font-medium text-muted-foreground">Actions</h3>
-
-            <SheetAction type="button" onClick={() => { onRefresh(); onClose(); }} data-touch-target>
-              <RefreshCw className="size-5" />
-              Refresh thread
-            </SheetAction>
-
-            {canStop && onStop && (
-              <SheetAction type="button" variant="destructive" onClick={() => { onStop(); onClose(); }} data-touch-target>
-                <CircleStop className="size-5" />
-                Stop agent
-              </SheetAction>
-            )}
-
-            <SheetAction type="button" onClick={copyLink} data-touch-target>
-              <Copy className="size-5" />
-              Copy link
-            </SheetAction>
-
-            {slackUrl ? (
-              <SheetAction asChild data-touch-target>
-                <a href={slackUrl}>
-                  <ExternalLink className="size-5" />
-                  Open in Slack
-                </a>
-              </SheetAction>
-            ) : null}
-          </div>
-        </div>
+    <ResponsivePanel
+      open={open}
+      side={isDesktop && !mobileOnly ? "right" : "bottom"}
+      onClose={onClose}
+      mobileOnly={mobileOnly}
+      dismissibleByDrag={!isDesktop || mobileOnly}
+      labelledBy="thread-info-title"
+    >
+      <div className="min-h-full">
+        <ThreadInfoContent
+          onClose={onClose}
+          thread={thread}
+          tokenUsage={tokenUsage}
+          elapsed={elapsed}
+          actions={actions}
+          showHandle={!isDesktop || mobileOnly}
+        />
+        <div
+          className="pointer-events-none h-[env(safe-area-inset-bottom)]"
+          aria-hidden="true"
+        />
       </div>
-    </div>
+    </ResponsivePanel>
   );
 }

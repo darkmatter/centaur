@@ -1,4 +1,5 @@
 import { ThreadLayout } from "@/components/thread/thread-layout";
+import { ThreadMotionProvider } from "@/motion/provider";
 
 const STORAGE_KEY = "threads.sidebar.collapsed.v1";
 const COLLAPSE_CLASS = "threads-sidebar-collapsed";
@@ -20,7 +21,9 @@ export default function ThreadsLayout({ children }: { children: React.ReactNode 
   return (
     <>
       <script dangerouslySetInnerHTML={{ __html: SIDEBAR_BOOTSTRAP_SCRIPT }} />
-      <ThreadLayout>{children}</ThreadLayout>
+      <ThreadMotionProvider>
+        <ThreadLayout>{children}</ThreadLayout>
+      </ThreadMotionProvider>
     </>
   );
 }

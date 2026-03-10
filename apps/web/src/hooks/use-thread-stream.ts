@@ -280,7 +280,7 @@ export function useThreadStream(
     return () => {
       cancelled = true;
     };
-  }, [threadKey]);
+  }, [fetchThread, initialThread, threadKey]);
 
   // Attach stream only when thread is active; re-attach on every active run.
   const threadState = thread?.state;
@@ -361,9 +361,17 @@ export function useThreadStream(
     async (message: string, route: SendRoute = "execute") => {
       const text = message.trim();
       if (!text) return;
-      await chat.sendMessage({ text }, { body: { route } });
+      await chat.sendMessage(
+        { text },
+        {
+          body: {
+            route,
+            ...(thread?.harness ? { harness: thread.harness } : {}),
+          },
+        },
+      );
     },
-    [chat.sendMessage],
+    [chat, thread?.harness],
   );
 
   return {

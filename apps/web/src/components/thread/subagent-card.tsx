@@ -17,29 +17,11 @@ import { Button } from "@/components/ui/button";
 import { Shimmer } from "@/components/ai-elements/shimmer";
 import { useHaptics } from "@/components/haptics-provider";
 import type { SubagentStep } from "@/lib/describe";
-import { getSubagentPreviewText, normalizeSubagentStatus, subagentStatusLabel } from "@/lib/viewer/subagent-steps";
+import { formatDurationShort } from "@/lib/formatting";
+import { getSubagentPreviewText } from "@/lib/viewer/subagent-steps";
+import { normalizeSubagentStatus, subagentDotClassName, subagentStatusLabel, subagentTone } from "@/lib/status-semantics";
 import { cn } from "@/lib/utils";
-
-function statusTone(status: string): "default" | "destructive" | "secondary" {
-  const normalized = normalizeSubagentStatus(status);
-  if (normalized === "failed") return "destructive";
-  if (normalized === "completed" || normalized === "selected") return "default";
-  return "secondary";
-}
-
-function statusDotClasses(status: string): string {
-  const normalized = normalizeSubagentStatus(status);
-  if (normalized === "failed") return "bg-destructive";
-  if (normalized === "completed" || normalized === "selected") return "bg-primary";
-  return "bg-primary animate-pulse";
-}
-
-function formatDuration(seconds: number): string {
-  if (seconds < 60) return `${Math.round(seconds)}s`;
-  const minutes = Math.floor(seconds / 60);
-  const remaining = Math.round(seconds % 60);
-  return remaining > 0 ? `${minutes}m ${remaining}s` : `${minutes}m`;
-}
+import { AnimatedNumber } from "@/components/ui/animated-number";
 
 export function subagentIdentityIcon(step: SubagentStep): LucideIcon {
   const haystack = [
@@ -73,7 +55,7 @@ export const SubagentCard = memo(function SubagentCard({
   const preview = getSubagentPreviewText(step);
   const metaParts: string[] = [];
   if (step.phase) metaParts.push(step.phase);
-  if (step.durationS !== undefined) metaParts.push(formatDuration(step.durationS));
+  if (step.durationS !== undefined) metaParts.push(formatDurationShort(step.durationS));
   if (step.toolCalls !== undefined) metaParts.push(`${step.toolCalls} ${step.toolCalls === 1 ? "tool" : "tools"}`);
   else if (step.turns !== undefined) metaParts.push(`${step.turns} ${step.turns === 1 ? "turn" : "turns"}`);
 
@@ -116,7 +98,7 @@ export const SubagentCard = memo(function SubagentCard({
         <span
           className={cn(
             "absolute -right-0.5 -top-0.5 size-2 rounded-full ring-2 ring-background",
-            statusDotClasses(step.status),
+              subagentDotClassName(step.status),
           )}
         />
       </div>
@@ -131,14 +113,14 @@ export const SubagentCard = memo(function SubagentCard({
             </Badge>
           )}
           {step.completed !== undefined && step.totalBranches !== undefined && (
-            <span className="shrink-0 text-detail font-mono tabular-nums text-muted-foreground">
-              {step.completed}/{step.totalBranches}
+            <span className="shrink-0 text-[11px] font-mono tabular-nums text-muted-foreground">
+              <AnimatedNumber value={step.completed} />/<AnimatedNumber value={step.totalBranches} />
             </span>
           )}
         </div>
         {preview ? (
           <div className="mt-0.5 line-clamp-2 text-xs leading-5 text-muted-foreground">
-            {statusTone(step.status) === "secondary" ? (
+            {subagentTone(step.status) === "secondary" ? (
               <Shimmer duration={2}>{preview}</Shimmer>
             ) : (
               preview
@@ -147,7 +129,7 @@ export const SubagentCard = memo(function SubagentCard({
         ) : null}
         <div className="mt-1 flex min-h-meta-min items-center gap-1.5 text-detail text-muted-foreground">
           <span className="inline-flex items-center gap-1">
-            <span className={cn("size-1.5 rounded-full", statusDotClasses(step.status))} />
+            <span className={cn("size-1.5 rounded-full", subagentDotClassName(step.status))} />
             <span>{subagentStatusLabel(step.status)}</span>
           </span>
           {metaParts.map((part) => (

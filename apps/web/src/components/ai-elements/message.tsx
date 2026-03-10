@@ -14,11 +14,8 @@ import {
   TooltipProvider,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
+import { streamdownPlugins } from "@/lib/streamdown-plugins";
 import { cn } from "@/lib/utils";
-import { cjk } from "@streamdown/cjk";
-import { createCodePlugin } from "@streamdown/code";
-import { math } from "@streamdown/math";
-import { mermaid } from "@streamdown/mermaid";
 import { ChevronLeftIcon, ChevronRightIcon } from "lucide-react";
 import {
   createContext,
@@ -324,9 +321,6 @@ export const MessageBranchPage = ({
 };
 
 export type MessageResponseProps = ComponentProps<typeof Streamdown>;
-
-const code = createCodePlugin({ themes: ["github-light", "github-dark-default"] });
-const streamdownPlugins = { cjk, code, math, mermaid };
 
 const DashboardLayout = lazy(() =>
   import("@/components/dashboard/layout").then((m) => ({ default: m.DashboardLayout })),

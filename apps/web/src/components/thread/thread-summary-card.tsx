@@ -6,8 +6,10 @@ import { HarnessBadge } from "@/components/ui/harness-badge";
 import { StateDot } from "@/components/ui/state-dot";
 import { ParticipantAvatars } from "@/components/thread/participant-avatars";
 import { Progress } from "@/components/ui/progress";
+import { TextReveal } from "@/components/ai-elements/text-reveal";
 import { PHASES, type ThreadSummary } from "@/lib/types";
 import { useElapsed } from "@/hooks/use-elapsed";
+import { threadStateLabel } from "@/lib/status-semantics";
 import { getThreadDisplayName, parseActivePhase, runningSubtitle } from "@/lib/viewer/thread-selectors";
 import { isRunningState } from "@/lib/viewer/thread-ordering";
 import { cn } from "@/lib/utils";
@@ -57,8 +59,8 @@ export const ThreadSummaryCard = memo(function ThreadSummaryCard({
       ref={linkRef}
       className={cn(
         "thread-action-transition group block w-full no-underline text-inherit",
-        compact ? "px-3 py-2.5" : "px-3 py-3",
-        "hover:bg-accent/40 active:bg-accent/50 focus-visible:bg-accent/40 focus-visible:outline-none",
+        compact ? "px-3 py-2.5 md:px-4" : "px-3 py-3 md:px-4",
+        "hover:bg-accent/40 active:bg-accent/50 focus-visible:bg-accent/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset",
         activeState && "bg-primary/5",
         thread.state === "error" && "bg-destructive/5",
         isSelected && "bg-accent/50",
@@ -76,22 +78,22 @@ export const ThreadSummaryCard = memo(function ThreadSummaryCard({
         </span>
       </div>
 
-      <div className="mt-0.5 flex items-center gap-1 pl-4 text-detail text-muted-foreground">
+      <div className="mt-1 flex items-center gap-1 pl-3 text-detail text-muted-foreground">
         <HarnessBadge harness={thread.harness} className="harness-badge-sm" />
-        <span className="text-border/60">·</span>
+        <span className="text-muted-foreground/45">·</span>
         <span>{thread.turn_count} turn{thread.turn_count === 1 ? "" : "s"}</span>
-        <span className="text-border/60">·</span>
-        <span>{thread.state}</span>
+        <span className="text-muted-foreground/45">·</span>
+        <span>{threadStateLabel(thread.state)}</span>
       </div>
 
       {taskPreview ? (
-        <div className="mt-0.5 line-clamp-1 pl-4 text-detail leading-relaxed text-muted-foreground/70">
+        <div className="mt-0.5 line-clamp-1 pl-3 text-detail leading-relaxed text-muted-foreground/70">
           {taskPreview}
         </div>
       ) : null}
       {resolvedStatusSubtitle ? (
-        <div className="mt-0.5 line-clamp-1 pl-4 text-detail text-muted-foreground">
-          {resolvedStatusSubtitle}
+        <div className="mt-0.5 line-clamp-1 pl-3 text-detail text-muted-foreground">
+          {activeState ? <TextReveal text={resolvedStatusSubtitle} /> : resolvedStatusSubtitle}
         </div>
       ) : null}
       {activePhase ? <Progress value={progress} className="mt-1.5 h-0.5 bg-muted/70" /> : null}

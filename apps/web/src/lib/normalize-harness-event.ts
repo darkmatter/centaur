@@ -20,6 +20,11 @@ export type ContentBlock =
   | { type: "tool_use"; id: string; name: string; input: Record<string, unknown> }
   | { type: "tool_result"; tool_use_id: string; content: unknown; is_error: boolean };
 
+type SubagentActivity = {
+  description: string;
+  toolName?: string;
+};
+
 export type CanonicalEvent =
   | {
       type: "assistant";
@@ -49,6 +54,8 @@ export type CanonicalEvent =
       name?: string;
       summary?: string;
       error?: string;
+      activity?: string;
+      activities?: SubagentActivity[];
     }
   | { type: "result"; text: string }
   | { type: "error"; error: string }
@@ -172,6 +179,8 @@ function subagentEvent(opts: {
   name?: string;
   summary?: string;
   error?: string;
+  activity?: string;
+  activities?: SubagentActivity[];
 }): CanonicalEvent {
   const payload: CanonicalEvent & { type: "subagent" } = {
     type: "subagent",
@@ -181,7 +190,37 @@ function subagentEvent(opts: {
   if (opts.name) payload.name = opts.name;
   if (opts.summary) payload.summary = opts.summary;
   if (opts.error) payload.error = opts.error;
+  if (opts.activity) payload.activity = opts.activity;
+  if (opts.activities?.length) payload.activities = opts.activities;
   return payload;
+}
+
+function firstNonEmptyString(...values: unknown[]): string | undefined {
+  for (const value of values) {
+    const normalized = asString(value).trim();
+    if (normalized) return normalized;
+  }
+  return undefined;
+}
+
+function makeActivity(description: unknown, toolName?: unknown): SubagentActivity | undefined {
+  const text = asString(description).trim();
+  if (!text) return undefined;
+  const tool = asString(toolName).trim();
+  return tool ? { description: text, toolName: tool } : { description: text };
+}
+
+function mergeActivities(...items: Array<SubagentActivity | undefined>): SubagentActivity[] | undefined {
+  const merged: SubagentActivity[] = [];
+  const seen = new Set<string>();
+  for (const item of items) {
+    if (!item) continue;
+    const key = `${item.toolName ?? ""}::${item.description}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    merged.push(item);
+  }
+  return merged.length > 0 ? merged : undefined;
 }
 
 // ---------------------------------------------------------------------------
@@ -284,6 +323,63 @@ function normalizeAmpLikeEvent(event: Record<string, unknown>): CanonicalEvent[]
     const message =
       asString(event.error) || asString(event.message) || "Unknown error";
     return [{ type: "error", error: message }];
+  }
+
+  if (eventType === "system") {
+    const subtype = asString(event.subtype).trim().toLowerCase();
+    const subagentId = firstNonEmptyString(
+      event.task_id,
+      event.subagent_id,
+      event.tool_use_id,
+      event.parent_tool_use_id,
+    );
+    if (!subagentId) return [];
+    const description = firstNonEmptyString(event.description, event.message);
+    const summary = firstNonEmptyString(event.summary, event.result, event.message);
+    const name = firstNonEmptyString(event.name, event.task_name, description);
+    const toolName = firstNonEmptyString(
+      event.tool_name,
+      event.toolName,
+      event.last_tool_name,
+      event.lastToolName,
+    );
+    const activities = mergeActivities(makeActivity(description, toolName));
+
+    if (subtype === "task_started") {
+      return [
+        subagentEvent({
+          status: "started",
+          subagent_id: subagentId,
+          name: name ?? "Delegated task",
+          activity: description,
+          activities,
+        }),
+      ];
+    }
+    if (subtype === "task_progress") {
+      return [
+        subagentEvent({
+          status: "working",
+          subagent_id: subagentId,
+          name: name,
+          activity: description,
+          activities,
+        }),
+      ];
+    }
+    if (subtype === "task_notification") {
+      return [
+        subagentEvent({
+          status: "completed",
+          subagent_id: subagentId,
+          name,
+          summary: summary ?? description,
+          activity: description,
+          activities,
+        }),
+      ];
+    }
+    return [];
   }
 
   if (eventType === "stream_event") {
@@ -393,6 +489,35 @@ function normalizeCodexItem(
         "Delegated subagent";
       if (phase === "started") {
         return [subagentEvent({ status: "started", subagent_id: toolId, name: label })];
+      }
+      if (phase === "updated") {
+        const activity = firstNonEmptyString(
+          item.message,
+          item.status_message,
+          item.progress_message,
+          item.summary,
+        );
+        return activity
+          ? [
+              subagentEvent({
+                status: "working",
+                subagent_id: toolId,
+                name: label,
+                activity,
+                activities: mergeActivities(
+                  makeActivity(
+                    activity,
+                    firstNonEmptyString(
+                      item.active_tool_name,
+                      item.activeToolName,
+                      item.last_tool_name,
+                      item.lastToolName,
+                    ),
+                  ),
+                ),
+              }),
+            ]
+          : [];
       }
       if (phase === "completed") {
         if (item.error !== undefined && item.error !== null) {
@@ -605,6 +730,52 @@ function normalizePiEvent(event: Record<string, unknown>): CanonicalEvent[] {
       ];
     }
     return [toolResultEvent(toolId, event.result, Boolean(event.isError))];
+  }
+
+  if (eventType === "tool_execution_update") {
+    const toolName = asString(event.toolName) || "tool";
+    let toolId = asString(event.toolCallId);
+    if (!toolId) {
+      const toolInput = asRecord(event.args);
+      const nonce =
+        asString(event.toolExecutionId) ||
+        asString(event.executionId) ||
+        asString(event.id);
+      toolId = stableToolCallId(toolName, toolInput, nonce);
+    }
+    if (toolName.trim().toLowerCase() !== "subagent") return [];
+    const toolInput = asRecord(event.args);
+    const label =
+      asString(toolInput.description) ||
+      asString(toolInput.name) ||
+      "Delegated subagent";
+    const activity = firstNonEmptyString(
+      event.message,
+      event.statusMessage,
+      event.progress_message,
+      event.summary,
+    );
+    return activity
+      ? [
+          subagentEvent({
+            status: "working",
+            subagent_id: toolId,
+            name: label,
+            activity,
+            activities: mergeActivities(
+              makeActivity(
+                activity,
+                firstNonEmptyString(
+                  event.active_tool_name,
+                  event.activeToolName,
+                  event.last_tool_name,
+                  event.lastToolName,
+                ),
+              ),
+            ),
+          }),
+        ]
+      : [];
   }
 
   if (eventType === "message_end") {

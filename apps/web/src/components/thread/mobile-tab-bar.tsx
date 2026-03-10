@@ -115,7 +115,7 @@ export function MobileTabBar({ activeThreadHref, hasRunningAgent, hasError }: Mo
           data-touch-target
         >
           {hasRunningAgent && (
-            <span className="absolute top-1.5 right-3 size-2 rounded-full bg-primary animate-pulse motion-reduce:animate-none" />
+            <span className="absolute top-1.5 right-3 size-2 rounded-full bg-primary" />
           )}
           <Zap className="size-5" />
           <span className="text-label font-medium">Active</span>
@@ -123,7 +123,7 @@ export function MobileTabBar({ activeThreadHref, hasRunningAgent, hasError }: Mo
       ) : (
         <Link href={activeHref} scroll={false} aria-current={undefined} onClick={() => trigger("selection")} className={activeClassName} data-touch-target>
           {hasRunningAgent && (
-            <span className="absolute top-1.5 right-3 size-2 rounded-full bg-primary animate-pulse motion-reduce:animate-none" />
+            <span className="absolute top-1.5 right-3 size-2 rounded-full bg-primary" />
           )}
           <Zap className="size-5" />
           <span className="text-label font-medium">Active</span>

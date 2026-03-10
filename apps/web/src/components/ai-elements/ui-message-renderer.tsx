@@ -17,7 +17,7 @@ import {
   summarizeGroup,
   type ToolCall,
 } from "@/lib/describe";
-import { asString, asRecord, asNumber, asBoolean } from "@/lib/parse-utils";
+import { asBoolean, asList, asNumber, asRecord, asString } from "@/lib/parse-utils";
 import { dedupeSources, extractSourcesFromUnknown, type StepSource } from "@/lib/viewer/source-utils";
 import { stringifyToolOutput } from "@/lib/viewer/tool-output-detect";
 import type { Participant } from "@/lib/types";
@@ -30,15 +30,7 @@ import {
   ReasoningContent,
   ReasoningTrigger,
 } from "@/components/ai-elements/reasoning";
-import {
-  Terminal,
-  TerminalContent,
-  TerminalHeader,
-  TerminalTitle,
-  TerminalStatus,
-  TerminalActions,
-  TerminalCopyButton,
-} from "@/components/ai-elements/terminal";
+import { ShellExecutionCard } from "@/components/ai-elements/shell-execution-card";
 import { SubagentCard } from "@/components/thread/subagent-card";
 import type { SubagentStep } from "@/lib/describe";
 import { normalizeSubagentStatus, subagentSelectionKey } from "@/lib/viewer/subagent-steps";
@@ -61,7 +53,6 @@ import {
   SourcesTrigger,
   Source,
 } from "@/components/ai-elements/sources";
-import { Badge } from "@/components/ui/badge";
 import { cn } from "@/lib/utils";
 import { AlertTriangle, CopyIcon, ChevronRight, Timer } from "lucide-react";
 import { toast } from "sonner";
@@ -79,13 +70,6 @@ function copyToClipboard(text: string, label?: string) {
     .catch(() => toast("Failed to copy"));
 }
 
-function formatDuration(seconds: number): string {
-  if (seconds < 60) return `${Math.round(seconds)}s`;
-  const minutes = Math.floor(seconds / 60);
-  const remaining = Math.round(seconds % 60);
-  return remaining > 0 ? `${minutes}m ${remaining}s` : `${minutes}m`;
-}
-
 function sourceLabel(source?: string): string {
   const normalized = (source ?? "").trim().toLowerCase();
   if (!normalized) return "Unknown";
@@ -100,6 +84,24 @@ function initials(name: string): string {
   if (words.length === 0) return "?";
   if (words.length === 1) return words[0].slice(0, 2).toUpperCase();
   return `${words[0][0]}${words[1][0]}`.toUpperCase();
+}
+
+function parseSubagentActivities(
+  value: unknown,
+): SubagentStep["activities"] {
+  const activities = asList(value)
+    .map((entry) => {
+      const record = asRecord(entry);
+      const description = asString(record.description).trim();
+      if (!description) return null;
+      const toolName = asString(record.toolName || record.tool_name).trim();
+      return toolName ? { description, toolName } : { description };
+    })
+    .filter(
+      (entry): entry is NonNullable<SubagentStep["activities"]>[number] =>
+        entry !== null,
+    );
+  return activities.length > 0 ? activities : undefined;
 }
 
 const SLACK_USER_ID_RE = /^U[A-Z0-9]+$/;
@@ -519,34 +521,12 @@ function PartElement({
 
     case "terminal":
       return (
-        <Terminal
-          output={`$ ${element.command}${element.output ? `\n${element.output}` : ""}`}
-          isStreaming={element.streaming}
-          className={
-            typeof element.exitCode === "number" && element.exitCode !== 0
-              ? "border-destructive/30"
-              : "border-border/70"
-          }
-        >
-          <TerminalHeader>
-            <TerminalTitle>Ran shell command</TerminalTitle>
-            <div className="flex items-center gap-1">
-              <TerminalStatus />
-              {typeof element.exitCode === "number" && (
-                <Badge
-                  variant={element.exitCode !== 0 ? "destructive" : "secondary"}
-                  className="text-xs"
-                >
-                  exit {element.exitCode}
-                </Badge>
-              )}
-              <TerminalActions>
-                <TerminalCopyButton />
-              </TerminalActions>
-            </div>
-          </TerminalHeader>
-          <TerminalContent className="max-h-64" />
-        </Terminal>
+        <ShellExecutionCard
+          command={element.command}
+          output={element.output}
+          exitCode={element.exitCode}
+          streaming={element.streaming}
+        />
       );
 
     case "error":
@@ -572,6 +552,7 @@ function PartElement({
 
     case "subagent": {
       const d = element.data;
+      const acceptableBoolean = asBoolean(d.acceptable);
       const step: SubagentStep = {
         id: asString(d.subagent_id) || element.key,
         type: "subagent",
@@ -597,15 +578,16 @@ function PartElement({
         completedCount: asNumber(d.completed_count) ?? undefined,
         acceptableCount: asNumber(d.acceptable_count) ?? undefined,
         failedCount: asNumber(d.failed_count) ?? undefined,
-        isAcceptable: asBoolean(d.is_acceptable) ?? undefined,
+        isAcceptable: asBoolean(d.is_acceptable) ?? acceptableBoolean ?? undefined,
         maxParallel: asNumber(d.max_parallel) ?? undefined,
         activity: asString(d.activity) || undefined,
+        activities: parseSubagentActivities(d.activities),
       };
       return (
         <SubagentCard
           step={step}
-          onSelect={onSelectSubagent}
           isSelected={selectedSubagentKey === subagentSelectionKey(step)}
+          onSelect={onSelectSubagent}
         />
       );
     }
@@ -620,7 +602,8 @@ function PartElement({
         <div className="rounded-lg border border-primary/20 bg-primary/5 px-2.5 py-2">
           <div className="mb-1.5 flex items-center gap-2 text-xs text-muted-foreground">
             {participant?.avatar_url ? (
-              <img src={participant.avatar_url} alt={displayName} className="size-[18px] rounded-full" />
+              // eslint-disable-next-line @next/next/no-img-element
+              <img src={participant.avatar_url} alt={displayName} loading="lazy" className="size-[18px] rounded-full" />
             ) : (
               <div className="flex size-[18px] items-center justify-center rounded-full bg-muted text-xs font-medium text-muted-foreground">
                 {initials(displayName)}
@@ -646,7 +629,8 @@ function PartElement({
         <div className="rounded-md border border-border/50 bg-background px-2 py-1.5">
           <div className="mb-1 flex items-center gap-2 text-xs text-muted-foreground">
             {participant?.avatar_url ? (
-              <img src={participant.avatar_url} alt={displayName} className="size-[16px] rounded-full" />
+              // eslint-disable-next-line @next/next/no-img-element
+              <img src={participant.avatar_url} alt={displayName} loading="lazy" className="size-[16px] rounded-full" />
             ) : (
               <div className="flex size-[16px] items-center justify-center rounded-full bg-muted text-3xs font-medium text-muted-foreground">
                 {initials(displayName)}
@@ -665,29 +649,7 @@ function PartElement({
       const command = asString(d.command);
       const output = stringifyToolOutput(d.output);
       const exitCode = typeof d.exitCode === "number" ? d.exitCode : undefined;
-      const isFailed = typeof exitCode === "number" && exitCode !== 0;
-      const combinedOutput = [`$ ${command}`, output, exitCode !== undefined ? `[exit ${exitCode}]` : ""]
-        .filter(Boolean)
-        .join("\n");
-      return (
-        <Terminal output={combinedOutput} className={isFailed ? "border-destructive/30" : "border-border/70"}>
-          <TerminalHeader>
-            <TerminalTitle>Ran shell command</TerminalTitle>
-            <div className="flex items-center gap-1">
-              <TerminalStatus />
-              {typeof exitCode === "number" && (
-                <Badge variant={isFailed ? "destructive" : "secondary"} className="text-xs">
-                  exit {exitCode}
-                </Badge>
-              )}
-              <TerminalActions>
-                <TerminalCopyButton />
-              </TerminalActions>
-            </div>
-          </TerminalHeader>
-          <TerminalContent className="max-h-64" />
-        </Terminal>
-      );
+      return <ShellExecutionCard command={command} output={output} exitCode={exitCode} streaming={d.status === "running"} />;
     }
 
     case "file-changes":

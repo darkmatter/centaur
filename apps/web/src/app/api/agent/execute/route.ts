@@ -20,9 +20,10 @@ import {
 import type { UIMessage } from "ai";
 import { resilientFetch, API_URL, ApiError } from "@/lib/api-client";
 import {
-  harnessEventToUiChunks,
+  canonicalEventToStreamChunks,
   createConversionState,
 } from "@/lib/harness-to-ui-chunks";
+import { normalizeHarnessEvent } from "@/lib/normalize-harness-event";
 import { getPool } from "@/lib/db";
 
 const generateMessageId = createIdGenerator({ prefix: "msg", size: 16 });
@@ -102,14 +103,16 @@ export async function POST(request: Request) {
           return;
         }
         const rawEvent = parseResult.value;
-        const chunks = harnessEventToUiChunks(
-          harness,
-          rawEvent,
-          0,
-          eventIndex,
-          conversionState,
+        const canonicalEvents = normalizeHarnessEvent(harness, rawEvent);
+        const chunks = canonicalEvents.flatMap((event, offset) =>
+          canonicalEventToStreamChunks(
+            0,
+            eventIndex + offset,
+            event,
+            conversionState,
+          ),
         );
-        eventIndex += 1;
+        eventIndex += Math.max(1, canonicalEvents.length);
         for (const chunk of chunks) {
           controller.enqueue(chunk);
         }
@@ -138,6 +141,10 @@ export async function POST(request: Request) {
             for (let i = 0; i < messages.length; i++) {
               const msg = messages[i];
               const ts = new Date(baseTs + i).toISOString();
+              const metadata = {
+                harness,
+                ...(msg.metadata || {}),
+              };
               await client.query(
                 `INSERT INTO chat_messages (id, thread_key, role, parts, metadata, created_at)
                  VALUES ($1, $2, $3, $4::jsonb, $5::jsonb, $6::timestamptz)
@@ -147,7 +154,7 @@ export async function POST(request: Request) {
                   slackThreadKey,
                   msg.role,
                   JSON.stringify(msg.parts),
-                  JSON.stringify(msg.metadata || {}),
+                  JSON.stringify(metadata),
                   ts,
                 ],
               );

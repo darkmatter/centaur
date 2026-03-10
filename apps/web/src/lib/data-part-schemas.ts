@@ -25,6 +25,17 @@ export const dataPartSchemas = {
     name: z.string().nullable().optional(),
     summary: z.string().nullable().optional(),
     error: z.string().nullable().optional(),
+    activity: z.string().nullable().optional(),
+    tool_name: z.string().nullable().optional(),
+    activities: z
+      .array(
+        z.object({
+          description: z.string(),
+          toolName: z.string().optional(),
+        }),
+      )
+      .nullable()
+      .optional(),
     branch_index: z.number().nullable().optional(),
     total_branches: z.number().nullable().optional(),
     completed: z.number().nullable().optional(),

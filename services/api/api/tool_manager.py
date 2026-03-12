@@ -631,6 +631,8 @@ class ToolManager:
         ctx = lt.ctx
         if lt.secrets_keys:
             resolved = await _resolve_secrets(lt.secrets_keys)
+            log.info("tool_secrets_resolved", tool=tool_name, keys=list(resolved.keys()),
+                     declared=lt.secrets_keys)
             if resolved:
                 ctx = ToolContext(name=lt.name, secrets={**lt.ctx.secrets, **resolved})
 

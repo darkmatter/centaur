@@ -1,6 +1,6 @@
 import * as crypto from "node:crypto";
 import { Chat, type StreamChunk } from "chat";
-import { createSlackAdapter } from "@chat-adapter/slack";
+import { createSlackAdapter, type SlackAdapter } from "@chat-adapter/slack";
 import { createPostgresState } from "@chat-adapter/state-pg";
 import {
   extractRunOptions,
@@ -11,7 +11,7 @@ import {
   reconnectStreamingWithRetries,
   type Harness,
 } from "./harness";
-import type { CanonicalEvent } from "@centaur/harness-events";
+import { splitThreadKey, type CanonicalEvent } from "@centaur/harness-events";
 import { log } from "@/lib/logger";
 import { ApiError } from "./api-client";
 import { truncateSlackText } from "./slack-text";
@@ -209,8 +209,12 @@ function createBot() {
     message: string,
     harness: Harness,
     tracker: ProgressTracker,
+    executionStartedAt: number,
   ): AsyncGenerator<StreamChunk> {
     let totalYieldedCount = 0;
+
+    // Yield immediately so the user sees the stream open right away.
+    yield { type: "task_update", id: "init", title: "Starting…", status: "in_progress" };
 
     // Phase 1: initial execute — sends turn.start to the container.
     const phase1 = drainStreamChunks(
@@ -264,6 +268,25 @@ function createBot() {
       } catch {
         // Recovery is best-effort
       }
+    }
+
+    // Yield the final result as the last streamed chunk so everything
+    // appears in a single Slack message instead of a separate follow-up.
+    const finalMessage = (tracker.resultText || tracker.lastAssistantText).trim();
+    if (finalMessage && !isLowValueResult(finalMessage)) {
+      const durationSeconds = Math.max(0, (Date.now() - executionStartedAt) / 1000);
+      const durationStr = durationSeconds < 10 ? `${durationSeconds.toFixed(1)}s` : `${Math.round(durationSeconds)}s`;
+      const metaParts = [
+        process.env.APP_NAME || "Centaur",
+        harness,
+        durationStr,
+      ].filter(Boolean);
+      const parts: string[] = [`_${metaParts.join(" · ")}_\n\n`, finalMessage];
+      if (THREAD_VIEWER_URL) {
+        const viewerUrl = `${THREAD_VIEWER_URL}/${encodeURIComponent(normalizeThreadKey(threadKey))}`;
+        parts.push(`\n\n[Thread Viewer](${viewerUrl})`);
+      }
+      yield { type: "markdown_text", text: parts.join("") };
     }
   }
 
@@ -327,7 +350,6 @@ function createBot() {
 
     try {
       const instruction = parsed.cleanedText || "hey";
-      await thread.startTyping("Running...");
       let threadHistory = "";
       if (isFirstMessage) {
         threadHistory = await fetchThreadHistory(thread, slackTs);
@@ -347,36 +369,31 @@ function createBot() {
       const executionStartedAt = Date.now();
 
       // Stream progress via SDK — uses Slack's native chat.startStream/appendStream/stopStream
-      await thread.post(streamProgress(threadKey, message, harness, tracker));
+      // The final result + thread viewer link are yielded as the last chunk so
+      // everything appears in a single Slack message (no duplicate follow-up).
+      await thread.post(streamProgress(threadKey, message, harness, tracker, executionStartedAt));
 
       const finalMessage = (tracker.resultText || tracker.lastAssistantText).trim();
 
-      // Update thread_name in sandbox_sessions
+      // Update thread_name in sandbox_sessions + set Slack assistant thread title
       if (finalMessage) {
+        const titleText = finalMessage.slice(0, 60);
         try {
           const pool = getPool();
           await pool.query(
             `UPDATE sandbox_sessions SET thread_name = $1, updated_at = NOW() WHERE thread_key = $2`,
-            [finalMessage.slice(0, 60), threadKey],
+            [titleText, threadKey],
           );
         } catch {
           // Best-effort
         }
-      }
-
-      // Post final result as a follow-up message
-      if (!isLowValueResult(finalMessage)) {
-        const durationSeconds = Math.max(0, (Date.now() - executionStartedAt) / 1000);
-        const durationStr = durationSeconds < 10 ? `${durationSeconds.toFixed(1)}s` : `${Math.round(durationSeconds)}s`;
-        const metaParts = [
-          process.env.APP_NAME || "Centaur",
-          harness,
-          durationStr,
-        ].filter(Boolean);
-        const viewerUrl = `${THREAD_VIEWER_URL}/${encodeURIComponent(normalizeThreadKey(threadKey))}`;
-        const prefix = `_${metaParts.join(" · ")}_\n\n`;
-        const suffix = `\n\n[Thread Viewer](${viewerUrl})`;
-        await thread.post({ markdown: prefix + finalMessage + suffix });
+        try {
+          const slack = bot.getAdapter("slack") as SlackAdapter;
+          const { channel, threadTs } = splitThreadKey(rawThreadKey);
+          await slack.setAssistantTitle(channel, threadTs, titleText);
+        } catch {
+          // Best-effort — only works in assistant threads (DMs)
+        }
       }
     } catch (error) {
       await thread.post(
@@ -392,6 +409,59 @@ function createBot() {
     const attachments = message.attachments?.map((a) => ({ url: a.url, name: a.name }));
     const mentionTs = (message as { ts?: string }).ts || "";
     await handleMessage(thread, message.text, true, attachments, message.author.userId, mentionTs);
+  });
+
+  // --- Slack AI Assistant events ---
+
+  const DEFAULT_PROMPTS = [
+    { title: "Research a topic", message: "Research the latest developments on..." },
+    { title: "Analyze data", message: "Analyze the following data and summarize key findings:" },
+    { title: "Draft a document", message: "Draft a brief document about..." },
+    { title: "Explain code", message: "Explain how this part of the codebase works:" },
+  ];
+
+  bot.onAssistantThreadStarted(async (event) => {
+    try {
+      const slack = bot.getAdapter("slack") as SlackAdapter;
+      const prompts = [...DEFAULT_PROMPTS];
+      if (event.context.channelId) {
+        prompts.unshift({
+          title: "Summarize this channel",
+          message: "Summarize the recent activity in this channel.",
+        });
+      }
+      await slack.setSuggestedPrompts(
+        event.channelId,
+        event.threadTs,
+        prompts.slice(0, 4),
+        "What can I help with?",
+      );
+    } catch (error) {
+      log.warn("assistant_thread_started_failed", {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  });
+
+  bot.onAssistantContextChanged(async (event) => {
+    try {
+      const slack = bot.getAdapter("slack") as SlackAdapter;
+      const prompts = event.context.channelId
+        ? [
+            { title: "Summarize this channel", message: "Summarize the recent activity in this channel." },
+            ...DEFAULT_PROMPTS.slice(0, 3),
+          ]
+        : DEFAULT_PROMPTS.slice(0, 4);
+      await slack.setSuggestedPrompts(
+        event.channelId,
+        event.threadTs,
+        prompts,
+      );
+    } catch (error) {
+      log.warn("assistant_context_changed_failed", {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
   });
 
   bot.onSubscribedMessage(async (thread, message) => {

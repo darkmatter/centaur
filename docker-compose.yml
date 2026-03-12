@@ -219,6 +219,7 @@ services:
       context: services/nginx
     ports:
       - "127.0.0.1:8000:8000"
+      - "[::1]:8000:8000"
     depends_on:
       - auth
       - api

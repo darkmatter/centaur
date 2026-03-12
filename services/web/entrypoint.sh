@@ -43,4 +43,4 @@ if [ -n "$SECRET_MANAGER_URL" ]; then
   fi
 fi
 
-exec node server.js
+exec "$@"

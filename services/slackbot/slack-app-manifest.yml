@@ -11,6 +11,13 @@ features:
   bot_user:
     display_name: AI2
     always_online: true
+  assistant_view:
+    assistant_description: AI agent that can research, analyze, code, and execute tasks.
+    suggested_prompts:
+      - title: Research a topic
+        message: "Research the latest developments on..."
+      - title: Analyze data
+        message: "Analyze the following data and summarize key findings:"
 
 oauth_config:
   scopes:
@@ -22,6 +29,7 @@ oauth_config:
       - files:read
       - files:write
       - groups:history
+      - im:history
       - groups:read
       - reactions:read
       - reactions:write
@@ -38,8 +46,11 @@ settings:
     request_url: https://your-domain.example.com/api/webhooks/slack
     bot_events:
       - app_mention
+      - assistant_thread_started
+      - assistant_thread_context_changed
       - message.channels
       - message.groups
+      - message.im
   org_deploy_enabled: false
   socket_mode_enabled: false
   token_rotation_enabled: false

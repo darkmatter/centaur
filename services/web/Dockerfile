@@ -25,7 +25,7 @@ ENV NODE_ENV=production
 
 # Next.js standalone output includes everything needed
 COPY --from=builder /app/services/web/.next/standalone ./
-COPY --from=builder /app/services/web/.next/static ./.next/static
+COPY --from=builder /app/services/web/.next/static ./services/web/.next/static
 COPY scripts/bootstrap-secrets.sh /app/bootstrap-secrets.sh
 COPY services/web/entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh /app/bootstrap-secrets.sh
@@ -35,4 +35,4 @@ ENV PORT=3001
 ENV HOSTNAME="0.0.0.0"
 
 ENTRYPOINT ["/app/entrypoint.sh"]
-CMD ["node", "server.js"]
+CMD ["node", "services/web/server.js"]

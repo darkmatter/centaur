@@ -16,7 +16,7 @@ jobs:
       OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
       SECRET_MANAGER_TOKEN: ${{ secrets.SECRET_MANAGER_TOKEN }}
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-      SLACK_DEPLOY_CHANNEL: ai-v2
+      SLACK_DEPLOY_CHANNEL: ${{ secrets.SLACK_DEPLOY_CHANNEL }}
     defaults:
       run:
         working-directory: /home/ubuntu/github/paradigmxyz/centaur

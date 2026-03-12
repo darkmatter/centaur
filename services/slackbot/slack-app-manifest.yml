@@ -9,7 +9,7 @@ features:
     messages_tab_enabled: true
     messages_tab_read_only_enabled: false
   bot_user:
-    display_name: AI2
+    display_name: Centaur AI
     always_online: true
   assistant_view:
     assistant_description: AI agent that can research, analyze, code, and execute tasks.
@@ -43,7 +43,7 @@ oauth_config:
 
 settings:
   event_subscriptions:
-    request_url: https://your-domain.example.com/api/webhooks/slack
+    request_url: https://svc-ai.paradigm.xyz/api/webhooks/slack
     bot_events:
       - app_mention
       - assistant_thread_started

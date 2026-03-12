@@ -20,6 +20,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, ClassVar
 
+import httpx
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import PlainTextResponse
@@ -30,6 +31,38 @@ from api.deps import get_key_info, verify_api_key
 from centaur_sdk import ToolContext, reset_tool_context, set_tool_context
 
 log = structlog.get_logger()
+
+_FIREWALL_URL = os.environ.get("FIREWALL_HEALTH_URL", "http://firewall:8081")
+_secret_cache: dict[str, tuple[str, float]] = {}
+_SECRET_CACHE_TTL = 60
+
+
+async def _resolve_secrets(keys: list[str]) -> dict[str, str]:
+    """Fetch secrets from the firewall sidecar, with a short TTL cache."""
+    now = time.monotonic()
+    result: dict[str, str] = {}
+    missing: list[str] = []
+    for k in keys:
+        cached = _secret_cache.get(k)
+        if cached and (now - cached[1]) < _SECRET_CACHE_TTL:
+            result[k] = cached[0]
+        else:
+            missing.append(k)
+    if not missing:
+        return result
+    async with httpx.AsyncClient(timeout=5) as client:
+        for k in missing:
+            try:
+                resp = await client.get(f"{_FIREWALL_URL}/secrets/{k}")
+                if resp.status_code == 200:
+                    val = resp.json().get("value", "")
+                    if val:
+                        result[k] = val
+                        _secret_cache[k] = (val, now)
+            except Exception:
+                pass
+    return result
+
 _MAX_INLINE_TOOL_BINARY_BYTES = max(
     1024, int(os.getenv("TOOL_BINARY_INLINE_MAX_BYTES", str(1 * 1024 * 1024)))
 )
@@ -594,7 +627,14 @@ class ToolManager:
         t0 = time.monotonic()
         log.info("tool_call_started", tool_name=tool_name, tool_method=method_name)
 
-        token = set_tool_context(lt.ctx)
+        # Resolve real secrets for tools that declare them
+        ctx = lt.ctx
+        if lt.secrets_keys:
+            resolved = await _resolve_secrets(lt.secrets_keys)
+            if resolved:
+                ctx = ToolContext(name=lt.name, secrets={**lt.ctx.secrets, **resolved})
+
+        token = set_tool_context(ctx)
         try:
             if inspect.iscoroutinefunction(method.fn):
                 result = await method.fn(**args)

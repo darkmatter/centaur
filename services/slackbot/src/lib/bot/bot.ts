@@ -213,7 +213,11 @@ function createBot() {
   ): AsyncGenerator<StreamChunk> {
     let totalYieldedCount = 0;
 
-    // Yield immediately so the user sees the stream open right away.
+    // Yield the thread viewer link immediately so it's clickable from the start.
+    if (THREAD_VIEWER_URL) {
+      const viewerUrl = `${THREAD_VIEWER_URL}/${encodeURIComponent(normalizeThreadKey(threadKey))}`;
+      yield { type: "markdown_text", text: `[Thread Viewer](${viewerUrl})` };
+    }
     yield { type: "task_update", id: "init", title: "Starting…", status: "in_progress" };
 
     // Phase 1: initial execute — sends turn.start to the container.
@@ -282,10 +286,6 @@ function createBot() {
         durationStr,
       ].filter(Boolean);
       const parts: string[] = [`_${metaParts.join(" · ")}_\n\n`, finalMessage];
-      if (THREAD_VIEWER_URL) {
-        const viewerUrl = `${THREAD_VIEWER_URL}/${encodeURIComponent(normalizeThreadKey(threadKey))}`;
-        parts.push(`\n\n[Thread Viewer](${viewerUrl})`);
-      }
       yield { type: "markdown_text", text: parts.join("") };
     }
   }
@@ -371,9 +371,32 @@ function createBot() {
       // Stream progress via SDK — uses Slack's native chat.startStream/appendStream/stopStream
       // The final result + thread viewer link are yielded as the last chunk so
       // everything appears in a single Slack message (no duplicate follow-up).
-      await thread.post(streamProgress(threadKey, message, harness, tracker, executionStartedAt));
+      const sentMessage = await thread.post(streamProgress(threadKey, message, harness, tracker, executionStartedAt));
 
       const finalMessage = (tracker.resultText || tracker.lastAssistantText).trim();
+
+      // One-time edit: replace the streamed message (which includes tool progress
+      // tasks like "Starting…", "Reading — file.ts", etc.) with just the clean
+      // final answer. This removes all tool-call noise from the Slack thread.
+      if (finalMessage && !isLowValueResult(finalMessage)) {
+        try {
+          const durationSeconds = Math.max(0, (Date.now() - executionStartedAt) / 1000);
+          const durationStr = durationSeconds < 10 ? `${durationSeconds.toFixed(1)}s` : `${Math.round(durationSeconds)}s`;
+          const metaParts = [
+            process.env.APP_NAME || "Centaur",
+            harness,
+            durationStr,
+          ].filter(Boolean);
+          const parts: string[] = [`_${metaParts.join(" · ")}_\n\n`, finalMessage];
+          if (THREAD_VIEWER_URL) {
+            const viewerUrl = `${THREAD_VIEWER_URL}/${encodeURIComponent(normalizeThreadKey(threadKey))}`;
+            parts.push(`\n\n[Thread Viewer](${viewerUrl})`);
+          }
+          await sentMessage.edit(parts.join(""));
+        } catch {
+          // Best-effort — the streamed message already has the final text
+        }
+      }
 
       // Update thread_name in sandbox_sessions + set Slack assistant thread title
       if (finalMessage) {

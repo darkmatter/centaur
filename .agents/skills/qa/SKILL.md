@@ -262,6 +262,32 @@ curl -s "http://localhost:8000/agent/status?key=test:qa-async" \
 
 **Verify:** Response includes `"busy": false` and `"last_result": "DONE"` (or similar).
 
+### 2h. Cross-Persona Dispatch (from inside sandbox)
+
+Test that one agent can spawn another persona via `call agent execute`, then poll for results. This is the most important integration test — it proves the full multi-agent orchestration pipeline.
+
+```bash
+curl -s --max-time 300 -X POST http://localhost:8000/agent/execute \
+  -H "Authorization: Bearer $API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "thread_key":"test:qa-cross-persona",
+    "message":"Run these commands in order:\n1. call agent execute '\''{ \"thread_key\": \"test:qa-legal-sub\", \"message\": \"What is a SAFE? One sentence.\", \"harness\": \"legal\" }'\''\\n2. sleep 30\\n3. call agent status '\''?key=test:qa-legal-sub'\''\\n4. Show me the last_result.",
+    "harness":"eng"
+  }'
+```
+
+**Verify the SSE trace shows:**
+1. eng agent runs `call agent execute` → gets SSE stream back (legal container spawned)
+2. eng agent runs `call agent status` → gets `busy: false` + `last_result` with legal's answer
+3. eng agent presents the result
+
+**If `call agent execute` returns "Tool 'agent' not found":** The sandbox container has an old `call.sh` without the `agent` case. Fix:
+1. Rebuild sandbox image: `docker build -t agent2:latest services/sandbox/`
+2. Drain old warm pool: `docker ps --filter label=ai2.warm=true -q | xargs -r docker rm -f`
+3. Restart API to replenish pool: `docker compose restart api`
+4. Wait ~15s for new warm containers, then retry
+
 ### 2g. Auth Gate
 
 ```bash
@@ -370,6 +396,8 @@ cp {SKILL_DIR}/templates/tool-qa-report-template.md {OUTPUT_DIR}/report.md
 | Port 3001 already allocated (OrbStack) | Ghost binding from previous container survives OrbStack restart | Remove host port mapping for `web` (nginx proxies internally) |
 | vlogs tool fails with DNS error | VictoriaLogs is on `obs_net`, not reachable from API's network | Expected — tool needs network config or internal proxy |
 | Slackbot port not mapped to host | `web` service removed host port binding | Use `docker exec` to reach slackbot internally at `slackbot:3001` |
+| `call agent execute` returns "Tool 'agent' not found" | Warm pool containers have old `call.sh` without `agent` case | Rebuild sandbox image, drain warm pool (`docker rm -f` warm containers), restart API |
+| Warm pool containers stale after sandbox rebuild | `docker build -t agent2:latest` doesn't update running containers | Drain: `docker ps --filter label=ai2.warm=true -q \| xargs -r docker rm -f` then `docker compose restart api` |
 
 ## Issue Investigation
 

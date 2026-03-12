@@ -192,6 +192,10 @@ ssh ubuntu@206.223.235.69 "docker logs <container_id> 2>&1 | tail -100"
 
 Only after reviewing logs should you dig into source code or try to reproduce locally.
 
+## Terminology
+
+- **Chat SDK** always refers to the [Vercel Chat SDK](https://github.com/vercel/chat) (`~/github/vercel/chat`)
+
 ## Code Conventions
 
 - Python 3.11+, `uv` for deps, `ruff` for lint/format (line-length=100)

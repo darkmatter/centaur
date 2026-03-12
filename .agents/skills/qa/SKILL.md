@@ -43,10 +43,18 @@ Use the **Task** tool to run layers 2, 3a, and 3b as parallel subagents once lay
 
 | Parameter | Default | Example override |
 |-----------|---------|-----------------|
-| **API Key env var** | `API_SECRET_KEY` from `.env` | |
+| **API Key** | Fetch from secrets service (see below) | |
 | **Output directory** | `./tool-qa-output/` | `Output directory: /tmp/qa` |
 | **Tool scope** | Sample (~10 tools) | `Full tools` or `Focus on slack, paradigmdb` |
 | **Layer scope** | All three layers | `Just layer 1` or `Layers 1 and 2` |
+
+**Getting the API key:** `API_SECRET_KEY` is NOT in `.env` — it's in the secrets manager. Fetch it:
+
+```bash
+API_KEY=$(docker exec centaur-api-1 curl -s http://firewall:8081/secrets/API_SECRET_KEY | python3 -c "import sys,json; print(json.load(sys.stdin)['value'])")
+```
+
+Use `$API_KEY` (not `$API_SECRET_KEY`) in all curl commands below.
 
 If the user says "QA", "QA the stack", or "health check", start immediately with defaults (sample tools, all layers). Do not ask clarifying questions.
 
@@ -173,12 +181,13 @@ Same operations as layer 1, but via `curl http://localhost:8000` from the host �
 ### 2a. Health & Tools
 
 ```bash
-source .env
 curl -s http://localhost:8000/health
-curl -s http://localhost:8000/tools -H "Authorization: Bearer $API_SECRET_KEY" | python3 -c "
+curl -s http://localhost:8000/tools -H "Authorization: Bearer $API_KEY" | python3 -c "
 import sys,json; d=json.load(sys.stdin); print(f'{len(d)} tools via nginx')
 "
 ```
+
+**Watch for:** If `/tools` returns `{"detail":"Invalid API key"}`, the API key is wrong — re-fetch from secrets (see Setup).
 
 ### 2b. Tool Calls via Nginx
 
@@ -186,20 +195,74 @@ Run the same sample tool tests from 1b, but via nginx with Bearer auth:
 
 ```bash
 curl -s -X POST http://localhost:8000/tools/demo/echo \
-  -H "Authorization: Bearer $API_SECRET_KEY" \
+  -H "Authorization: Bearer $API_KEY" \
   -H "Content-Type: application/json" -d '{"message":"hello"}'
 ```
 
 ### 2c. Agent Execute via Nginx
 
 ```bash
-curl -s -X POST http://localhost:8000/agent/execute \
-  -H "Authorization: Bearer $API_SECRET_KEY" \
+curl -s --max-time 120 -X POST http://localhost:8000/agent/execute \
+  -H "Authorization: Bearer $API_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"thread_key":"test:qa-nginx","message":"Say OK","harness":"amp"}'
+  -d '{"thread_key":"test:qa-nginx","message":"What persona are you? One word.","harness":"amp"}'
 ```
 
-### 2d. Auth Gate
+**Verify:** SSE stream arrives (not 502). `turn.done` event has non-empty `result`.
+
+**Known issue (fixed):** The `/agent/` nginx location needs `proxy_buffering off`, `proxy_cache off`, and `proxy_read_timeout 300s` for SSE streaming. Without these, nginx returns 502. If you see 502 on agent execute through nginx but it works via `docker exec`, check `services/nginx/nginx.conf` for missing SSE directives on the `/agent/` location.
+
+### 2d. Agent Execute — Personas via Nginx
+
+Test each persona (eng, events, invest, legal) through nginx:
+
+```bash
+for PERSONA in eng events invest legal; do
+  echo "=== Persona: $PERSONA ==="
+  curl -s --max-time 120 -X POST http://localhost:8000/agent/execute \
+    -H "Authorization: Bearer $API_KEY" \
+    -H "Content-Type: application/json" \
+    -d "{\"thread_key\":\"test:qa-persona-$PERSONA\",\"message\":\"What persona are you? One word.\",\"harness\":\"$PERSONA\"}" \
+    | grep 'turn.done'
+  echo ""
+done
+```
+
+**Verify:** Each returns a persona-specific answer. Do NOT run these in a bash loop with `&` — containers need time to spin up; run sequentially with `--max-time 120`.
+
+### 2e. Message Persistence
+
+After agent execute, verify both user AND assistant messages are in postgres:
+
+```bash
+docker exec centaur-postgres-1 psql -U tempo -d ai_v2 -c \
+  "SELECT role, substring(parts::text,1,150) FROM chat_messages WHERE thread_key='test:qa-nginx' ORDER BY created_at;"
+```
+
+**Verify:** Two rows — one `user`, one `assistant` with the agent's response text.
+
+**Known issue (fixed):** `stream_exec` previously expected `turn.done.result` to be a `dict` with a `.text` field, but it's actually a plain string. This caused assistant messages to never be persisted. If you see user messages but no assistant messages in `chat_messages`, check the result extraction logic in `services/api/api/agent.py` → `stream_exec()`.
+
+### 2f. Fire-and-Forget + Status Poll
+
+Test the async execution flow — fire a job and poll `/agent/status` for completion:
+
+```bash
+# Fire (background, don't wait for stream)
+curl -s --max-time 5 -X POST http://localhost:8000/agent/execute \
+  -H "Authorization: Bearer $API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"thread_key":"test:qa-async","message":"Say DONE","harness":"amp"}' > /dev/null 2>&1 &
+
+# Poll status after ~15s
+sleep 15
+curl -s "http://localhost:8000/agent/status?key=test:qa-async" \
+  -H "Authorization: Bearer $API_KEY" | python3 -m json.tool
+```
+
+**Verify:** Response includes `"busy": false` and `"last_result": "DONE"` (or similar).
+
+### 2g. Auth Gate
 
 ```bash
 # Unauthenticated browser request should redirect to /login
@@ -296,15 +359,28 @@ Copy the template and fill in results:
 cp {SKILL_DIR}/templates/tool-qa-report-template.md {OUTPUT_DIR}/report.md
 ```
 
+## Known Gotchas
+
+| Symptom | Root Cause | Fix |
+|---------|-----------|-----|
+| PgBouncer unhealthy on startup | `pg_isready` healthcheck defaults to user `postgres` but pgbouncer only knows `tempo` | Add `-U tempo` to healthcheck in `docker-compose.yml` |
+| 502 on `/agent/execute` via nginx | Missing SSE directives (`proxy_buffering off`, `proxy_read_timeout`) | Add SSE config to `/agent/` location in `nginx.conf` |
+| Assistant messages missing from `chat_messages` | `stream_exec` result extraction expected dict, got string | Fix in `services/api/api/agent.py` — handle both string and dict `result` |
+| `API_SECRET_KEY` empty from `.env` | Key is in secrets manager, not `.env` | Fetch via `curl http://firewall:8081/secrets/API_SECRET_KEY` |
+| Port 3001 already allocated (OrbStack) | Ghost binding from previous container survives OrbStack restart | Remove host port mapping for `web` (nginx proxies internally) |
+| vlogs tool fails with DNS error | VictoriaLogs is on `obs_net`, not reachable from API's network | Expected — tool needs network config or internal proxy |
+| Slackbot port not mapped to host | `web` service removed host port binding | Use `docker exec` to reach slackbot internally at `slackbot:3001` |
+
 ## Issue Investigation
 
 When something fails:
 
 1. **Service crash** — `docker compose logs {service} --tail 30`
 2. **Schema mismatch** — Check DB/API schema vs tool code
-3. **Missing credentials** — `docker exec centaur-api-1 curl -s http://secrets:8100/secrets/{KEY}`
+3. **Missing credentials** — `docker exec centaur-api-1 curl -s http://firewall:8081/secrets/{KEY}` (NOT `http://secrets:8100` — API can't reach secrets directly, use firewall proxy)
 4. **Connection failure** — Check upstream, tunnel, firewall
 5. **Routing issue** — Compare nginx config with expected path
+6. **Postgres persistence** — Check `chat_messages` table: `docker exec centaur-postgres-1 psql -U tempo -d ai_v2 -c "SELECT role, parts FROM chat_messages WHERE thread_key='...'"`
 
 Note root cause and suggested fix for each failure.
 

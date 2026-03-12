@@ -237,6 +237,8 @@ def _stream_turn(
     _ensure_reader(session)
 
     t0 = time.monotonic()
+    rt.busy = True
+    rt.last_result = None
     log.info(
         "turn_start",
         thread_key=session.thread_key,
@@ -270,6 +272,7 @@ def _stream_turn(
     while True:
         line = turn_queue.get()
         if line is None:
+            rt.busy = False
             log.info(
                 "turn_done",
                 thread_key=session.thread_key,
@@ -296,6 +299,8 @@ def _stream_turn(
             if evt.get("type") == "turn.done" and (
                 message is None or evt.get("turn_id") == turn_id
             ):
+                rt.busy = False
+                rt.last_result = evt.get("result")
                 log.info(
                     "turn_done",
                     thread_key=session.thread_key,
@@ -339,7 +344,8 @@ async def _get_status_async(thread_key: str) -> dict[str, Any]:
     if st == "gone":
         await _db_update_state(thread_key, "gone")
         return {"thread_key": thread_key, "status": "gone"}
-    return {
+    rt = _runtime.get(session.sandbox_id)
+    result: dict[str, Any] = {
         "thread_key": thread_key,
         "status": st,
         "sandbox_id": session.sandbox_id[:12],
@@ -347,6 +353,11 @@ async def _get_status_async(thread_key: str) -> dict[str, Any]:
         "engine": session.engine,
         "started_at": session.started_at,
     }
+    if rt:
+        result["busy"] = rt.busy
+        if rt.last_result is not None:
+            result["last_result"] = rt.last_result
+    return result
 
 
 # ── Async bridge ─────────────────────────────────────────────────────────────
@@ -464,11 +475,8 @@ async def stream_exec(session: SandboxSession, message: str) -> AsyncIterator[st
         try:
             evt = json.loads(line)
             if evt.get("type") == "turn.done":
-                result_text = (
-                    evt.get("result", {}).get("text", "")
-                    if isinstance(evt.get("result"), dict)
-                    else ""
-                )
+                r = evt.get("result", "")
+                result_text = r if isinstance(r, str) else r.get("text", "") if isinstance(r, dict) else ""
             elif evt.get("type") == "result" and isinstance(evt.get("text"), str):
                 result_text = evt["text"]
         except (json.JSONDecodeError, TypeError):

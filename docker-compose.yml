@@ -113,7 +113,7 @@ services:
       firewall:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "pg_isready", "-h", "localhost", "-p", "5432"]
+      test: ["CMD", "pg_isready", "-h", "localhost", "-p", "5432", "-U", "tempo"]
       interval: 5s
       timeout: 3s
       retries: 5
@@ -191,8 +191,6 @@ services:
     environment:
       CENTAUR_API_URL: http://api:8000
       SECRET_MANAGER_URL: http://firewall:8081
-    ports:
-      - "127.0.0.1:3001:3001"
     networks:
       - default
       - backend_net

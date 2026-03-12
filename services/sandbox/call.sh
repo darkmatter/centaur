@@ -78,6 +78,16 @@ case "$tool" in
   discover)
     request "GET" "$U/tools/$2"
     ;;
+  agent)
+    # Usage: call agent execute '{"thread_key":"...","message":"...","harness":"legal"}'
+    #        call agent stop '{"thread_key":"..."}'
+    #        call agent status '?key=...'
+    if [ "$method" = "status" ]; then
+      request "GET" "$U/agent/status$body"
+    else
+      request "POST" "$U/agent/$method" "$body"
+    fi
+    ;;
   *)
     if [ -z "$body" ]; then
       request "POST" "$U/tools/$tool/$method"

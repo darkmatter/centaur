@@ -27,6 +27,8 @@ class RuntimeState:
     reader_gen: int = 0
     stdin_sock: Any = None
     stdout_sock: Any = None
+    busy: bool = False
+    last_result: str | None = None
 
 
 @dataclass

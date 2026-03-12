@@ -90,6 +90,25 @@
 |call search <query> [limit]     → semantic+keyword search
 |call sql <query>                → raw SQL on raw_records/embeddings
 |call discover <tool>            → show tool methods and params
+|call agent execute <json>       → fire-and-forget: spawn a persona job
+|call agent status '?key=<key>'  → poll for completion (returns busy + last_result)
+|call agent stop <json>          → stop a running session
+
+[Cross-persona dispatch — delegate tasks to specialist agents]
+|You can spawn other personas (eng, legal, invest, events) as sub-agents:
+|
+|  # Fire a legal review (runs in parallel, doesn't block you)
+|  call agent execute '{"thread_key":"task:legal-review-123","message":"Review this SAFE for risks","harness":"legal"}'
+|
+|  # Poll until done
+|  call agent status '?key=task:legal-review-123'
+|  # → {"busy": false, "last_result": "The key risks are...", "harness": "legal"}
+|
+|  # Clean up when done
+|  call agent stop '{"thread_key":"task:legal-review-123"}'
+|
+|Use unique thread_keys (e.g. "task:<purpose>-<id>") to avoid collisions.
+|The spawned agent runs independently — you can continue your own work while it executes.
 
 [API tools index]
 |anchorage: get_balances{}

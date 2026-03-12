@@ -20,7 +20,8 @@ export function isNetworkError(err: unknown): boolean {
     msg.includes("dns") ||
     msg.includes("etimedout") ||
     msg.includes("enotfound") ||
-    msg.includes("udn_err")
+    msg.includes("udn_err") ||
+    msg.includes("terminated")
   );
 }
 

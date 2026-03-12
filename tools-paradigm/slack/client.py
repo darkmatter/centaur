@@ -30,6 +30,7 @@ class SlackClient:
                 "SLACK_BOT_TOKEN not set.\n"
                 "Get one at https://api.slack.com/apps → OAuth & Permissions → Bot User OAuth Token"
             )
+        self.token = token
         self._client = WebClient(token=token)
         self._user_cache: dict[str, str] = {}
 
@@ -167,7 +168,6 @@ class SlackClient:
                 channels, _ = cached
                 return channels[:limit]
 
-        client = self._client
         channels = []
         cursor = None
         types = "public_channel,private_channel" if include_private else "public_channel"
@@ -523,8 +523,6 @@ class SlackClient:
 
     def list_channels(self, include_private: bool = False, limit: int = 200) -> list[dict]:
         """List all Slack channels (not just bot member channels)."""
-        client = self._client
-
         channels = []
         cursor = None
         types = "public_channel,private_channel" if include_private else "public_channel"
@@ -562,8 +560,6 @@ class SlackClient:
 
     def list_users(self, limit: int = 200) -> list[dict]:
         """List workspace users."""
-        client = self._client
-
         try:
             response = self._client.users_list(limit=limit)
         except SlackApiError as e:
@@ -722,8 +718,9 @@ class SlackClient:
             raise RuntimeError(f"Slack API error: {e.response['error']}")
 
 
-    def upload_file(self, 
-        channel: str,
+    def upload_file(
+        self,
+        channel: str | None,
         file_path: str | None = None,
         title: str | None = None,
         comment: str | None = None,
@@ -732,6 +729,8 @@ class SlackClient:
         filename: str | None = None,
     ) -> dict:
         """Upload a file to a channel. Accepts file_path OR content_base64."""
+        if not channel:
+            raise ValueError("channel is required")
         channel_id = self._resolve_channel(channel)
 
         try:
@@ -743,6 +742,8 @@ class SlackClient:
                 kwargs["content"] = base64.b64decode(content_base64)
                 kwargs["filename"] = filename or "upload.png"
             elif file_path:
+                if not Path(file_path).exists():
+                    raise FileNotFoundError(f"File not found: {file_path}")
                 kwargs["file"] = file_path
             else:
                 raise ValueError("Either file_path or content_base64 is required")
@@ -767,8 +768,6 @@ class SlackClient:
 
     def list_usergroups(self) -> list[dict]:
         """List all user groups in the workspace."""
-        client = self._client
-
         try:
             response = self._client.usergroups_list(include_users=True)
         except SlackApiError as e:
@@ -794,8 +793,6 @@ class SlackClient:
         handle: str, name: str, description: str = "", user_ids: list[str] | None = None
     ) -> dict:
         """Create a new user group."""
-        client = self._client
-
         try:
             response = self._client.usergroups_create(
                 name=name,
@@ -819,8 +816,6 @@ class SlackClient:
 
     def update_usergroup_users(self, group_id_or_handle: str, user_ids: list[str]) -> dict:
         """Update users in an existing user group."""
-        client = self._client
-
         group_id = group_id_or_handle
         if not group_id.startswith("S"):
             groups = self.list_usergroups()
@@ -846,8 +841,6 @@ class SlackClient:
 
     def get_message_files(self, channel_id: str, message_ts: str) -> list[dict]:
         """Get files attached to a specific message."""
-        client = self._client
-
         try:
             response = self._client.conversations_replies(
                 channel=channel_id,
@@ -884,11 +877,10 @@ class SlackClient:
         """Download a Slack file to local path."""
         import urllib.request
 
-        token = self._client.token
-        if not token:
+        if not self.token:
             raise RuntimeError("SLACK_BOT_TOKEN not set")
 
-        req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
+        req = urllib.request.Request(url, headers={"Authorization": f"Bearer {self.token}"})
         with urllib.request.urlopen(req) as response:
             with open(output_path, "wb") as f:
                 f.write(response.read())

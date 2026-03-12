@@ -28,13 +28,16 @@ jobs:
           enable-cache: true
 
       - name: Install Python dependencies
+        working-directory: services/api
         run: uv sync --group dev
 
       - name: Lint
-        run: uv run ruff check services/api/
+        working-directory: services/api
+        run: uv run ruff check api/
 
       - name: Compile
-        run: uv run python -m compileall -q services/api/
+        working-directory: services/api
+        run: uv run python -m compileall -q api/
 
   web-contract:
     name: Web TS contract checks

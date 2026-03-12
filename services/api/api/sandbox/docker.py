@@ -160,7 +160,7 @@ class DockerSandboxBackend(SandboxBackend):
         client = self._get_client()
         repos_dir = os.path.abspath(_repos_host_dir())
 
-        container_name = f"sandbox-{thread_key.replace(':', '-').replace('.', '-')[:40]}"
+        container_name = f"centaur-sandbox-{thread_key.replace(':', '-').replace('.', '-')[:40]}"
         env = _container_env(thread_key, container_name)
         if persona:
             env.append(f"AGENT_PERSONA={persona}")

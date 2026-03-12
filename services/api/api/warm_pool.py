@@ -230,7 +230,7 @@ def claim_container(
             backend.stop_by_id(warm.sandbox_id)
         return None
 
-    new_name = f"sandbox-{thread_key.replace(':', '-').replace('.', '-')[:40]}"
+    new_name = f"centaur-sandbox-{thread_key.replace(':', '-').replace('.', '-')[:40]}"
     backend.rename_by_id(warm.sandbox_id, new_name)
 
     try:

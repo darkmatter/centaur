@@ -23,8 +23,14 @@ export class ProgressTracker {
     }
     if (event.type === "assistant" && event.message?.content) {
       let changed = false;
+      let textInThisEvent = "";
       for (const block of event.message.content) {
         if (block.type === "tool_use") {
+          // A tool is starting — any preceding assistant text (in this event
+          // or a prior one) was just preamble (e.g. "Let me look at…") and
+          // should not be posted as the final Slack message if the stream
+          // ends before the tool completes.
+          this.lastAssistantText = "";
           this.activeTools.set(block.id, {
             name: block.name,
             input: block.input,
@@ -38,8 +44,13 @@ export class ProgressTracker {
             status: "in_progress",
           });
         } else if (block.type === "text" && block.text) {
-          this.lastAssistantText = block.text;
+          textInThisEvent = block.text;
         }
+      }
+      // Only set lastAssistantText if this event had no tool_use blocks.
+      // When tools are active, text after all tools complete will set it.
+      if (textInThisEvent && this.activeTools.size === 0) {
+        this.lastAssistantText = textInThisEvent;
       }
       return changed;
     }

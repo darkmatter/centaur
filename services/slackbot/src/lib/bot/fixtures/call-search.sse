@@ -1,0 +1,14 @@
+data: {"type":"system","subtype":"init","cwd":"/home/agent/workspace","session_id":"T-019ce04a-a398-77ae-af03-e0c3013a6a5f","tools":["Bash","chart","create_file","edit_file","find_thread","finder","glob","Grep","handoff","librarian","look_at","mermaid","oracle","painter","Read","read_mcp_resource","read_thread","read_web_page","skill","Task","task_list","undo_edit","web_search"],"mcp_servers":[]}
+
+data: {"type":"user","message":{"role":"user","content":[{"type":"text","text":"Run this exact Bash command: call search stablecoin regulation 2025 \u2014 summarize the top result.\n"}]},"parent_tool_use_id":null,"session_id":"T-019ce04a-a398-77ae-af03-e0c3013a6a5f"}
+
+data: {"type":"assistant","message":{"type":"message","role":"assistant","content":[{"type":"tool_use","id":"toolu_01KLNM2AcRKd1D2EZwrteVtL","name":"Bash","input":{"cmd":"call search stablecoin regulation 2025"}}],"stop_reason":"tool_use","usage":{"input_tokens":9,"cache_creation_input_tokens":10453,"cache_read_input_tokens":14399,"output_tokens":105,"max_tokens":168000,"service_tier":"standard"}},"parent_tool_use_id":null,"session_id":"T-019ce04a-a398-77ae-af03-e0c3013a6a5f"}
+
+data: {"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_01KLNM2AcRKd1D2EZwrteVtL","content":"{\"output\":\"{\\\"error\\\":\\\"http_error\\\",\\\"status\\\":404,\\\"url\\\":\\\"http://api:8000/api/search\\\",\\\"body\\\":\\\"{\\\\\\\"detail\\\\\\\":\\\\\\\"Not Found\\\\\\\"}\\\"}\\n\",\"exitCode\":1}","is_error":false}]},"parent_tool_use_id":null,"session_id":"T-019ce04a-a398-77ae-af03-e0c3013a6a5f"}
+
+data: {"type":"assistant","message":{"type":"message","role":"assistant","content":[{"type":"text","text":"The search endpoint returned a **404 Not Found**, meaning the semantic search API isn't available in this environment. This likely means the search index/embeddings service isn't running on the local stack.\n\nAs an alternative, I can try `call sql` or `call paradigmdb notes_search` to find stablecoin regulation content, or use `web_search` for public sources. Want me to try one of those?"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"cache_creation_input_tokens":176,"cache_read_input_tokens":24852,"output_tokens":94,"max_tokens":168000,"service_tier":"standard"}},"parent_tool_use_id":null,"session_id":"T-019ce04a-a398-77ae-af03-e0c3013a6a5f"}
+
+data: {"type":"turn.done","turn_id":1,"result":"The search endpoint returned a **404 Not Found**, meaning the semantic search API isn't available in this environment. This likely means the search index/embeddings service isn't running on the local stack.\n\nAs an alternative, I can try `call sql` or `call paradigmdb notes_search` to find stablecoin regulation content, or use `web_search` for public sources. Want me to try one of those?","agent_thread_id":"T-019ce04a-a398-77ae-af03-e0c3013a6a5f"}
+
+data: [DONE]
+

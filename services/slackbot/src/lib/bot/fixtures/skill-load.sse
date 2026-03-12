@@ -1,0 +1,10 @@
+data: {"type":"stderr","text":"Error: Invalid or missing API key. Run 'amp login' to authenticate."}
+
+data: {"type":"stderr","text":"\u001b[=0u\u001b[<u\u001b[?25h"}
+
+data: {"type":"error","error":"Harness exited unexpectedly (code 1)"}
+
+data: {"type":"turn.done","turn_id":1,"result":"","agent_thread_id":"","exit_code":1}
+
+data: [DONE]
+

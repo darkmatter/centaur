@@ -89,10 +89,17 @@
 |call <tool> <method> [json_body] → e.g. call arkham get_transfers '{"address":"0x..."}'
 |call search <query> [limit]     → semantic+keyword search
 |call sql <query>                → raw SQL on raw_records/embeddings
-|call discover <tool>            → show tool methods and params
+|call tools                      → list all available tools with descriptions
+|call discover <tool>            → show tool methods, params, and descriptions
 |call agent execute <json>       → fire-and-forget: spawn a persona job
 |call agent status '?key=<key>'  → poll for completion (returns busy + last_result)
 |call agent stop <json>          → stop a running session
+
+[Tool discovery — discover before you call]
+|IMPORTANT: Before calling any API tool, run `call discover <tool>` to see its methods, parameters, and descriptions.
+|This tells you exactly which method to use and avoids redundant calls.
+|If you're unsure which tool has what you need, run `call tools` to list everything available.
+|Never guess at method names or call multiple methods that might do the same thing — discover first, then call the right one.
 
 [Cross-persona dispatch — delegate tasks to specialist agents]
 |You can spawn other personas (eng, legal, invest, events) as sub-agents:
@@ -109,39 +116,6 @@
 |
 |Use unique thread_keys (e.g. "task:<purpose>-<id>") to avoid collisions.
 |The spawned agent runs independently — you can continue your own work while it executes.
-
-[API tools index]
-|anchorage: get_balances{}
-|arkham: get_transfers{address}
-|ashby: candidates{} | jobs{} | applications{}
-|bitgo: get_total_balances{}
-|coinbase: get_portfolio_balances{portfolio}
-|coindesk: search{query}
-|coingecko: get_price{symbol} | get_markets{vs_currency,per_page}
-|coinmetrics: get_asset_metrics{assets,metrics}
-|crunchbase: search_organizations{query}
-|debank: get_user_total_balance{id}
-|defillama: get_tvl{}
-|dune: execute_query{query_id}
-|falconx: get_balances{}
-|googlenews: search{query}
-|gsuite: calendar_events{calendar} | gmail_search{query,user}
-|harmonic: search_companies_natural_language{query}
-|kalshi: list_events{}
-|linear: search_issues{query}
-|nansen: get_address_labels{address}
-|newsapi: search{query}
-|notion: search{query}
-|paradigmdb: bq_query{query} | db_query{query} | bq_transactions{} | db_tables{} | db_describe{table_name} | db_funds{} | db_assets{} | db_asset_by_symbol{symbol} | db_daily_prices{asset_id} | db_transactions{} | db_organizations{search} | db_organization{org_id} | db_people{search} | db_person{person_id} | db_positions{fund} | db_events{search} | db_funding_rounds{search} | db_equity_financing{} | db_valuations{} | db_corrections{} | db_cash_balances{} | db_jpm_transactions{} | db_anchorage_balances{} | db_coinbase_balances{} | notes_search{query} | notes_read{note_id} | notes_list{} | notes_for_org{org_name} | notes_stats{} | notes_authors{}
-|polymarket: search{query}
-|posthog: pageviews{}
-|twitter: search_tweets{query} | get_user{username} | get_timeline{handle,limit} | get_followers{handle,limit} | get_following{handle,limit} | lookup_users{ids} | lookup_tweets{ids} | get_usage{}
-|sensortower: search_apps{query}
-|similarweb: get_visits{domain}
-|slack: get_channel_history{channel,limit} | search_messages{query} | get_thread_replies{channel,thread_ts} | list_channels{} | send_message{channel,text} | upload_file{channel_id,file_path,thread_ts,initial_comment,title} | get_message_files{channel_id,message_ts} | download_file{url,output_path}
-|unit410: get_balances{}
-|browser: navigate{url,profile} | screenshot{} | click{selector} | type{selector,text} | text{} | console{} | network{} | evaluate{javascript} | save_cookies{profile} | load_cookies{profile} | import_cookies{cookies_json,profile} | list_profiles{} | close{}
-|unlisted: GET /tools/{name} to discover
 
 [Finance domain]
 |CRITICAL: always check ALL custodians for balances: anchorage+coinbase+bitgo+unit410+falconx

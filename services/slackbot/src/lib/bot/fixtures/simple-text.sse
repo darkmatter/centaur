@@ -1,0 +1,10 @@
+data: {"type":"system","subtype":"init","cwd":"/home/agent/workspace","session_id":"T-019ce043-b8fc-7040-b173-50927e5635b0","tools":["Bash","chart","create_file","edit_file","find_thread","finder","glob","Grep","handoff","librarian","look_at","mermaid","oracle","painter","Read","read_mcp_resource","read_thread","read_web_page","skill","Task","task_list","undo_edit","web_search"],"mcp_servers":[]}
+
+data: {"type":"user","message":{"role":"user","content":[{"type":"text","text":"What is 2+2? One sentence, no tools.\n"}]},"parent_tool_use_id":null,"session_id":"T-019ce043-b8fc-7040-b173-50927e5635b0"}
+
+data: {"type":"assistant","message":{"type":"message","role":"assistant","content":[{"type":"text","text":"2 + 2 = 4."}],"stop_reason":"end_turn","usage":{"input_tokens":9,"cache_creation_input_tokens":10438,"cache_read_input_tokens":14399,"output_tokens":22,"max_tokens":168000,"service_tier":"standard"}},"parent_tool_use_id":null,"session_id":"T-019ce043-b8fc-7040-b173-50927e5635b0"}
+
+data: {"type":"turn.done","turn_id":1,"result":"2 + 2 = 4.","agent_thread_id":"T-019ce043-b8fc-7040-b173-50927e5635b0"}
+
+data: [DONE]
+

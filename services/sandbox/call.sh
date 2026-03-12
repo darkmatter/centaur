@@ -4,6 +4,7 @@
 #   call <tool> <method> [json_body]   → POST /tools/<tool>/<method>
 #   call search <query> [limit]        → POST /api/search
 #   call sql <query>                   → POST /api/search/sql
+#   call tools                          → GET /tools (list all)
 #   call discover <tool>               → GET /tools/<tool>
 U="${CENTAUR_API_URL:-http://api:8000}"
 T="Accept: text/plain"
@@ -74,6 +75,9 @@ case "$tool" in
     ;;
   sql)
     request "POST" "$U/api/search/sql" "{\"query\":$(printf '%s' "$2" | jq -Rs .)}"
+    ;;
+  tools)
+    request "GET" "$U/tools"
     ;;
   discover)
     request "GET" "$U/tools/$2"

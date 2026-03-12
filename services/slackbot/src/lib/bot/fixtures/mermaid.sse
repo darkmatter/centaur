@@ -1,0 +1,14 @@
+data: {"type":"system","subtype":"init","cwd":"/home/agent/workspace","session_id":"T-019ce04c-b68a-760a-82d1-7245288ac3ff","tools":["Bash","chart","create_file","edit_file","find_thread","finder","glob","Grep","handoff","librarian","look_at","mermaid","oracle","painter","Read","read_mcp_resource","read_thread","read_web_page","skill","Task","task_list","undo_edit","web_search"],"mcp_servers":[]}
+
+data: {"type":"user","message":{"role":"user","content":[{"type":"text","text":"Use the mermaid tool to draw: flowchart LR; A-->B-->C. Confirm done.\n"}]},"parent_tool_use_id":null,"session_id":"T-019ce04c-b68a-760a-82d1-7245288ac3ff"}
+
+data: {"type":"assistant","message":{"type":"message","role":"assistant","content":[{"type":"tool_use","id":"toolu_019cCc8P3ifThNW6bBXut3mX","name":"mermaid","input":{"code":"flowchart LR\n    A --> B --> C","citations":{}}}],"stop_reason":"tool_use","usage":{"input_tokens":9,"cache_creation_input_tokens":10451,"cache_read_input_tokens":14399,"output_tokens":102,"max_tokens":168000,"service_tier":"standard"}},"parent_tool_use_id":null,"session_id":"T-019ce04c-b68a-760a-82d1-7245288ac3ff"}
+
+data: {"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_019cCc8P3ifThNW6bBXut3mX","content":"{\"success\":true}","is_error":false}]},"parent_tool_use_id":null,"session_id":"T-019ce04c-b68a-760a-82d1-7245288ac3ff"}
+
+data: {"type":"assistant","message":{"type":"message","role":"assistant","content":[{"type":"text","text":"Done \u2014 diagram rendered."}],"stop_reason":"end_turn","usage":{"input_tokens":1,"cache_creation_input_tokens":127,"cache_read_input_tokens":24850,"output_tokens":8,"max_tokens":168000,"service_tier":"standard"}},"parent_tool_use_id":null,"session_id":"T-019ce04c-b68a-760a-82d1-7245288ac3ff"}
+
+data: {"type":"turn.done","turn_id":1,"result":"Done \u2014 diagram rendered.","agent_thread_id":"T-019ce04c-b68a-760a-82d1-7245288ac3ff"}
+
+data: [DONE]
+

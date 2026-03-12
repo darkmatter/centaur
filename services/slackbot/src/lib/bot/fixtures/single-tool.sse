@@ -1,0 +1,14 @@
+data: {"type":"system","subtype":"init","cwd":"/home/agent/workspace","session_id":"T-019ce043-dab9-75d3-8f77-b0a560b611d3","tools":["Bash","chart","create_file","edit_file","find_thread","finder","glob","Grep","handoff","librarian","look_at","mermaid","oracle","painter","Read","read_mcp_resource","read_thread","read_web_page","skill","Task","task_list","undo_edit","web_search"],"mcp_servers":[]}
+
+data: {"type":"user","message":{"role":"user","content":[{"type":"text","text":"Read /home/agent/AGENTS.md and tell me the first line.\n"}]},"parent_tool_use_id":null,"session_id":"T-019ce043-dab9-75d3-8f77-b0a560b611d3"}
+
+data: {"type":"assistant","message":{"type":"message","role":"assistant","content":[{"type":"tool_use","id":"toolu_01UtXvXHYuPLFZ5NiBwNdtmw","name":"Read","input":{"path":"/home/agent/AGENTS.md","read_range":[1,1]}}],"stop_reason":"tool_use","usage":{"input_tokens":9,"cache_creation_input_tokens":10445,"cache_read_input_tokens":14399,"output_tokens":110,"max_tokens":168000,"service_tier":"standard"}},"parent_tool_use_id":null,"session_id":"T-019ce043-dab9-75d3-8f77-b0a560b611d3"}
+
+data: {"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_01UtXvXHYuPLFZ5NiBwNdtmw","content":"{\"absolutePath\":\"/home/agent/AGENTS.md\",\"content\":\"1: # Agent Instructions\\n[... omitted lines 2 to 267 ...]\"}","is_error":false}]},"parent_tool_use_id":null,"session_id":"T-019ce043-dab9-75d3-8f77-b0a560b611d3"}
+
+data: {"type":"assistant","message":{"type":"message","role":"assistant","content":[{"type":"text","text":"The first line is: `# Agent Instructions`"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"cache_creation_input_tokens":171,"cache_read_input_tokens":24844,"output_tokens":13,"max_tokens":168000,"service_tier":"standard"}},"parent_tool_use_id":null,"session_id":"T-019ce043-dab9-75d3-8f77-b0a560b611d3"}
+
+data: {"type":"turn.done","turn_id":1,"result":"The first line is: `# Agent Instructions`","agent_thread_id":"T-019ce043-dab9-75d3-8f77-b0a560b611d3"}
+
+data: [DONE]
+

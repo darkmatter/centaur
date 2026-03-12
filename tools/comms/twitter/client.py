@@ -91,7 +91,7 @@ class PTwitterClient:
     def search_tweets(
         self, query: str, search_type: str = "latest", limit: int = 20
     ) -> tuple[list, dict]:
-        """Search tweets with pagination."""
+        """Search tweets by keyword or advanced query (e.g. 'ethereum', 'from:vitalik ETH'). Use get_timeline instead if you just want a user's recent tweets."""
 
         async def _do():
             async with self._make_client() as client:
@@ -118,7 +118,7 @@ class PTwitterClient:
         return self._run(_do())
 
     def get_timeline(self, handle: str, limit: int = 20) -> tuple[dict | None, list, dict | None]:
-        """Get user timeline. Returns (user, tweets, meta)."""
+        """Get a user's recent tweets by handle. This is the best method for 'last N tweets by @user' requests."""
 
         async def _do():
             async with self._make_client() as client:

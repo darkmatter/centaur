@@ -78,6 +78,7 @@ USER root
 COPY --link --chmod=755 services/sandbox/call.sh /usr/local/bin/call
 COPY --link --chmod=755 services/sandbox/slack-upload.sh /usr/local/bin/slack-upload
 COPY --link --chmod=755 services/sandbox/md2docx.py /usr/local/bin/md2docx
+COPY --link --chmod=755 services/sandbox/amp-wrapper.sh /usr/local/bin/amp-wrapper
 COPY --link --chmod=755 services/sandbox/entrypoint.sh /entrypoint.sh
 
 USER agent
@@ -88,5 +89,6 @@ COPY --link --chown=1001:1001 .agents/skills/ /home/agent/.agents/skills/
 COPY --link --chown=1001:1001 services/sandbox/SYSTEM_PROMPT.md /home/agent/AGENTS.md
 
 ENTRYPOINT ["/entrypoint.sh"]
-# Default CMD is amp; docker.py overrides via command= for other engines.
-CMD ["amp", "--no-ide", "--no-notifications", "--dangerously-allow-all", "--execute", "--stream-json", "--stream-json-input"]
+# Default CMD uses amp-wrapper which handles follow-handoff chaining;
+# docker.py overrides via command= for other engines.
+CMD ["amp-wrapper"]

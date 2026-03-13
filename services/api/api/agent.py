@@ -433,6 +433,11 @@ async def stream_exec(
         agent_thread_id: str | None = None
         first_output = False
 
+        # Handoff tracking: when amp does handoff(follow=true), the wrapper
+        # script chains into `amp threads continue <id>` and keeps streaming
+        # on the same stdout.  We see TWO result events — skip the first.
+        pending_handoff = False
+
         async for line in backend.stream_stdout(session):
             if not first_output:
                 first_output = True
@@ -462,12 +467,44 @@ async def stream_exec(
                 stream_failed = True
                 result_text = ""
 
+            # Detect handoff(follow=true) in assistant tool_use events
+            if (
+                session.engine in ("amp", "claude-code")
+                and evt.get("type") == "assistant"
+            ):
+                for block in evt.get("message", {}).get("content", []):
+                    if (
+                        isinstance(block, dict)
+                        and block.get("type") == "tool_use"
+                        and block.get("name") == "handoff"
+                        and isinstance(block.get("input"), dict)
+                        and block["input"].get("follow") is True
+                    ):
+                        pending_handoff = True
+                        log.info(
+                            "handoff_follow_detected",
+                            thread_key=session.thread_key,
+                            sandbox=session.sandbox_id[:12],
+                        )
+                        break
+
             # Normalize raw harness event → canonical events and yield each
             for canonical in normalize_harness_event(session.engine, evt):
                 yield {"data": json.dumps(canonical, separators=(",", ":"))}
 
-            # Detect turn completion
+            # Detect turn completion — skip if a follow-handoff is pending
             if is_turn_done(session.engine, evt):
+                if pending_handoff:
+                    # The wrapper will chain into the handoff thread;
+                    # reset and keep streaming for the next result.
+                    pending_handoff = False
+                    log.info(
+                        "handoff_turn_done_skipped",
+                        thread_key=session.thread_key,
+                        sandbox=session.sandbox_id[:12],
+                        turn_id=turn_id,
+                    )
+                    continue
                 rt.busy = False
                 rt.last_result = result_text
                 yield {"data": json.dumps({
@@ -538,10 +575,8 @@ async def stream_reconnect(
     Yields SSE-ready ``{"data": line}`` dicts directly to EventSourceResponse.
 
     *skip_done_count*: number of ``turn.done`` events to skip before treating
-    one as terminal.  The slackbot sets this to 1 when reconnecting after a
-    follow=true handoff so that the old turn's ``turn.done`` (replayed from
-    container stdout history) is passed through and the followed thread's
-    output is streamed.
+    one as terminal.  Largely superseded by amp-wrapper's server-side handoff
+    chaining, but kept for backward compatibility.
     """
     backend = get_backend()
     # Force fresh stream for reconnect

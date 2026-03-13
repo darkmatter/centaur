@@ -239,7 +239,6 @@ services:
       - auth
       - api
       - slackbot
-      - web
       - grafana
     networks:
       - default

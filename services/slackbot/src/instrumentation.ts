@@ -8,7 +8,7 @@
  */
 export async function register() {
   if (process.env.NEXT_RUNTIME === "nodejs") {
-    const { getBot } = await import("@/lib/bot/bot");
+    const { getBot } = await import("@/lib/bot/setup");
     getBot();
   }
 }

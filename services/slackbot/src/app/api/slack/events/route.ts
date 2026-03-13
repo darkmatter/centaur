@@ -1,7 +1,7 @@
 import { after } from "next/server";
 import { NextRequest, NextResponse } from "next/server";
 import { log } from "@/lib/logger";
-import { getBot, getSlackBootstrapState } from "@/lib/bot/bot";
+import { getBot, getSlackBootstrapState } from "@/lib/bot/setup";
 
 export const dynamic = "force-dynamic";
 export const fetchCache = "force-no-store";

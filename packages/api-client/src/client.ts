@@ -1,4 +1,5 @@
 import type { CanonicalEvent } from "@centaur/harness-events";
+import { EventSourceParserStream } from "eventsource-parser/stream";
 import { resilientFetch } from "./resilient-fetch";
 import { ApiError } from "./types";
 
@@ -73,33 +74,16 @@ export function createCentaurClient(options: CentaurClientOptions): CentaurClien
   ): AsyncGenerator<CanonicalEvent, void, undefined> {
     if (!res.body) return;
 
-    const reader = (res.body as ReadableStream<Uint8Array>).getReader();
-    const decoder = new TextDecoder();
-    let buf = "";
+    const stream = (res.body as ReadableStream<Uint8Array>)
+      .pipeThrough(new TextDecoderStream())
+      .pipeThrough(new EventSourceParserStream());
 
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buf += decoder.decode(value, { stream: true });
-
-      while (buf.includes("\n\n")) {
-        const boundary = buf.indexOf("\n\n");
-        const raw = buf.slice(0, boundary);
-        buf = buf.slice(boundary + 2);
-
-        const dataLines = raw
-          .split("\n")
-          .filter((l) => l.startsWith("data:"))
-          .map((l) => l.slice(5).trim());
-        if (dataLines.length === 0) continue;
-        const payload = dataLines.join("\n");
-        if (payload === "[DONE]") return;
-
-        try {
-          yield JSON.parse(payload) as CanonicalEvent;
-        } catch {
-          // skip unparseable
-        }
+    for await (const event of stream) {
+      if (event.data === "[DONE]") return;
+      try {
+        yield JSON.parse(event.data) as CanonicalEvent;
+      } catch {
+        // skip unparseable
       }
     }
   }

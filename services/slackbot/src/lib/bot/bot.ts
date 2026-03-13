@@ -12,7 +12,6 @@ import {
   type ContentBlock,
   type Harness,
 } from "./harness";
-import { resilientFetch, API_URL } from "./api-client";
 import { splitThreadKey, type CanonicalEvent } from "@centaur/harness-events";
 import { log } from "@/lib/logger";
 import { ApiError, API_URL, resilientFetch } from "./api-client";

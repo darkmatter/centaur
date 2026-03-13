@@ -1,0 +1,78 @@
+{
+  "uid": "thread-debugger",
+  "title": "Thread Debugger",
+  "description": "Single-thread investigation dashboard. Enter a thread_key to inspect all logs, lifecycle events, tool calls, and firewall audit for that thread.",
+  "tags": ["centaur", "debug"],
+  "schemaVersion": 39,
+  "graphTooltip": 1,
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "refresh": "",
+  "time": { "from": "now-6h", "to": "now" },
+  "timezone": "utc",
+  "templating": {
+    "list": [
+      {
+        "name": "thread_key",
+        "label": "Thread Key",
+        "type": "textbox",
+        "current": { "value": "", "text": "" },
+        "options": [],
+        "query": "",
+        "hide": 0
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "All Events Timeline",
+      "description": "All log lines across all services for this thread.",
+      "type": "logs",
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 0 },
+      "datasource": { "type": "victoriametrics-logs-datasource", "uid": "victorialogs" },
+      "targets": [{ "datasource": { "type": "victoriametrics-logs-datasource", "uid": "victorialogs" }, "expr": "thread_key:${thread_key}", "refId": "A" }],
+      "options": { "showTime": true, "showLabels": true, "showCommonLabels": false, "wrapLogMessage": true, "prettifyLogMessage": false, "enableLogDetails": true, "sortOrder": "Ascending", "dedupStrategy": "none" }
+    },
+    {
+      "id": 2,
+      "title": "Request Flow",
+      "description": "Key lifecycle events: webhook → execute → SSE → turn → done → edit.",
+      "type": "logs",
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 10 },
+      "datasource": { "type": "victoriametrics-logs-datasource", "uid": "victorialogs" },
+      "targets": [{ "datasource": { "type": "victoriametrics-logs-datasource", "uid": "victorialogs" }, "expr": "thread_key:${thread_key} AND (event:webhook_received OR event:message_received OR event:execute_start OR event:sse_connect OR event:http_request OR event:turn_start OR event:turn_first_output OR event:turn_done OR event:execute_complete OR event:slack_edit_complete)", "refId": "A" }],
+      "options": { "showTime": true, "showLabels": true, "showCommonLabels": false, "wrapLogMessage": true, "prettifyLogMessage": false, "enableLogDetails": true, "sortOrder": "Ascending", "dedupStrategy": "none" }
+    },
+    {
+      "id": 3,
+      "title": "Errors & Warnings",
+      "description": "Only error and warning logs for this thread.",
+      "type": "logs",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 20 },
+      "datasource": { "type": "victoriametrics-logs-datasource", "uid": "victorialogs" },
+      "targets": [{ "datasource": { "type": "victoriametrics-logs-datasource", "uid": "victorialogs" }, "expr": "thread_key:${thread_key} AND (level:error OR level:warning OR level:warn)", "refId": "A" }],
+      "options": { "showTime": true, "showLabels": true, "showCommonLabels": false, "wrapLogMessage": true, "prettifyLogMessage": false, "enableLogDetails": true, "sortOrder": "Ascending", "dedupStrategy": "none" }
+    },
+    {
+      "id": 4,
+      "title": "Tool Calls",
+      "description": "All tool calls for this thread with success/failure status.",
+      "type": "logs",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 28 },
+      "datasource": { "type": "victoriametrics-logs-datasource", "uid": "victorialogs" },
+      "targets": [{ "datasource": { "type": "victoriametrics-logs-datasource", "uid": "victorialogs" }, "expr": "thread_key:${thread_key} AND (event:tool_call_started OR event:tool_call_completed)", "refId": "A" }],
+      "options": { "showTime": true, "showLabels": true, "showCommonLabels": false, "wrapLogMessage": true, "prettifyLogMessage": false, "enableLogDetails": true, "sortOrder": "Ascending", "dedupStrategy": "none" }
+    },
+    {
+      "id": 5,
+      "title": "Firewall Audit",
+      "description": "All outbound HTTP requests from the sandbox for this thread.",
+      "type": "logs",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 36 },
+      "datasource": { "type": "victoriametrics-logs-datasource", "uid": "victorialogs" },
+      "targets": [{ "datasource": { "type": "victoriametrics-logs-datasource", "uid": "victorialogs" }, "expr": "thread_key:${thread_key} AND event:proxy_audit", "refId": "A" }],
+      "options": { "showTime": true, "showLabels": true, "showCommonLabels": false, "wrapLogMessage": true, "prettifyLogMessage": false, "enableLogDetails": true, "sortOrder": "Ascending", "dedupStrategy": "none" }
+    }
+  ]
+}

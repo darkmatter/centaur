@@ -418,6 +418,14 @@ function createBot() {
     const harness: Harness = isFirstMessage ? parsed.harness : (activeHarness ?? parsed.harness);
     const budgetMode = parsed.budgetMode;
 
+    log.info("message_received", {
+      thread_key: threadKey,
+      harness,
+      is_first_message: isFirstMessage,
+      has_attachments: Boolean(attachments?.length),
+      user_id: userId,
+    });
+
     if (!isFirstMessage && !activeHarness && !parsed.harnessExplicit) {
       await thread.post(
         "I could not recover the active harness for this thread. Please retry with an explicit harness flag (for example `--legal`)."
@@ -488,6 +496,8 @@ function createBot() {
       const tracker = new ProgressTracker();
       const executionStartedAt = Date.now();
 
+      log.info("execute_start", { thread_key: threadKey, harness });
+
       // Stream progress via SDK — uses Slack's native chat.startStream/appendStream/stopStream
       // The final result + thread viewer link are yielded as the last chunk so
       // everything appears in a single Slack message (no duplicate follow-up).
@@ -500,8 +510,9 @@ function createBot() {
         // or poll the API for the final result if we don't have one yet.
         const errMsg = streamErr instanceof Error ? streamErr.message : String(streamErr);
         if (errMsg.includes("message_not_in_streaming_state")) {
-          log.warn("slack_stream_expired", { thread: threadKey, error: errMsg });
+          log.warn("slack_stream_expired", { thread_key: threadKey, error: errMsg });
           let fallback = (tracker.resultText || tracker.lastAssistantText).trim();
+          log.warn("stream_expired_fallback", { thread_key: threadKey, had_result: Boolean(fallback) });
 
           // If we don't have the final answer yet, poll the API until the agent
           // finishes (it's still running — Slack just expired the stream).
@@ -515,12 +526,29 @@ function createBot() {
             const viewerUrl = `${THREAD_VIEWER_URL}/${encodeURIComponent(normalizeThreadKey(threadKey))}`;
             await thread.post({ markdown: `Agent completed. [View full output](${viewerUrl})` });
           }
+          // Mark as delivered so the orphan checker doesn't repost
+          try {
+            await resilientFetch(`${API_URL}/agent/mark-delivered`, {
+              method: "POST",
+              body: JSON.stringify({ thread_key: threadKey }),
+            });
+          } catch {
+            // Best-effort
+          }
           return;
         }
         throw streamErr;
       }
 
       const finalMessage = (tracker.resultText || tracker.lastAssistantText).trim();
+
+      const durationS = (Date.now() - executionStartedAt) / 1000;
+      log.info("execute_complete", {
+        thread_key: threadKey,
+        harness,
+        duration_s: Math.round(durationS * 10) / 10,
+        result_length: finalMessage.length,
+      });
 
       // One-time edit: replace the streamed message (which includes tool progress
       // tasks like "Starting…", "Reading — file.ts", etc.) with just the clean
@@ -543,9 +571,20 @@ function createBot() {
             parts.push(`\n\n[Thread Viewer](${viewerUrl})`);
           }
           await sentMessage.edit({ markdown: parts.join("") });
+          log.info("slack_edit_complete", { thread_key: threadKey });
         } catch {
           // Best-effort — the streamed message already has the final text
         }
+      }
+
+      // Mark as delivered so orphan recovery won't re-post
+      try {
+        await resilientFetch(`${API_URL}/agent/mark-delivered`, {
+          method: "POST",
+          body: JSON.stringify({ thread_key: threadKey }),
+        });
+      } catch {
+        // Best-effort
       }
 
       // Update thread_name in sandbox_sessions + set Slack assistant thread title
@@ -569,6 +608,10 @@ function createBot() {
         }
       }
     } catch (error) {
+      log.error("execute_error", {
+        thread_key: threadKey,
+        error: error instanceof Error ? error.message : String(error),
+      });
       await thread.post(formatErrorForSlack(error, "Agent request failed"));
     }
   }
@@ -652,6 +695,87 @@ function createBot() {
       });
     }
   });
+
+  // ── Orphaned completion recovery ──────────────────────────────────────────
+  // When the slackbot crashes mid-execution, the agent's response is persisted
+  // in chat_messages but never posted to Slack. This polls for such orphans and
+  // delivers them retroactively.
+
+  const ORPHAN_CHECK_INTERVAL_MS = 60_000;
+
+  async function checkOrphanedCompletions() {
+    if (!hasSlackCreds) return;
+    try {
+      const res = await resilientFetch(`${API_URL}/agent/orphaned?max_age_s=300`, {
+        timeoutMs: 10_000,
+        maxAttempts: 1,
+      });
+      if (!res.ok) return;
+      const orphans = (await res.json()) as Array<{
+        thread_key: string;
+        text: string;
+        updated_at: string | null;
+      }>;
+      if (orphans.length === 0) return;
+      log.info("orphan_check_found", { count: orphans.length });
+
+      const slack = bot.getAdapter("slack") as SlackAdapter;
+
+      for (const orphan of orphans) {
+        if (!orphan.text) continue;
+        // Only handle Slack thread keys (channel:thread_ts format)
+        let channel: string;
+        let threadTs: string;
+        try {
+          ({ channel, threadTs } = splitThreadKey(orphan.thread_key));
+        } catch {
+          continue;
+        }
+        // Slack channel IDs start with C, D, or G
+        if (!/^[CDG]/.test(channel)) continue;
+
+        // Atomically claim this orphan (idle → delivering) to prevent duplicates
+        try {
+          const claimRes = await resilientFetch(`${API_URL}/agent/claim-delivery`, {
+            method: "POST",
+            body: JSON.stringify({ thread_key: orphan.thread_key }),
+            maxAttempts: 1,
+          });
+          if (claimRes.ok) {
+            const claimData = (await claimRes.json()) as { claimed: boolean };
+            if (!claimData.claimed) continue; // Another process already claimed it
+          } else {
+            continue;
+          }
+        } catch {
+          continue;
+        }
+
+        try {
+          const slackThreadId = `slack:${channel}:${threadTs}`;
+          await slack.postMessage(slackThreadId, orphan.text);
+          log.info("orphan_delivered", { thread_key: orphan.thread_key });
+          await resilientFetch(`${API_URL}/agent/mark-delivered`, {
+            method: "POST",
+            body: JSON.stringify({ thread_key: orphan.thread_key }),
+          });
+        } catch (err) {
+          log.warn("orphan_delivery_failed", {
+            thread_key: orphan.thread_key,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }
+    } catch (err) {
+      log.warn("orphan_check_failed", {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  // Run first check after a short delay (let bot finish initializing), then periodically
+  setTimeout(checkOrphanedCompletions, 10_000);
+  setInterval(checkOrphanedCompletions, ORPHAN_CHECK_INTERVAL_MS);
 
   bot.onSubscribedMessage(async (thread, message) => {
     if (message.author.isMe) return;

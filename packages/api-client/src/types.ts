@@ -13,6 +13,7 @@ export class ApiError extends Error {
 export type FetchOptions = {
   method?: string;
   body?: string;
+  headers?: Record<string, string>;
   signal?: AbortSignal;
   timeoutMs?: number;
   maxAttempts?: number;

@@ -53,6 +53,7 @@ export async function resilientFetch(
   const maxAttempts = opts.stream ? 1 : (opts.maxAttempts ?? RETRY_DEFAULTS.maxAttempts);
   const headers: Record<string, string> = {
     Authorization: `Bearer ${apiKey}`,
+    ...opts.headers,
   };
   if (opts.body) {
     headers["Content-Type"] = "application/json";

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import time
@@ -10,6 +11,7 @@ from pathlib import Path
 
 import httpx
 import structlog
+import structlog.contextvars
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -111,6 +113,27 @@ async def instrument_requests(request, call_next):
     if request.url.path == "/metrics":
         return await call_next(request)
 
+    structlog.contextvars.clear_contextvars()
+
+    trace_id = request.headers.get("x-trace-id")
+    thread_key = None
+
+    if trace_id:
+        structlog.contextvars.bind_contextvars(trace_id=trace_id)
+        thread_key = trace_id
+        structlog.contextvars.bind_contextvars(thread_key=thread_key)
+
+    if request.method == "POST" and request.url.path in ("/agent/execute", "/agent/reconnect"):
+        try:
+            body_bytes = await request.body()
+            body_json = json.loads(body_bytes)
+            body_tk = body_json.get("thread_key")
+            if body_tk:
+                thread_key = body_tk
+                structlog.contextvars.bind_contextvars(thread_key=thread_key)
+        except Exception:
+            pass
+
     start = time.perf_counter()
     status_code = 500
     HTTP_REQUESTS_IN_PROGRESS.inc()
@@ -122,12 +145,25 @@ async def instrument_requests(request, call_next):
         HTTP_REQUESTS_IN_PROGRESS.dec()
         route = request.scope.get("route")
         path = getattr(route, "path", None) or request.url.path
+        duration_ms = (time.perf_counter() - start) * 1000
         observe_http_request(
             method=request.method,
             path=path,
             status=status_code,
-            duration_s=time.perf_counter() - start,
+            duration_s=duration_ms / 1000,
         )
+        if not path.startswith(("/health", "/metrics")):
+            log.info(
+                "http_request",
+                method=request.method,
+                path=path,
+                status=status_code,
+                duration_ms=round(duration_ms, 2),
+                trace_id=trace_id,
+                thread_key=thread_key,
+                client_ip=request.client.host if request.client else None,
+            )
+        structlog.contextvars.clear_contextvars()
 
 app.include_router(health.router)
 app.include_router(agent_router_mod.router)

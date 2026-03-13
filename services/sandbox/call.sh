@@ -38,6 +38,9 @@ request() {
     -H "$T"
     "$url"
   )
+  if [ -n "${CENTAUR_THREAD_KEY:-}" ]; then
+    curl_args+=(-H "X-Trace-Id: ${CENTAUR_THREAD_KEY}")
+  fi
   if [ -n "$data" ]; then
     curl_args+=(-H "$J" -d "$data")
   fi

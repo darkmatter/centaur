@@ -32,7 +32,7 @@ from api.sandbox.registry import get_backend
 log = structlog.get_logger()
 
 _ENGINE_HARNESSES = {"amp", "claude-code", "codex", "pi-mono"}
-_REUSABLE_DB_STATES = {"running", "idle", "error"}
+_REUSABLE_DB_STATES = {"running", "idle", "delivering", "error"}
 
 # ── Process-local runtime state (ephemeral: queues, locks, sockets) ──────────
 

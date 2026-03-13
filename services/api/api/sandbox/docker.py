@@ -78,6 +78,7 @@ def _container_env(thread_key: str, container_name: str) -> list[str]:
     env = [
         f"CENTAUR_API_URL={os.getenv('AGENT_API_URL', 'http://api:8000')}",
         f"CENTAUR_API_KEY={api_key}",
+        f"CENTAUR_THREAD_KEY={thread_key}",
     ]
 
     if local_dev:

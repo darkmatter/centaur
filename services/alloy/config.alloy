@@ -6,7 +6,7 @@ discovery.docker "containers" {
 }
 
 discovery.relabel "docker_labels" {
-  targets = []
+  targets = discovery.docker.containers.targets
 
   rule {
     source_labels = ["__meta_docker_container_name"]
@@ -44,22 +44,20 @@ loki.source.docker "containers" {
 loki.process "json_extract" {
   stage.json {
     expressions = {
-      level   = "level",
-      service = "service",
-      event   = "event",
-      msg     = "msg",
+      level      = "level",
+      service    = "service",
+      event      = "event",
+      thread_key = "thread_key",
+      trace_id   = "trace_id",
     }
   }
 
   stage.labels {
     values = {
-      level   = "",
-      service = "",
+      level      = "",
+      service    = "",
+      thread_key = "",
     }
-  }
-
-  stage.output {
-    source = "msg"
   }
 
   forward_to = [loki.write.victorialogs.receiver]

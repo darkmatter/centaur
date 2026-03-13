@@ -23,6 +23,17 @@ export async function POST(request: NextRequest) {
   const requestId = request.headers.get("x-slack-request-id") || "";
   const retryNum = request.headers.get("x-slack-retry-num") || "";
 
+  // Parse body early to extract event type for logging
+  let body: Record<string, unknown>;
+  try {
+    body = JSON.parse(rawBody);
+  } catch {
+    return NextResponse.json({ error: "Invalid JSON" }, { status: 400 });
+  }
+
+  const eventType = (body.event as Record<string, unknown>)?.type ?? body.type ?? "unknown";
+  log.info("webhook_received", { event_type: eventType, request_id: requestId, retry_num: retryNum });
+
   // HMAC verification (previously done by Python proxy)
   const { valid, reason } = verifySlackSignature(SIGNING_SECRET, signature, timestamp, rawBody);
   if (!valid) {
@@ -37,14 +48,8 @@ export async function POST(request: NextRequest) {
   }
 
   // Handle URL verification challenge directly
-  let body: Record<string, unknown>;
-  try {
-    body = JSON.parse(rawBody);
-  } catch {
-    return NextResponse.json({ error: "Invalid JSON" }, { status: 400 });
-  }
-
   if (body.type === "url_verification") {
+    log.info("webhook_challenge", { request_id: requestId });
     return NextResponse.json({ challenge: body.challenge });
   }
 
@@ -63,6 +68,8 @@ export async function POST(request: NextRequest) {
       { status: 503 },
     );
   }
+
+  log.info("webhook_dispatched", { request_id: requestId, retry_num: retryNum });
 
   // Reconstruct a Request for the Chat SDK handler (it needs to re-read the body)
   const sdkRequest = new Request(request.url, {

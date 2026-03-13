@@ -149,6 +149,7 @@ async function* reconnectLoop(opts: {
           harness: harnessName,
           ...(skipDoneCount ? { skip_done_count: skipDoneCount } : {}),
         }),
+        headers: { "X-Trace-Id": threadKey },
         timeoutMs: 10 * 60_000,
         maxAttempts: 1,
         stream: true,
@@ -271,6 +272,8 @@ export async function* executeStreaming(
   const normalizedKey = normalizeThreadKey(threadKey);
   const harnessName = harness || "amp";
 
+  log.info("sse_connect", { thread_key: normalizedKey, endpoint: "execute", harness: harnessName });
+
   // Initial execute request
   const body: Record<string, unknown> = {
     thread_key: normalizedKey,
@@ -282,6 +285,7 @@ export async function* executeStreaming(
   const res = await resilientFetch(`${API_URL}/agent/execute`, {
     method: "POST",
     body: JSON.stringify(body),
+    headers: { "X-Trace-Id": normalizedKey },
     timeoutMs: 10 * 60_000,
     maxAttempts: 1,
     stream: true,
@@ -300,6 +304,7 @@ export async function* executeStreaming(
   // Track events already yielded so reconnect (which replays full history
   // via logs=True) can skip them and only surface new output.
   let yieldedCount = 0;
+  let firstEvent = false;
 
   try {
     const inner = readSSEStream(res, harnessName);
@@ -310,9 +315,14 @@ export async function* executeStreaming(
         lastAssistantText = ret.lastAssistantText || lastAssistantText;
         resultText = ret.resultText || resultText;
         if (ret.sawDone) {
+          log.info("sse_done", { thread_key: normalizedKey, yielded_count: yieldedCount });
           return resultText || lastAssistantText;
         }
         break; // EOF without [DONE] — stream dropped cleanly
+      }
+      if (!firstEvent) {
+        firstEvent = true;
+        log.info("sse_first_event", { thread_key: normalizedKey });
       }
       if (value.type === "result" && "text" in value) resultText = value.text;
       yieldedCount++;

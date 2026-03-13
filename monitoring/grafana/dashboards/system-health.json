@@ -1,0 +1,97 @@
+{
+  "uid": "system-health",
+  "title": "System Health",
+  "description": "Overview dashboard for Centaur stack health: error rates, turn durations, webhook volume, SSE disconnects, tool failures, and DB errors.",
+  "tags": ["centaur", "health"],
+  "schemaVersion": 39,
+  "graphTooltip": 1,
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "refresh": "30s",
+  "time": { "from": "now-1h", "to": "now" },
+  "timezone": "utc",
+  "templating": { "list": [] },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Turn Duration",
+      "description": "Recent turn durations from API logs.",
+      "type": "logs",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "datasource": { "type": "victoriametrics-logs-datasource", "uid": "victorialogs" },
+      "targets": [{ "datasource": { "type": "victoriametrics-logs-datasource", "uid": "victorialogs" }, "expr": "_stream:{service=\"api\"} AND event:turn_done AND duration_s:*", "refId": "A" }],
+      "options": { "showTime": true, "showLabels": true, "showCommonLabels": false, "wrapLogMessage": true, "prettifyLogMessage": false, "enableLogDetails": true, "sortOrder": "Descending", "dedupStrategy": "none" }
+    },
+    {
+      "id": 2,
+      "title": "Error Rate by Service",
+      "description": "All error-level logs grouped by service.",
+      "type": "logs",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "datasource": { "type": "victoriametrics-logs-datasource", "uid": "victorialogs" },
+      "targets": [{ "datasource": { "type": "victoriametrics-logs-datasource", "uid": "victorialogs" }, "expr": "level:error", "refId": "A" }],
+      "options": { "showTime": true, "showLabels": true, "showCommonLabels": false, "wrapLogMessage": true, "prettifyLogMessage": false, "enableLogDetails": true, "sortOrder": "Descending", "dedupStrategy": "none" }
+    },
+    {
+      "id": 3,
+      "title": "Recent Errors",
+      "description": "Last 50 errors across all services.",
+      "type": "logs",
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 8 },
+      "datasource": { "type": "victoriametrics-logs-datasource", "uid": "victorialogs" },
+      "targets": [{ "datasource": { "type": "victoriametrics-logs-datasource", "uid": "victorialogs" }, "expr": "level:error", "refId": "A" }],
+      "options": { "showTime": true, "showLabels": true, "showCommonLabels": false, "wrapLogMessage": true, "prettifyLogMessage": false, "enableLogDetails": true, "sortOrder": "Descending", "dedupStrategy": "none" },
+      "maxDataPoints": 50
+    },
+    {
+      "id": 4,
+      "title": "Webhook Volume",
+      "description": "Count of incoming webhooks over time.",
+      "type": "logs",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 18 },
+      "datasource": { "type": "victoriametrics-logs-datasource", "uid": "victorialogs" },
+      "targets": [{ "datasource": { "type": "victoriametrics-logs-datasource", "uid": "victorialogs" }, "expr": "event:webhook_received", "refId": "A" }],
+      "options": { "showTime": true, "showLabels": true, "showCommonLabels": false, "wrapLogMessage": true, "prettifyLogMessage": false, "enableLogDetails": true, "sortOrder": "Descending", "dedupStrategy": "none" }
+    },
+    {
+      "id": 5,
+      "title": "Slack Stream Expirations",
+      "description": "When Slack SSE streams expired and triggered fallback.",
+      "type": "logs",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 18 },
+      "datasource": { "type": "victoriametrics-logs-datasource", "uid": "victorialogs" },
+      "targets": [{ "datasource": { "type": "victoriametrics-logs-datasource", "uid": "victorialogs" }, "expr": "event:slack_stream_expired OR event:stream_expired_fallback", "refId": "A" }],
+      "options": { "showTime": true, "showLabels": true, "showCommonLabels": false, "wrapLogMessage": true, "prettifyLogMessage": false, "enableLogDetails": true, "sortOrder": "Descending", "dedupStrategy": "none" }
+    },
+    {
+      "id": 6,
+      "title": "SSE Disconnects",
+      "description": "SSE connection failures and disconnects.",
+      "type": "logs",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 26 },
+      "datasource": { "type": "victoriametrics-logs-datasource", "uid": "victorialogs" },
+      "targets": [{ "datasource": { "type": "victoriametrics-logs-datasource", "uid": "victorialogs" }, "expr": "event:stream_disconnect OR event:sse_disconnect", "refId": "A" }],
+      "options": { "showTime": true, "showLabels": true, "showCommonLabels": false, "wrapLogMessage": true, "prettifyLogMessage": false, "enableLogDetails": true, "sortOrder": "Descending", "dedupStrategy": "none" }
+    },
+    {
+      "id": 7,
+      "title": "Tool Call Failures",
+      "description": "Failed tool calls with error messages.",
+      "type": "logs",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 26 },
+      "datasource": { "type": "victoriametrics-logs-datasource", "uid": "victorialogs" },
+      "targets": [{ "datasource": { "type": "victoriametrics-logs-datasource", "uid": "victorialogs" }, "expr": "event:tool_call_completed AND success:false", "refId": "A" }],
+      "options": { "showTime": true, "showLabels": true, "showCommonLabels": false, "wrapLogMessage": true, "prettifyLogMessage": false, "enableLogDetails": true, "sortOrder": "Descending", "dedupStrategy": "none" }
+    },
+    {
+      "id": 8,
+      "title": "pgbouncer / DB Errors",
+      "description": "Database connectivity issues: pgbouncer errors, DNS failures, connection terminations.",
+      "type": "logs",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 34 },
+      "datasource": { "type": "victoriametrics-logs-datasource", "uid": "victorialogs" },
+      "targets": [{ "datasource": { "type": "victoriametrics-logs-datasource", "uid": "victorialogs" }, "expr": "pgbouncer OR ENOTFOUND OR \"Connection terminated\"", "refId": "A" }],
+      "options": { "showTime": true, "showLabels": true, "showCommonLabels": false, "wrapLogMessage": true, "prettifyLogMessage": false, "enableLogDetails": true, "sortOrder": "Descending", "dedupStrategy": "none" }
+    }
+  ]
+}

@@ -266,3 +266,101 @@ async def test_resolve_urls_gsuite_error_skips(monkeypatch):
     result = await _resolve_urls(pool, "t:1", "m:1", parts, FakeRequest())
     assert len(result) == 1
     assert len(pool.inserts) == 0
+
+
+# ---------------------------------------------------------------------------
+# GDrive folder regex tests
+# ---------------------------------------------------------------------------
+
+
+class TestGdriveFolderRegex:
+    def test_basic_folder_url(self):
+        m = _GDRIVE_FOLDER_RE.search("https://drive.google.com/drive/folders/abc123XYZ")
+        assert m
+        assert m.group(1) == "abc123XYZ"
+
+    def test_with_user_prefix(self):
+        m = _GDRIVE_FOLDER_RE.search("https://drive.google.com/drive/u/0/folders/def456")
+        assert m
+        assert m.group(1) == "def456"
+
+    def test_no_match_file_url(self):
+        assert _GDRIVE_FOLDER_RE.search("https://drive.google.com/file/d/abc") is None
+
+
+# ---------------------------------------------------------------------------
+# DocSend /view/s/ variant
+# ---------------------------------------------------------------------------
+
+
+class TestDocsendViewSVariant:
+    def test_view_s_variant(self):
+        m = _DOCSEND_RE.search("https://docsend.com/view/s/abc123")
+        assert m
+        assert m.group(1) == "abc123"
+
+
+# ---------------------------------------------------------------------------
+# GDrive folder _resolve_urls integration
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_resolve_urls_gdrive_folder(monkeypatch, tmp_path):
+    """GDrive folder URL resolves each file in the folder listing."""
+    fake_doc_pdf = b"%PDF-1.4 exported google doc"
+    fake_binary_pdf = b"%PDF-1.4 binary uploaded pdf"
+
+    doc_tmp = tmp_path / "exported_doc.pdf"
+    doc_tmp.write_bytes(fake_doc_pdf)
+
+    bin_tmp = tmp_path / "downloaded_binary.pdf"
+    bin_tmp.write_bytes(fake_binary_pdf)
+
+    class FakeTM:
+        async def call_tool_raw(self, tool, method, args):
+            assert tool == "gsuite"
+            if method == "drive_list":
+                assert args["folder_id"] == "folderABC"
+                return [
+                    {
+                        "id": "doc1",
+                        "name": "Meeting Notes",
+                        "mime_type": "application/vnd.google-apps.document",
+                    },
+                    {
+                        "id": "file2",
+                        "name": "report.pdf",
+                        "mime_type": "application/pdf",
+                    },
+                ]
+            if method == "drive_export":
+                assert args["file_id"] == "doc1"
+                return str(doc_tmp)
+            if method == "drive_download":
+                assert args["file_id"] == "file2"
+                import shutil
+
+                shutil.copy(bin_tmp, args["output_path"])
+                return args["output_path"]
+            raise AssertionError(f"unexpected method {method}")
+
+    _patch_get_tool_manager(monkeypatch, FakeTM())
+
+    from api.routers.agent import _resolve_urls
+
+    pool = FakePool()
+    parts = [{"type": "text", "text": "See https://drive.google.com/drive/folders/folderABC"}]
+    result = await _resolve_urls(pool, "t:1", "m:1", parts, FakeRequest())
+
+    # 1 original text + 2 attachment_refs (one per file)
+    assert len(result) == 3
+    assert result[0]["type"] == "text"
+    assert result[1]["type"] == "attachment_ref"
+    assert result[1]["name"] == "Meeting Notes.pdf"
+    assert result[1]["mime_type"] == "application/pdf"
+    assert result[2]["type"] == "attachment_ref"
+    assert result[2]["name"] == "report.pdf"
+    assert result[2]["mime_type"] == "application/pdf"
+    # 2 DB inserts (one per file)
+    assert len(pool.inserts) == 2

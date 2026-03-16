@@ -235,6 +235,81 @@ docker exec centaur-api-1 curl -s "http://victorialogs:9428/select/logsql/query"
   --data-urlencode 'query=container:"pipe-"' --data-urlencode "limit=2"
 ```
 
+### 1f. Attachments
+
+Test the attachment pipeline: inline extraction, upload endpoint, and sandbox download.
+
+**Inline base64 extraction roundtrip:**
+
+```bash
+# Buffer a message with inline base64 image
+B64=$(echo -n "FAKE_PNG_BYTES_FOR_QA_TEST" | base64)
+docker exec centaur-api-1 curl -s -X POST http://localhost:8000/agent/messages \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"thread_key\": \"test:qa-att-inline\",
+    \"messages\": [{
+      \"role\": \"user\",
+      \"parts\": [
+        {\"type\": \"text\", \"text\": \"analyze this\"},
+        {\"type\": \"image\", \"source\": {\"type\": \"base64\", \"media_type\": \"image/png\", \"data\": \"$B64\"}}
+      ]
+    }]
+  }"
+# → {"ok": true, "inserted": 1}
+
+# List attachments — should have 1 entry
+docker exec centaur-api-1 curl -s "http://localhost:8000/agent/attachments?thread_key=test:qa-att-inline"
+# → [{"id":"att-...","name":"image.png","mime_type":"image/png",...}]
+
+# Download and verify bytes
+ATT_ID=$(docker exec centaur-api-1 curl -s "http://localhost:8000/agent/attachments?thread_key=test:qa-att-inline" | python3 -c "import sys,json; print(json.load(sys.stdin)[0]['id'])")
+docker exec centaur-api-1 curl -s "http://localhost:8000/agent/attachments/$ATT_ID/download" | base64 | head -c 40
+```
+
+**Verify:** List returns 1 attachment with `mime_type: image/png`. Download returns non-empty bytes. Original message parts in `chat_messages` contain `attachment_ref`, not base64 blob.
+
+**Upload endpoint:**
+
+```bash
+B64=$(echo -n "UPLOAD_TEST_CONTENT" | base64)
+docker exec centaur-api-1 curl -s -X POST http://localhost:8000/agent/attachments/upload \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"thread_key\": \"test:qa-att-upload\",
+    \"name\": \"test-upload.txt\",
+    \"mime_type\": \"text/plain\",
+    \"data\": \"$B64\"
+  }"
+# → {"id":"att-...","name":"test-upload.txt","download_url":"/agent/attachments/att-.../download"}
+
+# Download and verify
+ATT_ID=$(docker exec centaur-api-1 curl -s -X POST http://localhost:8000/agent/attachments/upload \
+  -H "Content-Type: application/json" \
+  -d "{\"thread_key\":\"test:qa-att-upload2\",\"name\":\"verify.txt\",\"mime_type\":\"text/plain\",\"data\":\"$(echo -n hello | base64)\"}" | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
+docker exec centaur-api-1 curl -s "http://localhost:8000/agent/attachments/$ATT_ID/download"
+# → hello
+```
+
+**Verify:** Upload returns `id`, `name`, `download_url`. Download returns exact bytes uploaded.
+
+**Negative cases:**
+
+```bash
+# Missing fields → 422
+docker exec centaur-api-1 curl -s -X POST http://localhost:8000/agent/attachments/upload \
+  -H "Content-Type: application/json" \
+  -d '{"thread_key":"test:qa-att-bad"}'
+# → 422
+
+# Nonexistent attachment → 404
+docker exec centaur-api-1 curl -s -o /dev/null -w "%{http_code}" \
+  http://localhost:8000/agent/attachments/att-doesnotexist/download
+# → 404
+```
+
+**Verify:** Missing fields returns 422. Nonexistent attachment returns 404.
+
 ---
 
 ## Layer 2: Nginx (parallel subagent)

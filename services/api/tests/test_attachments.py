@@ -356,3 +356,80 @@ async def test_nonexistent_attachment_404(client, api_key):
         headers={"Authorization": f"Bearer {api_key}"},
     )
     assert resp.status_code == 404
+
+
+# ── Integration: upload endpoint roundtrip ─────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_upload_attachment_roundtrip(client, api_key):
+    """POST /agent/attachments/upload → download → list roundtrip."""
+    thread_key = "test:att-upload-rt"
+    b64_png = base64.b64encode(SAMPLE_PNG).decode()
+
+    # 1. Upload
+    resp = await client.post(
+        "/agent/attachments/upload",
+        json={
+            "thread_key": thread_key,
+            "name": "screenshot.png",
+            "mime_type": "image/png",
+            "data": b64_png,
+        },
+        headers={"Authorization": f"Bearer {api_key}"},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert "id" in body
+    assert body["name"] == "screenshot.png"
+    assert body["mime_type"] == "image/png"
+    assert "download_url" in body
+
+    # 2. Download via the returned URL
+    resp = await client.get(
+        body["download_url"],
+        headers={"Authorization": f"Bearer {api_key}"},
+    )
+    assert resp.status_code == 200
+    assert resp.content == SAMPLE_PNG
+
+    # 3. List attachments for the thread
+    resp = await client.get(
+        f"/agent/attachments?thread_key={thread_key}",
+        headers={"Authorization": f"Bearer {api_key}"},
+    )
+    assert resp.status_code == 200
+    attachments = resp.json()
+    assert any(a["id"] == body["id"] for a in attachments)
+
+
+@pytest.mark.asyncio
+async def test_upload_attachment_missing_fields(client, api_key):
+    """POST /agent/attachments/upload with missing data field → 422."""
+    resp = await client.post(
+        "/agent/attachments/upload",
+        json={
+            "thread_key": "test:att-missing",
+            "name": "test.png",
+            "mime_type": "image/png",
+            # no "data" field
+        },
+        headers={"Authorization": f"Bearer {api_key}"},
+    )
+    assert resp.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_upload_attachment_bad_base64(client, api_key):
+    """POST /agent/attachments/upload with invalid base64 → 422."""
+    resp = await client.post(
+        "/agent/attachments/upload",
+        json={
+            "thread_key": "test:att-bad-b64",
+            "name": "test.pdf",
+            "mime_type": "application/pdf",
+            "data": "not-valid-base64!!!",
+        },
+        headers={"Authorization": f"Bearer {api_key}"},
+    )
+    assert resp.status_code == 422

@@ -70,6 +70,9 @@ if [ -n "$PERSONA" ] && [ -f "$TARGET_PROMPT" ]; then
     fi
 fi
 
+# Switch to workspace so the harness reads workspace/AGENTS.md (with persona overlay)
+cd "$WORKSPACE_DIR"
+
 # Signal readiness
 touch "$HOME_DIR/.ready"
 

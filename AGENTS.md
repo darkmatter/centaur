@@ -317,6 +317,32 @@ Only after reviewing logs should you dig into source code or try to reproduce lo
 
 - **Chat SDK** always refers to the [Vercel Chat SDK](https://github.com/vercel/chat) (`~/github/vercel/chat`). When you need to understand how the Chat SDK or `@chat-adapter/*` packages work, **always read the source at `~/github/vercel/chat`** — never dig through `node_modules`.
 
+## Testing Before Pushing
+
+**NEVER push changes without testing them locally first.** Testing means actually running the affected service and proving the change works end-to-end — not just linting or reasoning about it.
+
+1. **Build the affected service:** `docker compose build <service>`
+2. **Bring it up:** `docker compose up -d <service>`
+3. **Make a real request** that exercises the change and show the output
+4. **Only then** commit and push
+
+For tool changes: tools hot-reload, so just verify via `curl -X POST http://localhost:8000/tools/<tool>/<method>` from inside the API container. For Dockerfile/infra changes: rebuild, restart, and verify the binary/service is present and functional. For firewall changes: test from inside a sandbox container through the proxy.
+
+## Local-First Testing — Never Touch the Deploy Box
+
+**All testing and E2E validation MUST happen on the local stack** (`docker compose up` on this machine). Never SSH into the deploy box (`206.223.235.69`) to run tests, rebuild services, or make ad-hoc changes unless explicitly told to do so by the user.
+
+The deploy box is **production**. Changes reach it via `git push` → GitHub Actions auto-deploy. The only reasons to SSH into it are:
+- Checking logs (`docker logs`, VictoriaLogs queries) for debugging production issues
+- Emergency manual intervention — **only when the user explicitly asks**
+
+For E2E testing, always:
+1. `docker compose build <service>` locally
+2. `docker compose up -d <service>` locally
+3. Run curl commands against `localhost` (or `docker exec centaur-api-1 curl ...`)
+4. Verify results locally
+5. Only then commit, push, and let CI/CD handle production
+
 ## Code Conventions
 
 - Python 3.11+, `uv` for deps, `ruff` for lint/format (line-length=100)

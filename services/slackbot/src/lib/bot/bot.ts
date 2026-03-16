@@ -231,11 +231,12 @@ export class SlackBot {
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
 
-      // Slack killed the streaming state before we called stop() (long-running turn).
+      // Slack killed the streaming state before we called stop() (long-running turn),
+      // or the accumulated streamed text exceeded Slack's message length limit.
       // Fall back to posting a plain message with whatever result we accumulated,
       // or poll the API for the final result if we don't have one yet.
-      if (errMsg.includes("message_not_in_streaming_state")) {
-        log.warn("slack_stream_expired", { thread_key: threadKey, error: errMsg });
+      if (errMsg.includes("message_not_in_streaming_state") || errMsg.includes("msg_too_long")) {
+        log.warn("slack_stream_fallback", { thread_key: threadKey, error: errMsg });
         let fallback = convertDashboardBlocks((tracker.resultText || tracker.lastAssistantText).trim());
 
         if (!fallback) {

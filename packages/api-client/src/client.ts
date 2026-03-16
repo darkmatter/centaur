@@ -120,6 +120,48 @@ export class CentaurClient {
     return data;
   }
 
+  /** Re-attach to a running container's stdout without sending a new turn. */
+  async *reconnect(opts: {
+    threadKey: string;
+    harness?: string;
+    skipDoneCount?: number;
+    signal?: AbortSignal;
+  }): AsyncGenerator<CanonicalEvent, void, undefined> {
+    const { threadKey, harness, skipDoneCount = 0, signal } = opts;
+    this.log?.info("sse_reconnect", { thread_key: threadKey });
+
+    const body: Record<string, unknown> = {
+      thread_key: threadKey,
+      skip_done_count: skipDoneCount,
+    };
+    if (harness) body.harness = harness;
+
+    const res = await fetch(`${this.http.defaults.baseURL}/agent/reconnect`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: this.authHeader,
+        "X-Trace-Id": threadKey,
+      },
+      body: JSON.stringify(body),
+      signal,
+    });
+
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      throw new Error(`/agent/reconnect failed (${res.status}): ${text.slice(0, 300)}`);
+    }
+
+    if (!res.body) return;
+    const stream = (res.body as ReadableStream<Uint8Array>)
+      .pipeThrough(new TextDecoderStream() as unknown as TransformStream<Uint8Array, string>)
+      .pipeThrough(new EventSourceParserStream());
+    for await (const event of stream as unknown as AsyncIterable<EventSourceMessage>) {
+      if (event.data === "[DONE]") return;
+      try { yield JSON.parse(event.data) as CanonicalEvent; } catch {}
+    }
+  }
+
   /** Check session status (used for recovery on expired streams). */
   async getStatus(threadKey: string) {
     const { data } = await this.http.get("/agent/status", { params: { key: threadKey } });

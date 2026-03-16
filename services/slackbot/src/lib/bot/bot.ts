@@ -12,6 +12,8 @@ const KEEPALIVE_MS = 120_000; // 2 min — Slack expires streaming state after ~
 const STREAM_EXPIRED_POLL_INTERVAL_MS = 3_000;
 const STREAM_EXPIRED_POLL_MAX_MS = 5 * 60_000;
 const SLACK_MSG_MAX_CHARS = 3900; // Slack's hard limit is 4000; leave margin
+const RECONNECT_MAX_RETRIES = 3;
+const RECONNECT_BASE_DELAY_MS = 2_000;
 
 /**
  * Split text into chunks that fit within Slack's message limit.
@@ -316,59 +318,8 @@ export class SlackBot {
       log.error("stdin_inject_failed", { thread_key: threadKey, error: err instanceof Error ? err.message : String(err) });
     });
 
-    // 3. Stream events from the wire until turn.done
-    let pending: Promise<IteratorResult<CanonicalEvent, void>> | null = null;
-
-    try {
-      while (true) {
-        // A newer execute() for this thread aborted us — stop consuming the wire
-        if (signal.aborted) {
-          log.info("stream_aborted", { thread_key: threadKey });
-          return;
-        }
-
-        if (!pending) pending = iter.next();
-
-        const raced = await Promise.race([
-          pending.then((r) => ({ kind: "value" as const, result: r })),
-          new Promise<{ kind: "keepalive" }>((r) => setTimeout(() => r({ kind: "keepalive" }), KEEPALIVE_MS)),
-          new Promise<{ kind: "aborted" }>((r) => {
-            if (signal.aborted) { r({ kind: "aborted" }); return; }
-            signal.addEventListener("abort", () => r({ kind: "aborted" }), { once: true });
-          }),
-        ]);
-
-        if (raced.kind === "aborted") {
-          log.info("stream_aborted", { thread_key: threadKey });
-          return;
-        }
-
-        if (raced.kind === "keepalive") {
-          yield { type: "plan_update", title: "Still working…" };
-          continue;
-        }
-
-        pending = null;
-        if (raced.result.done) {
-          // Wire closed (container exited) — clean up
-          this.wires.delete(threadKey);
-          break;
-        }
-        const event = raced.result.value;
-
-        // turn.done from wire — emit final text and finish this Slack message
-        if ((event as any).type === "turn.done") {
-          const result = ((event as any).result || "").trim();
-          if (result) tracker.resultText = result;
-          break;
-        }
-
-        yield* tracker.update(event);
-      }
-    } catch {
-      // Wire broke — clean up so next mention reconnects
-      this.wires.delete(threadKey);
-    }
+    // 3. Stream events from the wire until turn.done (with auto-reconnect on break)
+    yield* this.consumeWire(iter, threadKey, harness, tracker, signal);
 
     // If aborted, don't emit any final output — the new stream owns it
     if (signal.aborted) return;
@@ -394,6 +345,101 @@ export class SlackBot {
       tracker.overflowChunks = chunks.slice(1);
     } else {
       yield { type: "markdown_text", text: "Agent completed with no output." };
+    }
+  }
+
+  /**
+   * Consume events from a wire iterator until turn.done, with auto-reconnect
+   * on wire breaks (e.g. API restarts). Retries up to RECONNECT_MAX_RETRIES
+   * times with exponential backoff before giving up.
+   */
+  private async *consumeWire(
+    iter: AsyncIterator<CanonicalEvent, void, undefined>,
+    threadKey: string,
+    harness: string | undefined,
+    tracker: ProgressTracker,
+    signal: AbortSignal,
+  ): AsyncGenerator<StreamChunk> {
+    let currentIter = iter;
+    let retriesLeft = RECONNECT_MAX_RETRIES;
+
+    outer: while (true) {
+      let pending: Promise<IteratorResult<CanonicalEvent, void>> | null = null;
+      let wireBroke = false;
+
+      try {
+        while (true) {
+          if (signal.aborted) {
+            log.info("stream_aborted", { thread_key: threadKey });
+            return;
+          }
+
+          if (!pending) pending = currentIter.next();
+
+          const raced = await Promise.race([
+            pending.then((r) => ({ kind: "value" as const, result: r })),
+            new Promise<{ kind: "keepalive" }>((r) => setTimeout(() => r({ kind: "keepalive" }), KEEPALIVE_MS)),
+            new Promise<{ kind: "aborted" }>((r) => {
+              if (signal.aborted) { r({ kind: "aborted" }); return; }
+              signal.addEventListener("abort", () => r({ kind: "aborted" }), { once: true });
+            }),
+          ]);
+
+          if (raced.kind === "aborted") {
+            log.info("stream_aborted", { thread_key: threadKey });
+            return;
+          }
+
+          if (raced.kind === "keepalive") {
+            yield { type: "plan_update", title: "Still working…" };
+            continue;
+          }
+
+          pending = null;
+          if (raced.result.done) {
+            this.wires.delete(threadKey);
+            break outer;
+          }
+          const event = raced.result.value;
+
+          if ((event as any).type === "turn.done") {
+            const result = ((event as any).result || "").trim();
+            if (result) tracker.resultText = result;
+            break outer;
+          }
+
+          yield* tracker.update(event);
+        }
+      } catch {
+        wireBroke = true;
+        this.wires.delete(threadKey);
+      }
+
+      if (!wireBroke) break;
+
+      // Attempt reconnect
+      if (retriesLeft <= 0 || signal.aborted) {
+        log.warn("wire_reconnect_exhausted", { thread_key: threadKey });
+        break;
+      }
+
+      const delay = RECONNECT_BASE_DELAY_MS * (RECONNECT_MAX_RETRIES - retriesLeft + 1);
+      log.info("wire_reconnecting", { thread_key: threadKey, retries_left: retriesLeft, delay_ms: delay });
+      yield { type: "plan_update", title: "Reconnecting…" };
+      await new Promise((r) => setTimeout(r, delay));
+      retriesLeft--;
+
+      if (signal.aborted) return;
+
+      try {
+        const wire = this.client.reconnect({ threadKey, harness });
+        currentIter = wire[Symbol.asyncIterator]();
+        log.info("wire_reconnected", { thread_key: threadKey });
+        // Don't store in this.wires — it's a reconnect stream, not a persistent wire
+      } catch (err) {
+        log.warn("wire_reconnect_failed", { thread_key: threadKey, error: err instanceof Error ? err.message : String(err) });
+        // Loop will retry or exhaust
+      }
     }
   }
 

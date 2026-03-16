@@ -8,7 +8,7 @@ import re
 import time as _time
 import uuid
 
-import httpx
+
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse

@@ -10,7 +10,7 @@ set -euo pipefail
 
 source /app/scripts/bootstrap-secrets.sh
 
-bootstrap_required_secrets DATABASE_URL API_SECRET_KEY SLACK_SIGNING_SECRET
+bootstrap_required_secrets DATABASE_URL SLACK_SIGNING_SECRET
 
 # Install dependencies from bind-mounted tool directories (tools-paradigm, etc.)
 # These aren't baked into the image — install at startup so tool loading doesn't fail.

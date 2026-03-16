@@ -7,7 +7,7 @@ if [ -n "$SECRET_MANAGER_URL" ]; then
   RETRY=0
   while [ $RETRY -lt $MAX_RETRIES ]; do
     ALL_OK=true
-    for key in API_SECRET_KEY DATABASE_URL; do
+    for key in WEB_API_KEY DATABASE_URL; do
       eval current=\$$key
       if [ -n "$current" ]; then continue; fi
 

@@ -117,7 +117,7 @@ export class SlackBot {
     return new SlackBot(
       new CentaurClient({
         apiUrl: process.env.CENTAUR_API_URL || "http://api:8000",
-        apiKey: process.env.API_SECRET_KEY || "",
+        apiKey: process.env.SLACKBOT_API_KEY || process.env.API_SECRET_KEY || "",
         logger: log,
       }),
       process.env.THREAD_VIEWER_URL || "",

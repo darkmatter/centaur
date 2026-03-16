@@ -12,7 +12,7 @@ docker stop centaur-web-1
 cd apps/web
 source ../../.env
 CENTAUR_API_URL=https://svc-ai.paradigm.xyz \
-API_SECRET_KEY="$API_SECRET_KEY" \
+WEB_API_KEY="$WEB_API_KEY" \
 DATABASE_URL="postgresql://tempo:tempo_dev@localhost:5432/centaur" \
 pnpm dev --port 3001
 ```

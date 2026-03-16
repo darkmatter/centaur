@@ -22,13 +22,9 @@ SECRET_MANAGER_BACKEND=env
 # Postgres (auto-created by docker compose)
 DATABASE_URL=postgresql://tempo:tempo_dev@pgbouncer:5432/centaur
 
-# API auth key (generate one: openssl rand -hex 32)
-API_SECRET_KEY=your-api-key-here
-
 # Slack app (from https://api.slack.com/apps)
 SLACK_BOT_TOKEN=xoxb-...
 SLACK_SIGNING_SECRET=...
-SLACKBOT_API_KEY=your-api-key-here
 
 # Web UI auth gate
 UI_PASSWORD=pick-a-password
@@ -51,10 +47,10 @@ docker compose build sandbox
 
 ### 3. Test
 
+From inside the API container (localhost bypass — no key needed):
+
 ```bash
-source .env
-curl -s -X POST http://localhost:8000/agent/execute \
-  -H "Authorization: Bearer $API_SECRET_KEY" \
+docker exec centaur-api-1 curl -s -X POST http://localhost:8000/agent/execute \
   -H "Content-Type: application/json" \
   -d '{
     "thread_key": "test:hello",
@@ -62,6 +58,8 @@ curl -s -X POST http://localhost:8000/agent/execute \
     "harness": "amp"
   }'
 ```
+
+Or create a DB-backed key for external use (see [API Key Management](#api-key-management)).
 
 ## Architecture
 
@@ -439,12 +437,49 @@ Sandbox containers never see real API keys. The firewall (`services/firewall/add
 
 ## Security Model
 
-- **API auth**: Bearer token via `verify_api_key` dependency; Docker bridge IPs bypass auth for container→API calls
+- **API auth**: All callers authenticate with DB-backed API keys (`aiv2_*` prefix, stored in `api_keys` table). Docker bridge IPs (localhost) bypass auth for container→API calls.
+- **Sandbox auth**: Sandbox containers get auto-issued HMAC-signed tokens (`sbx1.*` prefix) minted by the API. These are short-lived (2h TTL) and scoped to `agent` + `tools:*`.
 - **Slack**: HMAC-SHA256 signature verification on all webhooks
 - **UI**: Password-based HMAC session cookie; nginx `auth_request` gates all UI routes
 - **Sandbox isolation**: Containers get stub keys only; real keys injected by firewall proxy in-flight
 - **Filesystem**: Host repos mounted read-only by default; only working repo is read-write
 - **Docker socket**: Proxied via `tecnativa/docker-socket-proxy` — only container/network/exec ops allowed
+
+## API Key Management
+
+All API authentication uses **DB-backed keys** stored in the `api_keys` Postgres table. Keys are managed via the admin API (localhost-only, or requires `admin` scope).
+
+### Getting a valid API key for testing
+
+From the deploy box (localhost bypass):
+
+```bash
+# List all keys (shows name, prefix, scopes — never the key itself)
+ssh ubuntu@206.223.235.69 "docker exec centaur-api-1 curl -s http://localhost:8000/admin/api-keys" | jq
+
+# Create a new key
+ssh ubuntu@206.223.235.69 "docker exec centaur-api-1 curl -s -X POST http://localhost:8000/admin/api-keys \
+  -H 'Content-Type: application/json' \
+  -d '{\"name\": \"my-test-key\", \"scopes\": [\"*\"]}'" | jq
+# → returns the plaintext key (only shown once!)
+
+# Revoke a key
+ssh ubuntu@206.223.235.69 "docker exec centaur-api-1 curl -s -X DELETE http://localhost:8000/admin/api-keys/<key-id>"
+```
+
+### Key types
+
+| Type | Prefix | Issued by | Used by | Scopes |
+|------|--------|-----------|---------|--------|
+| DB keys | `aiv2_*` | Admin API | Slackbot, web app, CLI, external callers | Per-key (e.g. `["*"]`, `["agent:execute"]`) |
+| Sandbox tokens | `sbx1.*` | API (automatic) | Sandbox containers → API tool calls | `["agent", "tools:*"]` |
+
+### How services get their keys
+
+- **Slackbot**: `SLACKBOT_API_KEY` env var, bootstrapped from secrets service (1Password item name: `SLACKBOT_API_KEY`)
+- **Web app**: `WEB_API_KEY` env var, same bootstrap
+- **Sandbox containers**: Auto-issued `sbx1.*` token injected as `CENTAUR_API_KEY` at container creation
+- **Local testing**: Use localhost bypass (no key needed from inside the API container), or create a key via admin API
 
 ## Secret Manager
 
@@ -544,14 +579,15 @@ All deploys happen automatically via GitHub Actions on merge to `main`.
 ```bash
 docker compose up -d postgres api
 docker compose build sandbox
-source .env
 ```
+
+All E2E curl commands below use `docker exec` for localhost bypass (no API key needed).
+To test from outside the container, create a DB-backed key via the [admin API](#api-key-management).
 
 ### 2. Open the stdout wire (terminal 1)
 
 ```bash
-curl -s -N -X POST http://localhost:8000/agent/connect \
-  -H "Authorization: Bearer $API_SECRET_KEY" \
+docker exec centaur-api-1 curl -s -N -X POST http://localhost:8000/agent/connect \
   -H "Content-Type: application/json" \
   -d '{
     "thread_key": "test:e2e-1",
@@ -564,8 +600,7 @@ This returns an SSE stream that stays open across all turns.
 ### 3. Execute a message (terminal 2)
 
 ```bash
-curl -s -X POST http://localhost:8000/agent/execute \
-  -H "Authorization: Bearer $API_SECRET_KEY" \
+docker exec centaur-api-1 curl -s -X POST http://localhost:8000/agent/execute \
   -H "Content-Type: application/json" \
   -d '{
     "thread_key": "test:e2e-1",
@@ -579,8 +614,7 @@ Output streams on the connect wire in terminal 1. Execute returns `{"ok": true, 
 ### 4. Follow-up (same container, same session)
 
 ```bash
-curl -s -X POST http://localhost:8000/agent/execute \
-  -H "Authorization: Bearer $API_SECRET_KEY" \
+docker exec centaur-api-1 curl -s -X POST http://localhost:8000/agent/execute \
   -H "Content-Type: application/json" \
   -d '{
     "thread_key": "test:e2e-1",
@@ -591,11 +625,9 @@ curl -s -X POST http://localhost:8000/agent/execute \
 ### 5. Inspect / Clean up
 
 ```bash
-curl -s "http://localhost:8000/agent/status?key=test:e2e-1" \
-  -H "Authorization: Bearer $API_SECRET_KEY" | jq
+docker exec centaur-api-1 curl -s "http://localhost:8000/agent/status?key=test:e2e-1" | jq
 
-curl -s -X POST http://localhost:8000/agent/stop \
-  -H "Authorization: Bearer $API_SECRET_KEY" \
+docker exec centaur-api-1 curl -s -X POST http://localhost:8000/agent/stop \
   -H "Content-Type: application/json" \
   -d '{"thread_key": "test:e2e-1"}'
 ```
@@ -604,5 +636,5 @@ curl -s -X POST http://localhost:8000/agent/stop \
 
 ```bash
 docker ps --filter label=centaur-agent=true
-docker exec <container_id> curl -s -H "Authorization: Bearer $CENTAUR_API_KEY" http://api:8000/health
+docker exec <container_id> curl -s http://api:8000/health
 ```

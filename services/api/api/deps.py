@@ -34,8 +34,22 @@ def _is_loopback_ip(client_ip: str) -> bool:
         return client_ip.startswith(_TRUSTED_PREFIXES)
 
 
-def _get_api_secret_key() -> str:
-    return os.environ.get("API_SECRET_KEY", "")
+def _get_sandbox_signing_key() -> str:
+    """Return the key used for HMAC-signing sandbox tokens.
+
+    Checks SANDBOX_SIGNING_KEY first, then falls back to API_SECRET_KEY for
+    backwards compatibility. If neither is set, auto-generates a random key
+    that persists for the lifetime of this process.
+    """
+    key = os.environ.get("SANDBOX_SIGNING_KEY") or os.environ.get("API_SECRET_KEY") or ""
+    if not key:
+        key = _auto_signing_key
+    return key
+
+
+# Auto-generated signing key — used when no explicit key is configured.
+# Stable for the lifetime of the process so sandbox tokens stay valid.
+_auto_signing_key: str = secrets.token_hex(32)
 
 
 # ---------------------------------------------------------------------------
@@ -44,10 +58,10 @@ def _get_api_secret_key() -> str:
 
 
 def mint_sandbox_token(thread_key: str, container_id: str, ttl_s: int = 7200) -> str:
-    """Create a short-lived sandbox token signed with API_SECRET_KEY."""
-    api_key = _get_api_secret_key()
+    """Create a short-lived sandbox token signed with the sandbox signing key."""
+    api_key = _get_sandbox_signing_key()
     if not api_key:
-        raise RuntimeError("API_SECRET_KEY not configured")
+        raise RuntimeError("Sandbox signing key not configured")
 
     now = int(time.time())
     payload = {
@@ -64,7 +78,7 @@ def mint_sandbox_token(thread_key: str, container_id: str, ttl_s: int = 7200) ->
 
 def verify_sandbox_token(token: str) -> dict | None:
     """Validate signature and expiry of a sandbox token. Returns claims or None."""
-    api_key = _get_api_secret_key()
+    api_key = _get_sandbox_signing_key()
     if not api_key:
         return None
 
@@ -111,18 +125,17 @@ async def verify_api_key(
         )
         return "localhost-bypass"
 
-    api_key = _get_api_secret_key()
-    if not api_key:
-        raise HTTPException(status_code=500, detail="API key not configured")
-
     token = x_api_key
     if not token:
         auth = request.headers.get("authorization", "")
         if auth.lower().startswith("bearer "):
             token = auth[7:]
 
-    # Scoped sandbox tokens (sbx1.* format)
-    if token and token.startswith("sbx1."):
+    if not token:
+        raise HTTPException(status_code=401, detail="Missing API key")
+
+    # Scoped sandbox tokens (sbx1.* format) — auto-issued by the API
+    if token.startswith("sbx1."):
         claims = verify_sandbox_token(token)
         if claims is not None:
             request.state.api_key_info = APIKeyInfo(
@@ -143,25 +156,12 @@ async def verify_api_key(
         )
         raise HTTPException(status_code=401, detail="Invalid or expired sandbox token")
 
-    # Root key check — any caller with the root key is fully trusted.
-    if token and secrets.compare_digest(token, api_key):
-        request.state.api_key_info = APIKeyInfo(
-            id="root",
-            name="root",
-            key_prefix="root",
-            scopes=["*"],
-            created_by="system",
-            source="root",
-        )
-        return token
-
-    # DB key lookup
-    if token:
-        pool = request.app.state.db_pool
-        key_info = await lookup_key(pool, token)
-        if key_info is not None:
-            request.state.api_key_info = key_info
-            return f"key:{key_info.key_prefix}"
+    # DB key lookup — all external callers use DB-backed aiv2_* keys
+    pool = request.app.state.db_pool
+    key_info = await lookup_key(pool, token)
+    if key_info is not None:
+        request.state.api_key_info = key_info
+        return f"key:{key_info.key_prefix}"
 
     raise HTTPException(status_code=401, detail="Invalid API key")
 

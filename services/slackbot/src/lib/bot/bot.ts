@@ -11,6 +11,20 @@ const KEEPALIVE_MS = 120_000; // 2 min — Slack expires streaming state after ~
 const STREAM_EXPIRED_POLL_INTERVAL_MS = 3_000;
 const STREAM_EXPIRED_POLL_MAX_MS = 5 * 60_000;
 
+/** Extract harness/persona flag (e.g. --invest, --legal) from message text. */
+function parseHarnessFlag(text: string): string | undefined {
+  // Match --flag patterns, skip known non-harness flags
+  const skip = new Set(["engine", "model", "opus", "sonnet", "haiku"]);
+  const re = /(?:^|\s)--([a-z][a-z0-9-]*)(?=\s|$)/gi;
+  let match: RegExpExecArray | null;
+  let harness: string | undefined;
+  while ((match = re.exec(text)) !== null) {
+    const flag = match[1].toLowerCase();
+    if (!skip.has(flag)) harness = flag;
+  }
+  return harness;
+}
+
 // ── Types ─────────────────────────────────────────────────────────────────
 
 export interface BotThread {
@@ -54,6 +68,9 @@ export class SlackBot {
     iter: AsyncIterator<CanonicalEvent, void, undefined>;
     ready: boolean;
   }>();
+
+  /** Abort controllers for in-flight streams — prevents duplicate responses when a new mention arrives mid-turn. */
+  private streamAbort = new Map<string, AbortController>();
 
   constructor(
     readonly client: CentaurClient,
@@ -115,12 +132,12 @@ export class SlackBot {
     await this.execute(thread, threadKey, text, userId);
   }
 
-  private async ensureWire(threadKey: string): Promise<AsyncIterator<CanonicalEvent, void, undefined>> {
+  private async ensureWire(threadKey: string, harness?: string): Promise<AsyncIterator<CanonicalEvent, void, undefined>> {
     const existing = this.wires.get(threadKey);
     if (existing?.ready) return existing.iter;
 
     // Open a new persistent wire
-    const wire = this.client.connect({ threadKey, platform: "slack" });
+    const wire = this.client.connect({ threadKey, harness, platform: "slack" });
     const iter = wire[Symbol.asyncIterator]();
 
     // Wait for wire.ready
@@ -136,6 +153,15 @@ export class SlackBot {
   }
 
   private async execute(thread: BotThread, threadKey: string, text: string, userId?: string) {
+    // Abort any in-flight stream for this thread so we don't get duplicate responses
+    const prev = this.streamAbort.get(threadKey);
+    if (prev) {
+      log.info("aborting_previous_stream", { thread_key: threadKey });
+      prev.abort();
+    }
+    const ac = new AbortController();
+    this.streamAbort.set(threadKey, ac);
+
     const tracker = new ProgressTracker();
     const t0 = Date.now();
     log.info("execute_start", { thread_key: threadKey, user_id: userId });
@@ -145,7 +171,7 @@ export class SlackBot {
     });
 
     try {
-      await thread.post(this.stream(threadKey, text, tracker, userId, t0), { taskDisplayMode: "plan" });
+      await thread.post(this.stream(threadKey, text, tracker, userId, t0, ac.signal), { taskDisplayMode: "plan" });
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
 
@@ -180,6 +206,9 @@ export class SlackBot {
       return;
     }
 
+    // Clean up abort controller if we're still the active one
+    if (this.streamAbort.get(threadKey) === ac) this.streamAbort.delete(threadKey);
+
     const finalText = (tracker.resultText || tracker.lastAssistantText).trim();
     log.info("execute_complete", { thread_key: threadKey, duration_s: Math.round((Date.now() - t0) / 100) / 10, result_length: finalText.length });
 
@@ -212,11 +241,13 @@ export class SlackBot {
 
   private async *stream(
     threadKey: string, text: string, tracker: ProgressTracker, userId: string | undefined, t0: number,
+    signal: AbortSignal,
   ): AsyncGenerator<StreamChunk> {
     // 1. Ensure we have a persistent wire (reuse existing or open new)
+    const harness = parseHarnessFlag(text);
     let iter: AsyncIterator<CanonicalEvent, void, undefined>;
     try {
-      iter = await this.ensureWire(threadKey);
+      iter = await this.ensureWire(threadKey, harness);
     } catch (err) {
       log.error("wire_connect_failed", { thread_key: threadKey, error: err instanceof Error ? err.message : String(err) });
       yield { type: "markdown_text", text: "Failed to establish agent connection." };
@@ -224,7 +255,7 @@ export class SlackBot {
     }
 
     // 2. Inject the message into stdin (fire-and-forget)
-    this.client.execute({ threadKey, message: text, platform: "slack", userId }).catch((err) => {
+    this.client.execute({ threadKey, message: text, harness, platform: "slack", userId }).catch((err) => {
       log.error("stdin_inject_failed", { thread_key: threadKey, error: err instanceof Error ? err.message : String(err) });
     });
 
@@ -233,12 +264,27 @@ export class SlackBot {
 
     try {
       while (true) {
+        // A newer execute() for this thread aborted us — stop consuming the wire
+        if (signal.aborted) {
+          log.info("stream_aborted", { thread_key: threadKey });
+          return;
+        }
+
         if (!pending) pending = iter.next();
 
         const raced = await Promise.race([
           pending.then((r) => ({ kind: "value" as const, result: r })),
           new Promise<{ kind: "keepalive" }>((r) => setTimeout(() => r({ kind: "keepalive" }), KEEPALIVE_MS)),
+          new Promise<{ kind: "aborted" }>((r) => {
+            if (signal.aborted) { r({ kind: "aborted" }); return; }
+            signal.addEventListener("abort", () => r({ kind: "aborted" }), { once: true });
+          }),
         ]);
+
+        if (raced.kind === "aborted") {
+          log.info("stream_aborted", { thread_key: threadKey });
+          return;
+        }
 
         if (raced.kind === "keepalive") {
           yield { type: "plan_update", title: "Still working…" };
@@ -266,6 +312,9 @@ export class SlackBot {
       // Wire broke — clean up so next mention reconnects
       this.wires.delete(threadKey);
     }
+
+    // If aborted, don't emit any final output — the new stream owns it
+    if (signal.aborted) return;
 
     // Complete all in-progress steps and set plan title to "Completed"
     yield* tracker.finalize();

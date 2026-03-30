@@ -9,6 +9,10 @@ Sources candidates from LinkedIn, GitHub, and X/Twitter based on a job descripti
 
 ## Workflow
 
+### 0. Calibrate on Historical Winners
+
+Before public sourcing, read `reference/outcome-calibration.md` and use `paradigmdb` to inspect the best prior introductions and hires with `rating >= 7` for the closest matching role or expertise. Extract 3-5 archetype signals, note market constraints, and label prior Paradigm touch in your output instead of suppressing it unless the user explicitly asks for net-new names only.
+
 ### 1. Parse Job Description
 
 Extract key requirements:
@@ -28,6 +32,8 @@ Create searches targeting high-signal profiles:
 | High-growth companies | People at early-stage Uber, Stripe, Coinbase, OpenAI, Anthropic, etc. before 2016-2018 |
 | GitHub activity | Use browser-use to find contributors to relevant repos |
 | Twitter/X influence | `ptwittercli search` for people tweeting about relevant topics |
+| Trusted backchannel path | Search for people with strong mutuals, prior collaborators, or obvious operator reference paths |
+| Technical taste | Prefer people with concrete project opinions, talks, writing, OSS work, or evidence they can speak credibly with technical users |
 
 ### 3. Location Filtering (Hard Requirement)
 
@@ -37,40 +43,47 @@ Create searches targeting high-signal profiles:
 - Check X/Twitter bio for city/region mentions
 - Exclude candidates who don't match, regardless of other qualifications
 - If JD says "Remote" or has no location, skip this filter
+- If the location constraint clearly collapses the market, say so explicitly instead of padding the slate with weak local matches
 
 ### 4. Candidate Ranking Criteria
 
-**Rank candidates in this priority order:**
+**After applying location as a hard filter, rank candidates in this priority order:**
 
-1. **Title Correspondence** (25%)
+1. **Archetype Fit & Reference Path** (25%)
+   - How closely does the candidate match the strongest historical Paradigm introductions or hires for this role?
+   - Prefer candidates with a clear trusted-backchannel path: respected operators, founders, hiring managers, or mutuals who would plausibly vouch for them.
+   - Strong multi-hop references beat generic keyword overlap.
+
+2. **Title Correspondence** (20%)
    - How closely does the candidate's current title match the target role?
    - Same function + same level = best match (e.g., "Trade Operations Associate" → "Trade Operations Manager")
    - Same function + different level = good match (e.g., "Senior Engineer" → "Staff Engineer")
    - Different function = poor match, even if skills align (e.g., "Trade Operations Associate" → "CFO" is a poor fit)
    - Weight functional alignment heavily over keyword/skill overlap
 
-2. **Educational Foundation** (20%)
-   - Elite university attendance (MIT, Stanford, CMU, Caltech, Harvard, Princeton, Yale, Berkeley, Oxford, Cambridge)
-   - Consider admissions selectivity (< 10% acceptance = top tier)
-   - Note: attendance matters more than graduation
-
 3. **Professional Trajectory** (20%)
    - Impact achieved relative to years of experience
    - 3 years with senior-level impact >>> 7 years at average pace
-   - Look for promotions, title progressions, scope expansions
+   - Look for promotions, title progressions, scope expansions, and unusually early leverage
+   - Joining at the 5-50 person stage or building a function from scratch is a major positive signal
+   - For engineering roles, concrete high-complexity project ownership beats generic logo prestige
 
-4. **Talent Density of Organizations** (20%)
+4. **Technical Taste / Market Credibility** (15%)
+   - Favor candidates with crisp opinions, named projects or people they follow, public writing, talks, OSS work, or clear evidence they can speak credibly with technical users.
+   - For GTM, product, and talent roles, technical empathy and crypto-native fluency matter more than generic enterprise polish.
+   - For engineering, security, and protocol roles, prioritize people who can clearly explain system constraints, tradeoffs, and what they actually shipped
+
+5. **Talent Density of Organizations** (15%)
    - Evaluated **dynamically** — do not rely solely on the static elite list
    - For any company not in the known-elite cache, run the **Company Enrichment** step (see below) to score it
    - Signals: investor quality, funding stage, headcount, engineering reputation
    - Known-elite overrides (always score 20, skip enrichment): Jane Street, Two Sigma, Renaissance, Google Brain, DeepMind, Paradigm, a16z crypto
-   - Early employees at hypergrowth startups get bonus points (see Timing Window)
+   - Early employees at hypergrowth startups get bonus points (fold into Professional Trajectory)
 
-5. **Timing Window** (15%)
-   - When did they join high-performers?
-   - Uber 2013 > Uber 2017
-   - Coinbase 2015 > Coinbase 2020
-   - Earlier = higher agency signal
+6. **Educational Foundation** (5%)
+   - Elite university attendance (MIT, Stanford, CMU, Caltech, Harvard, Princeton, Yale, Berkeley, Oxford, Cambridge)
+   - Consider admissions selectivity (< 10% acceptance = top tier)
+   - Note: attendance matters less than actual slope, taste, and evidence of leverage
 
 ### Company Enrichment (Dynamic Talent Density Evaluation)
 
@@ -473,6 +486,8 @@ def compute_title_match(candidate_title: str, target_title: str) -> int:
     return 5
 ```
 
+Before final sorting, manually apply the archetype, backchannel, and market-fit rules in `reference/outcome-calibration.md`. A smaller high-conviction slate is better than a padded one, but prior Paradigm touch should usually be called out rather than filtered away.
+
 ## Ideal Candidate Signals
 
 - Extremely articulate communicator, can explain complex ideas in a way that is easy to understand (Strong signal)
@@ -495,16 +510,22 @@ When sourcing for startup leadership roles (VP/Head of Eng at zero-to-one compan
 
 - Look for candidates who work at companies funded by the most prestigious VCs (Sequoia, Andreessen Horowitz, Founders Fund, Y Combinator, etc.)
 - Omit anyone who currently works at a Paradigm portfolio company, but use people at companies like Phantom, Uniswap, Zora, Magic Eden, OpenSea, Axiom, Coinbase, Privy, Kalshi, Monad and Coinbase as examples of exceptional talent, with some caveats
+- For GTM and talent roles, prioritize candidates who can point to specific operators they know, markets they've personally covered, and hires or deals they personally closed
+- For engineering, security, and protocol roles, prefer candidates with a crisp high-complexity build story, strong open-source or ecosystem taste, and evidence they can thrive in small technical teams
+- For niche searches, return the best 10-15 names plus a market read rather than 50 weak fits
+- By default, previously introduced or hired people can still be surfaced; clearly label prior Paradigm touch so the user can decide whether to reuse or prioritize net-new names
 
 ## Decision Framework
 
 - Would Dan McCarthy or Chris Shu feel comfortable recommending this candidate to a Paradigm portfolio company?
 - Would this person accelerate a portfolio company's trajectory?
 - Would we be interested in staying in touch with this person for a future role?
+- Can we explain the winning archetype match for this candidate in one sentence?
 
 ## Tips
 
 - **Parallelize searches** - Run LinkedIn, GitHub, Twitter searches concurrently
+- **Use `paradigmdb` first** - Calibrate on prior winners and linked notes before public search
 - **Respect rate limits** - Space out browser-use requests to avoid blocks
 - **Dedupe aggressively** - Same person may appear across platforms
 - **Verify emails** - Pattern-matched emails should be marked as unverified

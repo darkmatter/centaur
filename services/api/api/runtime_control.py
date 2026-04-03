@@ -830,7 +830,9 @@ async def enqueue_execution(
                 }
 
             active = await conn.fetchrow(
-                "SELECT assignment_generation FROM agent_runtime_assignments "
+                "SELECT assignment_generation, harness, engine, persona_id, "
+                "prompt_ref, effective_agents_md_sha256 "
+                "FROM agent_runtime_assignments "
                 "WHERE thread_key = $1 AND state = 'active' "
                 "ORDER BY assignment_generation DESC LIMIT 1",
                 thread_key,

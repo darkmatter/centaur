@@ -795,6 +795,12 @@ async def execution_cancel(request: Request, execution_id: str):
     result = await cancel_execution(pool, execution_id)
     if not result:
         raise HTTPException(status_code=404, detail="execution not found")
+    log.info(
+        "execution_cancel_requested",
+        execution_id=execution_id,
+        thread_key=result.get("thread_key"),
+        status=result.get("status"),
+    )
     return result
 
 
@@ -852,6 +858,14 @@ async def claim_final_delivery(request: Request, body: ClaimFinalDeliveryRequest
                 "final_payload": payload,
             }
         )
+        log.info(
+            "final_delivery_claimed",
+            execution_id=row["execution_id"],
+            thread_key=row["thread_key"],
+            consumer_id=body.consumer_id,
+            attempt_count=int(row["attempt_count"]),
+            platform=(delivery or {}).get("platform") if isinstance(delivery, dict) else None,
+        )
     return {"deliveries": deliveries}
 
 
@@ -907,6 +921,12 @@ async def mark_final_delivered(
             }
         ),
     )
+    log.info(
+        "final_delivery_delivered",
+        execution_id=execution_id,
+        thread_key=row["thread_key"],
+        consumer_id=body.consumer_id,
+    )
     return {"ok": True, "execution_id": execution_id}
 
 
@@ -946,6 +966,14 @@ async def mark_final_failed(
     )
     if not row:
         raise HTTPException(status_code=409, detail="delivery not claimable")
+    log.warning(
+        "final_delivery_failed",
+        execution_id=execution_id,
+        thread_key=row["thread_key"],
+        consumer_id=body.consumer_id,
+        retry_after_seconds=delay,
+        error=body.error,
+    )
     return {"ok": True, "execution_id": execution_id}
 
 
@@ -1187,7 +1215,13 @@ async def thread_detail(request: Request, key: str):
 
 # ── Internal DB query (read-only) ───────────────────────────────────────────
 
-_ALLOWED_TABLES = {"chat_messages", "sandbox_sessions", "attachments", "api_keys"}
+_ALLOWED_TABLES = {
+    "chat_messages", "sandbox_sessions", "attachments", "api_keys",
+    "agent_runtime_assignments", "agent_message_requests",
+    "agent_execution_requests", "agent_execution_events",
+    "agent_final_delivery_outbox", "agent_spawn_requests",
+    "agent_release_requests",
+}
 _BLOCKED_PATTERNS = {"drop ", "delete ", "insert ", "update ", "alter ", "create ", "truncate ", "grant ", "revoke "}
 
 

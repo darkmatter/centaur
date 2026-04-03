@@ -12,6 +12,7 @@ from collections.abc import Callable
 from typing import Annotated
 
 import structlog
+import structlog.contextvars
 from fastapi import Header, HTTPException, Request
 
 from api.api_keys import APIKeyInfo, check_scope, lookup_key
@@ -138,6 +139,11 @@ async def verify_api_key(
     if token.startswith("sbx1."):
         claims = verify_sandbox_token(token)
         if claims is not None:
+            request.state.sandbox_claims = claims
+            structlog.contextvars.bind_contextvars(
+                thread_key=claims.get("thread_key"),
+                sandbox_container_id=claims.get("container_id"),
+            )
             request.state.api_key_info = APIKeyInfo(
                 id=claims["container_id"],
                 name="sandbox",
@@ -179,6 +185,11 @@ def get_key_info(request: Request) -> APIKeyInfo:
             source="unknown",
         )
     return info
+
+
+def get_sandbox_claims(request: Request) -> dict[str, str] | None:
+    claims = getattr(request.state, "sandbox_claims", None)
+    return claims if isinstance(claims, dict) else None
 
 
 def require_scope(scope: str) -> Callable:

@@ -9,9 +9,9 @@ datasources:
     isDefault: true
     editable: false
 
-  - name: Prometheus
+  - name: VictoriaMetrics
     type: prometheus
-    uid: prometheus
+    uid: victoriametrics
     access: proxy
-    url: http://prometheus:9090
+    url: http://victoriametrics:8428
     editable: false

@@ -22,6 +22,23 @@ from api.agent import (
     inject_stdin,
     stop_session,
 )
+from api.observability import (
+    ExecutionObservationAccumulator,
+    extract_usage_metrics,
+    payload_size_bytes,
+    project_execution_observations,
+    summarize_message_parts,
+)
+from api.metrics import (
+    record_agent_execution,
+    record_execution_claimed,
+    record_execution_enqueued,
+    record_execution_terminal,
+    record_execution_watchdog_timeout,
+    record_message_observation,
+    record_usage_observation,
+)
+from api.sandbox.normalize import normalize_harness_event
 from api.sandbox.registry import get_backend
 
 log = structlog.get_logger()
@@ -126,6 +143,16 @@ def _attachment_name_from_source_path(source_path: str | None, attachment_id: st
         if parsed.name:
             return parsed.name
     return f"{attachment_id}.bin"
+
+
+def _metadata_platform(metadata: dict[str, Any]) -> str | None:
+    platform = metadata.get("platform") if isinstance(metadata, dict) else None
+    return platform if isinstance(platform, str) and platform else None
+
+
+def _delivery_platform(delivery: dict[str, Any]) -> str | None:
+    platform = delivery.get("platform") if isinstance(delivery, dict) else None
+    return platform if isinstance(platform, str) and platform else None
 
 
 async def _write_agents_override(runtime_id: str, agents_md_override: str) -> None:
@@ -348,6 +375,18 @@ async def spawn_assignment(
                 canonical_json(response),
             )
 
+            log.info(
+                "spawn_completed",
+                thread_key=thread_key,
+                spawn_id=spawn_id,
+                runtime_id=runtime_id,
+                assignment_generation=generation,
+                harness=session.harness,
+                engine=session.engine,
+                persona_id=resolved_persona,
+                prompt_ref=resolved_prompt_ref,
+                prompt_sha=resolved_prompt_sha,
+            )
             return response
 
 
@@ -505,7 +544,8 @@ async def append_message(
                 }
 
             active = await conn.fetchrow(
-                "SELECT assignment_generation FROM agent_runtime_assignments "
+                "SELECT assignment_generation, harness, engine, persona_id, prompt_ref, effective_agents_md_sha256 "
+                "FROM agent_runtime_assignments "
                 "WHERE thread_key = $1 AND state = 'active' "
                 "ORDER BY assignment_generation DESC LIMIT 1",
                 thread_key,
@@ -573,6 +613,23 @@ async def append_message(
                 ),
                 chat_message_id,
             )
+
+    message_summary = summarize_message_parts(normalized_parts)
+    record_message_observation(
+        role=role,
+        text_chars=message_summary["text_chars"],
+        attachment_count=message_summary["attachment_ref_count"],
+    )
+    log.info(
+        "message_stored",
+        thread_key=thread_key,
+        message_id=message_id,
+        assignment_generation=assignment_generation,
+        role=role,
+        source_platform=_metadata_platform(metadata),
+        event_size_bytes=payload_size_bytes(normalized_event),
+        **message_summary,
+    )
 
     return {
         "ok": True,
@@ -825,6 +882,21 @@ async def enqueue_execution(
 
     _worker_wake.set()
 
+    resolved_harness = str(active["harness"] or harness or "amp")
+    log.info(
+        "execute_queued",
+        thread_key=thread_key,
+        execution_id=execution_id,
+        assignment_generation=assignment_generation,
+        harness=resolved_harness,
+        engine=active["engine"],
+        persona_id=active["persona_id"],
+        prompt_ref=active["prompt_ref"],
+        prompt_sha=active["effective_agents_md_sha256"],
+        delivery_platform=_delivery_platform(delivery),
+    )
+    record_execution_enqueued(resolved_harness)
+
     return {
         "ok": True,
         "execution_id": execution_id,
@@ -900,6 +972,7 @@ async def cancel_execution(pool, execution_id: str) -> dict[str, Any] | None:
         return {
             "ok": True,
             "execution_id": execution_id,
+            "thread_key": thread_key,
             "status": status,
             "idempotent": True,
         }
@@ -908,6 +981,7 @@ async def cancel_execution(pool, execution_id: str) -> dict[str, Any] | None:
         return {
             "ok": True,
             "execution_id": execution_id,
+            "thread_key": thread_key,
             "status": status,
             "idempotent": True,
         }
@@ -969,6 +1043,7 @@ async def cancel_execution(pool, execution_id: str) -> dict[str, Any] | None:
     return {
         "ok": True,
         "execution_id": execution_id,
+        "thread_key": thread_key,
         "status": "cancel_requested" if status != "queued" else "cancelled",
     }
 
@@ -1054,6 +1129,15 @@ async def release_assignment(
     if response.get("released"):
         with contextlib.suppress(Exception):
             await stop_session(thread_key)
+    log.info(
+        "thread_released",
+        thread_key=thread_key,
+        release_id=release_id,
+        released=response.get("released"),
+        assignment_generation=response.get("assignment_generation"),
+        runtime_id=response.get("runtime_id"),
+        cancel_inflight=cancel_inflight,
+    )
     return response
 
 
@@ -1070,17 +1154,59 @@ async def _mark_execution_terminal(
     next_attempt_at = dt.datetime.now(dt.timezone.utc) + dt.timedelta(
         seconds=FINAL_DELIVERY_READY_GRACE_S,
     )
-    await pool.execute(
+    completed_at = dt.datetime.now(dt.timezone.utc)
+    row = await pool.fetchrow(
         "UPDATE agent_execution_requests SET status = $1, terminal_reason = $2, "
-        "result_text = $3, error_text = $4, completed_at = NOW(), "
+        "result_text = $3, error_text = $4, completed_at = $6, "
         "worker_id = NULL, worker_lease_expires_at = NULL, updated_at = NOW() "
-        "WHERE execution_id = $5",
+        "WHERE execution_id = $5 "
+        "RETURNING started_at, assignment_generation",
         status,
         terminal_reason,
         result_text,
         error_text,
         execution_id,
+        completed_at,
     )
+    harness = None
+    engine = None
+    persona_id = None
+    prompt_ref = None
+    prompt_sha = None
+    if row:
+        ag = row["assignment_generation"]
+        assignment_row = await pool.fetchrow(
+            "SELECT harness, engine, persona_id, prompt_ref, effective_agents_md_sha256 "
+            "FROM agent_runtime_assignments WHERE thread_key = $1 AND assignment_generation = $2",
+            thread_key,
+            ag,
+        )
+        if assignment_row:
+            harness = assignment_row["harness"]
+            engine = assignment_row["engine"]
+            persona_id = assignment_row["persona_id"]
+            prompt_ref = assignment_row["prompt_ref"]
+            prompt_sha = assignment_row["effective_agents_md_sha256"]
+    duration_s = 0.0
+    if row and row.get("started_at") and completed_at:
+        duration_s = (completed_at - row["started_at"]).total_seconds()
+    log.info(
+        "execute_completed",
+        execution_id=execution_id,
+        thread_key=thread_key,
+        status=status,
+        terminal_reason=terminal_reason,
+        duration_s=round(duration_s, 2),
+        harness=harness,
+        engine=engine,
+        persona_id=persona_id,
+        prompt_ref=prompt_ref,
+        prompt_sha=prompt_sha,
+        result_size_bytes=payload_size_bytes(result_text),
+        error_size_bytes=payload_size_bytes(error_text) if error_text else 0,
+    )
+    record_agent_execution(harness, status, duration_s)
+    record_execution_terminal(harness or "unknown", status, terminal_reason)
     await append_execution_state(
         pool,
         execution_id=execution_id,
@@ -1123,6 +1249,13 @@ async def _mark_execution_terminal(
             "result_text": result_text,
             **({"error_text": error_text} if error_text else {}),
         },
+    )
+    log.info(
+        "final_delivery_ready",
+        execution_id=execution_id,
+        thread_key=thread_key,
+        status=status,
+        terminal_reason=terminal_reason,
     )
 
 
@@ -1240,7 +1373,7 @@ async def _claim_next_execution(pool) -> dict[str, Any] | None:
                     "WHERE er.execution_id = $4 AND er.status IN ('queued', 'cancel_requested') "
                     "RETURNING er.execution_id, er.thread_key, er.assignment_generation, "
                     "er.execute_id, er.durable_turn_id, er.status, er.delivery, er.metadata, er.silence_deadline_at, "
-                    "er.hard_deadline_at",
+                    "er.hard_deadline_at, er.created_at, er.claimed_at",
                     float(EXECUTION_SILENCE_TIMEOUT_S),
                     WORKER_INSTANCE_ID,
                     float(EXECUTION_WORKER_LEASE_S),
@@ -1282,7 +1415,8 @@ async def _process_execution(pool, row: dict[str, Any]) -> None:
     )
 
     assignment = await pool.fetchrow(
-        "SELECT harness, engine, runtime_id, agents_md_override FROM agent_runtime_assignments "
+        "SELECT harness, engine, runtime_id, agents_md_override, persona_id, prompt_ref, effective_agents_md_sha256 "
+        "FROM agent_runtime_assignments "
         "WHERE thread_key = $1 AND assignment_generation = $2",
         thread_key,
         assignment_generation,
@@ -1298,6 +1432,26 @@ async def _process_execution(pool, row: dict[str, Any]) -> None:
             error_text="assignment not found",
         )
         return
+
+    harness = str(assignment["harness"])
+    engine = str(assignment["engine"] or harness)
+    persona_id = assignment["persona_id"]
+    prompt_ref = assignment["prompt_ref"]
+    prompt_sha = assignment["effective_agents_md_sha256"]
+    claimed_at = row.get("claimed_at")
+    queue_delay_s = (claimed_at - row["created_at"]).total_seconds() if claimed_at and row.get("created_at") else 0
+    log.info(
+        "execute_claimed",
+        execution_id=execution_id,
+        thread_key=thread_key,
+        harness=harness,
+        engine=engine,
+        persona_id=persona_id,
+        prompt_ref=prompt_ref,
+        prompt_sha=prompt_sha,
+        queue_delay_s=round(queue_delay_s, 2),
+    )
+    record_execution_claimed(harness, queue_delay_s)
 
     if row.get("hard_deadline_at"):
         hard_deadline = row["hard_deadline_at"]
@@ -1359,6 +1513,73 @@ async def _process_execution(pool, row: dict[str, Any]) -> None:
     backend = get_backend()
     await backend.attach(session)
     rt = _get_runtime(session.sandbox_id)
+    observations = ExecutionObservationAccumulator()
+    started_at = claimed_at or row.get("created_at")
+
+    async def _finalize_execution(
+        *,
+        status: str,
+        terminal_reason: str,
+        result_text: str,
+        error_text: str | None,
+    ) -> None:
+        duration_s = 0.0
+        completed_at = dt.datetime.now(dt.timezone.utc)
+        if isinstance(started_at, dt.datetime):
+            duration_s = max((completed_at - started_at).total_seconds(), 0.0)
+        summary_payload = observations.build_summary(
+            execution_id=execution_id,
+            thread_key=thread_key,
+            assignment_generation=assignment_generation,
+            harness=harness,
+            engine=engine,
+            persona_id=persona_id,
+            prompt_ref=prompt_ref,
+            prompt_sha=prompt_sha,
+            status=status,
+            terminal_reason=terminal_reason,
+            duration_s=duration_s,
+        )
+        await append_execution_event(
+            pool,
+            thread_key=thread_key,
+            execution_id=execution_id,
+            event_kind="execution_summary",
+            event_json=summary_payload,
+        )
+        log.info("execution_summary", **summary_payload)
+        await _mark_execution_terminal(
+            pool,
+            execution_id=execution_id,
+            thread_key=thread_key,
+            status=status,
+            terminal_reason=terminal_reason,
+            result_text=result_text,
+            error_text=error_text,
+        )
+
+    execution_started_payload = {
+        "type": "obs.execution_started",
+        "execution_id": execution_id,
+        "thread_key": thread_key,
+        "assignment_generation": assignment_generation,
+        "harness": harness,
+        "engine": engine,
+        "persona_id": persona_id,
+        "prompt_ref": prompt_ref,
+        "prompt_sha": prompt_sha,
+        "runtime_id": session.sandbox_id,
+        "queue_delay_s": round(queue_delay_s, 3),
+        "delivery_platform": _delivery_platform(delivery),
+    }
+    await append_execution_event(
+        pool,
+        thread_key=thread_key,
+        execution_id=execution_id,
+        event_kind="execution_started",
+        event_json=execution_started_payload,
+    )
+    log.info("execute_started", **execution_started_payload)
 
     turn_done_event: dict[str, Any] | None = None
     pending_event: asyncio.Task | None = None
@@ -1374,10 +1595,7 @@ async def _process_execution(pool, row: dict[str, Any]) -> None:
         while True:
             now = dt.datetime.now(dt.timezone.utc)
             if now >= hard_deadline:
-                await _mark_execution_terminal(
-                    pool,
-                    execution_id=execution_id,
-                    thread_key=thread_key,
+                await _finalize_execution(
                     status="failed_permanent",
                     terminal_reason="hard_deadline_exceeded",
                     result_text="",
@@ -1387,12 +1605,10 @@ async def _process_execution(pool, row: dict[str, Any]) -> None:
                     thread_key,
                     reason="hard_deadline_exceeded",
                 )
+                record_execution_watchdog_timeout(harness, "hard_deadline_exceeded")
                 return
             if now >= silence_deadline:
-                await _mark_execution_terminal(
-                    pool,
-                    execution_id=execution_id,
-                    thread_key=thread_key,
+                await _finalize_execution(
                     status="failed_permanent",
                     terminal_reason="silence_deadline_exceeded",
                     result_text="",
@@ -1402,6 +1618,7 @@ async def _process_execution(pool, row: dict[str, Any]) -> None:
                     thread_key,
                     reason="silence_deadline_exceeded",
                 )
+                record_execution_watchdog_timeout(harness, "silence_deadline_exceeded")
                 return
 
             if pending_event is None:
@@ -1424,10 +1641,7 @@ async def _process_execution(pool, row: dict[str, Any]) -> None:
                         thread_key,
                         reason="cancel_requested",
                     )
-                    await _mark_execution_terminal(
-                        pool,
-                        execution_id=execution_id,
-                        thread_key=thread_key,
+                    await _finalize_execution(
                         status="cancelled",
                         terminal_reason="cancel_requested",
                         result_text="",
@@ -1446,6 +1660,7 @@ async def _process_execution(pool, row: dict[str, Any]) -> None:
             payload = decode_jsonb(evt.get("data"), {})
             if not isinstance(payload, dict):
                 continue
+            observations.raw_event_count += 1
             await append_execution_event(
                 pool,
                 thread_key=thread_key,
@@ -1453,6 +1668,48 @@ async def _process_execution(pool, row: dict[str, Any]) -> None:
                 event_kind="amp_raw_event",
                 event_json=payload,
             )
+            for canonical_event in normalize_harness_event(engine, payload):
+                projected = project_execution_observations(
+                    canonical_event,
+                    execution_id=execution_id,
+                    thread_key=thread_key,
+                    assignment_generation=assignment_generation,
+                    harness=harness,
+                    engine=engine,
+                    persona_id=persona_id,
+                    prompt_ref=prompt_ref,
+                    prompt_sha=prompt_sha,
+                )
+                for event_kind, observation_payload in projected:
+                    await append_execution_event(
+                        pool,
+                        thread_key=thread_key,
+                        execution_id=execution_id,
+                        event_kind=event_kind,
+                        event_json=observation_payload,
+                    )
+                    log.info(event_kind, **observation_payload)
+                    observations.observe(event_kind, observation_payload)
+                    if event_kind == "usage_observed":
+                        usage_metrics = extract_usage_metrics(
+                            {
+                                "input_tokens": observation_payload.get("input_tokens"),
+                                "output_tokens": observation_payload.get("output_tokens"),
+                                "cache_creation_input_tokens": observation_payload.get("cache_creation_input_tokens"),
+                                "cache_read_input_tokens": observation_payload.get("cache_read_input_tokens"),
+                                "cost_usd": observation_payload.get("cost_usd"),
+                            },
+                            model=observation_payload.get("model") if isinstance(observation_payload.get("model"), str) else None,
+                        )
+                        record_usage_observation(
+                            harness=harness,
+                            model=usage_metrics.get("model"),
+                            input_tokens=usage_metrics["input_tokens"],
+                            output_tokens=usage_metrics["output_tokens"],
+                            cache_creation_input_tokens=usage_metrics["cache_creation_input_tokens"],
+                            cache_read_input_tokens=usage_metrics["cache_read_input_tokens"],
+                            cost_usd=usage_metrics["cost_usd"],
+                        )
             silence_deadline = await _touch_execution_progress(
                 pool,
                 execution_id,
@@ -1468,10 +1725,7 @@ async def _process_execution(pool, row: dict[str, Any]) -> None:
                     thread_key,
                     reason="cancel_requested",
                 )
-                await _mark_execution_terminal(
-                    pool,
-                    execution_id=execution_id,
-                    thread_key=thread_key,
+                await _finalize_execution(
                     status="cancelled",
                     terminal_reason="cancel_requested",
                     result_text="",
@@ -1483,10 +1737,7 @@ async def _process_execution(pool, row: dict[str, Any]) -> None:
                 turn_done_event = payload
                 break
     except Exception as exc:
-        await _mark_execution_terminal(
-            pool,
-            execution_id=execution_id,
-            thread_key=thread_key,
+        await _finalize_execution(
             status="failed_permanent",
             terminal_reason="execution_error",
             result_text="",
@@ -1502,10 +1753,7 @@ async def _process_execution(pool, row: dict[str, Any]) -> None:
             await stream.aclose()
 
     if turn_done_event is None:
-        await _mark_execution_terminal(
-            pool,
-            execution_id=execution_id,
-            thread_key=thread_key,
+        await _finalize_execution(
             status="failed_permanent",
             terminal_reason="stream_ended_without_turn_done",
             result_text="",
@@ -1527,10 +1775,7 @@ async def _process_execution(pool, row: dict[str, Any]) -> None:
         combined_error = (error_text or result_text or "harness_error").strip()
         if "timed out while reconnecting" in combined_error.lower():
             terminal_reason = "amp_reconnect_timeout"
-        await _mark_execution_terminal(
-            pool,
-            execution_id=execution_id,
-            thread_key=thread_key,
+        await _finalize_execution(
             status="failed_permanent",
             terminal_reason=terminal_reason,
             result_text=result_text,
@@ -1538,10 +1783,7 @@ async def _process_execution(pool, row: dict[str, Any]) -> None:
         )
         return
 
-    await _mark_execution_terminal(
-        pool,
-        execution_id=execution_id,
-        thread_key=thread_key,
+    await _finalize_execution(
         status="completed",
         terminal_reason="completed",
         result_text=result_text,

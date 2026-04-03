@@ -245,6 +245,32 @@ def list_annotations(
     console.print(table)
 
 
+@app.command("thread-debug-url")
+def thread_debug_url(
+    thread: str = typer.Argument(..., help="Slack thread URL, slack:C:ts key, or C:ts key"),
+    dashboard_uid: str = typer.Option("thread-debugger", "--dashboard-uid", help="Dashboard UID"),
+    from_range: str = typer.Option("now-24h", "--from", help="Grafana from range"),
+    to_range: str = typer.Option("now", "--to", help="Grafana to range"),
+    json_output: bool = typer.Option(False, "--json", help="Output as JSON"),
+):
+    """Build a direct Grafana thread-debugger URL from Slack thread input."""
+    client = get_client()
+    result = client.thread_debug_url(
+        thread=thread,
+        dashboard_uid=dashboard_uid,
+        from_range=from_range,
+        to_range=to_range,
+    )
+
+    if json_output:
+        print(json.dumps(result, indent=2))
+        return
+
+    console.print(f"[bold]Thread Key:[/] {result['thread_key']}")
+    console.print(f"[bold]Dashboard:[/] {result['dashboard_uid']}")
+    console.print(f"[bold]URL:[/] {result['url']}")
+
+
 @app.command()
 def health():
     """Check Grafana health."""

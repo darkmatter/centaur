@@ -482,6 +482,153 @@ async def test_worker_marks_turn_done_error_as_failed_and_updates_runtime(db_poo
 
 
 @pytest.mark.asyncio
+async def test_worker_records_projected_observations_and_execution_summary(db_pool):
+    from api.runtime_control import _process_execution
+
+    thread_key = f"slack:C-test:{uuid.uuid4().hex}"
+    execution_id = f"exe-{uuid.uuid4().hex[:12]}"
+    runtime_id = f"rt-{uuid.uuid4().hex[:8]}"
+
+    await db_pool.execute(
+        "INSERT INTO agent_runtime_assignments ("
+        "thread_key, assignment_generation, runtime_id, harness, engine, "
+        "persona_id, prompt_ref, effective_agents_md_sha256, state"
+        ") VALUES ($1, 1, $2, 'amp', 'amp', 'eng', 'persona:eng', 'sha-123', 'active')",
+        thread_key,
+        runtime_id,
+    )
+    await db_pool.execute(
+        "INSERT INTO agent_execution_requests ("
+        "execution_id, thread_key, assignment_generation, execute_id, request_hash, status, "
+        "delivery, metadata, hard_deadline_at"
+        ") VALUES ($1, $2, 1, 'exec-observe', 'hash-observe', 'running', '{}'::jsonb, '{}'::jsonb, NOW() + INTERVAL '10 minutes')",
+        execution_id,
+        thread_key,
+    )
+    await db_pool.execute(
+        "INSERT INTO agent_final_delivery_outbox (execution_id, thread_key, delivery, state) "
+        "VALUES ($1, $2, '{}'::jsonb, 'awaiting_terminal')",
+        execution_id,
+        thread_key,
+    )
+
+    row = {
+        "execution_id": execution_id,
+        "thread_key": thread_key,
+        "assignment_generation": 1,
+        "delivery": {},
+        "hard_deadline_at": dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=10),
+        "created_at": dt.datetime.now(dt.timezone.utc),
+        "claimed_at": dt.datetime.now(dt.timezone.utc),
+    }
+
+    session = SandboxSession(
+        sandbox_id=runtime_id,
+        thread_key=thread_key,
+        harness="amp",
+        engine="amp",
+    )
+
+    async def _fake_stream(*_args, **_kwargs):
+        yield {
+            "data": json.dumps(
+                {
+                    "type": "assistant",
+                    "message": {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": "toolu_test",
+                                "name": "web_search",
+                                "input": {"objective": "Find recent research"},
+                            }
+                        ],
+                        "usage": {"input_tokens": 10, "output_tokens": 20},
+                        "model": "claude-sonnet",
+                    },
+                }
+            )
+        }
+        yield {
+            "data": json.dumps(
+                {
+                    "type": "user",
+                    "message": {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "toolu_test",
+                                "content": "[{\"url\":\"https://example.com\"}]",
+                                "is_error": False,
+                            }
+                        ],
+                    },
+                }
+            )
+        }
+        yield {
+            "data": json.dumps(
+                {
+                    "type": "assistant",
+                    "message": {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "Here is the synthesis."}],
+                        "usage": {"input_tokens": 5, "output_tokens": 15, "cost_usd": 0.123},
+                        "model": "claude-sonnet",
+                    },
+                }
+            )
+        }
+        yield {"data": json.dumps({"type": "turn.done", "result": "Here is the synthesis."})}
+
+    backend = SimpleNamespace(attach=AsyncMock())
+    with (
+        patch("api.runtime_control.get_or_spawn", new=AsyncMock(return_value=session)),
+        patch(
+            "api.runtime_control.inject_stdin",
+            new=AsyncMock(return_value={"ok": True, "injected": True, "durable_turn_id": "turn-1"}),
+        ),
+        patch("api.runtime_control.get_backend", return_value=backend),
+        patch("api.runtime_control._get_runtime", return_value=SimpleNamespace(turn_counter=1)),
+        patch("api.runtime_control._stream_stdout", _fake_stream),
+    ):
+        await _process_execution(db_pool, row)
+
+    event_kinds = [
+        record["event_kind"]
+        for record in await db_pool.fetch(
+            "SELECT event_kind FROM agent_execution_events WHERE execution_id = $1 ORDER BY event_id",
+            execution_id,
+        )
+    ]
+    assert "execution_started" in event_kinds
+    assert "assistant_tool_use_observed" in event_kinds
+    assert "tool_result_observed" in event_kinds
+    assert "assistant_text_observed" in event_kinds
+    assert event_kinds.count("usage_observed") == 2
+    assert "execution_summary" in event_kinds
+
+    summary_row = await db_pool.fetchrow(
+        "SELECT event_json FROM agent_execution_events WHERE execution_id = $1 AND event_kind = 'execution_summary'",
+        execution_id,
+    )
+    assert summary_row is not None
+    summary = summary_row["event_json"]
+    if isinstance(summary, str):
+        summary = json.loads(summary)
+    assert summary["status"] == "completed"
+    assert summary["prompt_ref"] == "persona:eng"
+    assert summary["models"] == ["claude-sonnet"]
+    assert summary["assistant_tool_use_events"] == 1
+    assert summary["tool_result_events"] == 1
+    assert summary["total_tokens"] == 50
+    assert summary["cost_usd"] == 0.123
+    assert summary["tool_calls_by_name"] == {"web_search": 1}
+
+
+@pytest.mark.asyncio
 async def test_claim_next_execution_runs_different_threads_concurrently_but_serializes_each_thread(
     db_pool,
 ):

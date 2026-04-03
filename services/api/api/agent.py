@@ -75,6 +75,27 @@ def _elapsed_since(start_s: float) -> float:
     return round(max(time.time() - start_s, 0.0), 2)
 
 
+def _turn_input_metrics(turn_input: dict[str, Any]) -> dict[str, Any]:
+    message = turn_input.get("message") if isinstance(turn_input, dict) else None
+    content = message.get("content") if isinstance(message, dict) else None
+    if not isinstance(content, list):
+        return {"input_block_count": 0, "input_text_chars": 0, "input_attachment_refs": 0}
+    text_chars = 0
+    attachment_refs = 0
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") == "text":
+            text_chars += len(block.get("text", "") if isinstance(block.get("text"), str) else "")
+        if block.get("type") == "attachment_ref":
+            attachment_refs += 1
+    return {
+        "input_block_count": len(content),
+        "input_text_chars": text_chars,
+        "input_attachment_refs": attachment_refs,
+    }
+
+
 # ── DB pool access ───────────────────────────────────────────────────────────
 
 
@@ -821,10 +842,12 @@ async def stream_connect(
     lease_id = await _db_set_wire(session.thread_key)
 
     log.info(
-        "stream_connect",
+        "sse_connect",
         thread_key=session.thread_key,
         sandbox=session.sandbox_id[:12],
         lease_id=lease_id,
+        harness=session.harness,
+        engine=session.engine,
     )
 
     # Signal the client that the wire is ready
@@ -876,10 +899,12 @@ async def stream_connect(
         if await _db_get_inflight_turn(session.thread_key) is None:
             await _db_update_state(session.thread_key, "idle")
         log.info(
-            "wire_disconnected",
+            "sse_disconnect",
             thread_key=session.thread_key,
             sandbox=session.sandbox_id[:12],
             lease_id=lease_id,
+            harness=session.harness,
+            engine=session.engine,
         )
 
 
@@ -939,7 +964,7 @@ async def inject_stdin(
         fresh_token = mint_sandbox_token(session.thread_key, session.sandbox_id)
         await backend.refresh_token_by_id(session.sandbox_id, fresh_token)
     except Exception:
-        log.warning("token_refresh_failed", sandbox=session.sandbox_id[:12])
+        log.warning("token_refresh_failed", thread_key=session.thread_key, sandbox=session.sandbox_id[:12])
 
     await backend.attach(session)
 
@@ -947,7 +972,7 @@ async def inject_stdin(
         await backend.write_stdin(session, turn_input)
     except (BrokenPipeError, OSError, RuntimeError, AssertionError) as exc:
         log.warning(
-            "stdin_broken_pipe", sandbox=session.sandbox_id[:12], error=str(exc)
+            "stdin_broken_pipe", thread_key=session.thread_key, sandbox=session.sandbox_id[:12], error=str(exc)
         )
         st = await backend.status(session)
         if st != "running":
@@ -963,12 +988,18 @@ async def inject_stdin(
     if last_flushed_id:
         await _advance_cursor(session.thread_key, last_flushed_id)
 
+    turn_metrics = _turn_input_metrics(turn_input)
+
     log.info(
-        "stdin_injected",
+        "turn_start",
         thread_key=session.thread_key,
         sandbox=session.sandbox_id[:12],
         turn_id=rt.turn_counter,
         durable_turn_id=durable_turn_id,
+        platform=platform,
+        user_id=user_id,
+        flushed_message_count=len(flushed),
+        **turn_metrics,
     )
     return {
         "ok": True,
@@ -1007,14 +1038,14 @@ async def replay_inflight_turn(session: SandboxSession) -> dict:
         fresh_token = mint_sandbox_token(session.thread_key, session.sandbox_id)
         await backend.refresh_token_by_id(session.sandbox_id, fresh_token)
     except Exception:
-        log.warning("token_refresh_failed", sandbox=session.sandbox_id[:12])
+        log.warning("token_refresh_failed", thread_key=session.thread_key, sandbox=session.sandbox_id[:12])
 
     await backend.attach(session)
     try:
         await backend.write_stdin(session, turn_input)
     except (BrokenPipeError, OSError, RuntimeError, AssertionError) as exc:
         log.warning(
-            "replay_broken_pipe", sandbox=session.sandbox_id[:12], error=str(exc)
+            "replay_broken_pipe", thread_key=session.thread_key, sandbox=session.sandbox_id[:12], error=str(exc)
         )
         st = await backend.status(session)
         if st != "running":

@@ -1,0 +1,147 @@
+{
+  "uid": "operations-overview",
+  "title": "Operations Overview",
+  "description": "Metrics-first operations dashboard: execution throughput, latency percentiles, tool call rates, warm pool utilization, and delivery backlog.",
+  "tags": ["centaur", "operations"],
+  "schemaVersion": 39,
+  "graphTooltip": 1,
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "refresh": "30s",
+  "time": { "from": "now-1h", "to": "now" },
+  "timezone": "utc",
+  "templating": { "list": [] },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Executions Running",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+      "targets": [{ "expr": "sum(agent_execution_requests{status=\"running\"})", "refId": "A" }],
+      "options": { "colorMode": "background", "graphMode": "none", "textMode": "value_and_name" }
+    },
+    {
+      "id": 2,
+      "title": "Queue Depth",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+      "targets": [{ "expr": "sum(agent_execution_requests{status=\"queued\"})", "refId": "A" }],
+      "options": { "colorMode": "background", "graphMode": "none", "textMode": "value_and_name" }
+    },
+    {
+      "id": 3,
+      "title": "Warm Pool Available",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+      "targets": [{ "expr": "agent_warm_pool_containers{state=\"available\"}", "refId": "A" }],
+      "options": { "colorMode": "background", "graphMode": "none", "textMode": "value_and_name" }
+    },
+    {
+      "id": 4,
+      "title": "Delivery Backlog",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+      "targets": [{ "expr": "sum(agent_final_delivery_outbox{state=~\"pending|sending|retry_wait\"})", "refId": "A" }],
+      "options": { "colorMode": "background", "graphMode": "none", "textMode": "value_and_name" }
+    },
+    {
+      "id": 5,
+      "title": "Execution Throughput",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
+      "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+      "targets": [{ "expr": "sum by (status) (rate(agent_executions_total[5m]))", "legendFormat": "{{status}}", "refId": "A" }]
+    },
+    {
+      "id": 6,
+      "title": "HTTP Request Rate",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
+      "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+      "targets": [{ "expr": "topk(10, sum by (path) (rate(http_requests_total{path!~\"/health.*|/metrics\"}[5m])))", "legendFormat": "{{path}}", "refId": "A" }]
+    },
+    {
+      "id": 7,
+      "title": "Execution Duration p50/p95",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
+      "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+      "targets": [
+        { "expr": "histogram_quantile(0.50, sum by (le) (rate(agent_execution_duration_seconds_bucket{status=\"completed\"}[5m])))", "legendFormat": "p50", "refId": "A" },
+        { "expr": "histogram_quantile(0.95, sum by (le) (rate(agent_execution_duration_seconds_bucket{status=\"completed\"}[5m])))", "legendFormat": "p95", "refId": "B" }
+      ]
+    },
+    {
+      "id": 8,
+      "title": "HTTP Latency p95",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
+      "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+      "targets": [{ "expr": "topk(5, histogram_quantile(0.95, sum by (le, path) (rate(http_request_duration_seconds_bucket{path!~\"/health.*|/metrics\"}[5m]))))", "legendFormat": "{{path}}", "refId": "A" }]
+    },
+    {
+      "id": 9,
+      "title": "Tool Calls / sec (top 10)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 20 },
+      "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+      "targets": [{ "expr": "topk(10, sum by (tool_name) (rate(agent_tool_calls_total[5m])))", "legendFormat": "{{tool_name}}", "refId": "A" }]
+    },
+    {
+      "id": 10,
+      "title": "Tool Failures / sec",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 20 },
+      "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+      "targets": [{ "expr": "sum by (tool_name) (rate(agent_tool_calls_total{success=\"false\"}[5m]))", "legendFormat": "{{tool_name}}", "refId": "A" }]
+    },
+    {
+      "id": 11,
+      "title": "Tool Latency p95",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 20 },
+      "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+      "targets": [{ "expr": "topk(10, histogram_quantile(0.95, sum by (le, tool_name) (rate(agent_tool_call_duration_seconds_bucket[5m]))))", "legendFormat": "{{tool_name}}", "refId": "A" }]
+    },
+    {
+      "id": 12,
+      "title": "Warm Pool Claims",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 28 },
+      "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+      "targets": [{ "expr": "sum by (outcome) (rate(agent_warm_pool_claims_total[5m]))", "legendFormat": "{{outcome}}", "refId": "A" }]
+    },
+    {
+      "id": 13,
+      "title": "Watchdog Timeouts",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 28 },
+      "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+      "targets": [{ "expr": "sum by (reason) (increase(agent_execution_watchdog_timeouts_total[1h]))", "legendFormat": "{{reason}}", "refId": "A" }]
+    },
+    {
+      "id": 20,
+      "title": "Tool Usage (Log-based, Last Hour)",
+      "description": "All completed tool calls showing tool name, method, duration, and calling thread.",
+      "type": "logs",
+      "gridPos": { "h": 10, "w": 12, "x": 0, "y": 48 },
+      "datasource": { "type": "victoriametrics-logs-datasource", "uid": "victorialogs" },
+      "targets": [{ "datasource": { "type": "victoriametrics-logs-datasource", "uid": "victorialogs" }, "expr": "event:tool_call_completed", "refId": "A" }],
+      "options": { "showTime": true, "showLabels": true, "showCommonLabels": false, "wrapLogMessage": true, "prettifyLogMessage": false, "enableLogDetails": true, "sortOrder": "Descending", "dedupStrategy": "none" }
+    },
+    {
+      "id": 21,
+      "title": "Tool Failures",
+      "description": "Failed tool calls with error details.",
+      "type": "logs",
+      "gridPos": { "h": 10, "w": 12, "x": 12, "y": 48 },
+      "datasource": { "type": "victoriametrics-logs-datasource", "uid": "victorialogs" },
+      "targets": [{ "datasource": { "type": "victoriametrics-logs-datasource", "uid": "victorialogs" }, "expr": "event:tool_call_completed AND success:false", "refId": "A" }],
+      "options": { "showTime": true, "showLabels": true, "showCommonLabels": false, "wrapLogMessage": true, "prettifyLogMessage": false, "enableLogDetails": true, "sortOrder": "Descending", "dedupStrategy": "none" }
+    }
+  ]
+}

@@ -27,7 +27,8 @@ from fastapi.responses import PlainTextResponse
 from toon_format import encode as toon_encode
 
 from api.api_keys import check_scope
-from api.deps import get_key_info, verify_api_key
+from api.metrics import record_tool_call
+from api.deps import get_key_info, get_sandbox_claims, verify_api_key
 from centaur_sdk import ToolContext, reset_tool_context, set_tool_context
 
 log = structlog.get_logger()
@@ -128,6 +129,14 @@ def _to_toon(data: Any) -> str:
         return toon if len(toon) <= len(compact_json) else compact_json
     except Exception:
         return json.dumps(normalized, default=str)
+
+
+def _payload_size_bytes(value: Any) -> int:
+    normalized = _normalize_for_serialization(value)
+    try:
+        return len(json.dumps(normalized, separators=(",", ":"), default=str).encode("utf-8"))
+    except Exception:
+        return len(str(normalized).encode("utf-8", errors="replace"))
 
 
 # Mapping from Python built-in types to clean names for schema output
@@ -608,7 +617,14 @@ class ToolManager:
             "methods": method_schemas,
         }
 
-    async def call_tool_raw(self, tool_name: str, method_name: str, args: dict[str, Any]) -> Any:
+    async def call_tool_raw(
+        self,
+        tool_name: str,
+        method_name: str,
+        args: dict[str, Any],
+        *,
+        request: Request | None = None,
+    ) -> Any:
         """Call a tool method by name and return the raw Python result.
 
         Like ``call_tool`` but skips TOON/JSON serialization so the caller gets
@@ -625,14 +641,48 @@ class ToolManager:
                 "available_methods": sorted(m.method_name for m in lt.methods),
             }
 
+        sandbox_claims = get_sandbox_claims(request) if request is not None else None
+        call_fields = {
+            "tool_name": tool_name,
+            "tool_method": method_name,
+            "arg_keys": sorted(args.keys()),
+            "arg_size_bytes": _payload_size_bytes(args),
+            **(
+                {
+                    "thread_key": sandbox_claims.get("thread_key"),
+                    "sandbox_container_id": sandbox_claims.get("container_id"),
+                }
+                if sandbox_claims
+                else {}
+            ),
+        }
         t0 = time.monotonic()
-        log.info("tool_call_started", tool_name=tool_name, tool_method=method_name)
+        log.info("tool_call_started", **call_fields)
 
         ctx = lt.ctx
         if lt.secrets_keys:
             resolved = await _resolve_secrets(lt.secrets_keys)
             if resolved:
-                ctx = ToolContext(name=lt.name, secrets={**lt.ctx.secrets, **resolved})
+                ctx = ToolContext(
+                    name=lt.name,
+                    secrets={**lt.ctx.secrets, **resolved},
+                    thread_key=sandbox_claims.get("thread_key") if sandbox_claims else None,
+                    container_id=sandbox_claims.get("container_id") if sandbox_claims else None,
+                )
+            elif sandbox_claims:
+                ctx = ToolContext(
+                    name=lt.name,
+                    secrets=dict(lt.ctx.secrets),
+                    thread_key=sandbox_claims.get("thread_key"),
+                    container_id=sandbox_claims.get("container_id"),
+                )
+        elif sandbox_claims:
+            ctx = ToolContext(
+                name=lt.name,
+                secrets=dict(lt.ctx.secrets),
+                thread_key=sandbox_claims.get("thread_key"),
+                container_id=sandbox_claims.get("container_id"),
+            )
 
         token = set_tool_context(ctx)
         try:
@@ -643,10 +693,10 @@ class ToolManager:
             duration_ms = round((time.monotonic() - t0) * 1000)
             log.info(
                 "tool_call_completed",
-                tool_name=tool_name,
-                tool_method=method_name,
                 duration_ms=duration_ms,
                 success=True,
+                result_size_bytes=_payload_size_bytes(result),
+                **call_fields,
             )
             return result
         except (SystemExit, Exception) as e:
@@ -654,17 +704,24 @@ class ToolManager:
             error_msg = f"sys.exit({e.code})" if isinstance(e, SystemExit) else str(e)
             log.warning(
                 "tool_call_completed",
-                tool_name=tool_name,
-                tool_method=method_name,
                 duration_ms=duration_ms,
                 success=False,
                 error=error_msg,
+                error_type=type(e).__name__,
+                **call_fields,
             )
             return {"error": error_msg, "tool": tool_name, "method": method_name}
         finally:
             reset_tool_context(token)
 
-    async def call_tool(self, tool_name: str, method_name: str, args: dict[str, Any]) -> str:
+    async def call_tool(
+        self,
+        tool_name: str,
+        method_name: str,
+        args: dict[str, Any],
+        *,
+        request: Request | None = None,
+    ) -> str:
         """Call a tool method by name and return the result as a TOON string."""
         lt = self.tools.get(tool_name)
         if not lt:
@@ -681,8 +738,23 @@ class ToolManager:
                 }
             )
 
+        sandbox_claims = get_sandbox_claims(request) if request is not None else None
+        call_fields = {
+            "tool_name": tool_name,
+            "tool_method": method_name,
+            "arg_keys": sorted(args.keys()),
+            "arg_size_bytes": _payload_size_bytes(args),
+            **(
+                {
+                    "thread_key": sandbox_claims.get("thread_key"),
+                    "sandbox_container_id": sandbox_claims.get("container_id"),
+                }
+                if sandbox_claims
+                else {}
+            ),
+        }
         t0 = time.monotonic()
-        log.info("tool_call_started", tool_name=tool_name, tool_method=method_name)
+        log.info("tool_call_started", **call_fields)
 
         # Resolve real secrets for tools that declare them
         ctx = lt.ctx
@@ -691,7 +763,26 @@ class ToolManager:
             log.info("tool_secrets_resolved", tool=tool_name, keys=list(resolved.keys()),
                      declared=lt.secrets_keys)
             if resolved:
-                ctx = ToolContext(name=lt.name, secrets={**lt.ctx.secrets, **resolved})
+                ctx = ToolContext(
+                    name=lt.name,
+                    secrets={**lt.ctx.secrets, **resolved},
+                    thread_key=sandbox_claims.get("thread_key") if sandbox_claims else None,
+                    container_id=sandbox_claims.get("container_id") if sandbox_claims else None,
+                )
+            elif sandbox_claims:
+                ctx = ToolContext(
+                    name=lt.name,
+                    secrets=dict(lt.ctx.secrets),
+                    thread_key=sandbox_claims.get("thread_key"),
+                    container_id=sandbox_claims.get("container_id"),
+                )
+        elif sandbox_claims:
+            ctx = ToolContext(
+                name=lt.name,
+                secrets=dict(lt.ctx.secrets),
+                thread_key=sandbox_claims.get("thread_key"),
+                container_id=sandbox_claims.get("container_id"),
+            )
 
         token = set_tool_context(ctx)
         try:
@@ -702,11 +793,12 @@ class ToolManager:
             duration_ms = round((time.monotonic() - t0) * 1000)
             log.info(
                 "tool_call_completed",
-                tool_name=tool_name,
-                tool_method=method_name,
                 duration_ms=duration_ms,
                 success=True,
+                result_size_bytes=_payload_size_bytes(result),
+                **call_fields,
             )
+            record_tool_call(tool_name, method_name, True, duration_ms / 1000)
             if isinstance(result, str):
                 return result
             return _to_toon(result)
@@ -715,12 +807,13 @@ class ToolManager:
             error_msg = f"sys.exit({e.code})" if isinstance(e, SystemExit) else str(e)
             log.warning(
                 "tool_call_completed",
-                tool_name=tool_name,
-                tool_method=method_name,
                 duration_ms=duration_ms,
                 success=False,
                 error=error_msg,
+                error_type=type(e).__name__,
+                **call_fields,
             )
+            record_tool_call(tool_name, method_name, False, duration_ms / 1000)
             return json.dumps({"error": error_msg, "tool": tool_name, "method": method_name})
         finally:
             reset_tool_context(token)
@@ -814,12 +907,11 @@ class ToolManager:
                 if not isinstance(body, dict):
                     raise HTTPException(status_code=400, detail="Request body must be a JSON object")
             _require_tool_scope(request, tool_name)
-            result = await pm.call_tool(tool_name, method_name, body)
+            result = await pm.call_tool(tool_name, method_name, body, request=request)
             if "text/plain" in request.headers.get("accept", ""):
                 return PlainTextResponse(result)
             return {"tool": tool_name, "method": method_name, "result": result}
 
         return router
-
 
 

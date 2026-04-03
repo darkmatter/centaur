@@ -15,6 +15,8 @@ log = logging.getLogger(__name__)
 class ToolContext:
     name: str
     secrets: dict[str, str] = field(default_factory=dict)
+    thread_key: str | None = None
+    container_id: str | None = None
 
 
 _tool_ctx: ContextVar[ToolContext] = ContextVar("_tool_ctx")

@@ -262,7 +262,7 @@ services:
       - ./monitoring/grafana/provisioning:/etc/grafana/provisioning
       - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards
     depends_on:
-      prometheus:
+      victoriametrics:
         condition: service_healthy
       victorialogs:
         condition: service_healthy
@@ -271,16 +271,22 @@ services:
       - obs_net
     restart: unless-stopped
 
-  prometheus:
-    image: prom/prometheus:latest
+  victoriametrics:
+    image: victoriametrics/victoria-metrics:latest
+    command:
+      - -storageDataPath=/victoria-metrics-data
+      - -retentionPeriod=30d
+      - -promscrape.config=/etc/prometheus/prometheus.yml
+      - -promscrape.config.strictParse=false
+      - -selfScrapeInterval=15s
     volumes:
       - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
-      - prometheusdata:/prometheus
+      - vmdata:/victoria-metrics-data
     networks:
       - default
       - obs_net
     healthcheck:
-      test: ["CMD", "wget", "--spider", "-q", "http://localhost:9090/-/healthy"]
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8428/health || exit 1"]
       interval: 5s
       timeout: 3s
       retries: 3
@@ -307,12 +313,13 @@ services:
       start_interval: 1s
     restart: unless-stopped
 
-  alloy:
-    image: grafana/alloy:latest
-    command: ["run", "--server.http.listen-addr=0.0.0.0:12345", "/etc/alloy/config.alloy"]
+  fluentbit:
+    image: fluent/fluent-bit:latest
     volumes:
-      - ./services/alloy/config.alloy:/etc/alloy/config.alloy:ro
+      - ./services/fluentbit/fluent-bit.conf:/fluent-bit/etc/fluent-bit.conf:ro
+      - ./services/fluentbit/parsers.conf:/fluent-bit/etc/parsers.conf:ro
       - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
     depends_on:
       victorialogs:
         condition: service_healthy
@@ -328,9 +335,9 @@ volumes:
   grafanadata:
     external: true
     name: centaur_grafanadata
-  prometheusdata:
+  vmdata:
     external: true
-    name: centaur_prometheusdata
+    name: centaur_vmdata
   vldata:
     external: true
     name: centaur_vldata

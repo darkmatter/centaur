@@ -49,6 +49,49 @@
 |    -H "Content-Type: application/json" \
 |    -d '{"sql":"SELECT id, thread_key, name, mime_type, length(data) as bytes FROM attachments ORDER BY created_at DESC LIMIT 10"}'
 |Read-only SELECT only. Binary data (e.g. attachment bytes) is shown as "<N bytes>".
+|
+|[Observability — logs + execution data]
+|You have full access to Centaur's internal observability via the `vlogs` tool and the self-query endpoint.
+|
+|Logs (VictoriaLogs via `call vlogs`):
+|  call vlogs errors                                           → errors across all services (last 1h)
+|  call vlogs errors '{"service":"api","start":"6h"}'          → API errors in last 6h
+|  call vlogs thread_logs '{"thread_key":"C0AJ07U8Z1N:1234"}'  → all logs for a specific thread
+|  call vlogs thread_trace '{"thread_key":"C0AJ07U8Z1N:1234"}' → end-to-end timeline across Slackbot, API, sandbox, tools, subagents, and delivery
+|  call vlogs slow_requests '{"threshold_ms":3000}'            → requests slower than 3s
+|  call vlogs tool_calls '{"tool_name":"slack","start":"24h"}' → tool call history
+|  call vlogs execution_timeline '{"execution_id":"exe_123"}'  → full execution trace
+|  call vlogs service_health                                   → error/request counts per service
+|  call vlogs sandbox_activity                                 → sandbox container lifecycle
+|  call vlogs tool_analytics '{"start":"7d"}'                   → tool usage stats (calls, failures, avg latency)
+|  call vlogs tool_usage_by_thread '{"thread_key":"C0AJ07U8Z1N:1234"}' → tool calls for a thread
+|  call vlogs execution_summaries '{"start":"24h"}'             → per-execution summaries for prompt/tool/runtime analysis
+|  call vlogs prompt_analytics '{"start":"7d"}'                 → aggregate outcomes by prompt lineage
+|  call vlogs model_analytics '{"start":"24h"}'                 → aggregate model usage, tokens, and cost
+|  call vlogs query '{"query":"level:error AND event:tool_call_completed","limit":20}' → raw LogsQL
+|
+|Execution data (Postgres via self-query):
+|  # Recent executions with timing
+|  curl -sS -X POST "$CENTAUR_API_URL/agent/query" \
+|    -H "Authorization: Bearer $CENTAUR_API_KEY" \
+|    -H "Content-Type: application/json" \
+|    -d '{"sql":"SELECT execution_id, thread_key, status, harness, created_at, started_at, completed_at, EXTRACT(EPOCH FROM (completed_at - started_at)) as duration_s, result_text FROM agent_execution_requests ORDER BY created_at DESC LIMIT 20"}'
+|
+|  # Active runtime assignments
+|  curl -sS -X POST "$CENTAUR_API_URL/agent/query" \
+|    -H "Authorization: Bearer $CENTAUR_API_KEY" \
+|    -H "Content-Type: application/json" \
+|    -d '{"sql":"SELECT thread_key, runtime_id, harness, engine, state, created_at FROM agent_runtime_assignments WHERE state = '\''active'\'' ORDER BY created_at DESC"}'
+|
+|  # Failed deliveries
+|  curl -sS -X POST "$CENTAUR_API_URL/agent/query" \
+|    -H "Authorization: Bearer $CENTAUR_API_KEY" \
+|    -H "Content-Type: application/json" \
+|    -d '{"sql":"SELECT execution_id, thread_key, state, attempt_count, last_error FROM agent_final_delivery_outbox WHERE state NOT IN ('\''delivered'\'') ORDER BY updated_at DESC LIMIT 20"}'
+|
+|Available tables: chat_messages, sandbox_sessions, attachments, api_keys,
+|agent_runtime_assignments, agent_message_requests, agent_execution_requests,
+|agent_execution_events, agent_final_delivery_outbox, agent_spawn_requests, agent_release_requests
 
 [Common tool shortcuts — use these instead of direct web requests]
 |NEVER call external APIs (slack.com, api.twitter.com, etc.) directly via curl. The firewall blocks POST to most domains.
@@ -79,6 +122,17 @@
 |
 |Notion (pages, databases):
 |  call notion search '{"query":"meeting notes"}'
+|
+|Logs & observability:
+|  call vlogs errors '{"service":"api"}'
+|  call vlogs thread_logs '{"thread_key":"<thread_key>"}'
+|  call vlogs thread_trace '{"thread_key":"<thread_key>"}'
+|  call vlogs slow_requests '{"threshold_ms":5000}'
+|  call vlogs tool_calls '{"start":"24h"}'
+|  call vlogs tool_analytics '{"start":"7d"}'
+|  call vlogs execution_summaries '{"start":"24h"}'
+|  call vlogs prompt_analytics '{"start":"7d"}'
+|  call vlogs model_analytics '{"start":"24h"}'
 
 [Tool discovery — discover before you call]
 |IMPORTANT: Before calling any API tool, run `call discover <tool>` to see its methods, parameters, and descriptions.
@@ -297,4 +351,3 @@
 |    2025-01-02,3520
 |    2025-01-03,3480
 |```
-

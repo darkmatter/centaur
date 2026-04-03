@@ -339,6 +339,14 @@ class DockerSandboxBackend(SandboxBackend):
             rt.stdout_stream = container.attach(stdin=False, stdout=True, stderr=False, logs=logs)
         if rt.stdin_stream is None:
             rt.stdin_stream = container.attach(stdin=True, stdout=False, stderr=False)
+        log.info(
+            "sandbox_attached",
+            thread_key=session.thread_key,
+            container_id=session.sandbox_id[:12],
+            harness=session.harness,
+            engine=session.engine,
+            logs=logs,
+        )
 
     async def write_stdin(self, session: SandboxSession, obj: dict) -> None:
         rt = _get_rt(session)
@@ -346,6 +354,14 @@ class DockerSandboxBackend(SandboxBackend):
             raise RuntimeError("not attached (stdin)")
         payload = json.dumps(obj, separators=(",", ":")) + "\n"
         await rt.stdin_stream.write_in(payload.encode())
+        log.info(
+            "sandbox_stdin_write",
+            thread_key=session.thread_key,
+            container_id=session.sandbox_id[:12],
+            harness=session.harness,
+            engine=session.engine,
+            payload_size_bytes=len(payload.encode("utf-8")),
+        )
 
     async def stream_stdout(self, session: SandboxSession) -> AsyncIterator[str]:
         rt = _get_rt(session)

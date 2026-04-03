@@ -10,6 +10,12 @@ import structlog
 _LOG_LEVELS = {"critical": 50, "error": 40, "warning": 30, "info": 20, "debug": 10}
 
 
+def _add_default_service(logger, method_name, event_dict):
+    """Ensure API logs always carry a service name for downstream queries."""
+    event_dict.setdefault("service", os.getenv("CENTAUR_SERVICE_NAME", "api"))
+    return event_dict
+
+
 def _add_vlogs_msg(logger, method_name, event_dict):
     """Copy event to _msg for VictoriaLogs compatibility."""
     event_dict.setdefault("_msg", event_dict.get("msg") or event_dict.get("event", ""))
@@ -27,6 +33,7 @@ def configure_structlog() -> int:
     is_dev = sys.stderr.isatty()
     processors = [
         structlog.contextvars.merge_contextvars,
+        _add_default_service,
         structlog.processors.add_log_level,
         structlog.processors.TimeStamper(fmt="iso", key="timestamp"),
     ]

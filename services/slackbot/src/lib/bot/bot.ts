@@ -238,6 +238,11 @@ export class SlackBot {
       platform: "slack",
     });
     for (const delivery of deliveries as FinalDeliveryRecord[]) {
+      log.info("final_delivery_claimed", {
+        thread_key: delivery.thread_key,
+        execution_id: delivery.execution_id,
+        attempt_count: delivery.attempt_count,
+      });
       await this.processFinalDelivery(delivery);
     }
     return deliveries.length;
@@ -247,6 +252,8 @@ export class SlackBot {
 
   async onNewMention(thread: BotThread, msg: BotMessage) {
     if (msg.author.isMe || msg.author.isBot) return;
+    const threadKey = normalizeThreadKey(thread.id);
+    log.info("mention_received", { thread_key: threadKey, user_id: msg.author.userId, is_new_thread: true });
     await thread.subscribe();
     thread.startTyping().catch(() => {});
 
@@ -274,6 +281,7 @@ export class SlackBot {
 
     const parts = await this.toParts(text || "Shared attachment in thread.", attachments);
     if (msg.isMention) {
+      log.info("mention_received", { thread_key: normalizeThreadKey(thread.id), user_id: msg.author.userId, is_new_thread: false });
       thread.startTyping().catch(() => {});
       await this.bufferAndExecute(thread, text, parts, {
         messageId: stableSlackMessageId(msg),
@@ -294,8 +302,14 @@ export class SlackBot {
         parts,
         userId: msg.author.userId,
       });
+      log.info("message_buffered", {
+        thread_key: threadKey,
+        message_id: stableSlackMessageId(msg),
+        assignment_generation: state.assignmentGeneration,
+        is_mention: false,
+      });
     } catch (err) {
-      log.warn("message_buffer_failed", { thread: thread.id, error: err instanceof Error ? err.message : String(err) });
+      log.warn("message_buffer_failed", { thread_key: normalizeThreadKey(thread.id), error: err instanceof Error ? err.message : String(err) });
     }
   }
 
@@ -312,6 +326,12 @@ export class SlackBot {
       messageId: delivery.messageId,
       parts,
       userId: delivery.userId,
+    });
+    log.info("message_buffered", {
+      thread_key: threadKey,
+      message_id: delivery.messageId,
+      assignment_generation: state.assignmentGeneration,
+      is_mention: true,
     });
     await this.execute(thread, threadKey, {
       assignmentGeneration: state.assignmentGeneration,
@@ -421,7 +441,7 @@ export class SlackBot {
             deliveredToSlack = true;
           }
           if (deliveredToSlack) {
-            await this.ackFinalDelivery(executionId, { requireLease: false });
+            await this.ackFinalDelivery(executionId, threadKey, { requireLease: false });
           }
           return;
         }
@@ -460,11 +480,18 @@ export class SlackBot {
       log.info("execute_complete", { thread_key: threadKey, duration_s: Math.round((Date.now() - t0) / 100) / 10, result_length: finalText.length, overflow_chunks: tracker.overflowChunks.length });
 
       if (deliveredToSlack) {
-        await this.ackFinalDelivery(executionId, { requireLease: false });
+        await this.ackFinalDelivery(executionId, threadKey, { requireLease: false });
       }
 
       await this.setAssistantTitle(threadKey, finalText);
     } finally {
+      const durationMs = Date.now() - t0;
+      log.info("execute_completed", {
+        thread_key: threadKey,
+        execution_id: executionId,
+        duration_ms: durationMs,
+        delivered_to_slack: deliveredToSlack,
+      });
       const current = this.inFlightExecutions.get(threadKey);
       if (current?.executionId === executionId) {
         this.inFlightExecutions.delete(threadKey);
@@ -565,6 +592,7 @@ export class SlackBot {
   ): AsyncGenerator<StreamChunk> {
     let retriesLeft = RECONNECT_MAX_RETRIES;
     let afterEventId = 0;
+    log.info("stream_started", { thread_key: threadKey, execution_id: executionId });
 
     while (true) {
       const stream = this.client.streamEvents({
@@ -651,14 +679,22 @@ export class SlackBot {
         streamBroke = true;
       }
 
-      if (terminal) return;
-      if (await this.hydrateStoredTerminalResult(executionId, tracker)) {
+      if (terminal) {
+        log.info("stream_completed", { thread_key: threadKey, execution_id: executionId, last_event_id: afterEventId });
         return;
       }
-      if (!streamBroke) return;
+      if (await this.hydrateStoredTerminalResult(executionId, tracker)) {
+        log.info("stream_completed", { thread_key: threadKey, execution_id: executionId, last_event_id: afterEventId });
+        return;
+      }
+      if (!streamBroke) {
+        log.info("stream_completed", { thread_key: threadKey, execution_id: executionId, last_event_id: afterEventId });
+        return;
+      }
 
       if (retriesLeft <= 0 || signal.aborted) {
         log.warn("wire_reconnect_exhausted", { thread_key: threadKey, execution_id: executionId });
+        log.info("stream_completed", { thread_key: threadKey, execution_id: executionId, last_event_id: afterEventId });
         return;
       }
 
@@ -674,6 +710,7 @@ export class SlackBot {
 
   private async ackFinalDelivery(
     executionId: string,
+    threadKey: string,
     opts?: { requireLease?: boolean },
   ): Promise<void> {
     try {
@@ -683,19 +720,21 @@ export class SlackBot {
       );
     } catch (err) {
       log.warn("final_delivery_ack_failed", {
+        thread_key: threadKey,
         execution_id: executionId,
         error: err instanceof Error ? err.message : String(err),
       });
     }
   }
 
-  private async failFinalDelivery(executionId: string, error: string): Promise<void> {
+  private async failFinalDelivery(executionId: string, threadKey: string, error: string): Promise<void> {
     try {
       await this.client.markFinalFailed(executionId, error, {
         consumerId: this.deliveryConsumerId,
       });
     } catch (err) {
       log.warn("final_delivery_fail_mark_failed", {
+        thread_key: threadKey,
         execution_id: executionId,
         error: err instanceof Error ? err.message : String(err),
       });
@@ -733,6 +772,14 @@ export class SlackBot {
       spawnId: `spawn-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`,
       ...promptSelectorToSpawnOptions(promptSelector),
     });
+    log.info("assignment_ready", {
+      thread_key: threadKey,
+      assignment_generation: Number(spawn.assignment_generation || 0),
+      runtime_id: spawn.runtime_id,
+      prompt_ref: spawn.prompt_ref,
+      prompt_sha: spawn.effective_agents_md_sha256,
+      prompt_selector: promptSelector,
+    });
     return {
       assignmentGeneration: Number(spawn.assignment_generation || 0),
     };
@@ -749,6 +796,7 @@ export class SlackBot {
     const finalPayload = asRecord(record.final_payload);
 
     if (!executionId || !threadKey) return;
+    log.info("final_delivery_started", { thread_key: threadKey, execution_id: executionId });
 
     if (this.isExecutionStreaming(executionId)) {
       log.info("final_delivery_deferred_live_stream", {
@@ -767,7 +815,7 @@ export class SlackBot {
         status: finalPayload.status,
         terminal_reason: finalPayload.terminal_reason,
       });
-      await this.ackFinalDelivery(executionId);
+      await this.ackFinalDelivery(executionId, threadKey);
       return;
     }
 
@@ -778,8 +826,9 @@ export class SlackBot {
           await this.slack!.postMessage(slackAdapterThreadId(threadKey), { markdown: chunk });
         }
       });
-      await this.ackFinalDelivery(executionId);
+      await this.ackFinalDelivery(executionId, threadKey);
       await this.setAssistantTitle(threadKey, markdown);
+      log.info("final_delivery_completed", { thread_key: threadKey, execution_id: executionId });
     } catch (err) {
       const error = err instanceof Error ? err.message : String(err);
       log.warn("final_delivery_post_failed", {
@@ -787,7 +836,7 @@ export class SlackBot {
         thread_key: threadKey,
         error,
       });
-      await this.failFinalDelivery(executionId, error);
+      await this.failFinalDelivery(executionId, threadKey, error);
     }
   }
 
@@ -903,11 +952,11 @@ export class SlackBot {
     try {
       const refetched = await this.slack.fetchMessage(threadId, ts);
       if (refetched?.attachments?.length) {
-        log.info("mention_files_refetched", { thread: threadId, count: refetched.attachments.length });
+        log.info("mention_files_refetched", { thread_key: normalizeThreadKey(threadId), count: refetched.attachments.length });
         return [...refetched.attachments];
       }
     } catch (err) {
-      log.warn("mention_files_refetch_failed", { thread: threadId, error: err instanceof Error ? err.message : String(err) });
+      log.warn("mention_files_refetch_failed", { thread_key: normalizeThreadKey(threadId), error: err instanceof Error ? err.message : String(err) });
     }
     return [];
   }

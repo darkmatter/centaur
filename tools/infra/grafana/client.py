@@ -2,11 +2,55 @@
 
 import json as _json
 import os
+import re
 from typing import Any
+from urllib.parse import SplitResult, quote, urlsplit, urlunsplit
 
 import httpx
 
 from centaur_sdk import secret
+
+_SLACK_ARCHIVE_RE = re.compile(r"/archives/(?P<channel>[A-Z0-9]+)/p(?P<ts>\d{16})")
+_SLACK_CLIENT_THREAD_RE = re.compile(
+    r"/client/(?P<team>T[A-Z0-9]+)/(?P<channel>[A-Z0-9]+)/thread/(?P=channel)-(?P<ts>\d+\.\d+)"
+)
+
+
+def _normalize_thread_key_input(value: str) -> str:
+    candidate = value.strip()
+    if not candidate:
+        raise ValueError("thread input is required")
+
+    parsed = urlsplit(candidate)
+    if parsed.scheme and parsed.netloc:
+        match = _SLACK_ARCHIVE_RE.search(parsed.path)
+        if match:
+            ts = match.group("ts")
+            return f"{match.group('channel')}:{ts[:-6]}.{ts[-6:]}"
+        match = _SLACK_CLIENT_THREAD_RE.search(parsed.path)
+        if match:
+            return f"{match.group('channel')}:{match.group('ts')}"
+        query_thread_ts = next(
+            (part.split("=", 1)[1] for part in parsed.query.split("&") if part.startswith("thread_ts=")),
+            "",
+        )
+        query_channel = next(
+            (part.split("=", 1)[1] for part in parsed.query.split("&") if part.startswith("cid=")),
+            "",
+        )
+        if query_channel and query_thread_ts:
+            return f"{query_channel}:{query_thread_ts}"
+
+    if candidate.startswith("slack:"):
+        parts = candidate.split(":", 2)
+        if len(parts) == 3 and parts[1] and parts[2]:
+            return f"{parts[1]}:{parts[2]}"
+    if candidate.count(":") == 1:
+        channel, thread_ts = candidate.split(":", 1)
+        if channel and thread_ts:
+            return f"{channel}:{thread_ts}"
+
+    raise ValueError(f"Could not parse Slack thread input: {value}")
 
 
 class GrafanaClient:
@@ -34,7 +78,18 @@ class GrafanaClient:
 
     @property
     def base_url(self) -> str:
-        url = (self._url or os.environ.get("GRAFANA_URL", "")).rstrip("/")
+        url = (self._url or os.getenv("GRAFANA_URL", "")).rstrip("/")  # noqa: TID251
+        if url and not url.startswith(("http://", "https://")):
+            url = f"http://{url}"
+        return url
+
+    @property
+    def public_url(self) -> str:
+        url = (
+            os.getenv("GRAFANA_PUBLIC_URL", "")  # noqa: TID251
+            or os.getenv("GRAFANA_ROOT_URL", "")  # noqa: TID251
+            or self.base_url
+        ).rstrip("/")
         if url and not url.startswith(("http://", "https://")):
             url = f"http://{url}"
         return url
@@ -126,7 +181,7 @@ class GrafanaClient:
     def query_prometheus(
         self,
         expr: str,
-        datasource_uid: str = "prometheus",
+        datasource_uid: str = "victoriametrics",
         start: str | None = None,
         end: str | None = None,
         step: str = "60s",
@@ -155,7 +210,7 @@ class GrafanaClient:
             params={"query": expr},
         )
 
-    def prometheus_labels(self, datasource_uid: str = "prometheus") -> list[str]:
+    def prometheus_labels(self, datasource_uid: str = "victoriametrics") -> list[str]:
         """List all Prometheus label names."""
         data = self._request(
             "GET",
@@ -164,7 +219,7 @@ class GrafanaClient:
         return data.get("data", [])
 
     def prometheus_label_values(
-        self, label: str, datasource_uid: str = "prometheus"
+        self, label: str, datasource_uid: str = "victoriametrics"
     ) -> list[str]:
         """Get values for a Prometheus label."""
         data = self._request(
@@ -273,6 +328,40 @@ class GrafanaClient:
     def health(self) -> dict:
         """Check Grafana health."""
         return self._request("GET", "/api/health")
+
+    def thread_debug_url(
+        self,
+        thread: str,
+        dashboard_uid: str = "thread-debugger",
+        from_range: str = "now-24h",
+        to_range: str = "now",
+    ) -> dict:
+        """Build a direct Grafana thread-debugger URL from a Slack URL or thread key."""
+        normalized_thread_key = _normalize_thread_key_input(thread)
+        path = f"/d/{dashboard_uid}/{dashboard_uid}"
+        query = (
+            f"var-thread_key={quote(normalized_thread_key, safe='')}"
+            f"&from={quote(from_range, safe='')}"
+            f"&to={quote(to_range, safe='')}"
+        )
+        public_parts = urlsplit(self.public_url)
+        url = urlunsplit(
+            SplitResult(
+                scheme=public_parts.scheme,
+                netloc=public_parts.netloc,
+                path=f"{public_parts.path}{path}",
+                query=query,
+                fragment="",
+            )
+        )
+        return {
+            "thread_input": thread,
+            "thread_key": normalized_thread_key,
+            "dashboard_uid": dashboard_uid,
+            "from": from_range,
+            "to": to_range,
+            "url": url,
+        }
 
     # -- Lifecycle ------------------------------------------------------------
 

@@ -37,11 +37,11 @@
     {
       "id": 2,
       "title": "Request Flow",
-      "description": "Key lifecycle events: webhook → execute → SSE → turn → done → edit.",
+      "description": "Key lifecycle events across Slackbot, API, and sandbox: mention → spawn → buffer → queue → SSE → turn → execute → deliver.",
       "type": "logs",
       "gridPos": { "h": 10, "w": 24, "x": 0, "y": 10 },
       "datasource": { "type": "victoriametrics-logs-datasource", "uid": "victorialogs" },
-      "targets": [{ "datasource": { "type": "victoriametrics-logs-datasource", "uid": "victorialogs" }, "expr": "thread_key:${thread_key} AND (event:webhook_received OR event:message_received OR event:execute_start OR event:sse_connect OR event:http_request OR event:turn_start OR event:turn_first_output OR event:turn_done OR event:execute_complete OR event:slack_edit_complete)", "refId": "A" }],
+      "targets": [{ "datasource": { "type": "victoriametrics-logs-datasource", "uid": "victorialogs" }, "expr": "thread_key:${thread_key} AND (event:mention_received OR event:assignment_ready OR event:spawn_completed OR event:message_buffered OR event:message_stored OR event:execute_start OR event:execute_queued OR event:execute_claimed OR event:execute_started OR event:sse_connect OR event:turn_start OR event:sandbox_spawned OR event:sandbox_attached OR event:sandbox_stdin_write OR event:turn_first_output OR event:turn_done OR event:execute_complete OR event:execute_completed OR event:final_delivery_claimed OR event:final_delivery_started OR event:final_delivery_delivered OR event:final_delivery_completed OR event:final_delivery_failed OR event:sse_disconnect OR event:thread_released OR event:execution_cancel_requested)", "refId": "A" }],
       "options": { "showTime": true, "showLabels": true, "showCommonLabels": false, "wrapLogMessage": true, "prettifyLogMessage": false, "enableLogDetails": true, "sortOrder": "Ascending", "dedupStrategy": "none" }
     },
     {
@@ -72,6 +72,46 @@
       "gridPos": { "h": 8, "w": 24, "x": 0, "y": 36 },
       "datasource": { "type": "victoriametrics-logs-datasource", "uid": "victorialogs" },
       "targets": [{ "datasource": { "type": "victoriametrics-logs-datasource", "uid": "victorialogs" }, "expr": "thread_key:${thread_key} AND event:proxy_audit", "refId": "A" }],
+      "options": { "showTime": true, "showLabels": true, "showCommonLabels": false, "wrapLogMessage": true, "prettifyLogMessage": false, "enableLogDetails": true, "sortOrder": "Ascending", "dedupStrategy": "none" }
+    },
+    {
+      "id": 6,
+      "title": "Slackbot Flow",
+      "description": "Slack-side lifecycle: mention → execute → stream → deliver.",
+      "type": "logs",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 44 },
+      "datasource": { "type": "victoriametrics-logs-datasource", "uid": "victorialogs" },
+      "targets": [{ "datasource": { "type": "victoriametrics-logs-datasource", "uid": "victorialogs" }, "expr": "thread_key:${thread_key} AND _stream:{service=\"slackbot\"}", "refId": "A" }],
+      "options": { "showTime": true, "showLabels": true, "showCommonLabels": false, "wrapLogMessage": true, "prettifyLogMessage": false, "enableLogDetails": true, "sortOrder": "Ascending", "dedupStrategy": "none" }
+    },
+    {
+      "id": 7,
+      "title": "Execution Lifecycle",
+      "description": "API-side execution flow: queued → claimed → started → completed plus summaries.",
+      "type": "logs",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 52 },
+      "datasource": { "type": "victoriametrics-logs-datasource", "uid": "victorialogs" },
+      "targets": [{ "datasource": { "type": "victoriametrics-logs-datasource", "uid": "victorialogs" }, "expr": "thread_key:${thread_key} AND (event:spawn_completed OR event:message_stored OR event:execute_queued OR event:execute_claimed OR event:execute_started OR event:execute_completed OR event:execution_summary OR event:watchdog_timeout OR event:turn_done)", "refId": "A" }],
+      "options": { "showTime": true, "showLabels": true, "showCommonLabels": false, "wrapLogMessage": true, "prettifyLogMessage": false, "enableLogDetails": true, "sortOrder": "Ascending", "dedupStrategy": "none" }
+    },
+    {
+      "id": 8,
+      "title": "Agent And Subagents",
+      "description": "Projected agent-level activity: tool use, subagents, commands, reasoning, and execution summaries.",
+      "type": "logs",
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 60 },
+      "datasource": { "type": "victoriametrics-logs-datasource", "uid": "victorialogs" },
+      "targets": [{ "datasource": { "type": "victoriametrics-logs-datasource", "uid": "victorialogs" }, "expr": "thread_key:${thread_key} AND (event:assistant_tool_use_observed OR event:tool_result_observed OR event:subagent_status_observed OR event:command_execution_observed OR event:reasoning_observed OR event:assistant_text_observed OR event:usage_observed OR event:execution_summary)", "refId": "A" }],
+      "options": { "showTime": true, "showLabels": true, "showCommonLabels": false, "wrapLogMessage": true, "prettifyLogMessage": false, "enableLogDetails": true, "sortOrder": "Ascending", "dedupStrategy": "none" }
+    },
+    {
+      "id": 9,
+      "title": "Delivery Lifecycle",
+      "description": "Final delivery handoff from API outbox to Slackbot and back.",
+      "type": "logs",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 70 },
+      "datasource": { "type": "victoriametrics-logs-datasource", "uid": "victorialogs" },
+      "targets": [{ "datasource": { "type": "victoriametrics-logs-datasource", "uid": "victorialogs" }, "expr": "thread_key:${thread_key} AND (event:final_delivery_ready OR event:final_delivery_claimed OR event:final_delivery_started OR event:final_delivery_delivered OR event:final_delivery_completed OR event:final_delivery_failed OR event:final_delivery_ack_failed OR event:final_delivery_post_failed OR event:final_delivery_suppressed)", "refId": "A" }],
       "options": { "showTime": true, "showLabels": true, "showCommonLabels": false, "wrapLogMessage": true, "prettifyLogMessage": false, "enableLogDetails": true, "sortOrder": "Ascending", "dedupStrategy": "none" }
     }
   ]

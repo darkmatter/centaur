@@ -13,11 +13,47 @@
   "templating": { "list": [] },
   "panels": [
     {
+      "id": 10,
+      "title": "Running",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+      "targets": [{ "expr": "sum(agent_execution_requests{status=\"running\"}) or vector(0)", "refId": "A" }],
+      "options": { "colorMode": "background", "graphMode": "none", "textMode": "value_and_name" }
+    },
+    {
+      "id": 11,
+      "title": "Queued",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+      "targets": [{ "expr": "sum(agent_execution_requests{status=\"queued\"}) or vector(0)", "refId": "A" }],
+      "options": { "colorMode": "background", "graphMode": "none", "textMode": "value_and_name" }
+    },
+    {
+      "id": 12,
+      "title": "Warm Pool",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+      "targets": [{ "expr": "agent_warm_pool_containers{state=\"available\"} or vector(0)", "refId": "A" }],
+      "options": { "colorMode": "background", "graphMode": "none", "textMode": "value_and_name" }
+    },
+    {
+      "id": 13,
+      "title": "Delivery Backlog",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+      "targets": [{ "expr": "sum(agent_final_delivery_outbox{state=~\"pending|sending|retry_wait\"}) or vector(0)", "refId": "A" }],
+      "options": { "colorMode": "background", "graphMode": "none", "textMode": "value_and_name" }
+    },
+    {
       "id": 1,
       "title": "Turn Duration",
       "description": "Recent turn durations from API logs.",
       "type": "logs",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
       "datasource": { "type": "victoriametrics-logs-datasource", "uid": "victorialogs" },
       "targets": [{ "datasource": { "type": "victoriametrics-logs-datasource", "uid": "victorialogs" }, "expr": "_stream:{service=\"api\"} AND event:turn_done AND duration_s:*", "refId": "A" }],
       "options": { "showTime": true, "showLabels": true, "showCommonLabels": false, "wrapLogMessage": true, "prettifyLogMessage": false, "enableLogDetails": true, "sortOrder": "Descending", "dedupStrategy": "none" }
@@ -27,7 +63,7 @@
       "title": "Error Rate by Service",
       "description": "All error-level logs grouped by service.",
       "type": "logs",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
       "datasource": { "type": "victoriametrics-logs-datasource", "uid": "victorialogs" },
       "targets": [{ "datasource": { "type": "victoriametrics-logs-datasource", "uid": "victorialogs" }, "expr": "level:error", "refId": "A" }],
       "options": { "showTime": true, "showLabels": true, "showCommonLabels": false, "wrapLogMessage": true, "prettifyLogMessage": false, "enableLogDetails": true, "sortOrder": "Descending", "dedupStrategy": "none" }
@@ -37,7 +73,7 @@
       "title": "Recent Errors",
       "description": "Last 50 errors across all services.",
       "type": "logs",
-      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 8 },
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 12 },
       "datasource": { "type": "victoriametrics-logs-datasource", "uid": "victorialogs" },
       "targets": [{ "datasource": { "type": "victoriametrics-logs-datasource", "uid": "victorialogs" }, "expr": "level:error", "refId": "A" }],
       "options": { "showTime": true, "showLabels": true, "showCommonLabels": false, "wrapLogMessage": true, "prettifyLogMessage": false, "enableLogDetails": true, "sortOrder": "Descending", "dedupStrategy": "none" },
@@ -48,7 +84,7 @@
       "title": "Webhook Volume",
       "description": "Count of incoming webhooks over time.",
       "type": "logs",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 18 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 22 },
       "datasource": { "type": "victoriametrics-logs-datasource", "uid": "victorialogs" },
       "targets": [{ "datasource": { "type": "victoriametrics-logs-datasource", "uid": "victorialogs" }, "expr": "event:webhook_received", "refId": "A" }],
       "options": { "showTime": true, "showLabels": true, "showCommonLabels": false, "wrapLogMessage": true, "prettifyLogMessage": false, "enableLogDetails": true, "sortOrder": "Descending", "dedupStrategy": "none" }
@@ -58,7 +94,7 @@
       "title": "Slack Stream Expirations",
       "description": "When Slack SSE streams expired and triggered fallback.",
       "type": "logs",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 18 },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 22 },
       "datasource": { "type": "victoriametrics-logs-datasource", "uid": "victorialogs" },
       "targets": [{ "datasource": { "type": "victoriametrics-logs-datasource", "uid": "victorialogs" }, "expr": "event:slack_stream_expired OR event:stream_expired_fallback", "refId": "A" }],
       "options": { "showTime": true, "showLabels": true, "showCommonLabels": false, "wrapLogMessage": true, "prettifyLogMessage": false, "enableLogDetails": true, "sortOrder": "Descending", "dedupStrategy": "none" }
@@ -68,7 +104,7 @@
       "title": "SSE Disconnects",
       "description": "SSE connection failures and disconnects.",
       "type": "logs",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 26 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 30 },
       "datasource": { "type": "victoriametrics-logs-datasource", "uid": "victorialogs" },
       "targets": [{ "datasource": { "type": "victoriametrics-logs-datasource", "uid": "victorialogs" }, "expr": "event:stream_disconnect OR event:sse_disconnect", "refId": "A" }],
       "options": { "showTime": true, "showLabels": true, "showCommonLabels": false, "wrapLogMessage": true, "prettifyLogMessage": false, "enableLogDetails": true, "sortOrder": "Descending", "dedupStrategy": "none" }
@@ -78,7 +114,7 @@
       "title": "Tool Call Failures",
       "description": "Failed tool calls with error messages.",
       "type": "logs",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 26 },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 30 },
       "datasource": { "type": "victoriametrics-logs-datasource", "uid": "victorialogs" },
       "targets": [{ "datasource": { "type": "victoriametrics-logs-datasource", "uid": "victorialogs" }, "expr": "event:tool_call_completed AND success:false", "refId": "A" }],
       "options": { "showTime": true, "showLabels": true, "showCommonLabels": false, "wrapLogMessage": true, "prettifyLogMessage": false, "enableLogDetails": true, "sortOrder": "Descending", "dedupStrategy": "none" }
@@ -88,7 +124,7 @@
       "title": "pgbouncer / DB Errors",
       "description": "Database connectivity issues: pgbouncer errors, DNS failures, connection terminations.",
       "type": "logs",
-      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 34 },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 38 },
       "datasource": { "type": "victoriametrics-logs-datasource", "uid": "victorialogs" },
       "targets": [{ "datasource": { "type": "victoriametrics-logs-datasource", "uid": "victorialogs" }, "expr": "pgbouncer OR ENOTFOUND OR \"Connection terminated\"", "refId": "A" }],
       "options": { "showTime": true, "showLabels": true, "showCommonLabels": false, "wrapLogMessage": true, "prettifyLogMessage": false, "enableLogDetails": true, "sortOrder": "Descending", "dedupStrategy": "none" }

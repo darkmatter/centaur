@@ -117,7 +117,7 @@ Or create a DB-backed key for external use (see [API Key Management](#api-key-ma
                     ▼
                ┌──────────┐
                │ Postgres  │    pgvector, raw_records JSONB
-               │ + Redis   │    sandbox_sessions, chat_messages
+               │           │    sandbox_sessions, chat_messages
                └──────────┘
 ```
 
@@ -266,7 +266,7 @@ Agents call tools via `curl http://api:8000/tools/<tool>/<method>` over the `age
 | `agent_net` | internal | sandbox containers ↔ firewall ↔ api |
 | `app_net` | internal | api ↔ slackbot ↔ auth |
 | `control_net` | internal | api ↔ pgbouncer ↔ firewall |
-| `data_net` | internal | postgres, redis, pgbouncer ↔ api |
+| `data_net` | internal | postgres, pgbouncer ↔ api |
 | `obs_net` | internal | victoriametrics, victorialogs, fluentbit, grafana |
 
 ## Directory Structure

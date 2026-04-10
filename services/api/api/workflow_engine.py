@@ -1149,16 +1149,24 @@ def _split_thread_key(thread_key: str) -> tuple[str, str]:
 def _registered_schedule_specs() -> list[ScheduleSpec]:
     """Collect schedule specs from all registered workflow handlers.
 
-    Each handler may export a ``SCHEDULE`` dict with keys:
-    - ``cron`` or ``interval_seconds`` — the schedule trigger
-    - ``timezone`` — (default "UTC")
-    - ``input`` — static input dict merged with the handler's Input
-    - ``enabled`` — (default True)
-    - ``catchup_policy`` — "skip" (default) or "catch_up"
+    Each handler may export a ``SCHEDULE`` dict.  Minimal example::
 
-    Environment variables in the ``input`` values are expanded via
-    ``os.path.expandvars`` so you can write ``"$SOME_ENV_VAR"`` in the
-    workflow file and have it resolved at startup.
+        SCHEDULE = {
+            "cron": "45 7 * * *",
+            "timezone": "America/Los_Angeles",
+            "thread_key": os.getenv("MY_THREAD_KEY", ""),
+        }
+
+    Supported keys:
+
+    - ``cron`` or ``interval_seconds`` — trigger (required, one of)
+    - ``timezone`` — default ``"UTC"``
+    - ``enabled`` — default ``True``
+    - ``thread_key`` — Slack thread to post to; auto-derives delivery
+    - ``slack_channel`` — channel name (e.g. ``"paradigm-pulse"``);
+      used as delivery channel when no thread_key
+    - ``input`` — extra fields merged into the handler Input
+    - ``catchup_policy`` — ``"skip"`` (default) or ``"catch_up"``
     """
     specs: list[ScheduleSpec] = []
     for wf_name, reg in _WORKFLOW_HANDLERS.items():
@@ -1175,13 +1183,56 @@ def _registered_schedule_specs() -> list[ScheduleSpec]:
             )
             continue
 
-        raw_input = sched.get("input", {})
-        # Expand env vars in string values (one level deep)
-        input_json = _expand_env_vars(raw_input)
-
         enabled_val = sched.get("enabled", True)
         if isinstance(enabled_val, str):
             enabled_val = enabled_val.strip().lower() not in {"0", "false", "no"}
+
+        input_json = dict(sched.get("input") or {})
+        input_json.setdefault("metadata", {})
+        input_json["metadata"]["source"] = "workflow_schedule"
+        input_json["metadata"]["workflow_name"] = wf_name
+
+        # thread_key can be top-level shorthand or inside input
+        thread_key = (
+            sched.get("thread_key")
+            or input_json.get("thread_key")
+            or ""
+        ).strip()
+        slack_channel = str(sched.get("slack_channel", "")).strip().lstrip("#")
+
+        # If both thread_key and slack_channel are empty, skip —
+        # the workflow has nowhere to deliver results.
+        if not thread_key and not slack_channel:
+            log.info(
+                "workflow_schedule_skip_no_destination",
+                workflow_name=wf_name,
+            )
+            continue
+
+        if thread_key:
+            input_json["thread_key"] = thread_key
+            # Auto-derive Slack delivery from thread_key
+            if "delivery" not in input_json:
+                try:
+                    channel, thread_ts = _split_thread_key(thread_key)
+                    input_json["delivery"] = {
+                        "channel": channel,
+                        "thread_ts": thread_ts,
+                        "platform": "slack",
+                    }
+                except ControlPlaneError:
+                    log.warning(
+                        "workflow_schedule_bad_thread_key",
+                        workflow_name=wf_name,
+                        thread_key=thread_key,
+                    )
+
+        # slack_channel: use channel name for delivery (no thread_ts)
+        if slack_channel and "delivery" not in input_json:
+            input_json["delivery"] = {
+                "channel": slack_channel,
+                "platform": "slack",
+            }
 
         specs.append(ScheduleSpec(
             schedule_id=sched.get("schedule_id", wf_name),
@@ -1195,17 +1246,6 @@ def _registered_schedule_specs() -> list[ScheduleSpec]:
             enabled=bool(enabled_val),
         ))
     return specs
-
-
-def _expand_env_vars(obj: Any) -> Any:
-    """Recursively expand $ENV_VAR references in string values."""
-    if isinstance(obj, str):
-        return os.path.expandvars(obj)
-    if isinstance(obj, dict):
-        return {k: _expand_env_vars(v) for k, v in obj.items()}
-    if isinstance(obj, list):
-        return [_expand_env_vars(v) for v in obj]
-    return obj
 
 
 # ── Cron helpers ──────────────────────────────────────────────────────

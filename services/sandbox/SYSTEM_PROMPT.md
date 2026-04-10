@@ -146,11 +146,12 @@
 |        thread_key: str = ""
 |        # ... your fields
 |
-|    # Optional: run on a cron schedule
+|    # Optional: run on a schedule (delivery auto-derived from thread_key)
 |    SCHEDULE = {
-|        "cron": "0 9 * * *",        # 9am daily (cron expr or interval_seconds)
+|        "cron": "0 9 * * *",        # or interval_seconds: 300
 |        "timezone": "America/New_York",
-|        "input": {"thread_key": os.getenv("MY_THREAD_KEY", "")},
+|        "thread_key": os.getenv("MY_THREAD_KEY", ""),
+|        "slack_channel": "my-channel",  # alternative: channel name
 |    }
 |
 |    async def handler(inp: Input, ctx: WorkflowContext) -> dict[str, Any]:

@@ -41,7 +41,7 @@ RUN useradd -m -s /bin/bash -u 1001 agent \
 
 # ── Global npm CLIs (root, cached) ──────────────────────────────────────────
 RUN --mount=type=cache,target=/root/.npm,sharing=locked \
-    npm install -g @anthropic-ai/claude-code@1.0.16 @openai/codex@0.1.5 @mariozechner/pi-coding-agent@0.67.2 agent-browser@0.1.8
+    npm install -g @anthropic-ai/claude-code@1.0.16 @openai/codex@0.121.0 @mariozechner/pi-coding-agent@0.67.2 agent-browser@0.25.4
 
 USER agent
 WORKDIR /home/agent

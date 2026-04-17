@@ -1,0 +1,9 @@
+[project]
+name = "editorial"
+description = "Editorial persona — executive decision memos, rewrites, and artifact specs"
+version = "0.1.0"
+
+[tool.ai-v2]
+type = "persona"
+engine = "amp"
+prompt = "PROMPT.md"

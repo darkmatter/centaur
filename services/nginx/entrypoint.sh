@@ -72,6 +72,10 @@ if is_enabled api; then
   append_proxy_location "=" "/health" "${CENTAUR_NGINX_API_UPSTREAM:-http://api:8000}"
 fi
 
+if is_enabled apps; then
+  append_proxy_location "^~" "/apps/" "${CENTAUR_NGINX_API_UPSTREAM:-http://api:8000}"
+fi
+
 if is_enabled admin; then
   append_proxy_location "^~" "/admin/" "${CENTAUR_NGINX_ADMIN_UPSTREAM:-http://api:8000}"
 fi
@@ -104,6 +108,36 @@ EOF
 fi
 
 printf '}\n' >> "$CONF_PATH"
+
+# ── Wildcard subdomain server block for Centaur Apps ─────────────────────────
+# Routes {app-name}.{base-domain} → API /app-proxy/{app-name}/{path}
+# Only enabled when the "apps" service is active AND a base domain is set.
+APPS_DOMAIN="${CENTAUR_NGINX_APPS_DOMAIN:-}"
+if is_enabled apps && [ -n "$APPS_DOMAIN" ]; then
+  ESCAPED_DOMAIN=$(printf '%s' "$APPS_DOMAIN" | sed 's/\./\\./g')
+  API_UPSTREAM="${CENTAUR_NGINX_API_UPSTREAM:-http://api:8000}"
+  cat >> "$CONF_PATH" <<EOF
+
+server {
+    listen 80;
+    server_name ~^(?<appname>[a-z0-9][a-z0-9-]*)\.${ESCAPED_DOMAIN}\$;
+
+    location / {
+        rewrite ^(.*)\$ /app-proxy/\$appname\$1 break;
+        proxy_pass ${API_UPSTREAM};
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header X-Forwarded-Host \$host;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection \$connection_upgrade;
+        proxy_read_timeout 300s;
+    }
+}
+EOF
+fi
 
 nginx -t
 exec nginx -g 'daemon off;'

@@ -19,9 +19,21 @@ from api.api_keys import bootstrap_service_api_keys
 from api.config import settings
 from api.db import close_pool, create_pool
 from api.logging_config import configure_structlog
-from api.vm_metrics import HTTP_REQUESTS_IN_PROGRESS, observe_http_request, start_push_loop, stop_push_loop
-from api.routers import admin, attachments as attachments_mod, deprecated, health, internal
+from api.vm_metrics import (
+    HTTP_REQUESTS_IN_PROGRESS,
+    observe_http_request,
+    start_push_loop,
+    stop_push_loop,
+)
+from api.routers import (
+    admin,
+    attachments as attachments_mod,
+    deprecated,
+    health,
+    internal,
+)
 from api.routers import agent as agent_router_mod
+from api.routers import apps as apps_router_mod
 from api.routers import workflows as workflow_router_mod
 from api.tool_manager import ToolManager, load_plugins_config
 from api.agent import reconcile_tick
@@ -34,6 +46,7 @@ from api.workflow_engine import (
     stop_workflow_worker,
     sync_registered_workflow_schedules,
 )
+from api.apps import app_manager
 from api.warm_pool import start_replenish_loop, stop_replenish_loop
 
 configure_structlog()
@@ -102,7 +115,11 @@ async def _watch_workflows() -> None:
         log.info("workflow_files_changed", files=changed_files)
         try:
             result = discover_workflow_handlers()
-            log.info("workflows_auto_reloaded", workflows=list(result.keys()), count=len(result))
+            log.info(
+                "workflows_auto_reloaded",
+                workflows=list(result.keys()),
+                count=len(result),
+            )
         except Exception as e:
             log.error("workflow_auto_reload_failed", error=str(e))
 
@@ -122,12 +139,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.db_pool = await create_pool(settings.database_url)
     await bootstrap_service_api_keys(app.state.db_pool)
     await assert_runtime_credentials_ready()
-    execution_worker_enabled = os.getenv("EXECUTION_WORKER_ENABLED", "1").strip().lower() not in {
+    execution_worker_enabled = os.getenv(
+        "EXECUTION_WORKER_ENABLED", "1"
+    ).strip().lower() not in {
         "0",
         "false",
         "no",
     }
-    workflow_worker_enabled = os.getenv("WORKFLOW_WORKER_ENABLED", "1").strip().lower() not in {
+    workflow_worker_enabled = os.getenv(
+        "WORKFLOW_WORKER_ENABLED", "1"
+    ).strip().lower() not in {
         "0",
         "false",
         "no",
@@ -150,6 +171,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     reconcile_task = asyncio.create_task(_reconcile_loop())
     if warm_pool_enabled:
         await start_replenish_loop()
+    await app_manager.recover_apps(app.state.db_pool)
     try:
         yield
     finally:
@@ -249,11 +271,14 @@ async def instrument_requests(request, call_next):
             )
         structlog.contextvars.clear_contextvars()
 
+
 app.include_router(health.router)
 app.include_router(agent_router_mod.router)
 app.include_router(workflow_router_mod.router)
 app.include_router(attachments_mod.router)
 app.include_router(admin.router)
+app.include_router(apps_router_mod.router)
+app.include_router(apps_router_mod.proxy_router)
 app.include_router(internal.router)
 app.include_router(deprecated.router)
 
@@ -269,7 +294,9 @@ else:
     _plugins_config = _app_root / "tools.toml"
     _plugin_dirs = load_plugins_config(_plugins_config)
     _tools_dirs = (
-        _plugin_dirs if _plugin_dirs else [Path(os.environ.get("PLUGINS_DIR", _app_root / "tools"))]
+        _plugin_dirs
+        if _plugin_dirs
+        else [Path(os.environ.get("PLUGINS_DIR", _app_root / "tools"))]
     )
 
 tool_manager = ToolManager(_tools_dirs)

@@ -136,7 +136,7 @@ class AppManager:
             "Cmd": ["sleep", "infinity"],
             "Tty": False,
             "Env": env,
-            "WorkingDir": "/app",
+            "WorkingDir": "/home/agent",
             "Labels": {
                 "centaur-app": "true",
                 "centaur-app-name": name,
@@ -214,9 +214,10 @@ class AppManager:
         effective_start = start_cmd or "npm start"
         try:
             # Clone
+            app_dir = "/home/agent/app"
             exit_code, output = await self._exec(
                 container_id,
-                ["sh", "-c", f"gh repo clone {repo_url} /app -- --depth=1 2>&1"],
+                ["sh", "-c", f"gh repo clone {repo_url} {app_dir} -- --depth=1 2>&1"],
             )
             build_log_parts.append(f"=== clone ===\n{output.decode(errors='replace')}")
             if exit_code != 0:
@@ -225,7 +226,7 @@ class AppManager:
             # Build (user-provided or default npm install + build)
             exit_code, output = await self._exec(
                 container_id,
-                ["sh", "-c", f"cd /app && {effective_build} 2>&1"],
+                ["sh", "-c", f"cd {app_dir} && {effective_build} 2>&1"],
             )
             build_log_parts.append(f"=== build ===\n{output.decode(errors='replace')}")
             if exit_code != 0:
@@ -237,7 +238,7 @@ class AppManager:
                 [
                     "sh",
                     "-c",
-                    f"cd /app && PORT={port} nohup {effective_start} > /tmp/app.log 2>&1 &",
+                    f"cd {app_dir} && PORT={port} nohup {effective_start} > /tmp/app.log 2>&1 &",
                 ],
             )
             build_log_parts.append(f"=== start ===\n{output.decode(errors='replace')}")

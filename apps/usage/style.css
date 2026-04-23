@@ -51,7 +51,7 @@ nav {
 }
 
 .logo {
-  font-family: "Georgia", serif;
+  font-family: "Merriweather", Georgia, serif;
   font-size: 16px;
   font-weight: 600;
   color: var(--text);

@@ -240,6 +240,10 @@ function syncAllPills() {
 }
 
 function init() {
+  if (localStorage.getItem("theme") === "light") {
+    document.documentElement.classList.add("light");
+  }
+
   loadStateFromUrl();
 
   fetch("data.json")
@@ -324,10 +328,36 @@ function init() {
     render();
   });
 
+  const VIEWS = ["tools", "teams", "users"];
+
+  function switchView(view) {
+    state.view = view;
+    state.sort = DEFAULT_SORT[view] || "calls";
+    state.dir = "desc";
+    state.search = "";
+    $("#search").value = "";
+    syncFilterVisibility();
+    syncPills("view", state.view);
+    render();
+  }
+
   document.addEventListener("keydown", (e) => {
-    if (e.key === "/" && document.activeElement !== $("#search")) {
+    const typing = ["INPUT", "TEXTAREA", "SELECT"].includes(document.activeElement?.tagName);
+    if (e.key === "/" && !typing) {
       e.preventDefault();
       $("#search").focus();
+    }
+    if (e.key === "d" && !typing) {
+      document.documentElement.classList.toggle("light");
+      localStorage.setItem("theme", document.documentElement.classList.contains("light") ? "light" : "dark");
+    }
+    if (e.key === "[" && !typing) {
+      const idx = VIEWS.indexOf(state.view);
+      if (idx > 0) switchView(VIEWS[idx - 1]);
+    }
+    if (e.key === "]" && !typing) {
+      const idx = VIEWS.indexOf(state.view);
+      if (idx < VIEWS.length - 1) switchView(VIEWS[idx + 1]);
     }
   });
 

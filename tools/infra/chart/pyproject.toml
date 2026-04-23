@@ -1,0 +1,9 @@
+[project]
+name = "chart"
+description = "SVG chart generation for crypto market data — line charts, candlestick/OHLC charts, comparison charts, and bar charts. No external dependencies."
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = []
+
+[tool.ai-v2]
+module = "client.py"

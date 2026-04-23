@@ -68,16 +68,13 @@ const SKILL_COLS = [
 
 const APP_COLS = [
   { key: "rank",          label: "#",         num: true,  noSort: true, w: "3.5%" },
-  { key: "app",           label: "App",       num: false, w: "14%",     cls: "tool-name", hasAppLink: true, hasAppEmoji: true },
-  { key: "status",        label: "Status",    num: false, w: "7%",      cls: "col-status" },
-  { key: "views",         label: "Views",     num: true,  w: "7%" },
-  { key: "requests",      label: "Requests",  num: true,  w: "8%" },
-  { key: "visitors",      label: "Visitors",  num: true,  w: "7%" },
-  { key: "errors",        label: "Errors",    num: true,  w: "6%" },
-  { key: "error_rate",    label: "Err%",      num: true,  w: "5%",      cls: "col-cpt" },
-  { key: "path1",         label: "#1 Path",   num: false, w: "16%", noSort: true, cls: "method" },
-  { key: "path2",         label: "#2 Path",   num: false, w: "14%", noSort: true, cls: "method col-method2" },
-  { key: "path3",         label: "#3 Path",   num: false, w: "12%", noSort: true, cls: "method col-method3" },
+  { key: "app",           label: "App",       num: false, w: "18%",     cls: "tool-name", hasAppLink: true, hasAppEmoji: true },
+  { key: "status",        label: "Status",    num: false, w: "10%",     cls: "col-status" },
+  { key: "views",         label: "Views",     num: true,  w: "12%" },
+  { key: "requests",      label: "Requests",  num: true,  w: "12%" },
+  { key: "visitors",      label: "Visitors",  num: true,  w: "12%" },
+  { key: "errors",        label: "Errors",    num: true,  w: "10%" },
+  { key: "error_rate",    label: "Err%",      num: true,  w: "10%",     cls: "col-cpt" },
 ];
 
 const DEFAULT_SORT = { tools: "threads", skills: "threads", users: "threads", teams: "threads_per_member", apps: "views" };
@@ -118,7 +115,7 @@ function getRows() {
       if (state.view === "tools") fields = [r.tool, r.method1, r.method2, r.method3];
       else if (state.view === "skills") fields = [r.skill, r.user1, r.user2, r.user3];
       else if (state.view === "teams") fields = [r.team, r.member_list];
-      else if (state.view === "apps") fields = [r.app, r.path1, r.path2, r.path3];
+      else if (state.view === "apps") fields = [r.app, r.status];
       else fields = [r.name, r.handle, r.team, r.tool1, r.tool2, r.tool3];
       return fields.some((f) => f && f.toLowerCase().includes(q));
     });

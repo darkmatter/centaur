@@ -400,160 +400,152 @@ Answer any question about a Member of Congress — their staff, donors, voting r
 
 ### 2c. Hill Staff Map
 
-Maintain a standing map of current staff across the Senate Banking Committee and House Financial Services Committee (HFSC). The map is built once and stored in a Google Sheet — queries always read from that sheet, not from LegiStorm directly. LegiStorm is only called during the initial build or the weekly refresh.
+Maintain standing intelligence on current staff across the Senate Banking Committee and House Financial Services Committee (HFSC). This is part of the Gigabrain's persistent context — not a one-off report. Once built, the agent draws on it to answer any question about these people: who covers crypto for a given member, who's rising, who would be a strong hire for a portfolio company, who's the right door for a specific issue. The map is built once, stored in a Google Sheet as a memory layer, and refreshed weekly in the background.
 
-**LegiStorm office IDs (hardcoded — do not re-discover):**
+**LegiStorm office IDs (hardcoded):**
 - Senate Banking, Housing and Urban Affairs Committee: `office_id = 676`
 - House Financial Services Committee: `office_id = 1200`
 
-**Stored sheet name:** `Hill Staff Map` (created automatically on first build)
+**Stored sheet name:** `Hill Staff Map`
 
 ---
 
 **Trigger Phrases:**
-- "Hill staff map" / "Banking Committee staff" / "HFSC bench"
-- "Who do we know on Senate Banking?" / "Who do we know on HFSC?"
-- "Who should we be meeting on Senate Banking?" / "on HFSC?"
-- "Which staffers cover [issue] on Senate Banking / HFSC?"
-- "Talent view of Banking Committee staff"
-- "Any new hires on Senate Banking?" / "on HFSC?"
-- "Policy view / briefing view of Senate Banking / HFSC staff"
-- "Rebuild the Hill staff map" / "Refresh the Hill staff map"
+- "Who's the lead staffer for crypto on Senate Banking?"
+- "Who covers fintech / financial regulation for [member]?"
+- "Who on HFSC would be a strong hire for a portfolio company?"
+- "Who's up and coming on Senate Banking?"
+- "Hill staff map" / "HFSC bench" / "Banking Committee staff"
+- "Who's doing what on Senate Banking / HFSC?"
+- "Build the Hill Staff Map" / "Refresh the Hill Staff Map"
+- Any question about a specific staffer on Senate Banking or HFSC
 
 ---
 
-#### Build / Refresh the Map
+**What this map is for**
 
-Run this when first setting up or when explicitly asked to refresh. Do not run this on every query — the sheet persists between sessions.
+Three connected uses — answered from the same knowledge base, no mode-switching:
 
-**Step B1. Check if the sheet already exists:**
+1. **Issue mapping** — who is the lead staffer on crypto (and eventually AI and defense tech) for each member and on the committee staff itself. When someone asks "who's the right door on Senate Banking for stablecoin legislation," this is what the agent draws on.
+
+2. **Talent intelligence** — who is up-and-coming (strong trajectory, committee exposure, early career), and who is experienced enough to be a strong hire for a portfolio company Head of Policy or similar role. Trajectory matters more than current title — titles are inconsistent across offices.
+
+3. **Landscape awareness** — who's doing what, who's moving, who just joined, who has depth on financial regulation vs. crypto vs. broader economic policy.
+
+These are not separate views. They are different questions answered from the same stored context.
+
+---
+
+**Data to capture per staffer**
+
+| Field | Source | Notes |
+|-------|--------|-------|
+| Name | `staff.preferred_first_name` + `preferred_last_name` | |
+| Office / member | `positions[].office` or member name | Committee staff vs. personal office |
+| Committee | Senate Banking or HFSC | |
+| Side | `bio_details.party_name` + `maj_min` | Republican/Democrat, majority/minority |
+| Current title | `positions[is_current=true].position_title` | Metadata only — not used for ranking |
+| Hill years | Earliest `positions[].start_date` → today | Primary ranking signal |
+| Committee staff flag | Whether current position is office_id 676 or 1200 | Committee staff ranked above personal office |
+| Issue coverage | Inferred from title, committee, web search if needed | Crypto / fintech / financial regulation — flag as primary if apparent |
+| Trajectory signal | Junior + committee exposure = up-and-coming; 7+ years + policy depth = senior/hireable | Computed, not stored as a note |
+
+**Do not store evaluative notes.** Issue coverage and trajectory are structured fields, not written assessments.
+
+---
+
+#### Build the Map (run once, then weekly)
+
+**Step B1. Check for existing sheet:**
 ```bash
 call gsuite drive_search '{"query":"Hill Staff Map","max_results":5}'
 ```
-If a sheet named "Hill Staff Map" exists, note its `spreadsheet_id`. If not, create it:
+If found, note the `spreadsheet_id`. If not, create it:
 ```bash
-call gsuite sheets_create '{"title":"Hill Staff Map","content":[["name","office","member_or_committee","committee","side","title","hill_years","earliest_start","staff_id","member_id","known_to_paradigm","last_touchpoint","notes"]]}'
+call gsuite sheets_create '{"title":"Hill Staff Map","content":[["name","office","member","committee","side","party","title","hill_years","earliest_start","committee_staff","crypto_coverage","staff_id"]]}'
 ```
 
-**Step B2. Pull committee professional staff:**
+**Step B2. Pull committee professional staff directly:**
 ```bash
 call legistorm get_staff '{"updated_from":"2025-01-01","updated_to":"2026-12-31","office_id":676,"limit":100}'
 call legistorm get_staff '{"updated_from":"2025-01-01","updated_to":"2026-12-31","office_id":1200,"limit":100}'
 ```
-For each record, extract: `staff.preferred_first_name` + `staff.preferred_last_name`, `positions[is_current=true].position_title`, `staff.bio_details.party_name`, `staff.bio_details.maj_min`, earliest `positions[].start_date` (for Hill years). Mark `member_or_committee = "committee"`.
+These are the professional committee staff — the people who actually draft legislation. Mark `committee_staff = true`.
 
-**Step B3. Pull current committee membership pages:**
+**Step B3. Get current committee membership:**
 ```bash
 read_web_page https://www.banking.senate.gov/about/members
 read_web_page https://financialservices.house.gov/about/members.htm
 ```
-Extract the list of member names and states.
 
 **Step B4. Resolve members to LegiStorm IDs:**
 ```bash
 call legistorm get_members '{"updated_from":"2025-01-01","updated_to":"2026-12-31","limit":100}'
 ```
-Match each committee member by name and state to get their `member_id`.
+Match by name and state.
 
 **Step B5. Pull personal office policy staff for each committee member:**
 ```bash
-# Repeat for each member_id
 call legistorm get_staff '{"updated_from":"2025-01-01","updated_to":"2026-12-31","member_id":[member_id],"limit":50}'
 ```
-Filter to policy-relevant titles only: `Legislative Assistant`, `Senior Legislative Assistant`, `Legislative Correspondent`, `Legislative Director`, `Policy Advisor`, `Counsel`, `Professional Staff Member`, `Staff Director`. Skip schedulers, communications, and casework staff. Mark `member_or_committee = "[member name]"`.
+Filter to policy-relevant titles: `Legislative Assistant`, `Senior Legislative Assistant`, `Legislative Correspondent`, `Legislative Director`, `Policy Advisor`, `Counsel`, `Professional Staff Member`, `Staff Director`. Skip schedulers, press, and casework staff. Mark `committee_staff = false`.
 
-**Step B6. Write the full roster to the sheet:**
+**Step B6. Flag crypto/fintech coverage.**
+For committee staff, check `positions[].position_title` and the committee's known issue jurisdictions. For personal office staff, check title and — where not obvious — run a targeted web search:
 ```bash
-call gsuite sheets_update '{"spreadsheet_id":"[sheet_id]","range_notation":"A2:M[N]","values":[[...rows...]]}'
+call websearch search '{"query":"[member name] legislative assistant crypto fintech financial services"}'
 ```
-One row per staffer. Compute `hill_years` as years from earliest `positions[].start_date` to today.
+Mark `crypto_coverage = true` where apparent.
 
-**Step B7. Share the sheet** with the requesting user (once, on creation):
+**Step B7. Write to the sheet:**
+```bash
+call gsuite sheets_update '{"spreadsheet_id":"[sheet_id]","range_notation":"A2:L[N]","values":[[...rows...]]}'
+```
+
+**Step B8. Share with requesting user (first build only):**
 ```bash
 call gsuite drive_share '{"file_id":"[sheet_id]","email":"[requester_email]","role":"writer","send_notification":false}'
 ```
 
 ---
 
-#### Query the Map
+#### Answer Questions from the Map
 
-Run this on every query. Reads from the stored sheet — no LegiStorm calls.
+When any question triggers this section, read the stored sheet first — do not re-pull from LegiStorm:
 
-**Step Q1. Read the stored roster:**
 ```bash
 call gsuite drive_search '{"query":"Hill Staff Map","max_results":5}'
-call gsuite sheets_read '{"spreadsheet_id":"[sheet_id]","range_notation":"A:M"}'
+call gsuite sheets_read '{"spreadsheet_id":"[sheet_id]","range_notation":"A:L"}'
 ```
 
-**Step Q2. Join against Gigabrain touchpoints and notes** to populate `known_to_paradigm` and `last_touchpoint` for any rows not yet flagged:
-```bash
-call slack search_messages '{"query":"in:#gigabrain-feed [staffer_name]"}'
-call slack search_messages '{"query":"in:#gigabrain-feed #touchpoint [office_name]"}'
-call paradigmdb notes_search '{"query":"[staffer_name]"}'
-call gsuite sheets_read '{"spreadsheet_id":"[touchpoint_sheet_id]","range_notation":"A:C"}'
-```
+Then join against the broader Gigabrain context as needed — `#gigabrain-feed`, touchpoint log, paradigmdb — the same way any other Gigabrain workflow does. Use the combined context to answer the question. Do not just dump the table. Answer like someone who knows these people.
 
-**Step Q3. Render the requested view** (default: Policy View — see formats below).
+**Issue questions** ("who covers crypto for Lummis?"): filter by member, flag `crypto_coverage = true`, return name + title + context.
 
-**Step Q4. Relationship prompt.** Append to the response for any staffers with `known_to_paradigm = No`:
-> "I don't have a relationship record for these people — do you know any of them?"
+**Talent questions** ("who would be strong for a Head of Policy hire?"): sort by `hill_years` descending, filter `crypto_coverage = true`, surface people with 5+ years and committee exposure. Up-and-coming means 2–5 years, committee staff flag, or strong trajectory visible from career history.
 
-If the user replies inline, log as a retroactive touchpoint via the `#touchpoint` capture pattern from **1a** and update the `known_to_paradigm` field in the sheet.
-
----
-
-**Ranking Logic**
-
-Apply to all views — not title, since titles are inconsistent across offices:
-1. **Committee role depth** — `member_or_committee = "committee"` rows first
-2. **Total years of Hill experience** — `hill_years` descending within each tier
-
-All title variants are descriptive metadata only. Record as-is; do not use for ranking.
-
----
-
-**Three Views — Same Underlying Data**
-
-**Policy View** — outreach and issue tracking (default)
-
-| Name | Office / Member | Title (metadata) | Cmt Staff? | Hill Yrs | Side | Known to Paradigm | Last Touchpoint |
-|------|----------------|-----------------|------------|----------|------|-------------------|-----------------|
-
-Sort: committee staff first, then Hill years descending.
-
-**Talent View** — portfolio company hiring
-
-| Name | Current Office | Title (metadata) | Hill Yrs | Crypto/Fintech Coverage | Known to Paradigm |
-|------|---------------|-----------------|----------|------------------------|-------------------|
-
-Notes must be positive, observational, concrete, and professional — limited to what you would say directly to the person. Candidate filtering happens through structured data, not written notes.
-
-**Briefing View** — quick pre-meeting reference
-
-| Name | Office | Committee | Side | Title (metadata) | Hill Yrs | Known |
-|------|--------|-----------|------|-----------------|----------|-------|
+**Landscape questions** ("who's doing what on Senate Banking?"): return the full roster sorted by `committee_staff` first, then `hill_years` descending, with issue coverage noted.
 
 ---
 
 **Weekly Refresh**
 
-Silently re-pull from LegiStorm using the same Build steps above. Diff the new roster against the stored sheet:
+Silently re-run the build steps in the background. No notification unless:
 
-- **New staffer** (name not in current sheet): update the sheet, then post:
-  > "New staffer added to your bench — do you know them?" [name, office, title, committee side]
-- **Departed staffer** (name no longer in LegiStorm pull): mark as inactive in the sheet, then post a brief departure ping.
+- **New staffer** enters the universe: post to the policy Slack channel:
+  > "New staffer added to your bench — do you know them?" [name, office, committee side]
+- **Staffer departs**: brief ping with name and office.
 
 Do not ping for title changes, intra-office transfers, or data corrections.
 
 ```bash
-# Weekly refresh uses same build pattern with a narrower date window
 call legistorm get_staff '{"updated_from":"[last_refresh_date]","updated_to":"[today]","office_id":676,"limit":100}'
 call legistorm get_staff '{"updated_from":"[last_refresh_date]","updated_to":"[today]","office_id":1200,"limit":100}'
 ```
 
-**Notes Policy (scoped to this section)**
+**Notes policy (scoped to this section)**
 
-Notes must be positive, observational, concrete, and professional — limited to things you would say directly to the person. Candidate filtering happens through structured data and ranking logic, not written notes.
+Do not write evaluative or comparative assessments about individual staffers. Issue coverage and trajectory are structured fields. Notes, if any, must be positive, observational, concrete, and professional — limited to what you would say directly to the person.
 
 ### 3. Bill Tracking & Analysis
 

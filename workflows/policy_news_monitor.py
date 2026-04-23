@@ -9,6 +9,8 @@ WORKFLOW_NAME = "policy_news_monitor"
 
 SLACK_CHANNEL = "C0ASR4NFLPR"
 LOOKBACK_MINUTES = 20  # slightly wider than 15 to avoid gaps at cycle boundaries
+MAX_ARTICLES_PER_CYCLE = 12
+ANALYSIS_TIMEOUT = timedelta(minutes=5)
 
 RSS_FEEDS = [
     {"name": "Politico - Congress", "url": "https://rss.politico.com/congress.xml"},
@@ -77,11 +79,15 @@ Everything else is Standard.
 AGENT_PROMPT_TEMPLATE = """
 {brief}
 
-Here are {n} articles published in the last {lookback} minutes across Paradigm's policy news feeds:
+Here are {n} recent candidate articles published in the last {lookback} minutes across Paradigm's policy news feeds:
 
 {articles}
 
-For each article that passes the editorial filter above:
+Review the candidate articles and keep only the ones that genuinely pass the editorial filter above.
+Use the policy-gigabrain skill selectively for the stories you are actually considering including.
+Do not spend time enriching stories you plan to reject.
+
+For each story you keep:
 
 1. Query the policy-gigabrain skill for any relevant context on the story's topic, bill, or actors
    (prior Hill intel, bill status, agency positions, team meeting notes).
@@ -89,7 +95,7 @@ For each article that passes the editorial filter above:
    legislative agenda. Ground it only in what the article explicitly states plus any context
    returned by the gigabrain. Do not infer beyond those two sources. If the policy significance
    is genuinely unclear, write "Significance unclear — worth monitoring."
-3. Post the story to Slack channel {channel} in exactly this format:
+3. Produce a Slack-ready message in exactly this format:
 
 [Topic][Urgency]
 Headline
@@ -98,7 +104,19 @@ Why it matters: <your line>
 Reason for inclusion: <specific quote, vote, or action from the article>
 <url>
 
-If no articles pass the filter, post nothing.
+Return JSON only.
+
+The JSON shape must be:
+{{
+  "messages": [
+    {{
+      "url": "https://...",
+      "message": "[Topic][Urgency]\nHeadline\nSource | Published\nWhy it matters: ...\nReason for inclusion: ...\nhttps://..."
+    }}
+  ]
+}}
+
+If no articles pass the filter, return {"messages": []}.
 """
 
 
@@ -131,11 +149,43 @@ def fetch_recent_articles() -> list[dict]:
                     "summary": getattr(entry, "summary", "")[:500].strip(),
                     "url": url,
                     "published": str(published) if published else "unknown",
+                    "published_at": published.isoformat() if published else "",
                 })
         except Exception:
             pass
 
+    articles.sort(key=lambda article: article.get("published_at") or "", reverse=True)
     return articles
+
+
+def extract_messages(result: dict | None) -> list[str]:
+    if not isinstance(result, dict):
+        return []
+
+    result_text = str(result.get("result_text") or "").strip()
+    if not result_text:
+        return []
+
+    try:
+        payload = json.loads(result_text)
+    except json.JSONDecodeError:
+        return [result_text]
+
+    messages = payload.get("messages")
+    if not isinstance(messages, list):
+        return []
+
+    extracted: list[str] = []
+    seen_messages: set[str] = set()
+    for item in messages:
+        if not isinstance(item, dict):
+            continue
+        message = str(item.get("message") or "").strip()
+        if not message or message in seen_messages:
+            continue
+        seen_messages.add(message)
+        extracted.append(message)
+    return extracted
 
 
 @dataclass
@@ -149,14 +199,25 @@ async def handler(inp: Input, ctx: WorkflowContext) -> dict:
         articles = await ctx.step(f"fetch_{run}", fetch_recent_articles)
 
         if articles:
+            candidate_articles = articles[:MAX_ARTICLES_PER_CYCLE]
             prompt = AGENT_PROMPT_TEMPLATE.format(
                 brief=EDITORIAL_BRIEF,
-                n=len(articles),
+                n=len(candidate_articles),
                 lookback=LOOKBACK_MINUTES,
-                articles=json.dumps(articles, indent=2),
+                articles=json.dumps(candidate_articles, indent=2),
                 channel=SLACK_CHANNEL,
             )
-            await ctx.run_agent(f"analyze_{run}", text=prompt)
+            try:
+                result = await ctx.run_agent(
+                    f"analyze_{run}",
+                    text=prompt,
+                    timeout=ANALYSIS_TIMEOUT,
+                )
+            except Exception:
+                result = {}
+
+            for message in extract_messages(result):
+                await ctx.post_to_slack(SLACK_CHANNEL, message)
 
         await ctx.sleep(f"wait_{run}", timedelta(minutes=15))
         run += 1

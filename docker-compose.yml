@@ -138,6 +138,8 @@ services:
       AGENT_NETWORK: centaur_agent_net
       AGENT_EGRESS_NETWORK: centaur_agent_egress
       FIREWALL_CERTS_VOLUME: centaur_firewall-certs
+      EXECUTION_WORKER_CONCURRENCY: "16"
+      WORKFLOW_WORKER_CONCURRENCY: "8"
       DOCKER_HOST: tcp://docker-socket-proxy:2375
       HTTPS_PROXY: http://firewall:8080
       BROWSER_USE_PROFILE_ID: ${BROWSER_USE_PROFILE_ID:-}

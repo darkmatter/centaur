@@ -6,7 +6,7 @@ PORT = int(os.environ.get("PORT", 3000))
 PREFIX = "/apps/usage"
 API_URL = os.environ.get("CENTAUR_API_URL", "http://api:8000")
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-VIEWS = {"tools", "skills", "teams", "users", "apps", ""}
+VIEWS = {"tools", "skills", "teams", "users", "workflows", "apps", ""}
 
 class Handler(http.server.SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):

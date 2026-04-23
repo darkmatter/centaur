@@ -1,7 +1,7 @@
 const $ = (sel) => document.querySelector(sel);
 const $$ = (sel) => document.querySelectorAll(sel);
 
-let DATA = { tools: [], users: [], teams: [], skills: [], apps: [] };
+let DATA = { tools: [], users: [], teams: [], skills: [], apps: [], workflows: [] };
 let state = {
   view: "tools",
   sort: "threads",
@@ -66,6 +66,18 @@ const SKILL_COLS = [
   { key: "last_seen",  label: "Last",   num: false, w: "7%",  cls: "col-last" },
 ];
 
+const WORKFLOW_COLS = [
+  { key: "rank",         label: "#",          num: true,  noSort: true, w: "3.5%" },
+  { key: "workflow",     label: "Workflow",   num: false, w: "18%",     cls: "tool-name", hasWorkflowEmoji: true },
+  { key: "total",        label: "Total",      num: true,  w: "8%" },
+  { key: "completed",    label: "Completed",  num: true,  w: "9%" },
+  { key: "failed",       label: "Failed",     num: true,  w: "8%" },
+  { key: "success_rate", label: "Success%",   num: true,  w: "8%" },
+  { key: "avg_duration_s", label: "Avg (s)",  num: true,  w: "8%" },
+  { key: "first_seen",   label: "First",      num: false, w: "9%",  cls: "col-first" },
+  { key: "last_seen",    label: "Last",        num: false, w: "9%",  cls: "col-last" },
+];
+
 const APP_COLS = [
   { key: "rank",          label: "#",         num: true,  noSort: true, w: "3.5%" },
   { key: "app",           label: "App",       num: false, w: "18%",     cls: "tool-name", hasAppLink: true, hasAppEmoji: true },
@@ -77,7 +89,7 @@ const APP_COLS = [
   { key: "error_rate",    label: "Err%",      num: true,  w: "10%",     cls: "col-cpt" },
 ];
 
-const DEFAULT_SORT = { tools: "threads", skills: "threads", users: "threads", teams: "threads_per_member", apps: "views" };
+const DEFAULT_SORT = { tools: "threads", skills: "threads", users: "threads", teams: "threads_per_member", workflows: "total", apps: "views" };
 
 function fmt(n) {
   if (n == null) return "\u2014";
@@ -94,6 +106,7 @@ function getCols() {
   if (state.view === "tools") return TOOL_COLS;
   if (state.view === "skills") return SKILL_COLS;
   if (state.view === "teams") return TEAM_COLS;
+  if (state.view === "workflows") return WORKFLOW_COLS;
   if (state.view === "apps") return APP_COLS;
   return USER_COLS;
 }
@@ -103,6 +116,7 @@ function getRows() {
   if (state.view === "tools") src = DATA.tools;
   else if (state.view === "skills") src = DATA.skills;
   else if (state.view === "teams") src = DATA.teams;
+  else if (state.view === "workflows") src = DATA.workflows;
   else if (state.view === "apps") src = DATA.apps;
   else src = DATA.users;
 
@@ -115,6 +129,7 @@ function getRows() {
       if (state.view === "tools") fields = [r.tool, r.method1, r.method2, r.method3];
       else if (state.view === "skills") fields = [r.skill, r.user1, r.user2, r.user3];
       else if (state.view === "teams") fields = [r.team, r.member_list];
+      else if (state.view === "workflows") fields = [r.workflow];
       else if (state.view === "apps") fields = [r.app, r.status];
       else fields = [r.name, r.handle, r.team, r.tool1, r.tool2, r.tool3];
       return fields.some((f) => f && f.toLowerCase().includes(q));
@@ -188,6 +203,7 @@ function renderBody() {
 
   const html = rows.map((r, i) => {
     const tds = cols.map((c) => {
+      if (c.hasWorkflowEmoji) return `<td class="tool-name"><span class="tool-identity"><span class="team-emoji">${r.emoji || ""}</span>${escapeHtml(r.workflow)}</span></td>`;
       if (c.hasAppLink) return `<td class="tool-name"><span class="tool-identity"><span class="team-emoji">${r.emoji || ""}</span><a href="https://svc-ai.dayno.xyz/apps/${escapeHtml(r.app)}/" target="_blank" class="app-link">${escapeHtml(r.app)}</a></span></td>`;
       if (c.hasSkillEmoji) return `<td class="tool-name"><span class="tool-identity"><span class="team-emoji">${r.emoji || ""}</span>${escapeHtml(r.skill)}</span></td>`;
       if (c.hasIcon && state.view === "tools") return renderToolCell(r);
@@ -222,7 +238,7 @@ function render() {
 }
 
 const BASE_PATH = "/apps/usage";
-const VIEWS = ["tools", "skills", "teams", "users", "apps"];
+const VIEWS = ["tools", "skills", "teams", "users", "workflows", "apps"];
 
 function viewPath(view) {
   return `${BASE_PATH}/${view}`;

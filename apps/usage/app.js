@@ -183,10 +183,16 @@ function render() {
   syncUrl();
 }
 
-function syncUrl() {
+const BASE_PATH = "/apps/usage";
+const VIEWS = ["tools", "teams", "users"];
+
+function viewPath(view) {
+  return `${BASE_PATH}/${view}`;
+}
+
+function syncUrl(push) {
   const p = new URLSearchParams();
-  p.set("view", state.view);
-  if (state.sort) p.set("sort", state.sort);
+  if (state.sort && state.sort !== DEFAULT_SORT[state.view]) p.set("sort", state.sort);
   if (state.dir !== "desc") p.set("dir", state.dir);
   if (state.search) p.set("q", state.search);
   if (state.view === "tools") {
@@ -197,22 +203,33 @@ function syncUrl() {
     if (state.userMinThreads > 0) p.set("minThreads", state.userMinThreads);
   }
   const qs = p.toString();
-  const url = location.pathname + (qs ? `?${qs}` : "");
-  history.replaceState(null, "", url);
+  const url = viewPath(state.view) + (qs ? `?${qs}` : "");
+  if (push) {
+    history.pushState(null, "", url);
+  } else {
+    history.replaceState(null, "", url);
+  }
 }
 
 function loadStateFromUrl() {
+  const path = location.pathname.replace(/\/$/, "");
+  const segment = path.split("/").pop();
+  if (VIEWS.includes(segment)) {
+    state.view = segment;
+  }
   const p = new URLSearchParams(location.search);
-  if (p.has("view")) state.view = p.get("view");
   if (p.has("sort")) state.sort = p.get("sort");
+  else state.sort = DEFAULT_SORT[state.view] || "calls";
   if (p.has("dir")) state.dir = p.get("dir");
+  else state.dir = "desc";
   if (p.has("q")) state.search = p.get("q");
+  else state.search = "";
   if (state.view === "tools") {
-    if (p.has("minCalls")) state.minCalls = Number(p.get("minCalls"));
-    if (p.has("minUsers")) state.minUsers = Number(p.get("minUsers"));
+    state.minCalls = p.has("minCalls") ? Number(p.get("minCalls")) : 0;
+    state.minUsers = p.has("minUsers") ? Number(p.get("minUsers")) : 0;
   } else if (state.view === "users") {
-    if (p.has("minCalls")) state.userMinCalls = Number(p.get("minCalls"));
-    if (p.has("minThreads")) state.userMinThreads = Number(p.get("minThreads"));
+    state.userMinCalls = p.has("minCalls") ? Number(p.get("minCalls")) : 0;
+    state.userMinThreads = p.has("minThreads") ? Number(p.get("minThreads")) : 0;
   }
 }
 
@@ -246,6 +263,12 @@ function init() {
 
   loadStateFromUrl();
 
+  // Redirect bare path to /tools
+  const cleanPath = location.pathname.replace(/\/$/, "");
+  if (cleanPath === BASE_PATH) {
+    history.replaceState(null, "", viewPath("tools"));
+  }
+
   fetch("data.json")
     .then((r) => r.json())
     .then((d) => {
@@ -262,14 +285,7 @@ function init() {
 
   $$('input[name="view"]').forEach((r) => {
     r.addEventListener("change", () => {
-      state.view = r.value;
-      state.sort = DEFAULT_SORT[r.value] || "calls";
-      state.dir = "desc";
-      state.search = "";
-      $("#search").value = "";
-      syncFilterVisibility();
-      syncPills("view", state.view);
-      render();
+      switchView(r.value);
     });
   });
 
@@ -328,8 +344,6 @@ function init() {
     render();
   });
 
-  const VIEWS = ["tools", "teams", "users"];
-
   function switchView(view) {
     state.view = view;
     state.sort = DEFAULT_SORT[view] || "calls";
@@ -338,7 +352,9 @@ function init() {
     $("#search").value = "";
     syncFilterVisibility();
     syncPills("view", state.view);
-    render();
+    renderHead();
+    renderBody();
+    syncUrl(true);
   }
 
   document.addEventListener("keydown", (e) => {
@@ -364,7 +380,8 @@ function init() {
   window.addEventListener("popstate", () => {
     loadStateFromUrl();
     syncAllPills();
-    render();
+    renderHead();
+    renderBody();
   });
 }
 

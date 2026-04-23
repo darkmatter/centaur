@@ -56,11 +56,16 @@ nav {
   font-weight: 600;
   color: var(--text);
   letter-spacing: -0.3px;
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
 }
 
-.subtitle {
-  font-size: 12px;
-  color: var(--text-muted);
+.logo-icon {
+  width: 24px;
+  height: 24px;
+  border-radius: 4px;
+  object-fit: contain;
 }
 
 .nav-right {

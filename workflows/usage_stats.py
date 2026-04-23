@@ -146,7 +146,6 @@ STATIC_EXTS = frozenset({
 
 CALL_RE = re.compile(r"call\s+([a-z][a-z0-9_-]*)\s+([a-z][a-z0-9_-]*)")
 CURL_RE = re.compile(r"/tools/([a-z][a-z0-9_-]+)/([a-z][a-z0-9_-]+)")
-DATA_WINDOW_DAYS = 90
 
 
 def _thread_to_slack_url(thread_key: str) -> str | None:
@@ -197,7 +196,7 @@ async def _extract_tools_and_users(
         "WHERE event_kind = 'amp_raw_event' "
         "  AND event_json->>'type' = 'assistant' "
         "  AND event_json::text LIKE '%shell_command%'"
-        "  AND created_at > NOW() - INTERVAL '%s days'" % DATA_WINDOW_DAYS
+        "  AND created_at > NOW() - INTERVAL '90 days'"
     )
 
     tool_stats: dict[str, dict] = {}
@@ -310,7 +309,7 @@ async def _extract_skills(pool, thread_users: dict[str, str]) -> list[dict]:
         "  AND elem->>'type' = 'tool_use' "
         "  AND elem->>'name' = 'skill' "
         "  AND elem->'input'->>'name' IS NOT NULL"
-        "  AND e.created_at > NOW() - INTERVAL '%s days'" % DATA_WINDOW_DAYS
+        "  AND e.created_at > NOW() - INTERVAL '90 days'"
     )
 
     skill_stats: dict[str, dict] = {}
@@ -405,7 +404,11 @@ async def _extract_apps(pool) -> list[dict]:
                     "limit": "10000",
                 },
             )
-            for line in resp.text.strip().split("\n"):
+            resp.raise_for_status()
+            lines = resp.text.strip().split("\n")
+            if len(lines) >= 10000:
+                log.warning("VictoriaLogs returned 10000 rows (limit hit), app stats may be undercounted")
+            for line in lines:
                 if not line.strip():
                     continue
                 try:

@@ -27,6 +27,7 @@ log = structlog.get_logger()
 POOL_SIZE = int(os.getenv("WARM_POOL_SIZE", "5"))
 POOL_HARNESS = os.getenv("WARM_POOL_HARNESS", "amp")
 POOL_REPLENISH_INTERVAL = float(os.getenv("WARM_POOL_REPLENISH_INTERVAL", "5.0"))
+POOL_DOCKER_TIMEOUT = float(os.getenv("WARM_POOL_DOCKER_TIMEOUT", "30.0"))
 
 
 @dataclass
@@ -69,7 +70,10 @@ async def _spawn_warm_container() -> WarmContainer | None:
 
     placeholder_key = f"warm-{int(time.time() * 1000)}-{id(asyncio.current_task())}"
     try:
-        session = await backend.create(placeholder_key, POOL_HARNESS, engine, warm=True)
+        session = await asyncio.wait_for(
+            backend.create(placeholder_key, POOL_HARNESS, engine, warm=True),
+            timeout=POOL_DOCKER_TIMEOUT,
+        )
         warm = WarmContainer(
             sandbox_id=session.sandbox_id,
             harness=POOL_HARNESS,
@@ -90,7 +94,10 @@ async def replenish() -> int:
         alive = []
         for warm in _pool:
             try:
-                st = await backend.status_by_id(warm.sandbox_id)
+                st = await asyncio.wait_for(
+                    backend.status_by_id(warm.sandbox_id),
+                    timeout=POOL_DOCKER_TIMEOUT,
+                )
                 if st == "running" and (time.time() - warm.created_at) < 3600:
                     alive.append(warm)
                 else:
@@ -101,7 +108,10 @@ async def replenish() -> int:
                         age_s=round(time.time() - warm.created_at),
                     )
                     with contextlib.suppress(Exception):
-                        await backend.stop_by_id(warm.sandbox_id)
+                        await asyncio.wait_for(
+                            backend.stop_by_id(warm.sandbox_id),
+                            timeout=POOL_DOCKER_TIMEOUT,
+                        )
             except Exception:
                 log.info("warm_pool_evicted_error", sandbox=warm.sandbox_id[:12])
         if len(alive) != len(_pool):
@@ -264,11 +274,26 @@ async def claim_container(
 
     if warm is None:
         return None
-    st = await backend.status_by_id(warm.sandbox_id)
+    try:
+        st = await asyncio.wait_for(
+            backend.status_by_id(warm.sandbox_id),
+            timeout=POOL_DOCKER_TIMEOUT,
+        )
+    except (asyncio.TimeoutError, Exception):
+        log.warning("warm_container_dead_on_claim", sandbox=warm.sandbox_id[:12])
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(
+                backend.stop_by_id(warm.sandbox_id),
+                timeout=POOL_DOCKER_TIMEOUT,
+            )
+        return None
     if st != "running":
         log.warning("warm_container_dead_on_claim", sandbox=warm.sandbox_id[:12])
         with contextlib.suppress(Exception):
-            await backend.stop_by_id(warm.sandbox_id)
+            await asyncio.wait_for(
+                backend.stop_by_id(warm.sandbox_id),
+                timeout=POOL_DOCKER_TIMEOUT,
+            )
         return None
 
     try:
@@ -309,7 +334,10 @@ async def cleanup_pool() -> int:
     backend = get_backend()
     for warm in to_clean:
         with contextlib.suppress(Exception):
-            await backend.stop_by_id(warm.sandbox_id)
+            await asyncio.wait_for(
+                backend.stop_by_id(warm.sandbox_id),
+                timeout=POOL_DOCKER_TIMEOUT,
+            )
             cleaned += 1
     return cleaned
 
@@ -319,7 +347,10 @@ async def _recover_warm(assigned_sandbox_ids: set[str] | None = None) -> int:
     assigned = assigned_sandbox_ids or set()
     backend = get_backend()
     recovered = 0
-    sessions = await backend.recover_warm(POOL_HARNESS)
+    sessions = await asyncio.wait_for(
+        backend.recover_warm(POOL_HARNESS),
+        timeout=POOL_DOCKER_TIMEOUT * 2,
+    )
     async with _pool_lock:
         for session in sessions:
             if len(_pool) >= POOL_SIZE:

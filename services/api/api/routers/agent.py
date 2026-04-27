@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json as _json
+import os
 import re
 import uuid
 
@@ -40,6 +41,7 @@ from api.warm_pool import replenish as replenish_pool
 
 log = structlog.get_logger()
 
+FINAL_DELIVERY_MAX_ATTEMPTS = int(os.getenv("FINAL_DELIVERY_MAX_ATTEMPTS", "50"))
 
 router = APIRouter(
     prefix="/agent",
@@ -1093,28 +1095,42 @@ async def mark_final_failed(
     if body.consumer_id:
         owner_check = " AND lease_owner = $4"
         params.append(body.consumer_id)
+    max_param = f"${len(params) + 1}"
+    params.append(FINAL_DELIVERY_MAX_ATTEMPTS)
 
     row = await pool.fetchrow(
         (
-            "UPDATE agent_final_delivery_outbox SET state = 'pending', last_error = $3, "
+            "UPDATE agent_final_delivery_outbox SET "
+            f"state = CASE WHEN attempt_count >= {max_param}"
+            " THEN 'dead_letter' ELSE 'pending' END, "
+            "last_error = $3, "
             "next_attempt_at = NOW() + make_interval(secs => $2), "
             "lease_owner = NULL, lease_expires_at = NULL, updated_at = NOW() "
             "WHERE execution_id = $1"
         )
         + owner_check
-        + " RETURNING execution_id, thread_key",
+        + " RETURNING execution_id, thread_key, state, attempt_count",
         *params,
     )
     if not row:
         raise HTTPException(status_code=409, detail="delivery not claimable")
-    log.warning(
-        "final_delivery_failed",
-        execution_id=execution_id,
-        thread_key=row["thread_key"],
-        consumer_id=body.consumer_id,
-        retry_after_seconds=delay,
-        error=body.error,
-    )
+    if row["state"] == "dead_letter":
+        log.warning(
+            "final_delivery_dead_lettered",
+            execution_id=execution_id,
+            thread_key=row["thread_key"],
+            attempt_count=row["attempt_count"],
+            last_error=body.error,
+        )
+    else:
+        log.warning(
+            "final_delivery_failed",
+            execution_id=execution_id,
+            thread_key=row["thread_key"],
+            consumer_id=body.consumer_id,
+            retry_after_seconds=delay,
+            error=body.error,
+        )
     return {"ok": True, "execution_id": execution_id}
 
 

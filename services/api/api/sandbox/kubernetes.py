@@ -34,6 +34,8 @@ _READY_TIMEOUT_S = int(os.getenv("KUBERNETES_SANDBOX_READY_TIMEOUT_S", "60"))
 _ATTACH_LOG_TAIL_LINES = int(os.getenv("KUBERNETES_ATTACH_LOG_TAIL_LINES", "200"))
 _CONTAINER_NAME = "sandbox"
 _AGENT_UID = 1001
+_SANDBOX_OVERLAY_ROOT = "/home/agent/overlay"
+_SANDBOX_OVERLAY_DIR = f"{_SANDBOX_OVERLAY_ROOT}/org"
 
 
 def _get_rt(session: SandboxSession):
@@ -84,6 +86,21 @@ def _service_account_name() -> str | None:
 def _repos_pvc_name() -> str | None:
     value = (os.getenv("KUBERNETES_REPOS_PVC_NAME") or "").strip()
     return value or None
+
+
+def _overlay_image() -> str | None:
+    value = (os.getenv("CENTAUR_OVERLAY_IMAGE") or "").strip()
+    return value or None
+
+
+def _overlay_image_pull_policy() -> str:
+    value = (os.getenv("CENTAUR_OVERLAY_IMAGE_PULL_POLICY") or "").strip()
+    return value or _image_pull_policy()
+
+
+def _overlay_image_source_path() -> str:
+    value = (os.getenv("CENTAUR_OVERLAY_IMAGE_SOURCE_PATH") or "/overlay").strip()
+    return value or "/overlay"
 
 
 def _image_pull_secrets() -> list[dict[str, str]]:
@@ -348,6 +365,9 @@ class KubernetesExecutorBackend(SandboxBackend):
         pod_name = _resource_name("centaur-sandbox", thread_key)
         secret_name = _prompt_secret_name(pod_name)
         env = _container_env(thread_key, pod_name, resume_thread_id=resume_thread_id)
+        overlay_image = _overlay_image()
+        if overlay_image:
+            env.append(f"CENTAUR_OVERLAY_DIR={_SANDBOX_OVERLAY_DIR}")
         if persona:
             env.append(f"AGENT_PERSONA={persona}")
         if repo:
@@ -384,6 +404,53 @@ class KubernetesExecutorBackend(SandboxBackend):
                 "secret": {"secretName": secret_name},
             },
         ]
+        init_containers: list[dict[str, Any]] = []
+
+        if overlay_image:
+            volume_mounts.append(
+                {
+                    "name": "overlay-root",
+                    "mountPath": _SANDBOX_OVERLAY_ROOT,
+                    "readOnly": True,
+                }
+            )
+            volumes.append(
+                {
+                    "name": "overlay-root",
+                    "emptyDir": {},
+                }
+            )
+            init_containers.append(
+                {
+                    "name": "overlay-bootstrap",
+                    "image": overlay_image,
+                    "imagePullPolicy": _overlay_image_pull_policy(),
+                    "command": [
+                        "/bin/sh",
+                        "-ec",
+                        (
+                            f'src="{_overlay_image_source_path()}"\n'
+                            f'target="{_SANDBOX_OVERLAY_DIR}"\n'
+                            'mkdir -p "$target"\n'
+                            'cp -R "$src"/. "$target"/'
+                        ),
+                    ],
+                    "volumeMounts": [
+                        {
+                            "name": "overlay-root",
+                            "mountPath": _SANDBOX_OVERLAY_ROOT,
+                        }
+                    ],
+                    "securityContext": {
+                        "allowPrivilegeEscalation": False,
+                        "capabilities": {"drop": ["ALL"]},
+                        "runAsGroup": _AGENT_UID,
+                        "runAsNonRoot": True,
+                        "runAsUser": _AGENT_UID,
+                        "seccompProfile": {"type": "RuntimeDefault"},
+                    },
+                }
+            )
 
         repos_pvc = _repos_pvc_name()
         if repos_pvc:
@@ -418,6 +485,7 @@ class KubernetesExecutorBackend(SandboxBackend):
             "spec": {
                 "automountServiceAccountToken": False,
                 "restartPolicy": "Never",
+                "initContainers": init_containers,
                 "containers": [
                     {
                         "name": _CONTAINER_NAME,

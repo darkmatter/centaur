@@ -238,5 +238,8 @@ async def test_create_mounts_overlay_skills_and_prompt_when_present(
         if name.startswith("centaur-sandbox-")
     )
     binds = sandbox.config["HostConfig"]["Binds"]
+    env = dict(item.split("=", 1) for item in sandbox.config["Env"])
+    assert f"{overlay_root}:/home/agent/overlay/org:ro" in binds
     assert f"{overlay_skills_dir}:/home/agent/centaur-overlay-skills:ro" in binds
     assert f"{overlay_prompt}:/home/agent/AGENTS_OVERLAY.md:ro" in binds
+    assert env["CENTAUR_OVERLAY_DIR"] == "/home/agent/overlay/org"

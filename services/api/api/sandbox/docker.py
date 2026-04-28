@@ -68,6 +68,9 @@ def _overlay_host_dir() -> str | None:
     return os.path.abspath(os.path.expanduser(value))
 
 
+_SANDBOX_OVERLAY_DIR = "/home/agent/overlay/org"
+
+
 def _resolve_host_bind_path(container_path: Path) -> str | None:
     """Map a container-visible plugin path back to its host bind source."""
     roots: list[tuple[Path, Path]] = []
@@ -320,6 +323,8 @@ class DockerSandboxBackend(SandboxBackend):
         skills_host = os.path.join(repo_host, ".agents", "skills")
         binds.append(f"{skills_host}:/home/agent/centaur-skills:ro")
         if overlay_host:
+            binds.append(f"{overlay_host}:{_SANDBOX_OVERLAY_DIR}:ro")
+            env.append(f"CENTAUR_OVERLAY_DIR={_SANDBOX_OVERLAY_DIR}")
             overlay_skills_host = os.path.join(overlay_host, ".agents", "skills")
             if os.path.isdir(overlay_skills_host):
                 binds.append(f"{overlay_skills_host}:/home/agent/centaur-overlay-skills:ro")

@@ -52,12 +52,16 @@ mkdir -p "$HOME_DIR/uploads"
 BAKED_IN_CENTAUR_SKILLS="$HOME_DIR/.agents/skills"
 MOUNTED_CENTAUR_SKILLS="$HOME_DIR/centaur-skills"
 MOUNTED_ORG_SKILLS="$HOME_DIR/centaur-overlay-skills"
+OVERLAY_TREE_SKILLS=""
+if [ -n "${CENTAUR_OVERLAY_DIR:-}" ] && [ -d "${CENTAUR_OVERLAY_DIR}/.agents/skills" ]; then
+    OVERLAY_TREE_SKILLS="${CENTAUR_OVERLAY_DIR}/.agents/skills"
+fi
 CENTAUR_SKILLS=""
 if [ -d "$HOME_DIR/github" ]; then
     CENTAUR_SKILLS="$(find "$HOME_DIR/github" -path '*/centaur/.agents/skills' -type d -print -quit 2>/dev/null || true)"
 fi
 WS_SKILLS="$WORKSPACE_DIR/.agents/skills"
-for SKILLS_SRC in "$BAKED_IN_CENTAUR_SKILLS" "$MOUNTED_CENTAUR_SKILLS" "$CENTAUR_SKILLS" "$MOUNTED_ORG_SKILLS"; do
+for SKILLS_SRC in "$BAKED_IN_CENTAUR_SKILLS" "$MOUNTED_CENTAUR_SKILLS" "$CENTAUR_SKILLS" "$MOUNTED_ORG_SKILLS" "$OVERLAY_TREE_SKILLS"; do
     if [ -d "$SKILLS_SRC" ]; then
         mkdir -p "$WS_SKILLS"
         cp -r "$SKILLS_SRC"/. "$WS_SKILLS"/

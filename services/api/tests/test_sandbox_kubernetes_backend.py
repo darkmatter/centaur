@@ -188,6 +188,9 @@ async def test_create_builds_pod_and_prompt_secret(monkeypatch: pytest.MonkeyPat
     monkeypatch.setenv("KUBERNETES_NAMESPACE", "centaur-sandbox")
     monkeypatch.setenv("KUBERNETES_SANDBOX_RUNTIME_CLASS_NAME", "gvisor")
     monkeypatch.setenv("KUBERNETES_SANDBOX_SERVICE_ACCOUNT_NAME", "sandbox-runner")
+    monkeypatch.setenv("CENTAUR_OVERLAY_IMAGE", "ghcr.io/tempoxyz/centaur-tempo:latest")
+    monkeypatch.setenv("CENTAUR_OVERLAY_IMAGE_PULL_POLICY", "Always")
+    monkeypatch.setenv("CENTAUR_OVERLAY_IMAGE_SOURCE_PATH", "/overlay")
     monkeypatch.setattr(
         "api.sandbox.kubernetes._prompt_bundle",
         lambda persona: f"prompt:{persona}",
@@ -248,12 +251,47 @@ async def test_create_builds_pod_and_prompt_secret(monkeypatch: pytest.MonkeyPat
     assert env["CENTAUR_API_URL"] == "http://api.internal:8000"
     assert env["CENTAUR_API_KEY"] == "sandbox-token"
     assert env["AMP_API_KEY"] == "AMP_API_KEY"
+    assert env["CENTAUR_OVERLAY_DIR"] == "/home/agent/overlay/org"
     assert env["AGENT_PERSONA"] == "eng"
     assert env["AGENT_REPO"] == "paradigmxyz/centaur"
     assert pod_body["metadata"]["annotations"]["centaur.ai/thread-key"] == "slack:C123:123.456"
     assert any(volume["name"] == "repos" for volume in pod_body["spec"]["volumes"])
+    assert any(volume["name"] == "overlay-root" for volume in pod_body["spec"]["volumes"])
+    assert pod_body["spec"]["initContainers"] == [
+        {
+            "name": "overlay-bootstrap",
+            "image": "ghcr.io/tempoxyz/centaur-tempo:latest",
+            "imagePullPolicy": "Always",
+            "command": [
+                "/bin/sh",
+                "-ec",
+                'src="/overlay"\n'
+                'target="/home/agent/overlay/org"\n'
+                'mkdir -p "$target"\n'
+                'cp -R "$src"/. "$target"/',
+            ],
+            "volumeMounts": [
+                {
+                    "name": "overlay-root",
+                    "mountPath": "/home/agent/overlay",
+                }
+            ],
+            "securityContext": {
+                "allowPrivilegeEscalation": False,
+                "capabilities": {"drop": ["ALL"]},
+                "runAsGroup": 1001,
+                "runAsNonRoot": True,
+                "runAsUser": 1001,
+                "seccompProfile": {"type": "RuntimeDefault"},
+            },
+        }
+    ]
     assert any(
         mount["name"] == "repos" and mount["mountPath"] == "/home/agent/github"
+        for mount in container["volumeMounts"]
+    )
+    assert any(
+        mount["name"] == "overlay-root" and mount["mountPath"] == "/home/agent/overlay"
         for mount in container["volumeMounts"]
     )
 

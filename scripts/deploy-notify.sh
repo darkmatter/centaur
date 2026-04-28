@@ -17,6 +17,64 @@ JOB_STATUS="${5:-success}"
 ERROR_LOG="${6:-}"
 
 SLACK_CHANNEL="${SLACK_DEPLOY_CHANNEL:?Set SLACK_DEPLOY_CHANNEL env var}"
+CHANGED_FILES=$(git diff --name-only "${BEFORE}..${AFTER}" 2>/dev/null || true)
+
+redeploy_venue_scout_if_needed() {
+  if [ "${JOB_STATUS}" != "success" ]; then
+    return 0
+  fi
+
+  if ! printf '%s\n' "${CHANGED_FILES}" | grep -q '^apps/venue-scout/'; then
+    return 0
+  fi
+
+  echo "Redeploying venue-scout app from paradigmxyz/centaur/apps/venue-scout"
+
+  local payload status response
+  payload=$(jq -nc '{
+    name: "venue-scout",
+    repo_url: "https://github.com/paradigmxyz/centaur",
+    port: 3000,
+    build_cmd: "cd apps/venue-scout && npm install --no-package-lock && npm run build",
+    start_cmd: "cd apps/venue-scout && npm start",
+    created_by: "deploy-notify"
+  }')
+
+  status=$(docker exec centaur-api-1 sh -lc "curl -s -o /tmp/venue-scout-manage.json -w '%{http_code}' http://localhost:8000/apps/_manage/venue-scout")
+  if [ "${status}" = "200" ]; then
+    docker exec centaur-api-1 curl -sSf -X DELETE http://localhost:8000/apps/_manage/venue-scout > /dev/null
+  elif [ "${status}" != "404" ]; then
+    echo "Unexpected venue-scout lookup status: ${status}" >&2
+    docker exec centaur-api-1 cat /tmp/venue-scout-manage.json >&2 || true
+    exit 1
+  fi
+
+  printf '%s' "${payload}" | docker exec -i centaur-api-1 sh -lc \
+    "curl -sSf -X POST http://localhost:8000/apps -H 'Content-Type: application/json' --data @-" > /dev/null
+
+  for attempt in $(seq 1 60); do
+    response=$(docker exec centaur-api-1 curl -sSf http://localhost:8000/apps/_manage/venue-scout)
+    status=$(printf '%s' "${response}" | jq -r '.status // empty')
+    echo "venue-scout status attempt ${attempt}: ${status}"
+
+    if [ "${status}" = "running" ]; then
+      curl -fsSI https://svc-ai.dayno.xyz/apps/venue-scout > /dev/null
+      return 0
+    fi
+
+    if [ "${status}" = "failed" ]; then
+      printf '%s\n' "${response}" | jq . >&2
+      exit 1
+    fi
+
+    sleep 5
+  done
+
+  echo "Timed out waiting for venue-scout to reach running status" >&2
+  exit 1
+}
+
+redeploy_venue_scout_if_needed
 
 # Build commit list with links
 COMMIT_JSON=$(git log --no-merges --format='%H %s' "${BEFORE}..${AFTER}" 2>/dev/null | while read -r sha msg; do

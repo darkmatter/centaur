@@ -1,0 +1,1160 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Venue Scout</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg: #0a0a0a;
+      --surface: #111111;
+      --surface2: #1a1a1a;
+      --border: #2a2a2a;
+      --text: #f0f0f0;
+      --muted: #666;
+      --accent: #e8d5b0;
+      --accent2: #c4a882;
+      --danger: #e05252;
+      --radius: 10px;
+      --font: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+    }
+
+    html, body {
+      height: 100%;
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--font);
+      font-size: 15px;
+      line-height: 1.5;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    #app {
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 40px 20px;
+    }
+
+    /* ── API key gate ── */
+    #key-gate {
+      width: 100%;
+      max-width: 480px;
+      text-align: center;
+      padding: 0 16px;
+    }
+    #key-gate .wordmark {
+      font-size: 13px;
+      letter-spacing: .15em;
+      text-transform: uppercase;
+      color: var(--muted);
+      margin-bottom: 40px;
+    }
+    #key-gate h1 {
+      font-size: 28px;
+      font-weight: 300;
+      letter-spacing: -.02em;
+      margin-bottom: 8px;
+    }
+    #key-gate p {
+      color: var(--muted);
+      font-size: 14px;
+      margin-bottom: 32px;
+    }
+    .key-input-row {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+    @media (min-width: 480px) {
+      .key-input-row { flex-direction: row; }
+    }
+    .key-input-row input {
+      flex: 1;
+      padding: 12px 16px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      color: var(--text);
+      font-size: 14px;
+      font-family: monospace;
+      outline: none;
+      transition: border-color .2s;
+    }
+    .key-input-row input:focus { border-color: var(--accent2); }
+    .key-input-row input::placeholder { color: var(--muted); }
+
+    /* ── Buttons ── */
+    .btn {
+      padding: 12px 22px;
+      border-radius: var(--radius);
+      font-size: 14px;
+      font-family: var(--font);
+      font-weight: 500;
+      cursor: pointer;
+      border: none;
+      transition: opacity .15s, transform .1s;
+      white-space: nowrap;
+    }
+    .btn:active { transform: scale(.98); }
+    .btn-primary {
+      background: var(--accent);
+      color: #1a1612;
+    }
+    .btn-primary:hover { opacity: .92; }
+    .btn-primary:disabled { opacity: .4; cursor: not-allowed; }
+    .btn-ghost {
+      background: transparent;
+      color: var(--muted);
+      border: 1px solid var(--border);
+    }
+    .btn-ghost:hover { color: var(--text); border-color: #444; }
+
+    /* ── Intake form ── */
+    #intake {
+      width: 100%;
+      max-width: 600px;
+    }
+    .intake-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 48px;
+    }
+    .intake-header .wordmark {
+      font-size: 13px;
+      letter-spacing: .15em;
+      text-transform: uppercase;
+      color: var(--muted);
+    }
+    .progress-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .progress-label {
+      font-size: 13px;
+      color: var(--muted);
+      min-width: 40px;
+      text-align: right;
+    }
+    .progress-track {
+      width: 80px;
+      height: 2px;
+      background: var(--border);
+      border-radius: 2px;
+      overflow: hidden;
+    }
+    .progress-fill {
+      height: 100%;
+      background: var(--accent);
+      border-radius: 2px;
+      transition: width .4s ease;
+    }
+
+    /* ── Question card ── */
+    .q-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 40px;
+      transition: opacity .3s, transform .3s;
+    }
+    .q-card.leaving {
+      opacity: 0;
+      transform: translateX(-20px);
+    }
+    .q-label {
+      font-size: 12px;
+      letter-spacing: .12em;
+      text-transform: uppercase;
+      color: var(--muted);
+      margin-bottom: 12px;
+    }
+    .q-text {
+      font-size: 22px;
+      font-weight: 300;
+      letter-spacing: -.02em;
+      margin-bottom: 28px;
+      line-height: 1.3;
+    }
+
+    /* chips */
+    .chips {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-bottom: 12px;
+    }
+    .chip {
+      padding: 8px 16px;
+      border-radius: 100px;
+      font-size: 13px;
+      font-family: var(--font);
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      color: var(--muted);
+      cursor: pointer;
+      transition: all .15s;
+      user-select: none;
+    }
+    .chip:hover { border-color: #444; color: var(--text); }
+    .chip.selected {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: #1a1612;
+      font-weight: 500;
+    }
+
+    /* inputs */
+    .q-input, .q-textarea {
+      width: 100%;
+      padding: 14px 16px;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      color: var(--text);
+      font-size: 15px;
+      font-family: var(--font);
+      outline: none;
+      transition: border-color .2s;
+      resize: none;
+    }
+    .q-input:focus, .q-textarea:focus { border-color: var(--accent2); }
+    .q-input::placeholder, .q-textarea::placeholder { color: var(--muted); }
+
+    /* slider */
+    .slider-row {
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      margin-bottom: 8px;
+    }
+    .slider-val {
+      font-size: 28px;
+      font-weight: 300;
+      color: var(--accent);
+      min-width: 60px;
+      letter-spacing: -.02em;
+    }
+    input[type=range] {
+      flex: 1;
+      height: 4px;
+      appearance: none;
+      background: var(--border);
+      border-radius: 4px;
+      outline: none;
+      cursor: pointer;
+    }
+    input[type=range]::-webkit-slider-thumb {
+      appearance: none;
+      width: 20px;
+      height: 20px;
+      border-radius: 50%;
+      background: var(--accent);
+      cursor: pointer;
+      border: 2px solid var(--bg);
+      box-shadow: 0 0 0 2px var(--accent2);
+    }
+    .slider-hint { font-size: 13px; color: var(--muted); }
+
+    /* radio cards */
+    .radio-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+    }
+    .radio-card {
+      padding: 16px;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      cursor: pointer;
+      transition: all .15s;
+      user-select: none;
+    }
+    .radio-card:hover { border-color: #444; }
+    .radio-card.selected {
+      border-color: var(--accent);
+      background: rgba(232,213,176,.06);
+    }
+    .radio-card .rc-title {
+      font-size: 14px;
+      font-weight: 500;
+      margin-bottom: 2px;
+    }
+    .radio-card .rc-sub {
+      font-size: 12px;
+      color: var(--muted);
+    }
+    .radio-card.selected .rc-title { color: var(--accent); }
+
+    /* nav */
+    .q-nav {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-top: 28px;
+    }
+    .q-nav-right { display: flex; gap: 10px; align-items: center; }
+    .skip-link {
+      font-size: 13px;
+      color: var(--muted);
+      cursor: pointer;
+      text-decoration: underline;
+      text-underline-offset: 3px;
+      background: none;
+      border: none;
+      font-family: var(--font);
+    }
+    .skip-link:hover { color: var(--text); }
+
+    /* ── Loading ── */
+    #loading {
+      text-align: center;
+    }
+    #loading .wordmark {
+      font-size: 13px;
+      letter-spacing: .15em;
+      text-transform: uppercase;
+      color: var(--muted);
+      margin-bottom: 48px;
+    }
+    .spinner {
+      width: 40px;
+      height: 40px;
+      border: 2px solid var(--border);
+      border-top-color: var(--accent);
+      border-radius: 50%;
+      animation: spin .8s linear infinite;
+      margin: 0 auto 24px;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    #loading p { color: var(--muted); font-size: 14px; }
+    #loading .loading-status {
+      margin-top: 8px;
+      font-size: 13px;
+      color: var(--accent2);
+      min-height: 20px;
+    }
+
+    /* ── Results ── */
+    #results {
+      width: 100%;
+      max-width: 720px;
+    }
+    .results-header {
+      display: flex;
+      align-items: flex-end;
+      justify-content: space-between;
+      margin-bottom: 32px;
+      flex-wrap: wrap;
+      gap: 12px;
+    }
+    .results-header h2 {
+      font-size: 28px;
+      font-weight: 300;
+      letter-spacing: -.02em;
+    }
+    .results-header h2 span { color: var(--accent); }
+    .results-header .meta { font-size: 13px; color: var(--muted); }
+    .brief-summary {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 16px 20px;
+      font-size: 13px;
+      color: var(--muted);
+      margin-bottom: 24px;
+      line-height: 1.6;
+    }
+    .brief-summary strong { color: var(--text); font-weight: 500; }
+
+    /* venue cards */
+    .venue-list { display: flex; flex-direction: column; gap: 12px; }
+    .venue-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 28px 32px;
+      transition: border-color .2s;
+    }
+    .venue-card:hover { border-color: #333; }
+    .venue-card.top-pick {
+      border-color: rgba(232,213,176,.35);
+      background: rgba(232,213,176,.03);
+    }
+    .vc-top-row {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      margin-bottom: 6px;
+      gap: 16px;
+    }
+    .vc-name-block {}
+    .vc-badge {
+      font-size: 11px;
+      letter-spacing: .1em;
+      text-transform: uppercase;
+      color: var(--accent);
+      margin-bottom: 4px;
+    }
+    .vc-name {
+      font-size: 20px;
+      font-weight: 400;
+      letter-spacing: -.01em;
+    }
+    .vc-location {
+      font-size: 13px;
+      color: var(--muted);
+      margin-top: 2px;
+    }
+    .vc-score {
+      text-align: right;
+      flex-shrink: 0;
+    }
+    .vc-score-num {
+      font-size: 32px;
+      font-weight: 300;
+      color: var(--accent);
+      letter-spacing: -.03em;
+      line-height: 1;
+    }
+    .vc-score-denom { font-size: 16px; color: var(--muted); }
+    .vc-verdict {
+      font-size: 14px;
+      color: #bbb;
+      margin: 14px 0 18px;
+      line-height: 1.55;
+    }
+    .vc-scores {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px 24px;
+      margin-bottom: 18px;
+    }
+    .score-row {}
+    .score-row-label {
+      display: flex;
+      justify-content: space-between;
+      font-size: 12px;
+      color: var(--muted);
+      margin-bottom: 4px;
+    }
+    .score-row-label span:last-child { color: var(--text); }
+    .score-bar {
+      height: 3px;
+      background: var(--border);
+      border-radius: 3px;
+      overflow: hidden;
+    }
+    .score-bar-fill {
+      height: 100%;
+      background: var(--accent2);
+      border-radius: 3px;
+      transition: width 1s ease;
+    }
+    .vc-watch {
+      display: flex;
+      align-items: flex-start;
+      gap: 8px;
+      background: rgba(224,82,82,.08);
+      border: 1px solid rgba(224,82,82,.18);
+      border-radius: 8px;
+      padding: 10px 14px;
+      font-size: 13px;
+      color: #e8a0a0;
+      line-height: 1.4;
+    }
+    .vc-watch-icon { flex-shrink: 0; margin-top: 1px; }
+    .vc-outreach {
+      margin-top: 14px;
+      padding-top: 14px;
+      border-top: 1px solid var(--border);
+    }
+    .vc-outreach-btn {
+      font-size: 13px;
+      color: var(--muted);
+      background: none;
+      border: none;
+      cursor: pointer;
+      font-family: var(--font);
+      padding: 0;
+      text-decoration: underline;
+      text-underline-offset: 3px;
+    }
+    .vc-outreach-btn:hover { color: var(--accent); }
+    .vc-email-draft {
+      margin-top: 12px;
+      padding: 14px 16px;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      font-size: 13px;
+      color: #ccc;
+      line-height: 1.6;
+      white-space: pre-wrap;
+    }
+
+    .results-footer {
+      display: flex;
+      gap: 10px;
+      margin-top: 28px;
+      justify-content: flex-end;
+    }
+
+    /* ── Freewrite ── */
+    .freewrite-block {
+      margin-top: 20px;
+      padding-top: 18px;
+      border-top: 1px solid var(--border);
+    }
+    .freewrite-label {
+      font-size: 12px;
+      letter-spacing: .08em;
+      text-transform: uppercase;
+      color: var(--muted);
+      margin-bottom: 8px;
+    }
+    .freewrite-label span { text-transform: none; letter-spacing: 0; }
+    .freewrite-input { font-size: 14px; }
+
+    /* ── Utilities ── */
+    .hidden { display: none !important; }
+    .error-msg {
+      color: var(--danger);
+      font-size: 13px;
+      margin-top: 8px;
+    }
+
+    @media (max-width: 500px) {
+      .q-card { padding: 28px 20px; }
+      .radio-grid { grid-template-columns: 1fr; }
+      .vc-scores { grid-template-columns: 1fr; }
+      .vc-top-row { flex-direction: column; }
+      .vc-score { text-align: left; }
+    }
+  </style>
+</head>
+<body>
+<div id="app">
+
+  <!-- Intake Form -->
+  <div id="intake">
+    <div class="intake-header">
+      <div class="wordmark">Venue Scout</div>
+      <div class="progress-row">
+        <div class="progress-label" id="progress-label">1 / 8</div>
+        <div class="progress-track"><div class="progress-fill" id="progress-fill" style="width:12.5%"></div></div>
+      </div>
+    </div>
+    <div id="question-container"></div>
+  </div>
+
+  <!-- Loading -->
+  <div id="loading" class="hidden">
+    <div class="wordmark">Venue Scout</div>
+    <div class="spinner"></div>
+    <p>Scouting venues for you…</p>
+    <div class="loading-status" id="loading-status"></div>
+  </div>
+
+  <!-- Results -->
+  <div id="results" class="hidden"></div>
+
+</div>
+
+<script>
+// ── State ──────────────────────────────────────────────────────────────────
+let answers = {}
+let notes = {}   // freewrite notes keyed by question id
+let currentQ = 0
+
+const QUESTIONS = [
+  {
+    id: 'event_type',
+    label: 'Question 1',
+    text: 'What kind of event is this?',
+    type: 'chips-text',
+    chips: ['Dinner / reception', 'Happy hour', 'Offsite / retreat', 'Flagship / tentpole', 'Conference / summit', 'Workshop', 'Screening / performance', 'Cocktail party', 'Team lunch', 'Fellow dinner'],
+    placeholder: 'Describe the event in your own words — tone, purpose, who\'s coming, what you want people to feel…',
+    required: true
+  },
+  {
+    id: 'guest_count',
+    label: 'Question 2',
+    text: 'How many guests?',
+    type: 'slider',
+    min: 5, max: 500, default: 40,
+    hint: 'Move the slider to set your expected headcount'
+  },
+  {
+    id: 'duration',
+    label: 'Question 3',
+    text: 'How long does the event run?',
+    type: 'radio',
+    options: [
+      { value: 'single', title: 'Single session', sub: '2–5 hours, in and out' },
+      { value: 'full_day', title: 'Full day', sub: 'Morning through evening' },
+      { value: 'multi_overnight', title: 'Multi-day w/ sleep', sub: 'Resort / hotel required' },
+      { value: 'multi_no_sleep', title: 'Multi-day, no overnight', sub: 'Two or more days, own lodging' }
+    ]
+  },
+  {
+    id: 'space_config',
+    label: 'Question 4',
+    text: 'What kind of space setup?',
+    type: 'chips',
+    chips: ['Private dining room', 'Full buyout', 'Semi-private', 'Full resort / property buyout', 'Unconventional / non-venue', 'Outdoor or terrace', 'Rooftop', 'Ballroom / event hall'],
+    multi: true,
+    required: false
+  },
+  {
+    id: 'location',
+    label: 'Question 5',
+    text: 'Where does it need to be?',
+    type: 'text',
+    placeholder: 'City, neighborhood, or proximity — e.g. "Lower East Side NYC", "SoMa SF", or "mountain resort within 2hr of SFO"'
+  },
+  {
+    id: 'budget',
+    label: 'Question 6',
+    text: 'What\'s the budget range?',
+    type: 'chips',
+    chips: ['Under $5k', '$5k – $15k', '$15k – $30k', '$30k – $75k', '$75k – $150k', '$150k+', 'Flexible / no hard cap'],
+    multi: false,
+    required: false
+  },
+  {
+    id: 'vibe',
+    label: 'Question 7',
+    text: 'What\'s the vibe you\'re going for?',
+    type: 'chips',
+    chips: ['Michelin-caliber', 'Craft-driven kitchen', 'Design-forward', 'Under the radar', 'Intimate and warm', 'Buzzy / scene-y', 'Quiet and focused', 'Celebratory', 'Natural light', 'Neighborhood gem', 'Impressive / wow factor', 'Outdoorsy / adventure', 'Wine-forward'],
+    multi: true,
+    required: false
+  },
+  {
+    id: 'dealbreakers',
+    label: 'Question 8',
+    text: 'Hard nos — what would immediately rule a venue out?',
+    type: 'textarea',
+    placeholder: 'E.g. no hotel ballrooms, needs natural light, no F&B minimums above $15k, must have strong wine program, avoid touristy areas…',
+    required: false
+  },
+  {
+    id: 'extra',
+    label: 'Question 9',
+    text: 'Anything else that matters?',
+    type: 'textarea',
+    placeholder: 'Budget, A/V needs, past Paradigm events at venues you loved or hated, dietary requirements, specific aesthetic references…',
+    required: false
+  }
+]
+
+// ── Init ───────────────────────────────────────────────────────────────────
+renderQuestion(0)
+
+// ── Question renderer ──────────────────────────────────────────────────────
+function renderQuestion(idx) {
+  currentQ = idx
+  const q = QUESTIONS[idx]
+  const pct = ((idx + 1) / QUESTIONS.length * 100).toFixed(0)
+  document.getElementById('progress-label').textContent = `${idx + 1} / ${QUESTIONS.length}`
+  document.getElementById('progress-fill').style.width = pct + '%'
+
+  const container = document.getElementById('question-container')
+  container.innerHTML = buildQuestionHTML(q, idx)
+  attachQuestionListeners(q)
+
+  // restore answer
+  const saved = answers[q.id]
+  if (saved) restoreAnswer(q, saved)
+}
+
+function buildQuestionHTML(q, idx) {
+  const isLast = idx === QUESTIONS.length - 1
+  const isFirst = idx === 0
+  const btnLabel = isLast ? 'Get venues →' : 'Continue →'
+
+  let inputHTML = ''
+
+  if (q.type === 'chips-text') {
+    inputHTML = `
+      <div class="chips" id="chips-${q.id}">
+        ${q.chips.map(c => `<div class="chip" data-value="${c}">${c}</div>`).join('')}
+      </div>
+      <textarea class="q-textarea" id="text-${q.id}" rows="3" placeholder="${q.placeholder}"></textarea>
+    `
+  } else if (q.type === 'chips') {
+    inputHTML = `
+      <div class="chips" id="chips-${q.id}">
+        ${q.chips.map(c => `<div class="chip" data-value="${c}">${c}</div>`).join('')}
+      </div>
+    `
+  } else if (q.type === 'slider') {
+    inputHTML = `
+      <div class="slider-row">
+        <div class="slider-val" id="slider-val-${q.id}">${q.default}</div>
+        <input type="range" id="slider-${q.id}" min="${q.min}" max="${q.max}" value="${q.default}" />
+      </div>
+      <div class="slider-hint">${q.hint}</div>
+    `
+  } else if (q.type === 'radio') {
+    inputHTML = `
+      <div class="radio-grid" id="radio-${q.id}">
+        ${q.options.map(o => `
+          <div class="radio-card" data-value="${o.value}">
+            <div class="rc-title">${o.title}</div>
+            <div class="rc-sub">${o.sub}</div>
+          </div>
+        `).join('')}
+      </div>
+    `
+  } else if (q.type === 'text') {
+    inputHTML = `<input class="q-input" type="text" id="text-${q.id}" placeholder="${q.placeholder}" />`
+  } else if (q.type === 'textarea') {
+    inputHTML = `<textarea class="q-textarea" id="text-${q.id}" rows="4" placeholder="${q.placeholder}"></textarea>`
+  }
+
+  return `
+    <div class="q-card" id="q-card">
+      <div class="q-label">${q.label}</div>
+      <div class="q-text">${q.text}</div>
+      ${inputHTML}
+      ${q.type !== 'textarea' && q.type !== 'chips-text' ? `
+      <div class="freewrite-block">
+        <div class="freewrite-label">Add context <span>(optional)</span></div>
+        <textarea class="q-textarea freewrite-input" id="note-${q.id}" rows="2" placeholder="Anything specific to add…"></textarea>
+      </div>` : ''}
+      <div class="error-msg hidden" id="q-error"></div>
+      <div class="q-nav">
+        <div>
+          ${!isFirst ? `<button class="btn btn-ghost" onclick="goBack()">← Back</button>` : '<div></div>'}
+        </div>
+        <div class="q-nav-right">
+          ${!q.required ? `<button class="skip-link" onclick="skipQuestion()">Skip</button>` : ''}
+          <button class="btn btn-primary" id="next-btn" onclick="nextQuestion()">${btnLabel}</button>
+        </div>
+      </div>
+    </div>
+  `
+}
+
+function attachQuestionListeners(q) {
+  if (q.type === 'slider') {
+    const slider = document.getElementById(`slider-${q.id}`)
+    const val = document.getElementById(`slider-val-${q.id}`)
+    slider.addEventListener('input', () => { val.textContent = slider.value })
+    slider.addEventListener('keydown', e => { if (e.key === 'Enter') nextQuestion() })
+  }
+
+  if (q.type === 'chips' || q.type === 'chips-text') {
+    const multi = q.multi !== false
+    document.querySelectorAll(`#chips-${q.id} .chip`).forEach(chip => {
+      chip.addEventListener('click', () => {
+        if (multi) {
+          chip.classList.toggle('selected')
+        } else {
+          document.querySelectorAll(`#chips-${q.id} .chip`).forEach(c => c.classList.remove('selected'))
+          chip.classList.add('selected')
+        }
+      })
+    })
+  }
+
+  if (q.type === 'radio') {
+    document.querySelectorAll(`#radio-${q.id} .radio-card`).forEach(card => {
+      card.addEventListener('click', () => {
+        document.querySelectorAll(`#radio-${q.id} .radio-card`).forEach(c => c.classList.remove('selected'))
+        card.classList.add('selected')
+      })
+      card.addEventListener('dblclick', () => nextQuestion())
+    })
+  }
+
+  if (q.type === 'text') {
+    document.getElementById(`text-${q.id}`).addEventListener('keydown', e => {
+      if (e.key === 'Enter') nextQuestion()
+    })
+    document.getElementById(`text-${q.id}`).focus()
+  }
+
+  if (q.type === 'textarea') {
+    document.getElementById(`text-${q.id}`).addEventListener('keydown', e => {
+      if (e.key === 'Enter' && e.metaKey) nextQuestion()
+    })
+  }
+}
+
+function restoreAnswer(q, saved) {
+  if (q.type === 'chips-text') {
+    const chips = saved.chips || []
+    document.querySelectorAll(`#chips-${q.id} .chip`).forEach(c => {
+      if (chips.includes(c.dataset.value)) c.classList.add('selected')
+    })
+    const ta = document.getElementById(`text-${q.id}`)
+    if (ta) ta.value = saved.text || ''
+  } else if (q.type === 'chips') {
+    const vals = Array.isArray(saved) ? saved : [saved]
+    document.querySelectorAll(`#chips-${q.id} .chip`).forEach(c => {
+      if (vals.includes(c.dataset.value)) c.classList.add('selected')
+    })
+  } else if (q.type === 'slider') {
+    const slider = document.getElementById(`slider-${q.id}`)
+    const val = document.getElementById(`slider-val-${q.id}`)
+    if (slider) { slider.value = saved; val.textContent = saved }
+  } else if (q.type === 'radio') {
+    document.querySelectorAll(`#radio-${q.id} .radio-card`).forEach(c => {
+      if (c.dataset.value === saved) c.classList.add('selected')
+    })
+  } else {
+    const el = document.getElementById(`text-${q.id}`)
+    if (el) el.value = saved
+  }
+  // restore freewrite note
+  const noteEl = document.getElementById(`note-${q.id}`)
+  if (noteEl && notes[q.id]) noteEl.value = notes[q.id]
+}
+
+function collectAnswer(q) {
+  if (q.type === 'chips-text') {
+    const chips = [...document.querySelectorAll(`#chips-${q.id} .chip.selected`)].map(c => c.dataset.value)
+    const text = document.getElementById(`text-${q.id}`)?.value.trim() || ''
+    return { chips, text }
+  } else if (q.type === 'chips') {
+    return [...document.querySelectorAll(`#chips-${q.id} .chip.selected`)].map(c => c.dataset.value)
+  } else if (q.type === 'slider') {
+    return document.getElementById(`slider-${q.id}`)?.value
+  } else if (q.type === 'radio') {
+    return document.querySelector(`#radio-${q.id} .radio-card.selected`)?.dataset.value
+  } else {
+    return document.getElementById(`text-${q.id}`)?.value.trim() || ''
+  }
+}
+
+function validateAnswer(q, val) {
+  if (!q.required) return true
+  if (q.type === 'chips-text') return val.chips.length > 0 || val.text.length > 0
+  if (q.type === 'radio') return !!val
+  if (q.type === 'slider') return !!val
+  if (q.type === 'chips') return val.length > 0
+  return val && val.length > 0
+}
+
+function nextQuestion() {
+  const q = QUESTIONS[currentQ]
+  const val = collectAnswer(q)
+  if (!validateAnswer(q, val)) {
+    showError('q-error', q.type === 'radio' ? 'Please select an option.' : 'This one\'s required — add something above.')
+    return
+  }
+  hideEl('q-error')
+  answers[q.id] = val
+  const noteEl = document.getElementById(`note-${q.id}`)
+  if (noteEl) notes[q.id] = noteEl.value.trim()
+
+  if (currentQ < QUESTIONS.length - 1) {
+    const card = document.getElementById('q-card')
+    card.classList.add('leaving')
+    setTimeout(() => renderQuestion(currentQ + 1), 250)
+  } else {
+    runScout()
+  }
+}
+
+function goBack() {
+  if (currentQ > 0) {
+    const card = document.getElementById('q-card')
+    card.classList.add('leaving')
+    setTimeout(() => renderQuestion(currentQ - 1), 250)
+  }
+}
+
+function skipQuestion() {
+  const q = QUESTIONS[currentQ]
+  answers[q.id] = null
+  if (currentQ < QUESTIONS.length - 1) {
+    const card = document.getElementById('q-card')
+    card.classList.add('leaving')
+    setTimeout(() => renderQuestion(currentQ + 1), 250)
+  } else {
+    runScout()
+  }
+}
+
+// ── Build brief ────────────────────────────────────────────────────────────
+function buildBrief() {
+  const a = answers
+  const parts = []
+
+  const et = a.event_type
+  if (et) {
+    const chips = et.chips?.join(', ') || ''
+    const desc = et.text || ''
+    if (chips) parts.push(`Event type: ${chips}`)
+    if (desc) parts.push(`Description: "${desc}"`)
+  }
+
+  if (a.guest_count) parts.push(`Guest count: ${a.guest_count} people`)
+
+  const durMap = { single: 'Single session (2–5 hrs)', full_day: 'Full day', multi_overnight: 'Multi-day with overnight stay', multi_no_sleep: 'Multi-day, no overnight' }
+  if (a.duration) parts.push(`Duration: ${durMap[a.duration] || a.duration}`)
+
+  if (a.space_config?.length) parts.push(`Space setup: ${a.space_config.join(', ')}`)
+
+  if (a.location) parts.push(`Location: ${a.location}`)
+
+  if (a.budget) parts.push(`Budget: ${a.budget}`)
+
+  if (a.vibe?.length) parts.push(`Vibe: ${a.vibe.join(', ')}`)
+
+  if (a.dealbreakers) parts.push(`Dealbreakers: ${a.dealbreakers}`)
+
+  if (a.extra) parts.push(`Additional notes: ${a.extra}`)
+
+  // append any freewrite context notes
+  const noteLines = QUESTIONS
+    .filter(q => notes[q.id])
+    .map(q => `  [${q.id} note]: ${notes[q.id]}`)
+  if (noteLines.length) parts.push(`Extra context from planner:\n${noteLines.join('\n')}`)
+
+  return parts.join('\n')
+}
+
+// ── Agentic web-search loop ────────────────────────────────────────────────
+let lastSearchQueries = []  // tracked for display in results
+
+// ── API call ───────────────────────────────────────────────────────────────
+async function runScout() {
+  hide('intake')
+  show('loading')
+
+  const statusEl = document.getElementById('loading-status')
+  const cycleMessages = [
+    'Finding the best match for your brief…',
+    'Scanning Eater and local press for new openings…',
+    'Checking Resy and OpenTable for availability…',
+    'Browsing Reddit and Yelp for hidden gems…',
+    'Scanning Instagram for buzzy new spots…',
+    'Reading reviews across Infatuation and Beli…',
+    'Weighing vibe, neighborhood, and logistics…',
+    'Cross-checking private dining options…',
+    'Filtering out the dealbreakers…',
+    'Narrowing down your shortlist…',
+    'Almost there…'
+  ]
+  let cycleIdx = 0
+  const statusInterval = setInterval(() => {
+    cycleIdx = (cycleIdx + 1) % cycleMessages.length
+    if (statusEl) statusEl.textContent = cycleMessages[cycleIdx]
+  }, 2500)
+
+  statusEl.textContent = cycleMessages[0]
+
+  const brief = buildBrief()
+
+  try {
+    const res = await fetch('/api/scout', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({ brief })
+    })
+
+    const data = await res.json().catch(() => ({}))
+    if (!res.ok) {
+      throw new Error(data.error || data.detail || `Venue Scout error ${res.status}`)
+    }
+
+    lastSearchQueries = Array.isArray(data.sources_checked) ? data.sources_checked : []
+    const venues = extractVenueList(data)
+    if (!Array.isArray(venues) || venues.length === 0) {
+      throw new Error('No venue list found in response')
+    }
+
+    clearInterval(statusInterval)
+    hide('loading')
+    renderResults(venues, brief)
+  } catch (err) {
+    clearInterval(statusInterval)
+    hide('loading')
+    show('intake')
+    renderQuestion(currentQ)
+    alert('Something went wrong: ' + err.message)
+  }
+}
+
+// ── Results ────────────────────────────────────────────────────────────────
+function renderResults(venues, brief) {
+  const a = answers
+  const location = a.location || ''
+  const guestCount = a.guest_count || ''
+  const vibes = a.vibe?.join(' · ') || ''
+
+  const briefLines = brief.split('\n').slice(0, 4).join(' · ')
+
+  const cardsHTML = venues.map((v, i) => {
+    const isTop = i === 0
+    const scoreKeys = [
+      ['food_quality', 'Food / kitchen'],
+      ['private_dining', 'Private dining'],
+      ['neighborhood_feel', 'Neighborhood'],
+      ['design_aesthetic', 'Design & light'],
+      ['logistics', 'Logistics']
+    ]
+    const scoreHTML = scoreKeys.map(([key, label]) => {
+      const s = v.scores?.[key] ?? 7
+      return `
+        <div class="score-row">
+          <div class="score-row-label"><span>${label}</span><span>${s}/10</span></div>
+          <div class="score-bar"><div class="score-bar-fill" style="width:${s * 10}%"></div></div>
+        </div>
+      `
+    }).join('')
+
+    return `
+      <div class="venue-card ${isTop ? 'top-pick' : ''}">
+        <div class="vc-top-row">
+          <div class="vc-name-block">
+            ${isTop ? '<div class="vc-badge">Top pick</div>' : ''}
+            <div class="vc-name">${v.name}</div>
+            <div class="vc-location">${v.location}</div>
+            ${v.fit_summary ? `<div class="vc-location" style="margin-top:4px;font-style:italic">${v.fit_summary}</div>` : ''}
+          </div>
+          <div class="vc-score">
+            <div class="vc-score-num">${v.overall}<span class="vc-score-denom">/10</span></div>
+          </div>
+        </div>
+        <div class="vc-verdict">${v.verdict}</div>
+        <div class="vc-scores">${scoreHTML}</div>
+        <div class="vc-watch">
+          <span class="vc-watch-icon">⚠</span>
+          <span>${v.watch_out}</span>
+        </div>
+        <div class="vc-outreach">
+          <button class="vc-outreach-btn" onclick="toggleOutreach(this, '${escapeAttr(v.name)}', '${escapeAttr(v.outreach_hook || '')}')">Draft outreach email ↓</button>
+          <div class="vc-email-draft hidden"></div>
+        </div>
+      </div>
+    `
+  }).join('')
+
+  document.getElementById('results').innerHTML = `
+    <div class="results-header">
+      <div>
+        <div style="font-size:13px;letter-spacing:.12em;text-transform:uppercase;color:var(--muted);margin-bottom:8px">Venue Scout</div>
+        <h2>Your <span>shortlist</span>.</h2>
+      </div>
+      <div class="meta">${location} · ${guestCount ? guestCount + ' guests' : ''}</div>
+    </div>
+    <div class="brief-summary"><strong>Brief:</strong> ${briefLines}</div>
+    ${lastSearchQueries.length ? `
+    <div class="brief-summary" style="margin-top:-8px;font-size:12px">
+      <strong>Sources checked:</strong> ${lastSearchQueries.map(q => `<span style="color:var(--accent2)">${q}</span>`).join(' · ')}
+    </div>` : ''}
+    <div class="venue-list">${cardsHTML}</div>
+    <div class="results-footer">
+      <button class="btn btn-ghost" onclick="startOver()">Start over</button>
+    </div>
+  `
+  show('results')
+
+  // animate score bars in
+  setTimeout(() => {
+    document.querySelectorAll('.score-bar-fill').forEach(el => {
+      const w = el.style.width
+      el.style.width = '0'
+      setTimeout(() => { el.style.width = w }, 50)
+    })
+  }, 100)
+}
+
+async function toggleOutreach(btn, venueName, hook) {
+  const draft = btn.nextElementSibling
+  if (!draft.classList.contains('hidden')) {
+    draft.classList.add('hidden')
+    btn.textContent = 'Draft outreach email ↓'
+    return
+  }
+
+  btn.textContent = 'Drafting…'
+  btn.disabled = true
+
+  const a = answers
+  const eventType = a.event_type?.chips?.join(', ') || a.event_type?.text || 'event'
+  const guestCount = a.guest_count || ''
+  const location = a.location || ''
+  const spaceConfig = a.space_config?.length ? a.space_config.join(', ') : ''
+
+  try {
+    draft.textContent = buildOutreachDraft({ venueName, hook, eventType, guestCount, location, spaceConfig })
+    draft.classList.remove('hidden')
+    btn.textContent = 'Hide email ↑'
+    btn.disabled = false
+  } catch (e) {
+    btn.textContent = 'Draft outreach email ↓'
+    btn.disabled = false
+    alert('Could not generate email: ' + e.message)
+  }
+}
+
+function startOver() {
+  answers = {}
+  notes = {}
+  currentQ = 0
+  hide('results')
+  show('intake')
+  renderQuestion(0)
+}
+
+// ── Helpers ────────────────────────────────────────────────────────────────
+function extractVenueList(data) {
+  if (Array.isArray(data)) return data
+  if (Array.isArray(data?.venues)) return data.venues
+
+  const rawText = typeof data === 'string'
+    ? data
+    : (data?.output || data?.result || data?.text || '')
+
+  if (!rawText) return []
+
+  const match = rawText.match(/\[[\s\S]*\]/)
+  if (!match) return []
+
+  try {
+    return JSON.parse(match[0])
+  } catch {
+    return []
+  }
+}
+
+function buildOutreachDraft({ venueName, hook, eventType, guestCount, location, spaceConfig }) {
+  const subjectBits = ['Inquiry', eventType, guestCount ? `${guestCount} guests` : '', venueName]
+    .filter(Boolean)
+    .join(' · ')
+  const locationLine = location ? ` in ${location}` : ''
+  const setupLine = spaceConfig ? ` We are likely looking for ${spaceConfig.toLowerCase()}.` : ''
+  const hookLine = hook ? `${hook} ` : ''
+
+  return `Subject: ${subjectBits}\n\nHi ${venueName} team,\n\nI’m reaching out about hosting a ${eventType} for ${guestCount || 'a small group of'} guests${locationLine}. ${hookLine}It feels like it could be a strong fit for the atmosphere we want.${setupLine}\n\nWe’re still flexible on exact timing, but I’d love to understand what private dining or buyout options you offer, what guest counts and room formats you recommend, and the relevant pricing or F&B minimums.\n\nIf it sounds like a fit, please send over availability, event details, and the best next step for a booking conversation.\n`
+}
+
+function show(id) { document.getElementById(id)?.classList.remove('hidden') }
+function hide(id) { document.getElementById(id)?.classList.add('hidden') }
+function hideEl(id) { document.getElementById(id)?.classList.add('hidden') }
+function showError(id, msg) {
+  const el = document.getElementById(id)
+  if (el) { el.textContent = msg; el.classList.remove('hidden') }
+}
+function escapeAttr(str) {
+  return (str || '').replace(/'/g, "\\'").replace(/"/g, '&quot;')
+}
+</script>
+</body>
+</html>

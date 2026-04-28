@@ -34,31 +34,26 @@ Gather these from the user before generating. If the user provides them upfront,
 
 | Input | Default | Notes |
 |-------|---------|-------|
-| **No-shop period** | 30 days | Exclusivity window |
+| **No-shop period** | 45 days | Exclusivity window |
 | **Counsel fee cap** | $75,000 | Paradigm counsel expense cap |
-| **Qualified IPO threshold** | $100,000,000 | Gross proceeds threshold |
-| **Founder vesting — % vested at closing** | 25% | What's already vested |
-| **Founder vesting — remaining years** | 4 | Total vesting schedule |
-| **Founder vesting — cliff months** | 12 | Cliff period |
-| **Equity incentive plan shares** | (left blank) | Shares reserved for option pool |
-| **Automatic conversion consent %** | 60% | Majority threshold |
-| **Protective provisions consent %** | 50% | Majority threshold |
+| **Token floor %** | 50% | Only relevant for crypto companies |
 
-## Paradigm Standard Positions (Auto-Applied)
+## Paradigm Standard Positions (Baked into Template)
 
-These are **not** asked — they are hardcoded as Paradigm's form:
+These come from the Paradigm form template and are **not** configurable:
 
-- **Dividends**: Non-cumulative, as-converted basis only (no fixed dividend rate)
-- **Liquidation preference**: 1x non-participating preferred
-- **Anti-dilution**: Broad-based weighted average (BBWA)
+- **Dividends**: Non-cumulative, in preference to Common
+- **Liquidation preference**: 1x non-participating
+- **Anti-dilution**: Broad-based weighted average
 - **Redemption**: None
-- **Drag-along**: Majority of preferred + majority of key holders
-- **ROFR**: Company first, then investors; 30-day window
-- **Founder carveout**: 2% without consent
-- **Registration rights demand**: 5 years after closing or 180 days after IPO
-- **Pro rata rights**: Full pro rata on future issuances
+- **Conversion**: Automatic on IPO >$100M net proceeds or majority preferred vote
+- **Documentation**: 2025 NVCA forms
+- **ROFR/Co-Sale**: 1% Common stockholders, 2% carveout
+- **Drag-along**: Board + preferred majority
+- **Pro rata rights**: Including overallotment, for Major Investors (Paradigm only)
+- **Vesting**: Standard 4-year monthly with 1-year cliff (founder vesting subject to DD)
 
-If the user requests a deviation from any of these (e.g., participating preferred, full ratchet), generate the doc as requested but **warn them** that it deviates from Paradigm standard.
+The template is the Paradigm form — deviations require editing the output document.
 
 ## Steps
 
@@ -108,15 +103,9 @@ The JSON parameter object:
   "board_seat": true,
   "observer_seat": true,
   "is_crypto": false,
-  "no_shop_days": 30,
+  "no_shop_days": 45,
   "counsel_fee_cap": 75000,
-  "qualified_ipo_threshold": 100000000,
-  "founder_vesting_percent": 25,
-  "founder_vesting_years": 4,
-  "founder_cliff_months": 12,
-  "auto_conversion_percent": 60,
-  "protective_provisions_percent": 50,
-  "equity_plan_shares": null
+  "token_floor_percent": 50
 }
 ```
 

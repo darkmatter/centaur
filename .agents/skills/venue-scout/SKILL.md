@@ -26,17 +26,17 @@ Do not use this skill for travel planning, hotel room blocks without event progr
 
 ## Behavior
 
-When this skill is invoked without a concrete brief, first check whether `https://venue-scout.centaur.paradigm.xyz` is reachable. If it is, respond with the web app URL so the user can complete the full intake flow. If it is unavailable, skip the URL and ask for the brief directly in chat.
+When this skill is invoked without a concrete brief, respond with the GitHub Pages intake URL so the user can complete the full intake flow in the browser.
 
 ```text
 Venue Scout is ready.
-Open the full intake flow here: https://venue-scout.centaur.paradigm.xyz
+Open the full intake flow here: https://krgxyz.github.io/venue-scout/
 
 Or give me a quick brief here and I will return a shortlist right in chat:
 city · event type · guest count · vibe · budget
 ```
 
-If the app is unavailable, respond with:
+If the GitHub Pages app is unavailable, respond with:
 
 ```text
 Venue Scout is ready.

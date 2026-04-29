@@ -131,6 +131,47 @@ ALLOWED_OUTBOUND_HEADERS: frozenset[str] = frozenset({
     "jwt", "api-version",
 })
 
+# Header names that may legitimately carry a secret/placeholder value.
+# Only these headers are scanned for key-name placeholders; non-credential
+# headers (e.g. Content-Type, Accept) must never have substrings of secret
+# names rewritten — that previously mangled `Content-Type: application/json`
+# into `Content-Type: application/` when a secret named `json` existed.
+CREDENTIAL_HEADER_NAMES: frozenset[str] = frozenset({
+    "authorization",
+    "proxy-authorization",
+    "x-api-key",
+    "api-key",
+    "anthropic-api-key",
+    "x-goog-api-key",
+    "x-browser-use-api-key",
+    "x-cg-pro-api-key",
+    "x-cg-demo-api-key",
+    "x-auth-token",
+    "x-access-token",
+    "auth-token",
+    "jwt",
+    "cookie",
+})
+
+CREDENTIAL_HEADER_SUFFIXES: tuple[str, ...] = (
+    "-api-key",
+    "-apikey",
+    "-secret",
+    "-token",
+    "-auth",
+)
+
+
+def _is_credential_header(name: str) -> bool:
+    """Return True if a header name is allowed to carry a credential placeholder."""
+    n = name.lower()
+    if n in CREDENTIAL_HEADER_NAMES:
+        return True
+    if n.startswith("x-") and any(n.endswith(suffix) for suffix in CREDENTIAL_HEADER_SUFFIXES):
+        return True
+    return False
+
+
 FIXED_USER_AGENT = "ai-v2-sandbox/1.0"
 
 RATE_LIMIT = int(os.environ.get("FIREWALL_RATE_LIMIT", "500"))
@@ -644,6 +685,13 @@ class CredentialInjector:
         source_ip = flow.client_conn.peername[0] if flow.client_conn.peername else "unknown"
 
         for header_name in list(flow.request.headers.keys()):
+            # Only scan headers whose name is a known credential carrier.
+            # This prevents substrings of secret key names (e.g. a secret
+            # named "json") from being rewritten inside unrelated headers
+            # such as Content-Type or Accept.
+            if not _is_credential_header(header_name):
+                continue
+
             value = flow.request.headers[header_name]
 
             # Handle Basic auth: base64-decode, replace, re-encode
@@ -805,16 +853,13 @@ class CredentialInjector:
         """
         flow.request.headers["user-agent"] = FIXED_USER_AGENT
 
-        with self._keys_lock:
-            keys = self._known_keys
-
         to_remove = []
         for header_name in flow.request.headers:
             if header_name.lower() in ALLOWED_OUTBOUND_HEADERS or header_name.lower() == "user-agent":
                 continue
-            # Keep headers that carry a secret placeholder (e.g. x-cg-pro-api-key)
-            value = flow.request.headers[header_name]
-            if keys and any(k in value for k in keys):
+            # Keep credential-bearing headers (e.g. x-cg-pro-api-key) so the
+            # secret-injection step downstream can rewrite the placeholder.
+            if _is_credential_header(header_name):
                 continue
             to_remove.append(header_name)
 

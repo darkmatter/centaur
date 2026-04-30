@@ -144,10 +144,18 @@ def _ensure_kubernetes_env() -> None:
 
 
 def _pod_resources() -> dict[str, Any]:
-    limits = {
-        "cpu": (os.getenv("KUBERNETES_SANDBOX_CPU_LIMIT") or "2").strip(),
-        "memory": (os.getenv("KUBERNETES_SANDBOX_MEMORY_LIMIT") or "4Gi").strip(),
-    }
+    limits: dict[str, str] = {}
+    cpu_limit = os.environ.get("KUBERNETES_SANDBOX_CPU_LIMIT")
+    memory_limit = os.environ.get("KUBERNETES_SANDBOX_MEMORY_LIMIT")
+    if cpu_limit is None:
+        limits["cpu"] = "2"
+    elif cpu_limit.strip():
+        limits["cpu"] = cpu_limit.strip()
+    if memory_limit is None:
+        limits["memory"] = "4Gi"
+    elif memory_limit.strip():
+        limits["memory"] = memory_limit.strip()
+
     requests: dict[str, str] = {}
     cpu_request = (os.getenv("KUBERNETES_SANDBOX_CPU_REQUEST") or "").strip()
     memory_request = (os.getenv("KUBERNETES_SANDBOX_MEMORY_REQUEST") or "").strip()
@@ -155,7 +163,10 @@ def _pod_resources() -> dict[str, Any]:
         requests["cpu"] = cpu_request
     if memory_request:
         requests["memory"] = memory_request
-    resources: dict[str, Any] = {"limits": limits}
+
+    resources: dict[str, Any] = {}
+    if limits:
+        resources["limits"] = limits
     if requests:
         resources["requests"] = requests
     return resources

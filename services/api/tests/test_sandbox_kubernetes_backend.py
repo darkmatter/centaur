@@ -92,6 +92,35 @@ class FakeWsApiClient:
         return 17 if error_data else 0
 
 
+def test_pod_resources_uses_default_limits_when_unset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from api.sandbox.kubernetes import _pod_resources
+
+    monkeypatch.delenv("KUBERNETES_SANDBOX_CPU_LIMIT", raising=False)
+    monkeypatch.delenv("KUBERNETES_SANDBOX_MEMORY_LIMIT", raising=False)
+    monkeypatch.delenv("KUBERNETES_SANDBOX_CPU_REQUEST", raising=False)
+    monkeypatch.delenv("KUBERNETES_SANDBOX_MEMORY_REQUEST", raising=False)
+
+    assert _pod_resources() == {"limits": {"cpu": "2", "memory": "4Gi"}}
+
+
+def test_pod_resources_allows_explicitly_empty_memory_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from api.sandbox.kubernetes import _pod_resources
+
+    monkeypatch.setenv("KUBERNETES_SANDBOX_CPU_LIMIT", "4000m")
+    monkeypatch.setenv("KUBERNETES_SANDBOX_MEMORY_LIMIT", "")
+    monkeypatch.setenv("KUBERNETES_SANDBOX_CPU_REQUEST", "200m")
+    monkeypatch.setenv("KUBERNETES_SANDBOX_MEMORY_REQUEST", "256Mi")
+
+    assert _pod_resources() == {
+        "limits": {"cpu": "4000m"},
+        "requests": {"cpu": "200m", "memory": "256Mi"},
+    }
+
+
 def test_container_env_includes_firewall_host_for_secret_bootstrap(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

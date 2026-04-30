@@ -690,6 +690,8 @@ class SlackClient:
         thread_ts: str | None = None,
         no_attribution: bool = False,
         blocks: list | None = None,
+        unfurl_links: bool | None = None,
+        unfurl_media: bool | None = None,
     ) -> dict:
         """Send a message to a channel.
 
@@ -699,6 +701,8 @@ class SlackClient:
             thread_ts: Optional thread timestamp to reply in thread
             no_attribution: If True, skip adding requester attribution
             blocks: Optional Slack Block Kit blocks for rich formatting
+            unfurl_links: Override Slack's link unfurl behavior for this message
+            unfurl_media: Override Slack's media unfurl behavior for this message
 
         Returns:
             Dict with channel, ts, permalink
@@ -717,6 +721,10 @@ class SlackClient:
                 kwargs["thread_ts"] = thread_ts
             if blocks:
                 kwargs["blocks"] = blocks
+            if unfurl_links is not None:
+                kwargs["unfurl_links"] = unfurl_links
+            if unfurl_media is not None:
+                kwargs["unfurl_media"] = unfurl_media
             response = self._client.chat_postMessage(**kwargs)
             return {
                 "channel": channel_id,

@@ -7,6 +7,7 @@ let state = {
   sort: "threads",
   dir: "desc",
   window: "7d",
+  hideCentaur: true,
 };
 
 const TOOL_COLS = [
@@ -118,6 +119,10 @@ function getRows() {
 
   let rows = [...(src || [])];
 
+  if (state.hideCentaur && (state.view === "teams" || state.view === "users")) {
+    rows = rows.filter(r => (r.team || r.name) !== "Centaur Internal");
+  }
+
   const key = state.sort;
   const mult = state.dir === "desc" ? -1 : 1;
   rows.sort((a, b) => {
@@ -218,6 +223,8 @@ function render() {
   renderHead();
   renderBody();
   syncUrl();
+  const toggle = $("#centaur-toggle");
+  toggle.style.display = (state.view === "teams" || state.view === "users") ? "" : "none";
 }
 
 const BASE_PATH = "/apps/usage";
@@ -371,6 +378,11 @@ function init() {
       applyWindow();
       render();
     });
+  });
+
+  $("#show-centaur").addEventListener("change", (e) => {
+    state.hideCentaur = !e.target.checked;
+    render();
   });
 
   document.addEventListener("click", (e) => {

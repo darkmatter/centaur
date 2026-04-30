@@ -168,6 +168,13 @@ main {
   font-size: 12px;
   color: var(--text-muted);
 }
+.centaur-toggle {
+  cursor: pointer;
+  user-select: none;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+.centaur-toggle input { margin-right: 4px; }
 
 table {
   width: 100%;

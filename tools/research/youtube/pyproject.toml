@@ -17,5 +17,5 @@ build-backend = "hatchling.build"
 
 [tool.ai-v2]
 module = "client.py"
-hosts = ["www.googleapis.com"]
+hosts = ["www.googleapis.com", "www.youtube.com"]
 secrets = ["YOUTUBE_API_KEY", "GOOGLE_API_KEY"]

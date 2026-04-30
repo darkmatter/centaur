@@ -2,6 +2,7 @@
 
 import json
 import re
+from typing import Annotated
 
 import typer
 from dotenv import load_dotenv
@@ -57,6 +58,16 @@ def print_markdown_table(headers: list[str], rows: list[list[str]]) -> None:
     print("| " + " | ".join(["---"] * len(headers)) + " |")
     for row in rows:
         print("| " + " | ".join(str(cell) for cell in row) + " |")
+
+
+def format_timestamp(seconds: float | None) -> str:
+    """Format seconds as HH:MM:SS."""
+    if seconds is None:
+        return "N/A"
+    total_seconds = max(0, int(seconds))
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
 
 
 @app.command()
@@ -222,6 +233,109 @@ def channel(
     console.print(f"\nURL: https://www.youtube.com/channel/{channel_id}")
     if snippet.get("description"):
         console.print(f"\n[dim]{snippet.get('description')[:500]}[/]")
+
+
+@app.command("transcripts")
+def transcripts(
+    video_id: str = typer.Argument(..., help="YouTube video ID or URL"),
+    json_output: bool = typer.Option(False, "--json", help="Output as JSON"),
+    markdown: bool = typer.Option(False, "--markdown", "-m", help="Output as markdown"),
+):
+    """List the public caption tracks for a video."""
+    client = get_client()
+    data = client.list_transcripts(video_id)
+    tracks = data.get("tracks", [])
+
+    if json_output:
+        print(json.dumps(data, indent=2))
+        return
+
+    if markdown:
+        rows = [
+            [
+                track.get("language", ""),
+                track.get("language_code", ""),
+                "auto" if track.get("is_generated") else "manual",
+            ]
+            for track in tracks
+        ]
+        print_markdown_table(["Language", "Code", "Type"], rows)
+        return
+
+    table = Table(title=f"Caption Tracks: {data.get('video_id', video_id)}")
+    table.add_column("Language", style="cyan")
+    table.add_column("Code", style="white")
+    table.add_column("Type", style="dim")
+    for track in tracks:
+        table.add_row(
+            track.get("language", ""),
+            track.get("language_code", ""),
+            "auto-generated" if track.get("is_generated") else "manual",
+        )
+    console.print(table)
+
+
+@app.command()
+def transcript(
+    video_id: str = typer.Argument(..., help="YouTube video ID or URL"),
+    language: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--language",
+            "-l",
+            help="Preferred caption language code. Repeat the flag for fallbacks.",
+        ),
+    ] = None,
+    start: Annotated[
+        str | None,
+        typer.Option(
+            "--start",
+            help="Start offset in seconds or HH:MM:SS. Negative offsets are relative to the end.",
+        ),
+    ] = None,
+    end: Annotated[
+        str | None,
+        typer.Option(
+            "--end",
+            help="End offset in seconds or HH:MM:SS. Negative offsets are relative to the end.",
+        ),
+    ] = None,
+    json_output: bool = typer.Option(False, "--json", help="Output as JSON"),
+    markdown: bool = typer.Option(False, "--markdown", "-m", help="Output as markdown"),
+):
+    """Download a timestamped public transcript for a video."""
+    client = get_client()
+    data = client.get_transcript(
+        video_id,
+        language_codes=language,
+        start_time=start,
+        end_time=end,
+    )
+
+    transcript_rows = data.get("transcript", [])
+    if json_output:
+        print(json.dumps(data, indent=2))
+        return
+
+    if markdown:
+        print(
+            f"# Transcript ({data.get('language_code', 'unknown')}, "
+            f"{'auto-generated' if data.get('is_generated') else 'manual'})\n"
+        )
+        for row in transcript_rows:
+            print(f"- [{format_timestamp(row.get('start'))}] {row.get('text', '')}")
+        return
+
+    console.print(
+        f"\n[bold cyan]Transcript[/] {data.get('language', 'Unknown')} "
+        f"({'auto-generated' if data.get('is_generated') else 'manual'})"
+    )
+    console.print(
+        f"[dim]Window: {format_timestamp(data.get('window_start'))} → "
+        f"{format_timestamp(data.get('window_end'))}[/]"
+    )
+    for row in transcript_rows:
+        console.print(f"[cyan][{format_timestamp(row.get('start'))}][/cyan] {row.get('text', '')}")
 
 
 if __name__ == "__main__":

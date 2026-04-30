@@ -96,13 +96,10 @@ def _build_blocks(
         key=lambda x: x["total"], reverse=True,
     )
 
-    teams = sorted(
-        [t for t in w7.get("teams", []) if t["team"] != "Centaur Internal"],
-        key=lambda t: t["threads"], reverse=True,
-    )
+    teams_raw = [t for t in w7.get("teams", []) if t["team"] != "Centaur Internal"]
     users = sorted(
         [u for u in w7.get("users", []) if u.get("team") != "Other" and u["name"] != "Centaur Internal"],
-        key=lambda u: u["threads"], reverse=True,
+        key=lambda u: (u["threads"], u.get("tokens", 0)), reverse=True,
     )
 
     blocks: list[dict] = []
@@ -137,17 +134,23 @@ def _build_blocks(
         })
         blocks.append({"type": "divider"})
 
-    # Teams table
-    blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": "*Top Centaur Usage by Team* :celebrate:"}})
-    team_rows = [[_cell("#"), _cell("Team"), _cell("Members"), _cell("Sessions"), _cell("Tokens"), _cell("S/M"), _cell("T/M")]]
-    for i, t in enumerate(teams):
+    # Teams table — compute metrics, then sort by (S/M, T/M)
+    team_data = []
+    for t in teams_raw:
         members = t["members"]
         sessions = t["threads"]
         tokens = sum(u.get("tokens", 0) for u in users if u["team"] == t["team"])
         spm = round(sessions / members, 1) if members > 0 else 0
-        tpm = _fmt_tokens(round(tokens / members)) if members > 0 else "0"
+        tpm_raw = round(tokens / members) if members > 0 else 0
+        team_data.append({"t": t, "members": members, "sessions": sessions, "tokens": tokens, "spm": spm, "tpm_raw": tpm_raw})
+    team_data.sort(key=lambda x: (x["spm"], x["tpm_raw"]), reverse=True)
+
+    blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": "*Top Centaur Usage by Team* :celebrate:"}})
+    team_rows = [[_cell("#"), _cell("Team"), _cell("Members"), _cell("Sessions"), _cell("Tokens"), _cell("S/M"), _cell("T/M")]]
+    for i, td in enumerate(team_data):
+        t = td["t"]
         emoji = t.get("emoji", "")
-        team_rows.append([_cell(i + 1), _cell(f"{emoji} {t['team']}"), _cell(members), _cell(sessions), _cell(_fmt_tokens(tokens)), _cell(spm), _cell(tpm)])
+        team_rows.append([_cell(i + 1), _cell(f"{emoji} {t['team']}"), _cell(td["members"]), _cell(td["sessions"]), _cell(_fmt_tokens(td["tokens"])), _cell(td["spm"]), _cell(_fmt_tokens(td["tpm_raw"]))])
     blocks.append({
         "type": "table",
         "column_settings": [{"align": "center"}, {"align": "left"}, {"align": "right"}, {"align": "right"}, {"align": "right"}, {"align": "right"}, {"align": "right"}],

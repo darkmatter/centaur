@@ -1193,7 +1193,7 @@ async def test_worker_marks_silence_deadline_exceeded_and_stops_session(db_pool)
 
 
 @pytest.mark.asyncio
-async def test_worker_extends_silence_deadline_while_tool_is_running(db_pool):
+async def test_worker_keeps_tool_timeout_while_command_execution_reports_progress(db_pool):
     from api.runtime_control import _process_execution
 
     thread_key = f"slack:C-test:{uuid.uuid4().hex}"
@@ -1257,6 +1257,17 @@ async def test_worker_extends_silence_deadline_while_tool_is_running(db_pool):
                 }
             )
         }
+        await asyncio.sleep(0.03)
+        yield {
+            "data": json.dumps(
+                {
+                    "type": "command_execution",
+                    "command": "sleep 1",
+                    "aggregated_output": "still running",
+                    "status": "running",
+                }
+            )
+        }
         await asyncio.sleep(0.08)
         yield {
             "data": json.dumps(
@@ -1284,7 +1295,7 @@ async def test_worker_extends_silence_deadline_while_tool_is_running(db_pool):
         ),
         patch("api.runtime_control._stream_stdout", _tool_then_done_stream),
         patch("api.runtime_control.stop_session", stop_session_mock),
-        patch("api.runtime_control.EXECUTION_SILENCE_TIMEOUT_S", 1.0),
+        patch("api.runtime_control.EXECUTION_SILENCE_TIMEOUT_S", 0.05),
         patch("api.runtime_control.EXECUTION_TOOL_SILENCE_TIMEOUT_S", 0.2),
         patch("api.runtime_control.EXECUTION_WATCHDOG_POLL_S", 0.01),
     ):

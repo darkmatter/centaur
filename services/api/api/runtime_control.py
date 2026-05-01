@@ -148,9 +148,40 @@ def event_role(event: dict[str, Any]) -> str:
 
 
 def _event_silence_timeout_s(event: dict[str, Any]) -> float:
+    return _progress_silence_timeout_s(event, canonical_events=None, observations=None)
+
+
+def _tool_silence_timeout_s() -> float:
+    return float(max(EXECUTION_TOOL_SILENCE_TIMEOUT_S, EXECUTION_SILENCE_TIMEOUT_S))
+
+
+def _canonical_event_extends_tool_timeout(event: dict[str, Any]) -> bool:
+    event_type = str(event.get("type") or "")
+    if event_type != "command_execution":
+        return False
+    status = str(event.get("status") or "").strip().lower()
+    if status in {"working", "running", "in_progress", "progress"}:
+        return True
+    output = event.get("aggregated_output")
+    return isinstance(output, str) and bool(output.strip())
+
+
+def _progress_silence_timeout_s(
+    event: dict[str, Any],
+    *,
+    canonical_events: list[dict[str, Any]] | None,
+    observations: ExecutionObservationAccumulator | None,
+) -> float:
+    if observations and observations.active_tool_use_ids:
+        return _tool_silence_timeout_s()
     parts = flatten_event_parts(event)
     if any(part.get("type") == "tool_use" for part in parts):
-        return float(max(EXECUTION_TOOL_SILENCE_TIMEOUT_S, EXECUTION_SILENCE_TIMEOUT_S))
+        return _tool_silence_timeout_s()
+    if canonical_events and any(
+        _canonical_event_extends_tool_timeout(canonical_event)
+        for canonical_event in canonical_events
+    ):
+        return _tool_silence_timeout_s()
     return float(EXECUTION_SILENCE_TIMEOUT_S)
 
 
@@ -1783,7 +1814,8 @@ async def _process_execution(pool, row: dict[str, Any]) -> None:
                 event_kind="amp_raw_event",
                 event_json=payload,
             )
-            for canonical_event in normalize_harness_event(engine, payload):
+            canonical_events = normalize_harness_event(engine, payload)
+            for canonical_event in canonical_events:
                 projected = project_execution_observations(
                     canonical_event,
                     execution_id=execution_id,
@@ -1843,7 +1875,11 @@ async def _process_execution(pool, row: dict[str, Any]) -> None:
             silence_deadline = await _touch_execution_progress(
                 pool,
                 execution_id,
-                timeout_s=_event_silence_timeout_s(payload),
+                timeout_s=_progress_silence_timeout_s(
+                    payload,
+                    canonical_events=canonical_events,
+                    observations=observations,
+                ),
             )
 
             status_row = await pool.fetchrow(

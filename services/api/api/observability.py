@@ -376,6 +376,7 @@ class ExecutionObservationAccumulator:
     tools: Counter[str] = field(default_factory=Counter)
     tool_errors: Counter[str] = field(default_factory=Counter)
     tool_use_to_name: dict[str, str] = field(default_factory=dict)
+    active_tool_use_ids: set[str] = field(default_factory=set)
     tool_error_categories: Counter[str] = field(default_factory=Counter)
     first_token_seen: bool = False
     tool_sequence: list[str] = field(default_factory=list)
@@ -396,6 +397,8 @@ class ExecutionObservationAccumulator:
                 self.first_token_seen = True
             tool_use_id = _as_str(payload.get("tool_use_id"))
             tool_name = _as_str(payload.get("tool_name"))
+            if tool_use_id:
+                self.active_tool_use_ids.add(tool_use_id)
             if tool_name:
                 self.tools[tool_name] += 1
                 self.tool_sequence.append(tool_name)
@@ -411,7 +414,10 @@ class ExecutionObservationAccumulator:
         elif event_kind == "tool_result_observed":
             self.tool_result_events += 1
             is_error = bool(payload.get("is_error"))
-            tool_name = self.tool_use_to_name.get(_as_str(payload.get("tool_use_id")))
+            tool_use_id = _as_str(payload.get("tool_use_id"))
+            if tool_use_id:
+                self.active_tool_use_ids.discard(tool_use_id)
+            tool_name = self.tool_use_to_name.get(tool_use_id)
             if is_error:
                 self.tool_error_events += 1
                 category = _as_str(payload.get("error_category")) or "unknown"

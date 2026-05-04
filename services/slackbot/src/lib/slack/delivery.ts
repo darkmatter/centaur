@@ -6,6 +6,39 @@ const CANCELLED_EXECUTION_MESSAGE = "Request cancelled. Send another message whe
 const SILENCE_DEADLINE_MESSAGE = "Agent stopped after making no visible progress. Please retry.";
 const EXECUTION_FAILED_MESSAGE = "Agent hit a runtime issue before finishing. Please retry.";
 
+// Maximum length of the raw error detail that gets surfaced to Slack — enough
+// to be useful (e.g. "429 Rate limit exceeded") without dumping a full stack
+// trace into the channel.
+const ERROR_DETAIL_MAX_CHARS = 240;
+
+// Internal/noisy error texts that aren't actionable for the user — we keep the
+// generic friendly message and skip the detail block for these.
+const SUPPRESSED_ERROR_FRAGMENTS = [
+  "connection error",
+  "silence deadline",
+  "cancel_requested",
+];
+
+function truncate(value: string, limit: number): string {
+  return value.length > limit ? `${value.slice(0, limit).trimEnd()}…` : value;
+}
+
+function harnessErrorDetail(terminalReason: string, errorText: string): string {
+  if (!terminalReason && !errorText) return "";
+  const lowerErr = errorText.toLowerCase();
+  if (SUPPRESSED_ERROR_FRAGMENTS.some((frag) => lowerErr.includes(frag))) {
+    return "";
+  }
+  const lines: string[] = [];
+  if (terminalReason) {
+    lines.push(`> Reason: \`${terminalReason}\``);
+  }
+  if (errorText) {
+    lines.push(`> Detail: ${truncate(errorText, ERROR_DETAIL_MAX_CHARS)}`);
+  }
+  return lines.join("\n");
+}
+
 /**
  * Split text into chunks that fit within Slack's message limit.
  * Splits on paragraph boundaries, then line boundaries, then spaces.
@@ -137,7 +170,8 @@ export function renderTerminalResultCopy(opts: {
     || rawValues.includes("assignment_missing")
     || rawValues.includes("hard_deadline_exceeded")
     || rawBlob.includes("connection error")) {
-    return EXECUTION_FAILED_MESSAGE;
+    const detail = harnessErrorDetail(terminalReason, errorText);
+    return detail ? `${EXECUTION_FAILED_MESSAGE}\n\n${detail}` : EXECUTION_FAILED_MESSAGE;
   }
 
   return resultText;

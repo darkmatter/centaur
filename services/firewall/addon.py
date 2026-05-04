@@ -130,9 +130,6 @@ ALLOWED_OUTBOUND_HEADERS: frozenset[str] = frozenset({
 
 FIXED_USER_AGENT = "ai-v2-sandbox/1.0"
 
-RATE_LIMIT = int(os.environ.get("FIREWALL_RATE_LIMIT", "500"))
-RATE_WINDOW = 60  # seconds
-
 BODY_INSPECTION_ENABLED = os.environ.get("FIREWALL_BODY_INSPECTION", "0") == "1"
 CONTROL_TOKEN = os.environ.get("FIREWALL_CONTROL_TOKEN", "")
 
@@ -285,10 +282,6 @@ class CredentialInjector:
         self._known_keys: set[str] = set()
         self._canonicalize_google_key = False
         self._keys_lock = threading.Lock()
-        # Rate limiting: source_ip → list of timestamps
-        self._rate_tracker: dict[str, list[float]] = {}
-        self._rate_lock = threading.Lock()
-        self._rate_last_prune = time.monotonic()
         # Reverse secret map for response scanning: secret_value → key_name
         self._reverse_secrets: dict[str, str] = {}
         self._reverse_lock = threading.Lock()
@@ -828,48 +821,6 @@ class CredentialInjector:
             del flow.request.headers[header_name]
 
     # ------------------------------------------------------------------
-    # Rate limiting (sliding window per source IP)
-    # ------------------------------------------------------------------
-
-    _RATE_PRUNE_INTERVAL = 300  # prune stale IPs every 5 min
-
-    def _check_rate_limit(self, flow: http.HTTPFlow) -> bool:
-        """Return True and set 429 response if source exceeds rate limit."""
-        source_ip = flow.client_conn.peername[0] if flow.client_conn.peername else "unknown"
-        now = time.monotonic()
-        with self._rate_lock:
-            # Periodically prune IPs with no recent activity
-            if now - self._rate_last_prune > self._RATE_PRUNE_INTERVAL:
-                cutoff_prune = now - RATE_WINDOW
-                stale = [
-                    ip for ip, ts in self._rate_tracker.items()
-                    if not ts or ts[-1] < cutoff_prune
-                ]
-                for ip in stale:
-                    del self._rate_tracker[ip]
-                self._rate_last_prune = now
-
-            timestamps = self._rate_tracker.get(source_ip, [])
-            cutoff = now - RATE_WINDOW
-            timestamps = [t for t in timestamps if t > cutoff]
-            if len(timestamps) >= RATE_LIMIT:
-                self._rate_tracker[source_ip] = timestamps
-                flow.response = http.Response.make(
-                    429,
-                    b"Rate limit exceeded",
-                    {"content-type": "text/plain", "retry-after": "60"},
-                )
-                log.warning(
-                    "rate_limited",
-                    extra={"event": "rate_limited", "source_ip": source_ip,
-                           "count": len(timestamps)},
-                )
-                return True
-            timestamps.append(now)
-            self._rate_tracker[source_ip] = timestamps
-        return False
-
-    # ------------------------------------------------------------------
     # Response body secret scanning
     # ------------------------------------------------------------------
 
@@ -983,10 +934,6 @@ class CredentialInjector:
 
     def request(self, flow: http.HTTPFlow) -> None:
         host = flow.request.pretty_host.lower().rstrip(".")
-
-        # 0. Rate limiting (before any processing)
-        if self._check_rate_limit(flow):
-            return
 
         # 1. Strip sensitive inbound headers from sandbox requests
         for h in SENSITIVE_INBOUND_HEADERS:

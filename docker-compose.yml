@@ -325,6 +325,24 @@ services:
       start_interval: 1s
     restart: unless-stopped
 
+  iron-proxy:
+    build:
+      context: .
+      dockerfile: services/iron-proxy/Dockerfile
+    profiles: ["iron-proxy"]
+    environment:
+      SECRET_MANAGER_URL: http://secrets:8100
+    volumes:
+      - iron-proxy-config:/etc/iron-proxy
+      - iron-proxy-certs:/certs
+    networks:
+      - default
+      - secrets_net
+    depends_on:
+      secrets:
+        condition: service_healthy
+    restart: unless-stopped
+
   fluentbit:
     build:
       context: services/fluentbit
@@ -355,6 +373,12 @@ volumes:
   firewall-certs:
     external: true
     name: centaur_firewall-certs
+  iron-proxy-config:
+    external: true
+    name: centaur_iron-proxy-config
+  iron-proxy-certs:
+    external: true
+    name: centaur_iron-proxy-certs
 
 networks:
   secrets_net:

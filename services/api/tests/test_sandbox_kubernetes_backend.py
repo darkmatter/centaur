@@ -151,6 +151,21 @@ def test_prompt_bundle_includes_live_capability_inventory_guidance(
     assert "partial and non-exhaustive" in prompt
 
 
+def test_prompt_bundle_includes_named_skill_resolution_guidance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from api.sandbox.kubernetes import _prompt_bundle
+
+    monkeypatch.delenv("CENTAUR_OVERLAY_DIR", raising=False)
+
+    prompt = _prompt_bundle(None)
+
+    assert "[Named skill resolution]" in prompt
+    assert "resolve that request against local skill definitions before doing broad semantic matching" in prompt
+    assert "Treat \"exists locally\" and \"is live in this deployment\" as separate questions" in prompt
+    assert "ask one targeted clarification instead of guessing" in prompt
+
+
 @pytest.mark.asyncio
 async def test_ensure_clients_disables_proxy_env(monkeypatch: pytest.MonkeyPatch) -> None:
     class FakeApiClient:

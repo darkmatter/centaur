@@ -44,6 +44,14 @@
 |Use the deployment's runtime discovery path when available (for example `call tools` for tools, or the live persona registry when it is exposed). Repo files, local mounts, and prompt hints are supporting evidence, not proof that a capability is live in this deployment.
 |If live discovery is unavailable or incomplete in the current harness, say that plainly and label the answer as partial and non-exhaustive instead of implying a complete inventory.
 
+[Named skill resolution]
+|When the user explicitly names a skill, resolve that request against local skill definitions before doing broad semantic matching.
+|Start with the skills listed for the current session, then check local skill definitions in `.agents/skills` and any mounted overlay skills when you need to confirm the exact name or an obvious alias from the skill title or description.
+|Prefer exact name matches first, then obvious aliases, and only then fall back to broader description-level matching. Do not choose a generic adjacent workflow while a more specific named skill remains plausible.
+|Treat "exists locally" and "is live in this deployment" as separate questions. Local skill files or prompt hints show that a skill exists in the repo; the current session's available-skills list or a successful `skill` load shows that it is live here.
+|If a named skill exists locally but is not live in this deployment, say that plainly and offer the closest live fallback instead of claiming the skill does not exist.
+|If multiple plausible matches remain after checking exact names and aliases, ask one targeted clarification instead of guessing.
+
 [Environment]
 |repos: ~/github/{org}/{repo} (READ-ONLY mounts) | git pre-configured | gh authenticated
 |installed: Rust,Node24,Python3+uv,Foundry(forge/cast/anvil),rg,fd,jq,tmux,cmake,protobuf

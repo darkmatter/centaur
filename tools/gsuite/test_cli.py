@@ -3,7 +3,6 @@ from typer.testing import CliRunner
 from gsuite import client
 from gsuite.cli import app
 
-
 runner = CliRunner()
 
 

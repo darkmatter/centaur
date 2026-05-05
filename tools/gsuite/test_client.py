@@ -1,3 +1,5 @@
+import pytest
+
 from gsuite import client
 
 
@@ -138,6 +140,14 @@ def _paragraph(start_index: int, text: str, *, bullet: bool = False) -> dict:
         "startIndex": start_index,
         "endIndex": start_index + len(text),
         "paragraph": paragraph,
+    }
+
+
+def _tab(tab_id: str, content: list[dict], *, child_tabs: list[dict] | None = None) -> dict:
+    return {
+        "tabProperties": {"tabId": tab_id},
+        "documentTab": {"body": {"content": content}},
+        "childTabs": child_tabs or [],
     }
 
 
@@ -286,7 +296,7 @@ def test_docs_bullets_builds_google_docs_list_requests(monkeypatch):
                     "content": [
                         _paragraph(1, "Intro\n"),
                         _paragraph(7, "First item\n", bullet=True),
-                        _paragraph(18, "\tNested item\n", bullet=True),
+                        _paragraph(17, "Nested item\n", bullet=True),
                     ]
                 }
             },
@@ -305,22 +315,14 @@ def test_docs_bullets_builds_google_docs_list_requests(monkeypatch):
             "documentId": "doc-123",
             "body": {
                 "requests": [
-                    {
-                        "deleteContentRange": {
-                            "range": {"startIndex": 21, "endIndex": 23}
-                        }
-                    },
+                    {"deleteContentRange": {"range": {"startIndex": 21, "endIndex": 23}}},
                     {
                         "createParagraphBullets": {
                             "range": {"startIndex": 20, "endIndex": 33},
                             "bulletPreset": "BULLET_DISC_CIRCLE_SQUARE",
                         }
                     },
-                    {
-                        "deleteContentRange": {
-                            "range": {"startIndex": 7, "endIndex": 9}
-                        }
-                    },
+                    {"deleteContentRange": {"range": {"startIndex": 7, "endIndex": 9}}},
                     {
                         "createParagraphBullets": {
                             "range": {"startIndex": 7, "endIndex": 18},
@@ -346,12 +348,116 @@ def test_docs_bullets_builds_google_docs_list_requests(monkeypatch):
                 "paragraph_index": 1,
                 "before": "- First item",
                 "after": "First item",
+                "nesting_level": 0,
             },
             {
                 "tab_id": None,
                 "paragraph_index": 2,
                 "before": "\t- Nested item",
-                "after": "\tNested item",
+                "after": "Nested item",
+                "nesting_level": 1,
             },
         ],
     }
+
+
+def test_docs_bullets_rejects_empty_match_prefix_before_read(monkeypatch):
+    monkeypatch.setattr(
+        client,
+        "docs_get",
+        lambda document_id: (_ for _ in ()).throw(AssertionError("docs_get should not run")),
+    )
+
+    with pytest.raises(ValueError, match="match_prefix must not be empty"):
+        client.docs_bullets("doc-123", match_prefix="")
+
+
+def test_docs_bullets_rejects_unknown_bullet_preset_before_read(monkeypatch):
+    monkeypatch.setattr(
+        client,
+        "docs_get",
+        lambda document_id: (_ for _ in ()).throw(AssertionError("docs_get should not run")),
+    )
+
+    with pytest.raises(ValueError, match="Unsupported bullet_preset"):
+        client.docs_bullets("doc-123", bullet_preset="BULLET_MYSTERY")
+
+
+def test_docs_bullets_dry_run_does_not_write_or_verify(monkeypatch):
+    fake_service = _FakeDocsService(
+        [
+            {
+                "body": {
+                    "content": [
+                        _paragraph(1, "- First item\n"),
+                    ]
+                }
+            }
+        ]
+    )
+    monkeypatch.setattr(client, "get_docs_service", lambda: fake_service)
+
+    result = client.docs_bullets("doc-123", dry_run=True)
+
+    assert fake_service.documents_api.get_calls == [
+        {"documentId": "doc-123", "includeTabsContent": True},
+    ]
+    assert fake_service.documents_api.batch_update_calls == []
+    assert result["matched_paragraphs"] == 1
+    assert result["updated_paragraphs"] == 0
+    assert result["verified_paragraphs"] == 0
+    assert result["dry_run"] is True
+
+
+def test_docs_bullets_scopes_requests_to_tab(monkeypatch):
+    fake_service = _FakeDocsService(
+        [
+            {
+                "tabs": [
+                    _tab("tab-a", [_paragraph(1, "- Other tab\n")]),
+                    _tab("tab-b", [_paragraph(1, "- Target\n")]),
+                ]
+            },
+            {
+                "tabs": [
+                    _tab("tab-b", [_paragraph(1, "Target\n", bullet=True)]),
+                ]
+            },
+        ]
+    )
+    monkeypatch.setattr(client, "get_docs_service", lambda: fake_service)
+
+    result = client.docs_bullets("doc-123", tab_id="tab-b")
+
+    assert fake_service.documents_api.batch_update_calls == [
+        {
+            "documentId": "doc-123",
+            "body": {
+                "requests": [
+                    {
+                        "deleteContentRange": {
+                            "range": {"startIndex": 1, "endIndex": 3, "tabId": "tab-b"}
+                        }
+                    },
+                    {
+                        "createParagraphBullets": {
+                            "range": {"startIndex": 1, "endIndex": 8, "tabId": "tab-b"},
+                            "bulletPreset": "BULLET_DISC_CIRCLE_SQUARE",
+                        }
+                    },
+                ]
+            },
+        }
+    ]
+    assert result["matched_paragraphs"] == 1
+    assert result["updated_paragraphs"] == 1
+    assert result["verified_paragraphs"] == 1
+    assert result["paragraphs"] == [
+        {
+            "tab_id": "tab-b",
+            "paragraph_index": 0,
+            "before": "- Target",
+            "after": "Target",
+            "nesting_level": 0,
+        }
+    ]

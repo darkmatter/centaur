@@ -1,14 +1,14 @@
 """GSuite API client for Gmail, Calendar, and Drive."""
 
+import base64
 import json
 import os
 import re
-import base64
 from email.mime.text import MIMEText
 from pathlib import Path
 
-from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
@@ -1309,10 +1309,42 @@ def drive_export(file_id: str, export_format: str = "txt", output_path: str | No
 
 
 DEFAULT_DOCS_BULLET_PRESET = "BULLET_DISC_CIRCLE_SQUARE"
+VALID_DOCS_BULLET_PRESETS = {
+    "BULLET_ARROW3D_CIRCLE_SQUARE",
+    "BULLET_ARROW_DIAMOND_DISC",
+    "BULLET_CHECKBOX",
+    "BULLET_DIAMOND_CIRCLE_SQUARE",
+    "BULLET_DIAMONDX_ARROW3D_SQUARE",
+    "BULLET_DIAMONDX_HOLLOWDIAMOND_SQUARE",
+    "BULLET_DISC_CIRCLE_SQUARE",
+    "BULLET_LEFTTRIANGLE_DIAMOND_DISC",
+    "BULLET_STAR_CIRCLE_SQUARE",
+    "NUMBERED_DECIMAL_ALPHA_ROMAN",
+    "NUMBERED_DECIMAL_ALPHA_ROMAN_PARENS",
+    "NUMBERED_DECIMAL_NESTED",
+    "NUMBERED_UPPERALPHA_ALPHA_ROMAN",
+    "NUMBERED_UPPERROMAN_UPPERALPHA_DECIMAL",
+    "NUMBERED_ZERODECIMAL_ALPHA_ROMAN",
+}
 
 
 def _utf16_len(text: str) -> int:
     return len(text.encode("utf-16-le")) // 2
+
+
+def _validate_docs_bullet_match_prefix(match_prefix: str) -> None:
+    if not match_prefix:
+        raise ValueError("match_prefix must not be empty")
+
+
+def _validate_docs_bullets_args(match_prefix: str, bullet_preset: str) -> None:
+    _validate_docs_bullet_match_prefix(match_prefix)
+
+    if bullet_preset not in VALID_DOCS_BULLET_PRESETS:
+        valid_presets = ", ".join(sorted(VALID_DOCS_BULLET_PRESETS))
+        raise ValueError(
+            f"Unsupported bullet_preset {bullet_preset!r}. Expected one of: {valid_presets}"
+        )
 
 
 def _iter_document_tabs(tabs: list[dict]):
@@ -1321,8 +1353,7 @@ def _iter_document_tabs(tabs: list[dict]):
         body = tab.get("documentTab", {}).get("body", {})
         yield tab_id, body.get("content", [])
 
-        for child_tab_id, child_content in _iter_document_tabs(tab.get("childTabs", [])):
-            yield child_tab_id, child_content
+        yield from _iter_document_tabs(tab.get("childTabs", []))
 
 
 def _paragraph_text(paragraph: dict) -> str:
@@ -1397,6 +1428,8 @@ def _build_docs_bullet_matches(
     match_prefix: str,
     tab_id: str | None = None,
 ) -> tuple[list[dict], int]:
+    _validate_docs_bullet_match_prefix(match_prefix)
+
     matches: list[dict] = []
     already_bulleted = 0
     prefix_pattern = re.compile(rf"^(?P<tabs>\t*)(?P<spaces> *){re.escape(match_prefix)}")
@@ -1413,12 +1446,14 @@ def _build_docs_bullet_matches(
             already_bulleted += 1
             continue
 
+        nesting_tabs = match.group("tabs")
         delete_prefix = f"{match.group('spaces')}{match_prefix}"
-        transformed_text = f"{match.group('tabs')}{paragraph['text'][match.end():]}"
+        text_after_prefix = paragraph["text"][match.end() :]
+        transformed_text = f"{nesting_tabs}{text_after_prefix}"
         if not transformed_text.strip():
             continue
 
-        delete_start = paragraph["start_index"] + _utf16_len(match.group("tabs"))
+        delete_start = paragraph["start_index"] + _utf16_len(nesting_tabs)
         delete_end = delete_start + _utf16_len(delete_prefix)
         matches.append(
             {
@@ -1429,7 +1464,8 @@ def _build_docs_bullet_matches(
                 "delete_start": delete_start,
                 "delete_end": delete_end,
                 "before": paragraph["text"].rstrip("\n"),
-                "after": transformed_text.rstrip("\n"),
+                "after": text_after_prefix.rstrip("\n"),
+                "nesting_level": len(nesting_tabs),
             }
         )
 
@@ -1592,6 +1628,8 @@ def docs_bullets(
     Returns:
         Dict with match counts and verification details
     """
+    _validate_docs_bullets_args(match_prefix, bullet_preset)
+
     document = docs_get(document_id)
     matches, already_bulleted = _build_docs_bullet_matches(document, match_prefix, tab_id=tab_id)
 
@@ -1610,6 +1648,7 @@ def docs_bullets(
                 "paragraph_index": match["paragraph_index"],
                 "before": match["before"],
                 "after": match["after"],
+                "nesting_level": match["nesting_level"],
             }
             for match in matches
         ],

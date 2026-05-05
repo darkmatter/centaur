@@ -55,7 +55,7 @@ BODY=$(jq -nc \
   '{channel: $channel, content_base64: $content_base64, filename: $filename, title: $title, comment: $comment, thread_ts: $thread_ts}')
 
 run_upload "$BODY"
-if [ -n "$LINK" ]; then
+if [ "$STATUS" -eq 0 ] && [ -n "$LINK" ]; then
   echo "$LINK"
   exit 0
 fi

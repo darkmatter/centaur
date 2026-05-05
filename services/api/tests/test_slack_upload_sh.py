@@ -81,3 +81,34 @@ def test_slack_upload_extracts_permalink_from_toon_response(tmp_path: Path) -> N
 
     assert result.returncode == 0, result.stderr or result.stdout
     assert result.stdout.strip() == "https://slack.com/archives/C123/p789"
+
+
+def test_slack_upload_does_not_trust_permalink_from_failed_call(tmp_path: Path) -> None:
+    artifact = tmp_path / "artifact.mp4"
+    artifact.write_bytes(b"video-bytes")
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    script = """#!/bin/bash
+set -euo pipefail
+printf '%s\n' 'error: https://slack.com/archives/C123/pbad'
+exit 1
+"""
+    _write_fake_call(fake_bin / "call", script)
+
+    result = subprocess.run(
+        ["bash", str(SLACK_UPLOAD_SH), str(artifact)],
+        check=False,
+        capture_output=True,
+        text=True,
+        cwd=tmp_path,
+        env={
+            "PATH": f"{fake_bin}:/usr/bin:/bin",
+            "SLACK_CHANNEL": "C123",
+            "SLACK_THREAD_TS": "123.456",
+        },
+    )
+
+    assert result.returncode == 1
+    assert "https://slack.com/archives/C123/pbad" not in result.stdout
+    assert "upload_failed" in result.stderr

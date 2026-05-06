@@ -23,6 +23,23 @@ function truncate(value: string, limit: number): string {
   return value.length > limit ? `${value.slice(0, limit).trimEnd()}…` : value;
 }
 
+function redactErrorDetail(value: string): string {
+  return value
+    .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]+/gi, "Bearer [redacted]")
+    .replace(/\bxox[a-z]-[A-Za-z0-9-]+/gi, "[redacted Slack token]")
+    .replace(/\b(authorization|x-api-key|api[_-]?key|token)\s*[:=]\s*[^\s,;]+/gi, "$1=[redacted]")
+    .replace(/\/(?:home\/agent\/(?:workspace|uploads)|tmp)\/[^\s)`'"]+/g, "[redacted path]");
+}
+
+function codeFence(value: string, language = "text"): string {
+  const longestBacktickRun = Math.max(
+    0,
+    ...Array.from(value.matchAll(/`+/g), (match) => match[0].length),
+  );
+  const fence = "`".repeat(Math.max(3, longestBacktickRun + 1));
+  return `${fence}${language}\n${value}\n${fence}`;
+}
+
 function harnessErrorDetail(terminalReason: string, errorText: string): string {
   if (!terminalReason && !errorText) return "";
   const lowerErr = errorText.toLowerCase();
@@ -31,10 +48,10 @@ function harnessErrorDetail(terminalReason: string, errorText: string): string {
   }
   const lines: string[] = [];
   if (terminalReason) {
-    lines.push(`> Reason: \`${terminalReason}\``);
+    lines.push(`Reason: \`${terminalReason}\``);
   }
   if (errorText) {
-    lines.push(`> Detail: ${truncate(errorText, ERROR_DETAIL_MAX_CHARS)}`);
+    lines.push(codeFence(truncate(redactErrorDetail(errorText), ERROR_DETAIL_MAX_CHARS)));
   }
   return lines.join("\n");
 }
@@ -146,8 +163,9 @@ export function renderTerminalResultCopy(opts: {
     .map((value) => value.toLowerCase())
     .filter(Boolean);
   const rawBlob = rawValues.join("\n");
+  const detailText = errorText || (Boolean(opts.isError) ? resultText : "");
 
-  if (status === "completed") {
+  if (status === "completed" && !Boolean(opts.isError)) {
     return resultText;
   }
 
@@ -170,7 +188,7 @@ export function renderTerminalResultCopy(opts: {
     || rawValues.includes("assignment_missing")
     || rawValues.includes("hard_deadline_exceeded")
     || rawBlob.includes("connection error")) {
-    const detail = harnessErrorDetail(terminalReason, errorText);
+    const detail = harnessErrorDetail(terminalReason, detailText);
     return detail ? `${EXECUTION_FAILED_MESSAGE}\n\n${detail}` : EXECUTION_FAILED_MESSAGE;
   }
 

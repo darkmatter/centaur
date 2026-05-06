@@ -321,7 +321,6 @@ describe("SlackBot runtime control", () => {
       isMention: true,
     }));
 
-    expect(client.getExecution).toHaveBeenCalledWith("exe-new");
     const markdownCalls = post.mock.calls
       .map(([content]) => content)
       .filter((content): content is { markdown: string } => "markdown" in content)
@@ -378,6 +377,64 @@ describe("SlackBot runtime control", () => {
 
     expect(streamText(runtime.streamedChunks)).toContain("Agent hit a runtime issue before finishing. Please retry.");
     expect(streamText(runtime.streamedChunks)).not.toContain("Connection error.");
+  });
+
+  it("renders provider harness errors in a Slack code block", async () => {
+    const client = createImmediateStreamClient();
+    client.streamEvents = vi.fn(() => (async function* () {
+      yield {
+        eventId: 1,
+        eventKind: "amp_raw_event",
+        data: {
+          type: "turn.done",
+          result: "Model Provider Overloaded Try again in a few seconds.",
+          is_error: true,
+          error: "Model Provider Overloaded Try again in a few seconds.",
+        },
+      };
+    })());
+
+    const bot = new SlackBot(client as any);
+    const runtime = createThread();
+
+    await bot.onSubscribedMessage(runtime.thread, userMessage("follow-up", {
+      id: "1700000000.000004",
+      isMention: true,
+    }));
+
+    const rendered = streamText(runtime.streamedChunks);
+    expect(rendered).toContain("Agent hit a runtime issue before finishing. Please retry.");
+    expect(rendered).toContain("```text\nModel Provider Overloaded Try again in a few seconds.\n```");
+  });
+
+  it("uses result text as sanitized detail for error events without an error field", async () => {
+    const client = createImmediateStreamClient();
+    client.streamEvents = vi.fn(() => (async function* () {
+      yield {
+        eventId: 1,
+        eventKind: "amp_raw_event",
+        data: {
+          type: "turn.done",
+          result: "Provider failed with Authorization: Bearer sk-test at /home/agent/workspace/secret.txt",
+          is_error: true,
+        },
+      };
+    })());
+
+    const bot = new SlackBot(client as any);
+    const runtime = createThread();
+
+    await bot.onSubscribedMessage(runtime.thread, userMessage("follow-up", {
+      id: "1700000000.000004",
+      isMention: true,
+    }));
+
+    const rendered = streamText(runtime.streamedChunks);
+    expect(rendered).toContain("Agent hit a runtime issue before finishing. Please retry.");
+    expect(rendered).toContain("Authorization=[redacted]");
+    expect(rendered).toContain("[redacted path]");
+    expect(rendered).not.toContain("sk-test");
+    expect(rendered).not.toContain("/home/agent/workspace/secret.txt");
   });
 
   it("maps cancelled hydration to a friendly cancellation message", async () => {

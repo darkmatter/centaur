@@ -11,6 +11,16 @@ _DURATION_RE = re.compile(r"^\d+[smhdw]$")
 _DURATION_SECONDS = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}
 
 
+def _quote_logsql_value(value: str) -> str:
+    """Quote a LogsQL field value, escaping characters used by thread keys."""
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def _field_expr(field: str, value: str) -> str:
+    return f"{field}:{_quote_logsql_value(value)}"
+
+
 class VictoriaLogsClient:
     """Client for the VictoriaLogs HTTP API.
 
@@ -76,7 +86,9 @@ class VictoriaLogsClient:
             if line:
                 lines.append(json.loads(line))
         if len(lines) >= limit:
-            lines.append({"_note": f"Results truncated at {limit}. Increase limit or narrow your query."})
+            lines.append(
+                {"_note": f"Results truncated at {limit}. Increase limit or narrow your query."}
+            )
         return lines
 
     def hits(
@@ -203,7 +215,7 @@ class VictoriaLogsClient:
     def _coerce_float(value: Any) -> float:
         if isinstance(value, bool):
             return float(value)
-        if isinstance(value, (int, float)):
+        if isinstance(value, int | float):
             return float(value)
         if isinstance(value, str):
             try:
@@ -258,7 +270,7 @@ class VictoriaLogsClient:
             start: Time range start (shorthand like '1h' or RFC3339).
             end: Time range end (RFC3339).
         """
-        parts = [self._time_prefix(start), f"thread_key:{thread_key}"]
+        parts = [self._time_prefix(start), _field_expr("thread_key", thread_key)]
         if level:
             parts.append(f"level:{level}")
         q = " AND ".join(p for p in parts if p and not p.startswith("_time:"))
@@ -319,7 +331,7 @@ class VictoriaLogsClient:
             "inflight_turn_replayed",
         ]
         event_expr = " OR ".join(f"event:{event_name}" for event_name in flow_events)
-        q = f"{self._time_prefix(start)}thread_key:{thread_key} AND ({event_expr})"
+        q = f"{self._time_prefix(start)}{_field_expr('thread_key', thread_key)} AND ({event_expr})"
         results = self.query(q, limit=limit, **self._time_params(start))
         return [self._clean_entry(e) for e in results if "_note" not in e]
 
@@ -342,7 +354,7 @@ class VictoriaLogsClient:
         if service:
             parts.append(f'_stream:{{service="{service}"}}')
         if thread_key:
-            parts.append(f"thread_key:{thread_key}")
+            parts.append(_field_expr("thread_key", thread_key))
         q = f"{self._time_prefix(start)}{' AND '.join(parts)}"
         results = self.query(q, limit=limit, **self._time_params(start))
         return [self._clean_entry(e) for e in results if "_note" not in e]
@@ -385,10 +397,18 @@ class VictoriaLogsClient:
         if tool_name:
             parts.append(f"tool_name:{tool_name}")
         if thread_key:
-            parts.append(f"thread_key:{thread_key}")
+            parts.append(_field_expr("thread_key", thread_key))
         q = f"{self._time_prefix(start)}{' AND '.join(parts)}"
         results = self.query(q, limit=limit, **self._time_params(start))
-        keep_fields = {"_time", "_msg", "duration_ms", "success", "tool_name", "tool_method", "thread_key"}
+        keep_fields = {
+            "_time",
+            "_msg",
+            "duration_ms",
+            "success",
+            "tool_name",
+            "tool_method",
+            "thread_key",
+        }
         return [
             {k: v for k, v in self._clean_entry(e).items() if k in keep_fields}
             for e in results
@@ -420,7 +440,9 @@ class VictoriaLogsClient:
         time_params = self._time_params(start)
 
         svc_names = [
-            svc for svc in self.field_values("service", query=f"{time_prefix}*", **time_params) if svc.strip()
+            svc
+            for svc in self.field_values("service", query=f"{time_prefix}*", **time_params)
+            if svc.strip()
         ]
         result: dict[str, dict[str, int]] = {}
         step = self._hits_step(start)
@@ -444,7 +466,7 @@ class VictoriaLogsClient:
             limit: Max entries.
         """
         q = (
-            f'{self._time_prefix(start)}'
+            f"{self._time_prefix(start)}"
             f'_stream:{{service="sandbox"}} OR event:warm_container_claimed OR event:sandbox_*'
         )
         results = self.query(q, limit=limit, **self._time_params(start))
@@ -463,12 +485,18 @@ class VictoriaLogsClient:
         """
         q = f"{self._time_prefix(start)}event:tool_call_completed"
         results = self.query(q, limit=10000, **self._time_params(start))
-        
+
         from collections import defaultdict
-        stats: dict[str, dict] = defaultdict(lambda: {
-            "calls": 0, "failures": 0, "total_duration_ms": 0,
-            "methods": defaultdict(int), "threads": set(),
-        })
+
+        stats: dict[str, dict] = defaultdict(
+            lambda: {
+                "calls": 0,
+                "failures": 0,
+                "total_duration_ms": 0,
+                "methods": defaultdict(int),
+                "threads": set(),
+            }
+        )
         for entry in results:
             if "_note" in entry:
                 continue
@@ -477,7 +505,7 @@ class VictoriaLogsClient:
             success = entry.get("success", "true") == "true"
             duration = round(self._coerce_float(entry.get("duration_ms", 0)))
             thread = entry.get("thread_key", "")
-            
+
             stats[tool]["calls"] += 1
             if not success:
                 stats[tool]["failures"] += 1
@@ -485,20 +513,22 @@ class VictoriaLogsClient:
             stats[tool]["methods"][method] += 1
             if thread:
                 stats[tool]["threads"].add(thread)
-        
+
         result = []
         for tool, s in sorted(stats.items(), key=lambda x: x[1]["calls"], reverse=True)[:limit]:
             avg_ms = round(s["total_duration_ms"] / s["calls"]) if s["calls"] else 0
             failure_rate = round(s["failures"] / s["calls"] * 100, 1) if s["calls"] else 0
-            result.append({
-                "tool": tool,
-                "calls": s["calls"],
-                "failures": s["failures"],
-                "failure_rate_pct": failure_rate,
-                "avg_duration_ms": avg_ms,
-                "unique_threads": len(s["threads"]),
-                "methods": dict(s["methods"]),
-            })
+            result.append(
+                {
+                    "tool": tool,
+                    "calls": s["calls"],
+                    "failures": s["failures"],
+                    "failure_rate_pct": failure_rate,
+                    "avg_duration_ms": avg_ms,
+                    "unique_threads": len(s["threads"]),
+                    "methods": dict(s["methods"]),
+                }
+            )
         return result
 
     def tool_usage_by_thread(
@@ -515,18 +545,26 @@ class VictoriaLogsClient:
             limit: Max entries.
         """
         if thread_key:
-            q = f"{self._time_prefix(start)}event:tool_call_completed AND thread_key:{thread_key}"
+            q = (
+                f"{self._time_prefix(start)}event:tool_call_completed "
+                f"AND {_field_expr('thread_key', thread_key)}"
+            )
             results = self.query(q, limit=limit, **self._time_params(start))
             return [
-                {k: v for k, v in self._clean_entry(e).items()
-                 if k in ("_time", "tool_name", "tool_method", "duration_ms", "success")}
-                for e in results if "_note" not in e
+                {
+                    k: v
+                    for k, v in self._clean_entry(e).items()
+                    if k in ("_time", "tool_name", "tool_method", "duration_ms", "success")
+                }
+                for e in results
+                if "_note" not in e
             ]
-        
+
         # Top threads by tool usage
         q = f"{self._time_prefix(start)}event:tool_call_completed AND thread_key:*"
         results = self.query(q, limit=10000, **self._time_params(start))
         from collections import Counter
+
         threads: Counter = Counter()
         for entry in results:
             if "_note" in entry:
@@ -682,7 +720,9 @@ class VictoriaLogsClient:
             stat["calls"] += 1
             stat["input_tokens"] += float(entry.get("input_tokens") or 0)
             stat["output_tokens"] += float(entry.get("output_tokens") or 0)
-            stat["cache_creation_input_tokens"] += float(entry.get("cache_creation_input_tokens") or 0)
+            stat["cache_creation_input_tokens"] += float(
+                entry.get("cache_creation_input_tokens") or 0
+            )
             stat["cache_read_input_tokens"] += float(entry.get("cache_read_input_tokens") or 0)
             stat["cost_usd"] += float(entry.get("cost_usd") or 0.0)
 
@@ -704,7 +744,9 @@ class VictoriaLogsClient:
                         + stat["cache_read_input_tokens"]
                     ),
                     "cost_usd": round(stat["cost_usd"], 6),
-                    "avg_cost_usd": round(stat["cost_usd"] / stat["calls"], 6) if stat["calls"] else 0.0,
+                    "avg_cost_usd": round(stat["cost_usd"] / stat["calls"], 6)
+                    if stat["calls"]
+                    else 0.0,
                 }
             )
         return sorted(rows, key=lambda row: row["cost_usd"], reverse=True)[:limit]

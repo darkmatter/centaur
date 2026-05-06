@@ -1,19 +1,23 @@
 """Slack API client with bot operations plus optional native search user token."""
 
+import base64
 import json
+import mimetypes
 import os
 import re
 import time
+import urllib.request
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, ClassVar
+from urllib.parse import urljoin, urlparse
 
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 
-from centaur_sdk.tool_sdk import secret
+from centaur_sdk.tool_sdk import get_tool_context, secret
 
 # Cache for channel list to avoid repeated API calls
 
@@ -44,6 +48,7 @@ class SlackAuthError(RuntimeError):
         self.payload = payload
         super().__init__(json.dumps(payload, sort_keys=True))
 
+
 class SlackClient:
     """Slack API client.
 
@@ -61,15 +66,17 @@ class SlackClient:
     _MAX_PAGE_SIZE = 200
     _DATE_ONLY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
     _NUMERIC_TS_RE = re.compile(r"^\d+(?:\.\d+)?$")
-    _AUTH_ERROR_CODES: ClassVar[frozenset[str]] = frozenset({
-        "account_inactive",
-        "invalid_auth",
-        "missing_scope",
-        "no_permission",
-        "not_allowed_token_type",
-        "not_authed",
-        "token_revoked",
-    })
+    _AUTH_ERROR_CODES: ClassVar[frozenset[str]] = frozenset(
+        {
+            "account_inactive",
+            "invalid_auth",
+            "missing_scope",
+            "no_permission",
+            "not_allowed_token_type",
+            "not_authed",
+            "token_revoked",
+        }
+    )
 
     def __init__(self, bot_token: str | None = None, search_token: str | None = None):
         token = (bot_token or secret("SLACK_BOT_TOKEN", default="")).strip()
@@ -81,15 +88,15 @@ class SlackClient:
         self.token = token
         self.search_token = (search_token or secret("SLACK_SEARCH_TOKEN", default="")).strip()
         self._client = WebClient(token=token)
-        self._search_client = WebClient(token=self.search_token) if self.search_token else self._client
+        self._search_client = (
+            WebClient(token=self.search_token) if self.search_token else self._client
+        )
         self._user_cache: dict[str, str] = {}
         self._ratelimit_deadlines: dict[str, float] = {}
 
     def __getattr__(self, name: str):
         """Proxy raw Slack SDK methods when the higher-level wrapper does not define them."""
         return getattr(self._client, name)
-
-
 
     def _is_ratelimit_error(self, error: SlackApiError) -> bool:
         """Detect Slack rate limit responses from either payload or status code."""
@@ -176,7 +183,7 @@ class SlackClient:
         if value in (None, ""):
             return None
 
-        if isinstance(value, (int, float)):
+        if isinstance(value, int | float):
             seconds = float(value)
             if seconds >= 1_000_000_000_000:
                 seconds /= 1000.0
@@ -285,7 +292,6 @@ class SlackClient:
 
         return items, next_cursor, bool(next_cursor)
 
-
     def _resolve_channel(self, channel: str) -> str:
         """Resolve a channel name to its ID using cached channel list."""
         normalized = channel.lstrip("#")
@@ -308,7 +314,6 @@ class SlackClient:
 
         return re.sub(r"<@([A-Z0-9]+)>", replace_mention, text)
 
-
     def _load_channel_cache(self) -> tuple[list[dict], float] | None:
         """Load cached channel list if valid."""
         try:
@@ -320,7 +325,6 @@ class SlackClient:
         except Exception:
             pass
         return None
-
 
     def _save_channel_cache(self, channels: list[dict]) -> None:
         """Save channel list to cache."""
@@ -337,7 +341,6 @@ class SlackClient:
         except Exception:
             pass
 
-
     def _load_user_cache(self) -> dict[str, str] | None:
         """Load cached user list if valid."""
         try:
@@ -349,7 +352,6 @@ class SlackClient:
         except Exception:
             pass
         return None
-
 
     def _save_user_cache(self, users: dict[str, str]) -> None:
         """Save user mapping to cache."""
@@ -365,7 +367,6 @@ class SlackClient:
             )
         except Exception:
             pass
-
 
     def _get_user_cache(self) -> dict[str, str]:
         """Get user ID -> name mapping, using cache when possible."""
@@ -383,9 +384,8 @@ class SlackClient:
             pass
         return user_cache
 
-
-    def list_bot_channels(self, 
-        include_private: bool = True, limit: int = 500, force_refresh: bool = False
+    def list_bot_channels(
+        self, include_private: bool = True, limit: int = 500, force_refresh: bool = False
     ) -> list[dict]:
         """List channels the bot is a member of.
 
@@ -445,8 +445,8 @@ class SlackClient:
         self._save_channel_cache(result)
         return result
 
-
-    def _fetch_channel_history(self, 
+    def _fetch_channel_history(
+        self,
         client: WebClient,
         channel_id: str,
         channel_name: str,
@@ -477,12 +477,9 @@ class SlackClient:
 
         return messages
 
-
     _MAX_SEARCH_CHANNELS = 50  # Max channels to search when no filter specified
 
-    def _rank_channels_for_query(
-        self, channels: list[dict], query_terms: list[str]
-    ) -> list[dict]:
+    def _rank_channels_for_query(self, channels: list[dict], query_terms: list[str]) -> list[dict]:
         """Rank channels by relevance to query terms. Most relevant first."""
         scored = []
         for ch in channels:
@@ -523,7 +520,6 @@ class SlackClient:
             score *= 0.8
 
         return score
-
 
     def search_messages(
         self,
@@ -685,7 +681,6 @@ class SlackClient:
             del msg["_score"]
 
         return scored_results[:max_results]
-
 
     def get_channel_history_page(
         self,
@@ -929,7 +924,6 @@ class SlackClient:
             "sync_state": next_state,
         }
 
-
     def list_channels(self, include_private: bool = False, limit: int = 200) -> list[dict]:
         """List all Slack channels (not just bot member channels)."""
         channels = []
@@ -970,7 +964,6 @@ class SlackClient:
 
         return sorted(channels, key=lambda x: x["name"])
 
-
     def list_users(self, limit: int = 200) -> list[dict]:
         """List workspace users."""
         try:
@@ -998,7 +991,6 @@ class SlackClient:
             )
 
         return sorted(users, key=lambda x: x["name"])
-
 
     def get_channel_members(self, channel: str) -> list[dict]:
         """Get all members of a Slack channel with their user info.
@@ -1052,7 +1044,6 @@ class SlackClient:
 
         return members
 
-
     def get_channel_member_emails(self, channel: str) -> list[str]:
         """Get email addresses of all non-bot members in a Slack channel.
 
@@ -1064,7 +1055,6 @@ class SlackClient:
         """
         members = self.get_channel_members(channel)
         return [m["email"] for m in members if m.get("email")]
-
 
     def get_user_email(self, user_id: str) -> str | None:
         """Get a user's email address by their Slack user ID.
@@ -1139,7 +1129,6 @@ class SlackClient:
             "custom_fields": custom_fields,
         }
 
-
     def _format_requester_attribution(self) -> str:
         """Get requester attribution from environment variables.
 
@@ -1158,8 +1147,8 @@ class SlackClient:
             return f"\n\n_(requested by @{requester_name})_"
         return ""
 
-
-    def send_message(self,
+    def send_message(
+        self,
         channel: str,
         text: str,
         thread_ts: str | None = None,
@@ -1209,10 +1198,74 @@ class SlackClient:
         except SlackApiError as e:
             raise RuntimeError(f"Slack API error: {e.response['error']}") from e
 
+    def _current_slack_destination(self) -> tuple[str | None, str | None]:
+        """Return the active Slack channel/thread from the tool context, if any."""
+        try:
+            thread_key = get_tool_context().thread_key or ""
+        except LookupError:
+            return None, None
+        parts = thread_key.split(":")
+        if len(parts) == 3 and parts[0] == "slack" and parts[1] and parts[2]:
+            return parts[1], parts[2]
+        return None, None
+
+    @staticmethod
+    def _preview_for_bytes(data: bytes, filename: str) -> dict[str, Any]:
+        """Return cheap metadata that helps identify generated artifacts."""
+        preview: dict[str, Any] = {"size_bytes": len(data)}
+        mime_type, _ = mimetypes.guess_type(filename)
+        if mime_type:
+            preview["mime_type"] = mime_type
+        suffix = Path(filename).suffix.lower()
+        if suffix == ".csv":
+            sample = data[:64_000].decode("utf-8", errors="replace")
+            lines = [line for line in sample.splitlines() if line.strip()]
+            if lines:
+                preview["csv_rows_sampled"] = max(len(lines) - 1, 0)
+                preview["csv_columns"] = len(lines[0].split(","))
+        elif suffix in {".png", ".jpg", ".jpeg", ".gif", ".webp"}:
+            preview["file_type"] = "image"
+        elif suffix == ".pdf" and data.startswith(b"%PDF"):
+            preview["file_type"] = "pdf"
+        elif suffix in {".mp4", ".mov", ".webm"}:
+            preview["file_type"] = "video"
+        return preview
+
+    def _download_attachment_bytes(
+        self,
+        *,
+        attachment_id: str | None = None,
+        attachment_url: str | None = None,
+    ) -> bytes:
+        """Fetch artifact bytes from Centaur's existing attachment API."""
+        path = attachment_url
+        if attachment_id:
+            path = f"/agent/attachments/{attachment_id}/download"
+        if not path:
+            raise ValueError("attachment_id or attachment_url is required")
+        base_url = secret("CENTAUR_API_URL", "http://api:8000").rstrip("/")
+        base_parts = urlparse(base_url)
+        if path.startswith(("http://", "https://")):
+            url_parts = urlparse(path)
+            if (url_parts.scheme, url_parts.netloc) != (base_parts.scheme, base_parts.netloc):
+                raise ValueError("attachment_url must point at the configured Centaur API")
+            url = path
+        else:
+            if not path.startswith("/agent/attachments/"):
+                raise ValueError("attachment_url must be a Centaur attachment download path")
+            url = urljoin(f"{base_url}/", path.lstrip("/"))
+        headers: dict[str, str] = {}
+        api_key = secret("CENTAUR_API_KEY", "").strip()
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        request = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(request, timeout=30) as response:
+            return response.read()
 
     def upload_file(
         self,
-        channel: str | None,
+        channel: str | None = None,
+        channel_id: str | None = None,
         file_path: str | None = None,
         title: str | None = None,
         comment: str | None = None,
@@ -1220,37 +1273,72 @@ class SlackClient:
         content_base64: str | None = None,
         filename: str | None = None,
         alt_text: str | None = None,
+        attachment_id: str | None = None,
+        attachment_url: str | None = None,
     ) -> dict:
-        """Upload a file to a channel. Accepts file_path OR content_base64.
+        """Upload a file to Slack.
+
+        Accepts one of: file_path, content_base64, attachment_id, or attachment_url.
+        If channel/thread_ts are omitted and the tool runs in an active Slack
+        thread, the destination is inferred from tool context.
 
         alt_text: accessibility description for screen readers (max 1000 chars).
             Strongly recommended for chart images so users with visual
             impairments and indexers can understand what the image shows.
         """
-        if not channel:
-            raise ValueError("channel is required")
-        channel_id = self._resolve_channel(channel)
+        inferred_channel, inferred_thread_ts = self._current_slack_destination()
+        requested_channel = channel or channel_id or inferred_channel
+        if not requested_channel:
+            raise ValueError(
+                "channel is required; pass channel/channel_id or call from an active Slack thread"
+            )
+        resolved_channel = self._resolve_channel(requested_channel)
+        effective_thread_ts = thread_ts or inferred_thread_ts
 
         try:
             kwargs = {
-                "channel": channel_id,
+                "channel": resolved_channel,
             }
+            upload_bytes: bytes | None = None
+            effective_filename = filename
             if content_base64:
-                import base64
-                kwargs["content"] = base64.b64decode(content_base64)
-                kwargs["filename"] = filename or "upload.png"
+                upload_bytes = base64.b64decode(content_base64)
+                effective_filename = filename or "upload.png"
             elif file_path:
-                if not Path(file_path).exists():
-                    raise FileNotFoundError(f"File not found: {file_path}")
-                kwargs["file"] = file_path
+                path = Path(file_path)
+                if not path.exists():
+                    raise FileNotFoundError(
+                        "File not found: "
+                        f"{file_path}. If this file was generated in another sandbox, "
+                        "upload via content_base64 or a Centaur attachment_id instead."
+                    )
+                effective_filename = filename or path.name
+                upload_bytes = path.read_bytes()
+            elif attachment_id or attachment_url:
+                upload_bytes = self._download_attachment_bytes(
+                    attachment_id=attachment_id,
+                    attachment_url=attachment_url,
+                )
+                effective_filename = filename or f"{attachment_id or 'attachment'}.bin"
             else:
-                raise ValueError("Either file_path or content_base64 is required")
+                raise ValueError(
+                    "One of file_path, content_base64, attachment_id, or attachment_url is required"
+                )
+            kwargs["content"] = upload_bytes
+            kwargs["filename"] = effective_filename
             if title:
                 kwargs["title"] = title
+            elif effective_filename:
+                kwargs["title"] = effective_filename
+            preview = self._preview_for_bytes(
+                upload_bytes or b"", effective_filename or "upload.bin"
+            )
             if comment:
                 kwargs["initial_comment"] = comment
-            if thread_ts:
-                kwargs["thread_ts"] = thread_ts
+            elif effective_filename:
+                kwargs["initial_comment"] = f"Uploaded `{effective_filename}`."
+            if effective_thread_ts:
+                kwargs["thread_ts"] = effective_thread_ts
             if alt_text:
                 # Slack's files.completeUploadExternal accepts alt_txt per file.
                 # slack_sdk's files_upload_v2 forwards top-level alt_txt onto the
@@ -1264,16 +1352,16 @@ class SlackClient:
                 "name": file_info.get("name", ""),
                 "permalink": file_info.get("permalink", ""),
                 "url": file_info.get("url_private", ""),
+                "preview": preview,
             }
         except SlackApiError as e:
             self._raise_slack_api_error(
                 e,
                 slack_method="files.upload_v2",
                 access_path="file_upload",
-                requested_channel=channel,
-                resolved_channel=channel_id,
+                requested_channel=requested_channel,
+                resolved_channel=resolved_channel,
             )
-
 
     def list_usergroups(self) -> list[dict]:
         """List all user groups in the workspace."""
@@ -1301,9 +1389,8 @@ class SlackClient:
 
         return sorted(groups, key=lambda x: x["handle"])
 
-
-    def create_usergroup(self, 
-        handle: str, name: str, description: str = "", user_ids: list[str] | None = None
+    def create_usergroup(
+        self, handle: str, name: str, description: str = "", user_ids: list[str] | None = None
     ) -> dict:
         """Create a new user group."""
         try:
@@ -1326,7 +1413,6 @@ class SlackClient:
         except SlackApiError as e:
             raise RuntimeError(f"Slack API error: {e.response['error']}") from e
 
-
     def update_usergroup_users(self, group_id_or_handle: str, user_ids: list[str]) -> dict:
         """Update users in an existing user group."""
         group_id = group_id_or_handle
@@ -1340,7 +1426,9 @@ class SlackClient:
                 raise RuntimeError(f"User group '@{group_id_or_handle}' not found")
 
         try:
-            response = self._client.usergroups_users_update(usergroup=group_id, users=",".join(user_ids))
+            response = self._client.usergroups_users_update(
+                usergroup=group_id, users=",".join(user_ids)
+            )
             group = response.get("usergroup", {})
             return {
                 "id": group.get("id", ""),
@@ -1350,7 +1438,6 @@ class SlackClient:
             }
         except SlackApiError as e:
             raise RuntimeError(f"Slack API error: {e.response['error']}") from e
-
 
     def get_message_files(self, channel_id: str, message_ts: str) -> list[dict]:
         """Get files attached to a specific message."""
@@ -1391,7 +1478,6 @@ class SlackClient:
 
         return files
 
-
     def download_file(self, url: str, output_path: str) -> str:
         """Download a Slack file to local path."""
         import urllib.request
@@ -1405,7 +1491,6 @@ class SlackClient:
             f.write(response.read())
 
         return output_path
-
 
     def search_files(
         self,
@@ -1447,18 +1532,20 @@ class SlackClient:
             if query_lower and query_lower not in name.lower() and query_lower not in title.lower():
                 continue
             user_id = f.get("user", "")
-            results.append({
-                "id": f.get("id", ""),
-                "name": name,
-                "title": title,
-                "filetype": f.get("filetype", ""),
-                "size": f.get("size", 0),
-                "user": user_cache.get(user_id, user_id),
-                "channels": f.get("channels", []),
-                "permalink": f.get("permalink", ""),
-                "url_private": f.get("url_private", ""),
-                "created": f.get("created", 0),
-            })
+            results.append(
+                {
+                    "id": f.get("id", ""),
+                    "name": name,
+                    "title": title,
+                    "filetype": f.get("filetype", ""),
+                    "size": f.get("size", 0),
+                    "user": user_cache.get(user_id, user_id),
+                    "channels": f.get("channels", []),
+                    "permalink": f.get("permalink", ""),
+                    "url_private": f.get("url_private", ""),
+                    "created": f.get("created", 0),
+                }
+            )
 
         return results
 
@@ -1490,7 +1577,8 @@ class SlackClient:
 
         return matches[:max_results]
 
-    def dump_channel_with_threads(self, 
+    def dump_channel_with_threads(
+        self,
         channel_name: str,
         limit: int = 500,
         min_replies: int = 0,
@@ -1564,7 +1652,6 @@ class SlackClient:
             },
         }
 
-
     def close(self):
         """Close the underlying HTTP session."""
         pass  # WebClient doesn't need explicit close
@@ -1572,6 +1659,7 @@ class SlackClient:
 
 def _client() -> SlackClient:
     from centaur_sdk import secret
+
     return SlackClient(
         bot_token=secret("SLACK_BOT_TOKEN"),
         search_token=secret("SLACK_SEARCH_TOKEN", ""),
@@ -1596,7 +1684,9 @@ def list_bot_channels(*args, **kwargs):
     return _client().list_bot_channels(*args, **kwargs)
 
 
-def resolve_mentions(text: str, client: SlackClient | None = None, user_cache: dict[str, str] | None = None) -> str:
+def resolve_mentions(
+    text: str, client: SlackClient | None = None, user_cache: dict[str, str] | None = None
+) -> str:
     slack_client = client or _client()
     resolved_user_cache = user_cache or slack_client._get_user_cache()
     return slack_client._resolve_mentions(text, resolved_user_cache)

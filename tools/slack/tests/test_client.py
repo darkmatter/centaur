@@ -3,11 +3,14 @@ import json
 import pytest
 from slack_sdk.errors import SlackApiError
 
+from centaur_sdk.tool_sdk import ToolContext, reset_tool_context, set_tool_context
 from slack.client import SlackAuthError, SlackClient
 
 
 class _FakeSlackResponse(dict):
-    def __init__(self, *, error: str = "ratelimited", headers: dict | None = None, status_code: int = 429) -> None:
+    def __init__(
+        self, *, error: str = "ratelimited", headers: dict | None = None, status_code: int = 429
+    ) -> None:
         super().__init__(error=error)
         self.headers = headers or {}
         self.status_code = status_code
@@ -53,7 +56,9 @@ def _make_client() -> tuple[SlackClient, _FakeWebClient]:
     return client, fake_web_client
 
 
-def _make_slack_error(*, error: str, status_code: int, message: str = "Slack request failed") -> SlackApiError:
+def _make_slack_error(
+    *, error: str, status_code: int, message: str = "Slack request failed"
+) -> SlackApiError:
     return SlackApiError(
         message=message,
         response=_FakeSlackResponse(error=error, status_code=status_code),
@@ -221,6 +226,88 @@ def test_upload_file_surfaces_structured_auth_failure() -> None:
         "slack_method": "files.upload_v2",
         "status_code": 401,
     }
+
+
+def test_upload_file_accepts_channel_id_alias_and_returns_preview() -> None:
+    client, fake_web_client = _make_client()
+
+    result = client.upload_file(
+        None,
+        channel_id="paradigm-pulse",
+        content_base64="YSxiCjEsMgo=",
+        filename="data.csv",
+    )
+
+    assert fake_web_client.last_kwargs is not None
+    assert fake_web_client.last_kwargs["channel"] == "C123"
+    assert fake_web_client.last_kwargs["filename"] == "data.csv"
+    assert fake_web_client.last_kwargs["content"] == b"a,b\n1,2\n"
+    assert result["preview"] == {
+        "size_bytes": 8,
+        "mime_type": "text/csv",
+        "csv_rows_sampled": 1,
+        "csv_columns": 2,
+    }
+
+
+def test_upload_file_infers_slack_thread_from_tool_context() -> None:
+    client, fake_web_client = _make_client()
+    token = set_tool_context(
+        ToolContext(name="slack", thread_key="slack:C-thread:1777910337.403889"),
+    )
+    try:
+        client.upload_file(
+            None,
+            content_base64="dGVzdA==",
+            filename="chart.png",
+        )
+    finally:
+        reset_tool_context(token)
+
+    assert fake_web_client.last_kwargs is not None
+    assert fake_web_client.last_kwargs["channel"] == "C123"
+    assert fake_web_client.last_kwargs["thread_ts"] == "1777910337.403889"
+    assert fake_web_client.last_kwargs["initial_comment"] == "Uploaded `chart.png`."
+
+
+def test_upload_file_missing_path_points_to_artifact_handle() -> None:
+    client, _ = _make_client()
+
+    with pytest.raises(FileNotFoundError) as excinfo:
+        client.upload_file("paradigm-pulse", file_path="/tmp/missing-chart.png")
+
+    assert "Centaur attachment_id" in str(excinfo.value)
+
+
+def test_attachment_url_must_use_centaur_api(monkeypatch: pytest.MonkeyPatch) -> None:
+    client, _ = _make_client()
+    monkeypatch.setenv("CENTAUR_API_URL", "http://api:8000")
+
+    with pytest.raises(ValueError, match="configured Centaur API"):
+        client._download_attachment_bytes(attachment_url="https://evil.example/file")
+
+
+def test_attachment_url_requires_attachment_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    client, _ = _make_client()
+    monkeypatch.setenv("CENTAUR_API_URL", "http://api:8000")
+
+    with pytest.raises(ValueError, match="attachment download path"):
+        client._download_attachment_bytes(attachment_url="/not-attachments/file")
+
+
+def test_upload_file_can_infer_destination_without_channel_arg() -> None:
+    client, fake_web_client = _make_client()
+    token = set_tool_context(
+        ToolContext(name="slack", thread_key="slack:C-thread:1777910337.403889"),
+    )
+    try:
+        client.upload_file(content_base64="dGVzdA==", filename="chart.png")
+    finally:
+        reset_tool_context(token)
+
+    assert fake_web_client.last_kwargs is not None
+    assert fake_web_client.last_kwargs["channel"] == "C123"
+    assert fake_web_client.last_kwargs["thread_ts"] == "1777910337.403889"
 
 
 def test_native_search_uses_dedicated_search_client() -> None:

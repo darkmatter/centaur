@@ -522,7 +522,7 @@ async def handler(inp: Input, ctx: WorkflowContext) -> dict[str, Any]:
                 "latest": checkpoint.get("latest_ts") if checkpoint else None,
             }
             oldest = inp.oldest
-            if oldest is None and state.get("watermark"):
+            if oldest is None and not state.get("cursor") and state.get("watermark"):
                 oldest = _ts_minus_days(str(state["watermark"]), thread_lookback_days)
 
             page = client._sync_etl_channel_history(

@@ -476,6 +476,31 @@ async def test_incremental_oldest_uses_thread_lookback(db_pool):
 
 
 @pytest.mark.asyncio
+async def test_pending_backfill_cursor_preserves_original_window(db_pool):
+    from workflows import slack_sync
+
+    await db_pool.execute(
+        "INSERT INTO slack_sync_channels (channel_id, channel_name, is_member) "
+        "VALUES ('C_PUBLIC', 'ai-agent', TRUE)",
+    )
+    await db_pool.execute(
+        "INSERT INTO slack_sync_checkpoints ("
+        "channel_id, cursor, watermark_ts, oldest_ts, thread_lookback_days"
+        ") VALUES ('C_PUBLIC', 'cursor-2', '3000000.000000', '400000.000000', 3)",
+    )
+    fake = FakeSlackClient(channels=[_public_channel()], messages=[], replies={})
+    ctx = FakeCtx(db_pool)
+
+    with patch.object(slack_sync, "_client", return_value=fake):
+        await slack_sync.handler(slack_sync.Input(), ctx)
+
+    call = fake.history_calls[0]
+    assert call["oldest"] is None
+    assert call["state"]["cursor"] == "cursor-2"
+    assert call["state"]["oldest"] == "400000.000000"
+
+
+@pytest.mark.asyncio
 async def test_failed_write_does_not_advance_watermark(db_pool):
     from workflows import slack_sync
 

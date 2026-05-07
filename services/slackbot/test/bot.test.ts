@@ -894,7 +894,7 @@ describe("consumeWire reconnects on graceful EOF without turn.done", () => {
     expect(markdownChunks[markdownChunks.length - 1].text).toContain("no output");
   });
 
-  it("emits an invisible markdown keepalive before structured progress", async () => {
+  it("emits structured keepalives without blank markdown", async () => {
     vi.useFakeTimers();
     try {
       const mockClient = {
@@ -918,10 +918,12 @@ describe("consumeWire reconnects on graceful EOF without turn.done", () => {
       await vi.advanceTimersByTimeAsync(120_000);
       expect(await firstChunkPromise).toEqual({
         done: false,
-        value: { type: "markdown_text", text: "\u200b" },
+        value: { type: "plan_update", title: "Still working…" },
       });
 
-      expect(await streamGen.next()).toEqual({
+      const secondChunkPromise = streamGen.next();
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(await secondChunkPromise).toEqual({
         done: false,
         value: { type: "plan_update", title: "Still working…" },
       });

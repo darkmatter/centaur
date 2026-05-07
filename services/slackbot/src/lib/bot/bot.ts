@@ -60,7 +60,6 @@ const KNOWN_PROMPT_SELECTORS = new Set([
   "eng",
   "invest",
 ]);
-const STREAM_BOOTSTRAP_TEXT = "\u200b";
 
 type SlackRepoContext = {
   cwd?: string;
@@ -1115,9 +1114,9 @@ export class SlackBot {
           }
 
           if (raced.kind === "keepalive") {
-            // Invisible markdown keepalive prevents Slack from expiring the stream
-            // on long-running turns even when there is no user-visible text yet.
-            yield { type: "markdown_text", text: STREAM_BOOTSTRAP_TEXT };
+            // Keep Slack's stream alive without appending invisible markdown to
+            // the assistant body. Slack renders repeated zero-width text
+            // keepalives as blank lines on queued/long-running turns.
             yield { type: "plan_update", title: "Still working…" };
             continue;
           }

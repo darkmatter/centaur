@@ -30,7 +30,15 @@ class TestRuntimeStateNoBusy:
 
         rt = RuntimeState()
         field_names = {f.name for f in rt.__dataclass_fields__.values()}
-        assert field_names == {"turn_counter", "stdout_stream", "stdin_stream", "last_result"}
+        assert field_names == {
+            "turn_counter",
+            "stdout_stream",
+            "stdin_stream",
+            "attach_context",
+            "prefetched_stdout",
+            "stdout_read_lock",
+            "last_result",
+        }
 
 
 # ── 2. inject_stdin never blocks on busy ─────────────────────────────────────

@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import abc
+import asyncio
 from collections.abc import AsyncIterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 
@@ -21,6 +22,7 @@ class RuntimeState:
     stdin_stream: Any = None  # backend stream for writing stdin
     attach_context: Any = None  # backend-specific context manager for attach sessions
     prefetched_stdout: list[str] | None = None  # buffered lines loaded before live attach
+    stdout_read_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     last_result: str | None = None
 
 

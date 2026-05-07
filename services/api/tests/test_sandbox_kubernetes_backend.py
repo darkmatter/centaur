@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 
 import pytest
@@ -601,6 +602,65 @@ async def test_stream_stdout_yields_prefetched_and_live_lines() -> None:
 
     assert lines == ["prefetched line", "live line"]
     _drop_runtime(session.sandbox_id)
+
+
+@pytest.mark.asyncio
+async def test_stream_stdout_serializes_concurrent_readers() -> None:
+    from api.agent import _drop_runtime, _get_runtime
+
+    class BlockingWebSocket:
+        def __init__(self) -> None:
+            self.in_receive = False
+            self.receive_started = asyncio.Event()
+            self.release_receive = asyncio.Event()
+            self.receive_calls = 0
+
+        async def receive(self) -> SimpleNamespace:
+            if self.in_receive:
+                raise AssertionError("concurrent receive")
+            self.in_receive = True
+            self.receive_calls += 1
+            self.receive_started.set()
+            await self.release_receive.wait()
+            self.in_receive = False
+            return SimpleNamespace(type=WSMsgType.CLOSED, data=b"")
+
+    session = SandboxSession(
+        sandbox_id="sandbox-pod",
+        thread_key="slack:C123:123.456",
+        harness="amp",
+        engine="amp",
+    )
+    _drop_runtime(session.sandbox_id)
+    rt = _get_runtime(session.sandbox_id)
+    websocket = BlockingWebSocket()
+    rt.stdout_stream = websocket
+
+    backend = KubernetesExecutorBackend()
+    first = asyncio.create_task(
+        asyncio.wait_for(_collect_stdout(backend, session), 1)
+    )
+    await websocket.receive_started.wait()
+    second = asyncio.create_task(
+        asyncio.wait_for(_collect_stdout(backend, session), 1)
+    )
+    await asyncio.sleep(0)
+
+    assert websocket.receive_calls == 1
+    assert not second.done()
+
+    websocket.release_receive.set()
+    assert await first == []
+    assert await second == []
+    assert websocket.receive_calls == 2
+    _drop_runtime(session.sandbox_id)
+
+
+async def _collect_stdout(
+    backend: KubernetesExecutorBackend,
+    session: SandboxSession,
+) -> list[str]:
+    return [line async for line in backend.stream_stdout(session)]
 
 
 def test_auto_configure_selects_kubernetes_backend(monkeypatch: pytest.MonkeyPatch) -> None:

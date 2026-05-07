@@ -663,6 +663,22 @@ class KubernetesExecutorBackend(SandboxBackend):
 
     async def stream_stdout(self, session: SandboxSession) -> AsyncIterator[str]:
         rt = _get_rt(session)
+        if rt.stdout_read_lock.locked():
+            log.warning(
+                "sandbox_stdout_stream_already_active",
+                thread_key=session.thread_key,
+                sandbox=session.sandbox_id,
+                harness=session.harness,
+                engine=session.engine,
+                backend=self.name,
+            )
+
+        async with rt.stdout_read_lock:
+            async for line in self._stream_stdout_unlocked(session):
+                yield line
+
+    async def _stream_stdout_unlocked(self, session: SandboxSession) -> AsyncIterator[str]:
+        rt = _get_rt(session)
         if rt.stdout_stream is None:
             raise RuntimeError("not attached (stdout)")
 

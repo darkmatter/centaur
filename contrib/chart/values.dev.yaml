@@ -16,7 +16,6 @@ slackbot:
   enabled: false
 
 api:
-  runtimeCredentialGuardEnabled: false
   executionWorkerEnabled: true
   egressDiscovery:
     enabled: false

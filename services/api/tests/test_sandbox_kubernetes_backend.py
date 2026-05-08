@@ -138,24 +138,6 @@ def test_container_env_includes_firewall_host_for_secret_bootstrap(
     assert env_map["no_proxy"] == env_map["NO_PROXY"]
 
 
-def test_container_env_materializes_runtime_secret_values(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.delenv("AGENT_LOCAL_DEV", raising=False)
-    monkeypatch.setenv("AGENT_API_URL", "http://api.internal:8000")
-    monkeypatch.setenv("FIREWALL_HOST", "firewall.internal")
-
-    env = sandbox_container_env(
-        "thread-key",
-        "sandbox-id",
-        runtime_secret_values={"AMP_API_KEY": "real-amp-key"},
-    )
-    env_map = dict(item.split("=", 1) for item in env)
-
-    assert env_map["AMP_API_KEY"] == "real-amp-key"
-    assert env_map["OPENAI_API_KEY"] == "OPENAI_API_KEY"
-
-
 def test_prompt_bundle_includes_live_capability_inventory_guidance(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -280,13 +262,6 @@ async def test_create_builds_pod_and_prompt_secret(monkeypatch: pytest.MonkeyPat
             "AMP_API_KEY=AMP_API_KEY",
         ],
     )
-    async def fake_runtime_secret_values_for_sandbox() -> dict[str, str]:
-        return {"AMP_API_KEY": "real-amp-key"}
-
-    monkeypatch.setattr(
-        "api.sandbox.kubernetes._runtime_secret_values_for_sandbox",
-        fake_runtime_secret_values_for_sandbox,
-    )
     monkeypatch.setattr("api.sandbox.kubernetes.build_harness_cmd", lambda *_args: ["amp-wrapper"])
     monkeypatch.setattr("api.sandbox.kubernetes.image", lambda: "centaur-agent:test")
 
@@ -400,13 +375,6 @@ async def test_create_cleans_up_pod_and_prompt_secret_when_readiness_times_out(
         "api.sandbox.kubernetes.container_env",
         lambda *_args, **_kwargs: ["CENTAUR_API_URL=http://api.internal:8000"],
     )
-    async def fake_runtime_secret_values_for_sandbox() -> dict[str, str]:
-        return {"AMP_API_KEY": "real-amp-key"}
-
-    monkeypatch.setattr(
-        "api.sandbox.kubernetes._runtime_secret_values_for_sandbox",
-        fake_runtime_secret_values_for_sandbox,
-    )
     monkeypatch.setattr("api.sandbox.kubernetes.build_harness_cmd", lambda *_args: ["amp-wrapper"])
     monkeypatch.setattr("api.sandbox.kubernetes.image", lambda: "centaur-agent:test")
 
@@ -450,13 +418,6 @@ async def test_create_mounts_repo_cache_host_path(monkeypatch: pytest.MonkeyPatc
             "CENTAUR_API_URL=http://api.internal:8000",
             "CENTAUR_API_KEY=sandbox-token",
         ],
-    )
-    async def fake_runtime_secret_values_for_sandbox() -> dict[str, str]:
-        return {"AMP_API_KEY": "real-amp-key"}
-
-    monkeypatch.setattr(
-        "api.sandbox.kubernetes._runtime_secret_values_for_sandbox",
-        fake_runtime_secret_values_for_sandbox,
     )
     monkeypatch.setattr("api.sandbox.kubernetes.build_harness_cmd", lambda *_args: ["amp-wrapper"])
     monkeypatch.setattr("api.sandbox.kubernetes.image", lambda: "centaur-agent:test")

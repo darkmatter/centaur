@@ -37,7 +37,6 @@ from api.routers import agent as agent_router_mod
 from api.routers import workflows as workflow_router_mod
 from api.tool_manager import ToolManager, load_plugins_config
 from api.agent import reconcile_tick
-from api.runtime_guardrails import assert_runtime_credentials_ready
 from api.runtime_control import (
     recover_interrupted_executions_on_startup,
     start_execution_worker,
@@ -142,7 +141,6 @@ async def _reconcile_loop() -> None:
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.db_pool = await create_pool(settings.database_url)
     await bootstrap_service_api_keys(app.state.db_pool)
-    await assert_runtime_credentials_ready()
     execution_worker_enabled = os.getenv(
         "EXECUTION_WORKER_ENABLED", "1"
     ).strip().lower() not in {

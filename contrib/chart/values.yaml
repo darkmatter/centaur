@@ -56,8 +56,6 @@ api:
   slackEtlEnabled: true
   slackSyncIntervalSeconds: 14400
   victoriaMetricsPushEnabled: false
-  runtimeCredentialGuardEnabled: true
-  requiredRuntimeSecretKeys: AMP_API_KEY
   startupProbe:
     failureThreshold: 30
     periodSeconds: 10

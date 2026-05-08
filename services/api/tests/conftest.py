@@ -223,7 +223,6 @@ def _setup_env(pg, run_migrations):
     os.environ["EXECUTION_WORKER_ENABLED"] = "0"
     os.environ["WORKFLOW_WORKER_ENABLED"] = "0"
     os.environ["WARM_POOL_ENABLED"] = "0"
-    os.environ["RUNTIME_CREDENTIAL_GUARD_ENABLED"] = "0"
 
 
 @pytest.fixture(scope="session")

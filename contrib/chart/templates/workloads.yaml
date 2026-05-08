@@ -520,10 +520,6 @@ spec:
 {{- end }}
             - name: VICTORIAMETRICS_PUSH_ENABLED
               value: {{ ternary "1" "0" .Values.api.victoriaMetricsPushEnabled | quote }}
-            - name: RUNTIME_CREDENTIAL_GUARD_ENABLED
-              value: {{ ternary "1" "0" .Values.api.runtimeCredentialGuardEnabled | quote }}
-            - name: REQUIRED_RUNTIME_SECRET_KEYS
-              value: {{ .Values.api.requiredRuntimeSecretKeys | quote }}
 {{- if .Values.slackbot.enabled }}
             - name: SLACKBOT_URL
               value: {{ printf "http://%s:3001" (include "centaur.componentName" (dict "root" . "component" "slackbot")) | quote }}

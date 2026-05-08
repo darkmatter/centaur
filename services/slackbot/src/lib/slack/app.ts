@@ -784,6 +784,18 @@ export class BoltSlackApp {
       || isPolicyTouchpoint
       || isDirectMessage
       || this.messageMentionsBot(event.text || "");
+
+    // Fire typing indicator immediately on mention so the user sees instant
+    // feedback while we resolve subscriptions, attachments, and history.
+    if (isMention) {
+      this.adapter.startTyping(threadId).catch((err) => {
+        log.warn("early_typing_indicator_failed", {
+          thread_id: threadId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      });
+    }
+
     const isSubscribed = await this.isSubscribedThread(threadId);
 
     if (!isSubscribed && !isMention) return;

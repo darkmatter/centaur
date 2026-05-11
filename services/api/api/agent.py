@@ -1093,11 +1093,18 @@ async def steer_stdin(
     turn_input = build_user_input(content_blocks, steer=True)
     backend = get_backend()
 
+    is_amp = session.engine == "amp" or session.harness == "amp"
     try:
-        if session.engine == "amp" or session.harness == "amp":
+        if is_amp:
             await backend.interrupt_by_id(session.sandbox_id)
             await asyncio.sleep(0.05)
-        await backend.write_stdin(session, turn_input)
+        try:
+            await backend.write_stdin(session, turn_input)
+        except (BrokenPipeError, OSError, RuntimeError, AssertionError):
+            if not is_amp:
+                raise
+            await backend.reattach_stdin(session)
+            await backend.write_stdin(session, turn_input)
     except (BrokenPipeError, OSError, RuntimeError, AssertionError) as exc:
         log.warning(
             "steer_stdin_failed",

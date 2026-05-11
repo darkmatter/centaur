@@ -678,7 +678,7 @@ export class SlackBot {
       await this.releaseForPromptSwitch(threadKey, delivery.messageId);
     } else {
       const steerResult = await this.steerOrCancelInflightExecution(threadKey, parts, delivery);
-      if (steerResult === "steered") return;
+      if (steerResult === "steered" || steerResult === "cancelled") return;
     }
     const { channel, threadTs } = splitThreadKey(thread.id);
     const workflowInput = {

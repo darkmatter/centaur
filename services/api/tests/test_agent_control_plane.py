@@ -1873,6 +1873,45 @@ async def test_steer_stdin_interrupts_amp_before_injecting(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_steer_stdin_reattaches_when_interrupt_closes_stdin(monkeypatch):
+    from api.agent import steer_stdin
+
+    calls: list[str] = []
+
+    async def _interrupt_by_id(_sandbox_id: str) -> None:
+        calls.append("interrupt")
+
+    async def _write_stdin(_session: SandboxSession, _payload: dict) -> None:
+        calls.append("write")
+        if calls.count("write") == 1:
+            raise RuntimeError("not attached (stdin)")
+
+    async def _reattach_stdin(_session: SandboxSession) -> None:
+        calls.append("reattach")
+
+    backend = SimpleNamespace(
+        interrupt_by_id=AsyncMock(side_effect=_interrupt_by_id),
+        reattach_stdin=AsyncMock(side_effect=_reattach_stdin),
+        write_stdin=AsyncMock(side_effect=_write_stdin),
+    )
+    monkeypatch.setattr("api.agent.get_backend", lambda: backend)
+    monkeypatch.setattr("api.agent.asyncio.sleep", AsyncMock())
+
+    session = SandboxSession(
+        sandbox_id=f"rt-{uuid.uuid4().hex[:8]}",
+        thread_key=f"slack:C-test:{uuid.uuid4().hex}",
+        harness="amp",
+        engine="amp",
+    )
+
+    result = await steer_stdin(session, [{"type": "text", "text": "stop"}])
+
+    assert result == {"ok": True, "steered": True}
+    assert calls == ["interrupt", "write", "reattach", "write"]
+    backend.reattach_stdin.assert_awaited_once_with(session)
+
+
+@pytest.mark.asyncio
 async def test_recover_stale_running_requeues_expired_execution(db_pool):
     from api.runtime_control import _recover_stale_running
 
@@ -2458,6 +2497,93 @@ async def test_worker_stops_session_when_cancel_requested_mid_stream(db_pool):
     assert execution["terminal_reason"] == "cancel_requested"
     assert execution["error_text"] == "cancel_requested"
     stop_session_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_worker_maps_amp_user_cancelled_error_to_cancelled(db_pool):
+    from api.runtime_control import _process_execution
+
+    thread_key = f"slack:C-test:{uuid.uuid4().hex}"
+    execution_id = f"exe-{uuid.uuid4().hex[:12]}"
+    runtime_id = f"rt-{uuid.uuid4().hex[:8]}"
+
+    await db_pool.execute(
+        "INSERT INTO agent_runtime_assignments ("
+        "thread_key, assignment_generation, runtime_id, harness, engine, "
+        "persona_id, prompt_ref, effective_agents_md_sha256, state"
+        ") VALUES ($1, 1, $2, 'amp', 'amp', NULL, 'harness:amp', 'sha', 'active')",
+        thread_key,
+        runtime_id,
+    )
+    await db_pool.execute(
+        "INSERT INTO agent_execution_requests ("
+        "execution_id, thread_key, assignment_generation, execute_id, request_hash, status, "
+        "delivery, metadata, hard_deadline_at"
+        ") VALUES ($1, $2, 1, 'exec-user-cancelled', 'hash-user-cancelled', 'running', '{}'::jsonb, '{}'::jsonb, NOW() + INTERVAL '10 minutes')",
+        execution_id,
+        thread_key,
+    )
+    await db_pool.execute(
+        "INSERT INTO agent_final_delivery_outbox (execution_id, thread_key, delivery, state) "
+        "VALUES ($1, $2, '{}'::jsonb, 'awaiting_terminal')",
+        execution_id,
+        thread_key,
+    )
+
+    row = {
+        "execution_id": execution_id,
+        "thread_key": thread_key,
+        "assignment_generation": 1,
+        "status": "running",
+        "delivery": {},
+        "hard_deadline_at": dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=10),
+    }
+    session = SandboxSession(
+        sandbox_id=runtime_id,
+        thread_key=thread_key,
+        harness="amp",
+        engine="amp",
+    )
+
+    async def _cancelled_stream(*_args, **_kwargs):
+        yield {
+            "data": json.dumps(
+                {
+                    "type": "turn.done",
+                    "result": "User cancelled (SIGINT/SIGTERM)",
+                    "error": "User cancelled (SIGINT/SIGTERM)",
+                    "is_error": True,
+                }
+            )
+        }
+
+    backend = SimpleNamespace(attach=AsyncMock())
+    with (
+        patch("api.runtime_control.get_or_spawn", new=AsyncMock(return_value=session)),
+        patch(
+            "api.runtime_control.inject_stdin",
+            new=AsyncMock(
+                return_value={"ok": True, "injected": True, "durable_turn_id": "turn-1"}
+            ),
+        ),
+        patch("api.runtime_control.get_backend", return_value=backend),
+        patch(
+            "api.runtime_control._get_runtime",
+            return_value=SimpleNamespace(turn_counter=1),
+        ),
+        patch("api.runtime_control._stream_stdout", _cancelled_stream),
+    ):
+        await _process_execution(db_pool, row)
+
+    execution = await db_pool.fetchrow(
+        "SELECT status, terminal_reason, result_text, error_text FROM agent_execution_requests WHERE execution_id = $1",
+        execution_id,
+    )
+    assert execution is not None
+    assert execution["status"] == "cancelled"
+    assert execution["terminal_reason"] == "cancel_requested"
+    assert execution["result_text"] == ""
+    assert execution["error_text"] == "cancel_requested"
 
 
 @pytest.mark.asyncio

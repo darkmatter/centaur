@@ -44,6 +44,12 @@ export type StopResult = {
   followUp: MockSlackResult;
 };
 
+export type StopOnlyResult = {
+  steerStatus: string;
+  execution: Omit<MockSlackResult, "runId" | "threadTs">;
+  executionCount: number;
+};
+
 const TERMINAL_EXECUTION_STATUSES = new Set([
   "completed",
   "failed_permanent",
@@ -215,6 +221,48 @@ export class MockSlackbot {
         events: previous.events,
       },
       followUp,
+    };
+  }
+
+  async stopInFlightOnly(
+    started: StartedMention,
+    opts: { text?: string; timeoutMs?: number } = {},
+  ): Promise<StopOnlyResult> {
+    await this.waitForExecutionRunning(
+      started.threadKey,
+      started.executionId,
+      Math.min(opts.timeoutMs ?? 180_000, 60_000),
+    );
+
+    const steer = await this.client.steerExecution(started.executionId, {
+      contentBlocks: [
+        {
+          type: "text",
+          text: opts.text ?? "send message",
+        },
+      ],
+      messageId: `slack:${started.threadTs}:steer-only`,
+      metadata: { platform: "slack", e2e: true },
+    });
+
+    const terminal = await this.pollExecutionTerminalResult(
+      started.threadKey,
+      started.executionId,
+      opts.timeoutMs ?? 180_000,
+    );
+    const listed = await this.client.listExecutions(started.threadKey, 10);
+
+    return {
+      steerStatus: typeof steer.status === "string" ? steer.status : "unknown",
+      executionCount: listed.executions.length,
+      execution: {
+        threadKey: started.threadKey,
+        executionId: started.executionId,
+        status: terminal.status,
+        terminalReason: terminal.terminalReason,
+        finalText: terminal.finalText,
+        events: terminal.events,
+      },
     };
   }
 

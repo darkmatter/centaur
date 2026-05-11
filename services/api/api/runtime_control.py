@@ -144,6 +144,15 @@ def _matches_raw_harness_auth_failure(*values: str | None) -> bool:
     return False
 
 
+def _matches_user_cancelled(*values: str | None) -> bool:
+    for value in values:
+        if not isinstance(value, str):
+            continue
+        if "user cancelled (sigint/sigterm)" in value.casefold():
+            return True
+    return False
+
+
 def _raw_harness_auth_retry_attempt(metadata: dict[str, Any]) -> int:
     retry_metadata = metadata.get(_RAW_HARNESS_AUTH_RETRY_METADATA_KEY)
     if not isinstance(retry_metadata, dict):
@@ -2390,6 +2399,14 @@ async def _process_execution(pool, row: dict[str, Any]) -> None:
     if is_error:
         terminal_reason = "harness_error"
         combined_error = (error_text or result_text or "harness_error").strip()
+        if _matches_user_cancelled(error_text, result_text, combined_error):
+            await _finalize_execution(
+                status="cancelled",
+                terminal_reason="cancel_requested",
+                result_text="",
+                error_text="cancel_requested",
+            )
+            return
         if _matches_raw_harness_auth_failure(error_text, result_text, combined_error):
             retry_attempt = _raw_harness_auth_retry_attempt(execution_metadata)
             if retry_attempt < _RAW_HARNESS_AUTH_RETRY_LIMIT:

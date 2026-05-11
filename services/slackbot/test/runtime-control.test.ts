@@ -211,6 +211,28 @@ describe("SlackBot runtime control", () => {
     expect(client.startWorkflowRun).not.toHaveBeenCalled();
   });
 
+  it("does not start a duplicate workflow when steering falls back to cancellation", async () => {
+    const client = createImmediateStreamClient();
+    client.steerExecution = vi.fn(async () => ({ ok: true, status: "cancel_requested" }));
+    const bot = new SlackBot(client as any);
+    const { thread } = createThread();
+    const oldAbortController = new AbortController();
+
+    (bot as any).inFlightExecutions.set(normalizedThreadKey, {
+      executionId: "exe-old",
+      abortController: oldAbortController,
+    });
+
+    await bot.onSubscribedMessage(thread, userMessage("<@bot> stop", {
+      id: "1700000000.000006",
+      isMention: true,
+    }));
+
+    expect(oldAbortController.signal.aborted).toBe(true);
+    expect(client.cancelExecution).toHaveBeenCalledWith("exe-old");
+    expect(client.startWorkflowRun).not.toHaveBeenCalled();
+  });
+
   it("excludes Slack messages newer than the current mention from workflow history", async () => {
     const client = createImmediateStreamClient();
     const slack = createSlackAdapter({
@@ -286,8 +308,9 @@ describe("SlackBot runtime control", () => {
     await firstTurn;
 
     expect(client.cancelExecution).toHaveBeenCalledWith("exe-1");
-    expect(runtime.postCount).toBe(1);
-    expect(streamText(streamedChunks).trim()).not.toBe("");
+    expect(runtime.postCount).toBe(0);
+    expect(client.startWorkflowRun).toHaveBeenCalledTimes(1);
+    expect(streamText(streamedChunks).trim()).toBe("");
   });
 
   it("acks live streamed deliveries without requiring an outbox lease", async () => {

@@ -38,6 +38,13 @@ if ! git clone --quiet --shared "$SRC" "$DEST"; then
     git clone --quiet "$SRC" "$DEST"
 fi
 
+# --shared clones set origin to the local path; fix it to the upstream URL
+# so that git push and gh pr create target the real GitHub remote.
+UPSTREAM_URL=$(git -C "$SRC" config --get remote.origin.url 2>/dev/null || echo "")
+if [ -n "$UPSTREAM_URL" ]; then
+    git -C "$DEST" remote set-url origin "$UPSTREAM_URL"
+fi
+
 BRANCH="agent-$(date +%s)-${RANDOM}-${RANDOM}"
 git -C "$DEST" checkout -q -b "$BRANCH"
 

@@ -735,6 +735,64 @@ async def test_create_cleans_up_pod_and_prompt_secret_when_readiness_times_out(
 
 
 @pytest.mark.asyncio
+async def test_create_cleans_up_when_cancelled_during_readiness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = KubernetesExecutorBackend()
+    fake_core = FakeCoreApi()
+    fake_networking = FakeNetworkingApi()
+    backend._core = fake_core
+    backend._networking = fake_networking
+
+    monkeypatch.setenv("AGENT_API_URL", "http://api.internal:8000")
+    monkeypatch.setenv("FIREWALL_HOST", "firewall.internal")
+    monkeypatch.setenv("KUBERNETES_FIREWALL_CA_SECRET_NAME", "firewall-ca")
+    monkeypatch.setenv("KUBERNETES_NAMESPACE", "centaur-sandbox")
+    monkeypatch.setattr(
+        "api.sandbox.kubernetes._prompt_bundle", lambda persona: "prompt"
+    )
+    monkeypatch.setattr(
+        "api.sandbox.kubernetes.container_env",
+        lambda *_args, **_kwargs: ["CENTAUR_API_URL=http://api.internal:8000"],
+    )
+
+    async def fake_runtime_secret_values_for_sandbox() -> dict[str, str]:
+        return {"AMP_API_KEY": "real-amp-key"}
+
+    monkeypatch.setattr(
+        "api.sandbox.kubernetes._runtime_secret_values_for_sandbox",
+        fake_runtime_secret_values_for_sandbox,
+    )
+    monkeypatch.setattr(
+        "api.sandbox.kubernetes.build_harness_cmd", lambda *_args: ["amp-wrapper"]
+    )
+    monkeypatch.setattr("api.sandbox.kubernetes.image", lambda: "centaur-agent:test")
+
+    async def fake_ensure_clients() -> None:
+        return None
+
+    async def fake_proxy_wait_ready(_pod_name: str) -> float:
+        return 0.01
+
+    async def cancel_wait_ready(_pod_name: str) -> float:
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(backend, "_ensure_clients", fake_ensure_clients)
+    monkeypatch.setattr(backend, "_wait_pod_ready", fake_proxy_wait_ready)
+    monkeypatch.setattr(backend, "_wait_ready", cancel_wait_ready)
+
+    with pytest.raises(asyncio.CancelledError):
+        await backend.create("slack:C123:123.456", "amp", "amp")
+
+    pod_name = fake_core.created_pods[1][1]["metadata"]["name"]
+    secret_name = fake_core.created_secrets[0][1]["metadata"]["name"]
+
+    assert ("centaur-sandbox", pod_name, 5) in fake_core.deleted_pods
+    assert fake_core.deleted_secrets[-1] == ("centaur-sandbox", secret_name)
+    assert fake_networking.deleted_network_policies
+
+
+@pytest.mark.asyncio
 async def test_create_mounts_repo_cache_host_path(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -1161,7 +1161,11 @@ class KubernetesExecutorBackend(SandboxBackend):
             await self._wait_pod_ready(_proxy_pod_name(pod_name))
             await self._core_api().create_namespaced_pod(_namespace(), pod_spec)
             await self._wait_ready(pod_name)
-        except Exception:
+        except BaseException:
+            # Catch BaseException so asyncio.CancelledError (e.g. from
+            # wait_for timing out around create()) still triggers cleanup;
+            # otherwise the partially created pod, proxy pod, service,
+            # network policies, and prompt secret leak.
             with contextlib.suppress(Exception):
                 await self._delete_pod(pod_name)
             with contextlib.suppress(Exception):

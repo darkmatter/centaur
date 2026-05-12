@@ -1925,6 +1925,43 @@ async def test_steer_execution_reports_cancel_when_execution_finishes_during_inj
         "suppress_cancellation_delivery": True,
     }
 
+    message = await db_pool.fetchrow(
+        "SELECT 1 FROM agent_message_requests WHERE thread_key = $1 AND message_id = $2",
+        thread_key,
+        message_id,
+    )
+    assert message is None
+
+    await db_pool.execute(
+        "UPDATE agent_execution_requests SET status = 'running', terminal_reason = NULL "
+        "WHERE execution_id = $1",
+        execution_id,
+    )
+    with (
+        patch("api.runtime_control.get_backend", return_value=backend),
+        patch("api.runtime_control.steer_stdin", AsyncMock(return_value={"ok": True, "steered": True})),
+    ):
+        result = await steer_execution(
+            db_pool,
+            execution_id,
+            content_blocks=content_blocks,
+            message_id=message_id,
+            metadata={"platform": "slack", "user_id": "U-test", "steer_replacement": True},
+        )
+    assert result == {
+        "ok": True,
+        "execution_id": execution_id,
+        "thread_key": thread_key,
+        "status": "steered",
+    }
+
+    message = await db_pool.fetchrow(
+        "SELECT event_json FROM agent_message_requests WHERE thread_key = $1 AND message_id = $2",
+        thread_key,
+        message_id,
+    )
+    assert message is not None
+
 
 @pytest.mark.asyncio
 async def test_steer_stdin_interrupts_amp_before_injecting(monkeypatch):

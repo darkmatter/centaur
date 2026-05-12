@@ -1283,18 +1283,6 @@ async def steer_execution(
                         },
                     },
                 )
-            event = {
-                "type": "user",
-                "message": {"role": "user", "content": content_blocks},
-            }
-            await append_message(
-                pool,
-                thread_key=thread_key,
-                assignment_generation=assignment_generation,
-                message_id=message_id,
-                event=event,
-                metadata=metadata or {},
-            )
 
     # Build content blocks from pending messages if not provided
     if content_blocks is None:
@@ -1373,6 +1361,20 @@ async def steer_execution(
             "thread_key": thread_key,
             "status": "cancel_requested" if current_status == "cancelled" else current_status,
         }
+
+    if message_id and content_blocks:
+        event = {
+            "type": "user",
+            "message": {"role": "user", "content": content_blocks},
+        }
+        await append_message(
+            pool,
+            thread_key=thread_key,
+            assignment_generation=assignment_generation,
+            message_id=message_id,
+            event=event,
+            metadata=metadata or {},
+        )
 
     log.info(
         "execution_steered",

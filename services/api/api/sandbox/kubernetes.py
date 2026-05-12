@@ -700,7 +700,6 @@ class KubernetesExecutorBackend(SandboxBackend):
             env_from.append({"secretRef": {"name": bootstrap_secret_name}})
         secret_key_refs = {
             "FIREWALL_CONTROL_TOKEN": _secret_env_key("FIREWALL_CONTROL_TOKEN"),
-            "SECRETS_AUTH_TOKEN": _secret_env_key("SECRETS_AUTH_TOKEN"),
             "IRON_MANAGEMENT_API_KEY": _secret_env_key("IRON_MANAGEMENT_API_KEY"),
         }
         manager_env = [
@@ -717,10 +716,6 @@ class KubernetesExecutorBackend(SandboxBackend):
         ]
         manager_env.extend(
             [
-                {
-                    "name": "SECRET_MANAGER_URL",
-                    "value": os.getenv("SECRET_MANAGER_URL", "http://secrets:8100"),
-                },
                 {
                     "name": "IRON_PROXY_CONFIG_PATH",
                     "value": "/etc/iron-proxy/proxy.yaml",

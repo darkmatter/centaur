@@ -68,7 +68,7 @@ def _require_bearer_token(request: Request) -> None:
         return
     raise HTTPException(status_code=403, detail="forbidden")
 
-# In-memory cache: key → entry (value + optional backend "item/field" path).
+# In-memory cache: key → entry.
 _cache: dict[str, SecretEntry] = {}
 _last_refresh_error: str | None = None
 
@@ -215,20 +215,3 @@ async def get_secret(key: str) -> dict:
     if entry is None:
         raise HTTPException(status_code=404, detail="not found")
     return {"value": entry.value}
-
-
-@app.get("/secrets/{key}/ref", dependencies=[Depends(_require_bearer_token)])
-async def get_secret_ref(key: str) -> dict:
-    """Return a fully-qualified backend reference for this key.
-
-    Used by callers (e.g. firewall-manager) that need to point another
-    system at the underlying secret store directly (e.g.
-    ``op://vault/item/field``).  404 for keys whose backend doesn't expose
-    a native reference.
-    """
-    entry = _cache.get(key)
-    if entry is None:
-        raise HTTPException(status_code=404, detail="not found")
-    if entry.ref is None:
-        raise HTTPException(status_code=404, detail="no ref metadata for key")
-    return {"ref": entry.ref}

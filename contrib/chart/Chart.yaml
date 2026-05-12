@@ -2,5 +2,5 @@ apiVersion: v2
 name: centaur
 description: Helm chart for the trusted Centaur control plane
 type: application
-version: 0.1.28
+version: 0.1.29
 appVersion: "0.1.0"

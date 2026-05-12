@@ -10,7 +10,6 @@ MANAGER_PATH = Path(__file__).resolve().parents[2] / "firewall-manager" / "manag
 
 
 def load_manager(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setenv("SECRETS_AUTH_TOKEN", "secrets-token")
     monkeypatch.setenv("FIREWALL_CONTROL_TOKEN", "control-token")
     monkeypatch.setenv("IRON_MANAGEMENT_API_KEY", "iron-token")
     monkeypatch.delenv(

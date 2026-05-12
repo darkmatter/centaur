@@ -8,16 +8,9 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True, slots=True)
 class SecretEntry:
-    """A single resolved secret + optional backend reference.
-
-    ``ref`` is a fully-qualified, backend-native reference to the secret
-    (e.g. ``op://vault/item/field`` for 1Password) for callers that need
-    to point another system at the underlying store directly.  Backends
-    without that notion (env vars, etc.) leave it ``None``.
-    """
+    """A single resolved secret."""
 
     value: str
-    ref: str | None = None
 
 
 class SecretManagerBackend(ABC):

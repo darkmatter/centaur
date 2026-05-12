@@ -161,12 +161,6 @@ spec:
             matchLabels:
 {{ include "centaur.componentSelectorLabels" (dict "root" . "component" "slackbot") | nindent 14 }}
 {{- end }}
-        - podSelector:
-            matchLabels:
-{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "iron-proxy") | nindent 14 }}
-        - podSelector:
-            matchLabels:
-              centaur.ai/iron-proxy: "true"
       ports:
         - protocol: TCP
           port: 8100
@@ -420,14 +414,22 @@ spec:
         - protocol: TCP
           port: {{ .Values.ironProxy.manager.service.controlPort }}
   egress:
+    # firewall-manager polls the api for the injection map.
     - to:
         - podSelector:
             matchLabels:
-{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "secrets") | nindent 14 }}
+{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "api") | nindent 14 }}
       ports:
         - protocol: TCP
-          port: 8100
-    - {}
+          port: 8000
+    # iron-proxy forwards sandbox traffic to external HTTP(S) endpoints.
+    # Restricting to 80/443 keeps in-cluster services (notably the
+    # secret manager on 8100) unreachable from this pod.
+    - ports:
+        - protocol: TCP
+          port: 443
+        - protocol: TCP
+          port: 80
 ---
 {{- if .Values.repoCache.enabled }}
 apiVersion: networking.k8s.io/v1

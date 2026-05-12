@@ -11,10 +11,6 @@ Endpoints:
   POST /injection-map  — bearer-auth, deprecated manual override;
                          replaces the host→keys allowlist;
                          rewrites proxy.yaml and POSTs /v1/reload to iron-proxy
-
-Note: unlike the legacy mitmproxy firewall, this service does NOT expose a
-``/secrets/{key}`` passthrough — callers that need raw secrets should hit
-the secrets service (``$SECRET_MANAGER_URL/secrets/{key}``) directly.
 """
 
 from __future__ import annotations
@@ -27,7 +23,6 @@ import sys
 import tempfile
 import threading
 import time
-import urllib.parse
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Any
@@ -38,15 +33,6 @@ import yaml
 
 CONTROL_TOKEN = os.environ.get("FIREWALL_CONTROL_TOKEN", "").strip()
 HEALTH_PORT = int(os.environ.get("FIREWALL_MANAGER_PORT", "8081"))
-SECRET_MANAGER_URL = os.environ.get("SECRET_MANAGER_URL", "http://secrets:8100").rstrip(
-    "/"
-)
-SECRETS_AUTH_TOKEN = os.environ.get("SECRETS_AUTH_TOKEN", "").strip()
-if not SECRETS_AUTH_TOKEN:
-    raise SystemExit(
-        "SECRETS_AUTH_TOKEN is not set. Refusing to start: the secrets service "
-        "requires bearer auth on /secrets/{key}/ref lookups."
-    )
 IRON_PROXY_CONFIG_PATH = Path(
     os.environ.get("IRON_PROXY_CONFIG_PATH", "/etc/iron-proxy/proxy.yaml")
 )
@@ -69,6 +55,7 @@ STARTUP_BACKOFF_MAX_S = float(
 )
 SECRET_SOURCE = os.environ.get("FIREWALL_MANAGER_SECRET_SOURCE", "env").strip().lower()
 SECRET_TTL = os.environ.get("FIREWALL_MANAGER_SECRET_TTL", "10m").strip()
+OP_VAULT = os.environ.get("OP_VAULT", "ai-agents").strip()
 
 # Headers iron-proxy will scan for proxy_value placeholders.  Literal
 # strings match a single header name; values wrapped in /.../ are
@@ -96,43 +83,17 @@ DEFAULT_MATCH_HEADERS: tuple[str, ...] = (
 log = structlog.get_logger("firewall-manager")
 
 
-def _fetch_secret_ref(key: str) -> str | None:
-    """Ask the secrets service for a backend-native reference to a key.
-
-    Returns ``None`` when the secrets service doesn't know the key or has
-    no ref metadata for it (env-backed secrets, etc).
-    """
-    url = f"{SECRET_MANAGER_URL}/secrets/{urllib.parse.quote(key, safe='')}/ref"
-    headers = {"Authorization": f"Bearer {SECRETS_AUTH_TOKEN}"}
-    try:
-        with httpx.Client(timeout=3.0) as client:
-            resp = client.get(url, headers=headers)
-    except httpx.HTTPError as exc:
-        log.warning("ref_fetch_error", key=key, error=str(exc))
-        return None
-    if resp.status_code == 404:
-        return None
-    if resp.status_code != 200:
-        log.warning("ref_fetch_status", key=key, status=resp.status_code)
-        return None
-    ref = resp.json().get("ref")
-    return ref if isinstance(ref, str) and ref else None
-
-
-def _build_source(key: str) -> dict[str, str] | None:
+def _build_source(key: str) -> dict[str, str]:
     """Translate a centaur key name to iron-proxy's secret source schema.
 
-    Returns ``None`` when the source can't be built — e.g. 1P mode but the
-    secrets service has no ref metadata for this key. Callers should skip
-    such keys so iron-proxy doesn't get a malformed reference.
+    1Password items are named after the env var (``key``) with the secret
+    on the ``credential`` field, so the ref is built deterministically from
+    the key name. iron-proxy resolves the source itself.
     """
     if SECRET_SOURCE == "onepassword":
-        ref = _fetch_secret_ref(key)
-        if ref is None:
-            return None
         return {
             "type": "1password",
-            "secret_ref": ref,
+            "secret_ref": f"op://{OP_VAULT}/{key}/credential",
             "ttl": SECRET_TTL,
         }
     return {"type": "env", "var": key}
@@ -144,8 +105,8 @@ def _build_secret_transform(
     """Convert {host: [keys]} → an iron-proxy `secrets` transform block.
 
     Inverts the map so each key gets one entry with all its allowed hosts as
-    rules.  Returns None when the map (or every key in it) yields no usable
-    sources, so callers can omit the transform entirely.
+    rules.  Returns None when the map is empty so callers can omit the
+    transform entirely.
     """
     by_key: dict[str, list[str]] = {}
     for host, keys in injection_map.items():
@@ -157,22 +118,16 @@ def _build_secret_transform(
 
     secrets = []
     for key in sorted(by_key):
-        source = _build_source(key)
-        if source is None:
-            log.warning("skipping_key_without_source", key=key)
-            continue
         hosts = sorted(set(by_key[key]))
         secrets.append(
             {
-                "source": source,
+                "source": _build_source(key),
                 "proxy_value": key,
                 "match_headers": list(DEFAULT_MATCH_HEADERS),
                 "rules": [{"host": h} for h in hosts],
             }
         )
 
-    if not secrets:
-        return None
     return {"name": "secrets", "config": {"secrets": secrets}}
 
 
@@ -494,6 +449,7 @@ def main() -> None:
         startup_backoff_initial_s=STARTUP_BACKOFF_INITIAL_S,
         startup_backoff_max_s=STARTUP_BACKOFF_MAX_S,
         secret_source=SECRET_SOURCE,
+        op_vault=OP_VAULT if SECRET_SOURCE == "onepassword" else None,
     )
     server = HTTPServer(("0.0.0.0", HEALTH_PORT), Handler)
 

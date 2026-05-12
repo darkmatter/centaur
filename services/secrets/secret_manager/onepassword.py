@@ -2,13 +2,16 @@
 
 Fetches all items from a 1Password vault using the official SDK.
 Requires ``OP_SERVICE_ACCOUNT_TOKEN`` in the environment.
+
+Items are expected to follow a uniform schema: each item's title is the
+canonical ENV_VAR name and the secret value lives on the ``credential``
+field.  Items lacking a non-empty ``credential`` field are skipped.
 """
 
 from __future__ import annotations
 
 import logging
 import os
-import re
 from typing import Any
 
 from onepassword.client import Client
@@ -17,66 +20,23 @@ from secret_manager.backend import SecretEntry, SecretManagerBackend
 
 log = logging.getLogger("secret_manager")
 
-# Preferred field IDs to extract a secret value from a full Item, in priority order.
-_FIELD_IDS = ("password", "credential", "api_key", "key", "token", "secret", "value", "notesPlain")
-
-# Built-in field IDs that should not be treated as named sub-fields.
-_BUILTIN_FIELD_IDS = frozenset(_FIELD_IDS) | frozenset(("username", "url"))
+_CREDENTIAL_FIELD = "credential"
 
 # items.get_all() supports up to 50 items per call.
 _GET_ALL_BATCH = 50
 
-# All vault items are now named with canonical ENV_VAR names directly.
-_ALIASES: dict[str, list[str]] = {}
 
-
-def _normalize(title: str) -> str:
-    """Convert a human-readable title to an ENV_VAR_NAME."""
-    return re.sub(r"[^A-Z0-9]", "_", title.upper()).strip("_")
-
-
-def _extract_value(item: Any) -> tuple[str | None, str | None]:
-    """Pick the best secret value from a fully-fetched Item's fields.
-
-    Returns ``(value, field_id)`` so callers can record which field id
-    actually held the secret — needed for downstream consumers that build
-    direct ``op://vault/item/field`` references.
-    """
+def _extract_credential(item: Any) -> str | None:
+    """Return the value of the ``credential`` field on an item, if any."""
     fields = getattr(item, "fields", []) or []
-    # Try by field id first (most reliable), then by title.
-    for target in _FIELD_IDS:
-        for f in fields:
-            if getattr(f, "id", "") == target and getattr(f, "value", ""):
-                return f.value, target
-    for target in _FIELD_IDS:
-        for f in fields:
-            if getattr(f, "title", "").lower() == target and getattr(f, "value", ""):
-                return f.value, target
-    # Fall back to notes.
-    notes = getattr(item, "notes", "")
-    if notes:
-        return notes, "notesPlain"
-    return None, None
-
-
-def _extract_named_fields(item: Any) -> dict[str, str]:
-    """Extract individually-named fields from a multi-field item.
-
-    Returns a dict of {field_title: field_value} for custom fields that have
-    meaningful titles (not built-in IDs like "password" or "notesPlain").
-    """
-    fields = getattr(item, "fields", []) or []
-    result: dict[str, str] = {}
     for f in fields:
-        field_title = getattr(f, "title", "").strip()
-        field_value = getattr(f, "value", "")
-        field_id = getattr(f, "id", "")
-        if not field_title or not field_value:
-            continue
-        if field_id in _BUILTIN_FIELD_IDS or field_title.lower() in _BUILTIN_FIELD_IDS:
-            continue
-        result[field_title] = field_value
-    return result
+        if getattr(f, "id", "") == _CREDENTIAL_FIELD or getattr(
+            f, "title", ""
+        ).lower() == _CREDENTIAL_FIELD:
+            value = getattr(f, "value", "")
+            if value:
+                return value
+    return None
 
 
 async def _list_vaults(client: Client) -> list[Any]:
@@ -142,63 +102,28 @@ class OnePasswordBackend(SecretManagerBackend):
         vault_id = await _find_vault_id(self._client, self._vault_name)
         items = await _list_items(self._client, vault_id)
 
-        # Collect item IDs and titles from the overview list.
-        overviews: list[tuple[str, str]] = []
-        for item_overview in items:
-            item_id = getattr(item_overview, "id", "")
-            item_title = getattr(item_overview, "title", "")
-            if item_id:
-                overviews.append((item_id, item_title))
+        overviews: list[str] = [
+            getattr(o, "id", "") for o in items if getattr(o, "id", "")
+        ]
 
-        # Batch-fetch full items via get_all (50 per call).
         full_items: list[Any] = []
         for i in range(0, len(overviews), _GET_ALL_BATCH):
-            batch_ids = [oid for oid, _ in overviews[i : i + _GET_ALL_BATCH]]
+            batch_ids = overviews[i : i + _GET_ALL_BATCH]
             resp = await self._client.items.get_all(vault_id, batch_ids)
             for r in resp.individual_responses:
                 if r.content is not None:
                     full_items.append(r.content)
 
         new_cache: dict[str, SecretEntry] = {}
-        vault_ref = self._vault_name
         for item in full_items:
             title = getattr(item, "title", "")
-
-            # Multi-field items: each named field becomes its own cache key.
-            named = _extract_named_fields(item)
-            if named:
-                for field_name, field_value in named.items():
-                    entry = SecretEntry(
-                        value=field_value,
-                        ref=f"op://{vault_ref}/{title}/{field_name}",
-                    )
-                    new_cache[field_name] = entry
-                    norm = _normalize(field_name)
-                    if norm != field_name:
-                        new_cache[norm] = entry
-
-            # Single-value fallback: store under item title.
-            value, field_id = _extract_value(item)
-            if not value and not named:
-                log.debug("skipping item %s — no resolvable field", title)
+            if not title:
                 continue
-            if value and field_id:
-                entry = SecretEntry(
-                    value=value,
-                    ref=f"op://{vault_ref}/{title}/{field_id}",
-                )
-                new_cache[title] = entry
-                norm = _normalize(title)
-                if norm != title:
-                    new_cache[norm] = entry
-
-        # Apply aliases.
-        for alias, sources in _ALIASES.items():
-            if alias not in new_cache:
-                for source in sources:
-                    if source in new_cache:
-                        new_cache[alias] = new_cache[source]
-                        break
+            value = _extract_credential(item)
+            if not value:
+                log.debug("skipping item %s — no credential field", title)
+                continue
+            new_cache[title] = SecretEntry(value=value)
 
         log.info(
             "loaded %d keys from vault '%s': %s",

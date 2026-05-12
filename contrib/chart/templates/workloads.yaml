@@ -264,18 +264,11 @@ spec:
                 secretKeyRef:
                   name: {{ include "centaur.secretEnvName" . }}
                   key: {{ printf "%sFIREWALL_CONTROL_TOKEN" .Values.secretManager.envPrefix }}
-            - name: SECRETS_AUTH_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "centaur.secretEnvName" . }}
-                  key: {{ printf "%sSECRETS_AUTH_TOKEN" .Values.secretManager.envPrefix }}
             - name: IRON_MANAGEMENT_API_KEY
               valueFrom:
                 secretKeyRef:
                   name: {{ include "centaur.secretEnvName" . }}
                   key: {{ printf "%sIRON_MANAGEMENT_API_KEY" .Values.secretManager.envPrefix }}
-            - name: SECRET_MANAGER_URL
-              value: {{ printf "http://%s:8100" (include "centaur.componentName" (dict "root" . "component" "secrets")) | quote }}
             - name: IRON_PROXY_CONFIG_PATH
               value: /etc/iron-proxy/proxy.yaml
             - name: IRON_PROXY_MANAGEMENT_URL

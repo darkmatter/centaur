@@ -195,6 +195,10 @@ This gives agents useful power without treating them like trusted production ser
 
 ## Documentation
 
+- [Docs app](docs/) — Vocs documentation source
+- [Quickstart](docs/pages/quickstart.mdx) — boot the local Kubernetes stack and run one agent turn
+- [Learning Path](docs/pages/learning-path.mdx) — choose the right docs for your role or use case
+- [Troubleshooting](docs/pages/reference/troubleshooting.mdx) — common setup, Slack, API, harness, and workflow failures
 - [Developer Guide](AGENTS.md) — full local setup, architecture, API contracts, migrations, testing, and conventions
 - [Tools](tools/) — built-in tool plugins
 - [Workflows](workflows/) — external workflow plugins

@@ -57,6 +57,17 @@ SECRET_SOURCE = os.environ.get("FIREWALL_MANAGER_SECRET_SOURCE", "env").strip().
 SECRET_TTL = os.environ.get("FIREWALL_MANAGER_SECRET_TTL", "10m").strip()
 OP_VAULT = os.environ.get("OP_VAULT", "ai-agents").strip()
 
+# Credential whose value is a GCP service account keyfile JSON.  Routed to
+# iron-proxy's `gcp_auth` transform instead of `secrets` so iron-proxy mints
+# OAuth2 access tokens from the keyfile and injects them as
+# `Authorization: Bearer` headers, rather than passing the raw keyfile through.
+# Tokens are attached to every Google API host under the cloud-platform scope.
+GCP_KEYFILE_KEY = "GCP_GCLOUD_CREDENTIAL"
+GCP_AUTH_SCOPES: tuple[str, ...] = (
+    "https://www.googleapis.com/auth/cloud-platform",
+)
+GCP_AUTH_HOSTS: tuple[str, ...] = ("*.googleapis.com",)
+
 # Headers iron-proxy will scan for proxy_value placeholders.  Literal
 # strings match a single header name; values wrapped in /.../ are
 # interpreted as regexes.
@@ -117,11 +128,14 @@ def _build_secret_transform(
 
     Inverts the map so each key gets one entry with all its allowed hosts as
     rules.  Returns None when the map is empty so callers can omit the
-    transform entirely.
+    transform entirely.  GCP_GCLOUD_CREDENTIAL is excluded — it is handled
+    by the `gcp_auth` transform instead.
     """
     by_key: dict[str, list[str]] = {}
     for host, keys in injection_map.items():
         for key in keys:
+            if key == GCP_KEYFILE_KEY:
+                continue
             by_key.setdefault(key, []).append(host)
 
     if not by_key:
@@ -142,8 +156,37 @@ def _build_secret_transform(
     return {"name": "secrets", "config": {"secrets": secrets}}
 
 
+def _build_gcp_auth_transform(
+    injection_map: dict[str, list[str]],
+) -> dict[str, Any] | None:
+    """Emit a `gcp_auth` transform when any host is wired to GCP_GCLOUD_CREDENTIAL.
+
+    iron-proxy loads the service account keyfile from the configured secret
+    source, mints short-lived OAuth2 access tokens, and injects them as
+    `Authorization: Bearer`.  Token attachment is restricted to
+    ``GCP_AUTH_HOSTS`` regardless of which hosts the injection map paired
+    with the credential — the injection map only gates whether the transform
+    is emitted at all.  Returns None when no host requests the credential.
+    """
+    has_gcp = any(GCP_KEYFILE_KEY in keys for keys in injection_map.values())
+    if not has_gcp:
+        return None
+
+    return {
+        "name": "gcp_auth",
+        "config": {
+            "keyfile": _build_source(GCP_KEYFILE_KEY),
+            "scopes": list(GCP_AUTH_SCOPES),
+            "rules": [{"host": h} for h in GCP_AUTH_HOSTS],
+        },
+    }
+
+
+_MANAGED_TRANSFORMS: frozenset[str] = frozenset({"secrets", "gcp_auth"})
+
+
 def _render_config(injection_map: dict[str, list[str]]) -> str:
-    """Load proxy.yaml, splice the new `secrets` transform in, dump as YAML.
+    """Load proxy.yaml, splice managed transforms in, dump as YAML.
 
     Other transforms (allowlist, log config, listeners) are preserved
     verbatim so this service stays a single-purpose translator.
@@ -152,16 +195,25 @@ def _render_config(injection_map: dict[str, list[str]]) -> str:
         cfg = yaml.safe_load(f) or {}
 
     transforms = list(cfg.get("transforms") or [])
-    transforms = [t for t in transforms if (t or {}).get("name") != "secrets"]
+    transforms = [
+        t for t in transforms if (t or {}).get("name") not in _MANAGED_TRANSFORMS
+    ]
 
-    secret_transform = _build_secret_transform(injection_map)
-    if secret_transform is not None:
+    new_transforms = [
+        t
+        for t in (
+            _build_secret_transform(injection_map),
+            _build_gcp_auth_transform(injection_map),
+        )
+        if t is not None
+    ]
+    if new_transforms:
         for index, transform in enumerate(transforms):
             if (transform or {}).get("name") == "header_allowlist":
-                transforms.insert(index, secret_transform)
+                transforms[index:index] = new_transforms
                 break
         else:
-            transforms.append(secret_transform)
+            transforms.extend(new_transforms)
 
     cfg["transforms"] = transforms
     return yaml.safe_dump(cfg, sort_keys=False)

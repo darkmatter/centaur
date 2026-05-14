@@ -182,3 +182,98 @@ def test_firewall_manager_poll_loop_stops_without_fetching_when_stop_event_is_se
     monkeypatch.setattr(manager, "_fetch_injection_map", unexpected_fetch)
 
     manager._poll_loop()
+
+
+def test_firewall_manager_routes_gcp_credential_to_gcp_auth_transform(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = load_manager(monkeypatch)
+
+    injection_map = {
+        "api.openai.com": ["OPENAI_API_KEY"],
+        "storage.googleapis.com": ["GCP_GCLOUD_CREDENTIAL"],
+        "compute.googleapis.com": ["GCP_GCLOUD_CREDENTIAL"],
+    }
+
+    secrets = manager._build_secret_transform(injection_map)
+    assert secrets is not None
+    secret_keys = [s["proxy_value"] for s in secrets["config"]["secrets"]]
+    assert secret_keys == ["OPENAI_API_KEY"]
+
+    gcp_auth = manager._build_gcp_auth_transform(injection_map)
+    assert gcp_auth == {
+        "name": "gcp_auth",
+        "config": {
+            "keyfile": {"type": "env", "var": "GCP_GCLOUD_CREDENTIAL"},
+            "scopes": list(manager.GCP_AUTH_SCOPES),
+            "rules": [{"host": h} for h in manager.GCP_AUTH_HOSTS],
+        },
+    }
+
+
+def test_firewall_manager_omits_gcp_auth_when_no_gcp_credential(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = load_manager(monkeypatch)
+    assert (
+        manager._build_gcp_auth_transform({"api.openai.com": ["OPENAI_API_KEY"]})
+        is None
+    )
+
+
+def test_firewall_manager_gcp_auth_keyfile_uses_onepassword_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("FIREWALL_MANAGER_SECRET_SOURCE", "onepassword-connect")
+    monkeypatch.setenv("OP_VAULT", "engineering")
+    manager = load_manager(monkeypatch)
+
+    gcp_auth = manager._build_gcp_auth_transform(
+        {"storage.googleapis.com": ["GCP_GCLOUD_CREDENTIAL"]}
+    )
+    assert gcp_auth is not None
+    assert gcp_auth["config"]["keyfile"] == {
+        "type": "1password_connect",
+        "secret_ref": "op://engineering/GCP_GCLOUD_CREDENTIAL/credential",
+        "ttl": manager.SECRET_TTL,
+    }
+
+
+def test_firewall_manager_render_config_splices_both_transforms(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    manager = load_manager(monkeypatch)
+    config_path = tmp_path / "proxy.yaml"
+    config_path.write_text(
+        "transforms:\n"
+        "  - name: allowlist\n"
+        "    config:\n"
+        "      domains:\n"
+        "        - '*'\n"
+        "  - name: header_allowlist\n"
+        "    config:\n"
+        "      headers:\n"
+        "        - host\n"
+    )
+    manager.IRON_PROXY_CONFIG_PATH = config_path
+
+    rendered = manager._render_config(
+        {
+            "api.openai.com": ["OPENAI_API_KEY"],
+            "storage.googleapis.com": ["GCP_GCLOUD_CREDENTIAL"],
+        }
+    )
+    import yaml as _yaml
+
+    cfg = _yaml.safe_load(rendered)
+    names = [t["name"] for t in cfg["transforms"]]
+    assert names == ["allowlist", "secrets", "gcp_auth", "header_allowlist"]
+
+    # Re-rendering must replace, not duplicate, the managed transforms.
+    config_path.write_text(rendered)
+    rerendered = manager._render_config(
+        {"storage.googleapis.com": ["GCP_GCLOUD_CREDENTIAL"]}
+    )
+    cfg2 = _yaml.safe_load(rerendered)
+    names2 = [t["name"] for t in cfg2["transforms"]]
+    assert names2 == ["allowlist", "gcp_auth", "header_allowlist"]

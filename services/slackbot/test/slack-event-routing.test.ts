@@ -195,6 +195,32 @@ describe("Slack event routing and dedup", () => {
     expect(bot.onSubscribedMessage).not.toHaveBeenCalled();
   });
 
+  it("does not let ignored file_share deliveries suppress a later app_mention", async () => {
+    const { app, bot } = createRoutingHarness();
+    const files = [{ id: "F123", mimetype: "image/png", url_private: "https://files.slack.test/F123" }];
+
+    await app.routeSlackEvent(
+      slackEvent({
+        type: "message",
+        subtype: "file_share",
+        text: "",
+        files,
+      }),
+      "T123",
+    );
+    await app.routeSlackEvent(
+      slackEvent({
+        type: "app_mention",
+        text: "<@UBOT> what are these?",
+        files,
+      }),
+      "T123",
+    );
+
+    expect(bot.onNewMention).toHaveBeenCalledTimes(1);
+    expect(bot.onSubscribedMessage).not.toHaveBeenCalled();
+  });
+
   it("treats direct messages without explicit bot mentions as mentions", async () => {
     const { app, adapter, bot } = createRoutingHarness();
 

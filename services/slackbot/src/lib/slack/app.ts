@@ -875,7 +875,7 @@ export class BoltSlackApp {
   private async routeSlackEvent(event: SlackMessageEvent, teamId?: string): Promise<void> {
     const threadId = threadIdFromEvent(event);
     if (!threadId) return;
-    const duplicateMessage = event.ts ? this.seenMessageRecently(threadId, event) : false;
+    const duplicateMessage = event.ts ? this.hasSeenMessageRecently(threadId, event) : false;
     log.info("slack_event_route_decision", {
       event_type: event.type,
       event_subtype: event.subtype,
@@ -889,19 +889,18 @@ export class BoltSlackApp {
     if (this.isPotentialMention(event) && this.queue.has(threadId)) {
       const inFlightReady = await this.bot.waitForInFlightExecution(threadId);
       if (inFlightReady) {
-        await this.processMessageEvent(event, threadId, teamId, true);
+        await this.processMessageEvent(event, threadId, teamId);
         return;
       }
     }
 
-    await this.enqueue(threadId, () => this.processMessageEvent(event, threadId, teamId, true));
+    await this.enqueue(threadId, () => this.processMessageEvent(event, threadId, teamId));
   }
 
   private async processMessageEvent(
     event: SlackMessageEvent,
     threadId: string,
     teamId?: string,
-    messageAlreadyClaimed = false,
   ): Promise<void> {
     if (event.type !== "message" && event.type !== "app_mention") return;
     if (isIgnoredMessageSubtype(event.subtype)) return;
@@ -929,7 +928,7 @@ export class BoltSlackApp {
     const isSubscribed = await this.isSubscribedThread(threadId);
 
     if (!isSubscribed && !isMention) return;
-    if (!messageAlreadyClaimed && this.seenMessageRecently(threadId, event)) return;
+    if (this.seenMessageRecently(threadId, event)) return;
 
     const thread = this.createThread(threadId, {
       recipientUserId: event.user,
@@ -1070,13 +1069,26 @@ export class BoltSlackApp {
     return false;
   }
 
+  private pruneSeenMessages(now: number): void {
+    for (const [seenKey, expiresAt] of this.seenMessages) {
+      if (expiresAt <= now) this.seenMessages.delete(seenKey);
+    }
+  }
+
+  private hasSeenMessageRecently(threadId: string, event: SlackMessageEvent): boolean {
+    if (!event.ts) return false;
+    const key = `${threadId}:${event.ts}`;
+    const now = Date.now();
+    this.pruneSeenMessages(now);
+    const expiresAt = this.seenMessages.get(key);
+    return Boolean(expiresAt && expiresAt > now);
+  }
+
   private seenMessageRecently(threadId: string, event: SlackMessageEvent): boolean {
     if (!event.ts) return false;
     const key = `${threadId}:${event.ts}`;
     const now = Date.now();
-    for (const [seenKey, expiresAt] of this.seenMessages) {
-      if (expiresAt <= now) this.seenMessages.delete(seenKey);
-    }
+    this.pruneSeenMessages(now);
 
     const expiresAt = this.seenMessages.get(key);
     if (expiresAt && expiresAt > now) {

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import Any
 
 from fastapi import APIRouter, Depends
@@ -69,6 +70,17 @@ async def usage_stats() -> Response:
         return JSONResponse(status_code=500, content={"detail": "Malformed stats data"})
     data["generated_at"] = row["generated_at"].isoformat() if row["generated_at"] else None
     return JSONResponse(content=data, headers={"Cache-Control": "public, max-age=240"})
+
+
+@router.get("/health/env", dependencies=[Depends(verify_operator_api_key)])
+async def health_env() -> dict[str, list[str]]:
+    """List the names of the API process's currently-set environment variables.
+
+    Reflects runtime mutations (e.g. pg_dsn vars set by the API proxy
+    bring-up), which the pod spec and ``kubectl exec`` cannot show. Values
+    are not returned, only names.
+    """
+    return {"env": sorted(os.environ)}
 
 
 @router.get("/health/tools", dependencies=[Depends(verify_operator_api_key)])

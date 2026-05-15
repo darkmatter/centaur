@@ -1543,6 +1543,18 @@ class KubernetesExecutorBackend(SandboxBackend):
         rendered = render_proxy_yaml(secrets, pg_listen_ports=pg_listen_ports)
         config_hash = hashlib.sha256(rendered.encode("utf-8")).hexdigest()[:16]
 
+        # Mirror the sandbox pg_dsn wiring onto the API process itself: each
+        # PgDsnSecret gets an env var pointing at the API proxy's local
+        # postgres listener, matching what sandboxes receive via container_env.
+        api_proxy_host = _proxy_service_name(_API_PROXY_SANDBOX_ID)
+        for secret, proxy_password in pg_secrets:
+            os.environ[secret.name] = _build_proxied_pg_url(
+                api_proxy_host,
+                pg_listen_ports[secret.name],
+                proxy_password,
+                secret.database,
+            )
+
         await self._apply_proxy_configmap_data(
             _proxy_configmap_name(_API_PROXY_SANDBOX_ID), _API_PROXY_SANDBOX_ID, rendered
         )

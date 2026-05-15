@@ -9,6 +9,8 @@ the network.
 
 from __future__ import annotations
 
+import os
+
 from centaur_sdk.backends.base import SecretBackend
 
 
@@ -17,9 +19,17 @@ class StubBackend(SecretBackend):
 
     This is the server-mode default. Tools put the stub in HTTP headers,
     and the firewall replaces it with the real credential in-flight.
+
+    Some secrets can't go through firewall injection: things like a
+    Postgres DSN are consumed in-process rather than placed in an
+    outbound HTTPS header, so a stub is unusable. When the key is
+    present in the environment, its value is returned instead.
     """
 
     async def get(self, key: str) -> str | None:
+        env_val = os.environ.get(key)
+        if env_val is not None:
+            return env_val
         return key
 
     async def list_keys(self) -> list[str]:

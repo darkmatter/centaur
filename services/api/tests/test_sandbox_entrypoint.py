@@ -52,3 +52,6 @@ def test_sandbox_entrypoint_bootstraps_mock_google_adc(tmp_path: Path) -> None:
     }
     assert adc["private_key"].startswith("-----BEGIN PRIVATE KEY-----\n")
     assert adc["private_key"].endswith("-----END PRIVATE KEY-----\n")
+
+    codex_config = (home / ".codex" / "config.toml").read_text()
+    assert 'model_verbosity = "low"' in codex_config

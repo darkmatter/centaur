@@ -64,6 +64,7 @@ mkdir -p "$HOME_DIR/.codex"
 cat > "$HOME_DIR/.codex/config.toml" <<EOF
 sandbox_mode = "danger-full-access"
 approval_policy = "never"
+model_verbosity = "low"
 
 [features]
 goals = true

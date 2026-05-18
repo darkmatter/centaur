@@ -1,0 +1,15 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "centaur-docs",
+  "compatibility_date": "2026-05-05",
+  "routes": [
+    {
+      "pattern": "centaur.run",
+      "custom_domain": true
+    }
+  ],
+  "assets": {
+    "directory": "./dist",
+    "not_found_handling": "404-page"
+  }
+}

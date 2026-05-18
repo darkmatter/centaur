@@ -1,0 +1,27 @@
+model = "gpt-5.5"
+model_reasoning_effort = "low"
+personality = "pragmatic"
+model_verbosity = "low"
+service_tier = "fast"
+approval_policy = "never"
+sandbox_mode = "danger-full-access"
+suppress_unstable_features_warning = true
+
+[features]
+goals = true
+fast_mode = true
+memories = true
+hooks = true
+enable_fanout = true
+runtime_metrics = true
+
+[features.multi_agent_v2]
+enabled = true
+max_concurrent_threads_per_session = 6
+
+[agents]
+max_depth = 2
+job_max_runtime_seconds = 1800
+
+[tools]
+view_image = true

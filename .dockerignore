@@ -1,0 +1,40 @@
+# Version control
+.git
+
+# Virtual environments
+.venv
+
+# Node
+services/slackbot/node_modules
+
+# Sandbox cached repos (4GB+)
+services/sandbox/repos
+
+# Caches
+.ruff_cache
+.pytest_cache
+__pycache__
+
+# Logs
+logs/
+
+# IDE / editor
+.claude
+.cursor
+.vscode
+.idea
+.amp
+.windsurf
+
+# Docker
+.dockerignore
+
+# Docs / non-runtime
+*.md
+!centaur_sdk/README.md
+!services/sandbox/SYSTEM_PROMPT.md
+!.agents/skills/**
+
+# Environment (secrets)
+.env
+.env.*

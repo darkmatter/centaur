@@ -1,0 +1,124 @@
+---
+title: Quickstart
+description: Boot Centaur locally and verify the control plane.
+---
+
+# Quickstart
+
+This guide gets you from a fresh checkout to a working local Centaur stack. The
+happy path is: point `kubectl` at a local cluster, bootstrap the required infra
+Secret, run `just up`, then verify the API is healthy.
+
+## 1. Install prerequisites
+
+From the repo root:
+
+```bash
+brew install just kubectl helm jq
+```
+
+You also need Docker and a local Kubernetes cluster. The most direct path on
+macOS is Docker Desktop with Kubernetes enabled, but kind, minikube, and k3d are
+fine as long as `kubectl` points at that local cluster and it can run the Helm
+chart.
+
+Check the target before booting Centaur:
+
+```bash
+kubectl config current-context
+kubectl get nodes
+```
+
+The `Justfile` builds local images named `centaur-api:latest`,
+`centaur-iron-proxy:latest`, `centaur-slackbot:latest`, and
+`centaur-agent:latest`, then deploys `contrib/chart` with
+`contrib/chart/values.dev.yaml`.
+
+## 2. Export bootstrap secrets
+
+The default local chart expects one infra Secret named `centaur-infra-env`.
+`just bootstrap-secrets` creates it from your shell environment.
+
+`just bootstrap-secrets` currently requires these shell variables:
+
+```bash
+export OP_SERVICE_ACCOUNT_TOKEN=...
+export OP_VAULT=...
+export SLACK_BOT_TOKEN=...
+export SLACK_SIGNING_SECRET=...
+export SLACKBOT_API_KEY=...
+```
+
+Create the Slackbot app at [api.slack.com/apps](https://api.slack.com/apps).
+Use the app's Bot User OAuth Token for `SLACK_BOT_TOKEN` and its Signing Secret
+for `SLACK_SIGNING_SECRET`.
+
+`OP_SERVICE_ACCOUNT_TOKEN` and `OP_VAULT` let [iron-proxy](https://iron.sh)
+resolve model and tool credentials through 1Password. `SLACK_SIGNING_SECRET`
+and `SLACKBOT_API_KEY` are API boot requirements in the current chart.
+`SLACK_BOT_TOKEN` is required by the default local bootstrap because Slackbot is
+enabled in `values.dev.yaml`; use a real token if you want to test Slack.
+
+`SLACKBOT_API_KEY` is a static service token. The API bootstraps that value into
+Postgres on startup, so it must exist before `just up`.
+
+Application-level model and tool secrets, such as `OPENAI_API_KEY`,
+`ANTHROPIC_API_KEY`, `AMP_API_KEY`, and `GITHUB_TOKEN`, should live in
+1Password or the configured [iron-proxy](https://iron.sh) secret source. Sandboxes receive
+placeholder values and [iron-proxy](https://iron.sh) injects the real credentials only on approved
+outbound requests.
+
+The default harness is `codex`, so `OPENAI_API_KEY` must exist in the configured
+secret source before Slack agent turns can complete. Use explicit harness
+selectors only when you want a non-default harness such as Amp or Claude Code.
+
+## 3. Boot the stack
+
+```bash
+just up
+```
+
+That runs:
+
+1. `just bootstrap-secrets`
+2. `just build`
+3. `just deploy`
+
+Check the namespace:
+
+```bash
+just status
+```
+
+## 4. Verify the API
+
+The API exposes localhost inside its own deployment. Localhost bypasses external
+API-key auth, which is why the health check runs through `kubectl exec`:
+
+```bash
+kubectl exec -n centaur deploy/centaur-centaur-api -- \
+  curl -fsS http://localhost:8000/health
+```
+
+Expected shape:
+
+```json
+{"status":"ok"}
+```
+
+## 5. Try Slack after the API works
+
+Mention the bot in a test channel where the Slack app is installed:
+
+```text
+@<your bot's username> reply with exactly PONG
+```
+
+Slack messages without a harness flag use Codex. Add a selector such as
+`--amp`, `--claude`, or `--pi` only when you want to override the default.
+
+If Slack receives the mention but no agent runs, inspect Slackbot logs:
+
+```bash
+just logs slackbot
+```

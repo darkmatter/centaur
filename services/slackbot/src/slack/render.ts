@@ -1,0 +1,100 @@
+import type { AnyBlock, AnyChunk, MarkdownBlock, RichTextBlock } from '@slack/types'
+
+const MAX_BLOCKS = 50
+const MAX_MARKDOWN_CHARS = 12_000
+const MAX_FALLBACK_CHARS = 3_900
+const MAX_STREAM_CHUNK_CHARS = 4_000
+
+export type StatusMetadata = {
+  title?: string
+  status?: string
+  fields?: Record<string, string | number | boolean | null | undefined>
+}
+
+export function renderMarkdownBlocks(markdown: string): MarkdownBlock[] {
+  const normalized = markdown.trim() || ' '
+  const blocks: MarkdownBlock[] = []
+  let used = 0
+
+  for (const chunk of splitText(normalized, MAX_MARKDOWN_CHARS)) {
+    if (blocks.length >= MAX_BLOCKS) break
+    const remaining = MAX_MARKDOWN_CHARS - used
+    if (remaining <= 0) break
+    const text = chunk.slice(0, remaining)
+    used += text.length
+    blocks.push({ type: 'markdown', text })
+  }
+
+  return blocks
+}
+
+export function renderStatusBlock(metadata: StatusMetadata): RichTextBlock | null {
+  const elements: Array<{ type: 'text'; text: string; style?: { bold?: boolean } }> = []
+  if (metadata.title) {
+    elements.push({ type: 'text', text: metadata.title, style: { bold: true } })
+  }
+  if (metadata.status) {
+    if (elements.length) elements.push({ type: 'text', text: '\n' })
+    elements.push({ type: 'text', text: metadata.status })
+  }
+  for (const [key, value] of Object.entries(metadata.fields ?? {})) {
+    if (value === undefined || value === null) continue
+    if (elements.length) elements.push({ type: 'text', text: '\n' })
+    elements.push({ type: 'text', text: `${key}: `, style: { bold: true } })
+    elements.push({ type: 'text', text: String(value) })
+  }
+  if (!elements.length) return null
+
+  return {
+    type: 'rich_text',
+    elements: [{ type: 'rich_text_section', elements }]
+  }
+}
+
+export function enforceBlockLimits(blocks: AnyBlock[]): AnyBlock[] {
+  return blocks.slice(0, MAX_BLOCKS)
+}
+
+export function fallbackText(input: {
+  markdown?: string
+  metadata?: StatusMetadata
+  fallback?: string
+}): string {
+  const parts = [
+    input.fallback,
+    input.markdown,
+    input.metadata?.title,
+    input.metadata?.status,
+    ...Object.entries(input.metadata?.fields ?? {}).map(([key, value]) =>
+      value === undefined || value === null ? '' : `${key}: ${String(value)}`
+    )
+  ].filter(Boolean)
+
+  const text = parts.join('\n').replace(/\s+/g, ' ').trim() || 'Centaur update'
+  return text.length > MAX_FALLBACK_CHARS ? `${text.slice(0, MAX_FALLBACK_CHARS - 1)}…` : text
+}
+
+export function markdownToStreamChunks(markdown: string): AnyChunk[] {
+  return splitText(markdown || ' ', MAX_STREAM_CHUNK_CHARS).map(text => ({
+    type: 'markdown_text',
+    text
+  }))
+}
+
+function splitText(input: string, maxChars: number): string[] {
+  const chunks: string[] = []
+  let remaining = input
+  while (remaining.length > maxChars) {
+    const hard = remaining.slice(0, maxChars)
+    const boundary = Math.max(
+      hard.lastIndexOf('\n\n'),
+      hard.lastIndexOf('\n'),
+      hard.lastIndexOf(' ')
+    )
+    const take = boundary > maxChars * 0.5 ? boundary : maxChars
+    chunks.push(remaining.slice(0, take))
+    remaining = remaining.slice(take).trimStart()
+  }
+  if (remaining) chunks.push(remaining)
+  return chunks
+}

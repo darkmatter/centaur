@@ -1,0 +1,22 @@
+[project]
+name = "twitter"
+description = "Twitter CLI for user profiles, followers, tweets, and search"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "typer>=0.12.0",
+    "rich>=13.0.0",
+    "httpx>=0.28.1",
+    "tenacity>=8.0.0",
+    "pydantic>=2.0.0",
+    "pydantic-settings>=2.0.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.ai-v2]
+module = "client.py"
+hosts = ["api.synoptic.com", "api.fxtwitter.com"]
+secrets = ["SYNOPTIC_API_KEY"]

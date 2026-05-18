@@ -1,0 +1,128 @@
+"""Attachments router — download attachments from sandbox agents."""
+
+from __future__ import annotations
+
+import base64
+import uuid
+
+import structlog
+from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import Response
+
+from api.deps import get_sandbox_claims, sandbox_thread_in_scope, verify_api_key
+
+log = structlog.get_logger()
+
+router = APIRouter(
+    prefix="/agent/attachments",
+    tags=["attachments"],
+    dependencies=[Depends(verify_api_key)],
+)
+
+
+def _enforce_sandbox_thread_scope(request: Request, thread_key: str) -> None:
+    """Reject if a sandbox token is trying to access a different thread."""
+    claims = get_sandbox_claims(request)
+    if claims is None:
+        return
+    allowed = claims.get("thread_key")
+    if not sandbox_thread_in_scope(allowed, thread_key):
+        raise HTTPException(status_code=403, detail="Sandbox token is scoped to a different thread")
+
+
+@router.get("")
+async def list_attachments(request: Request, thread_key: str):
+    """List attachment metadata for a thread."""
+    _enforce_sandbox_thread_scope(request, thread_key)
+    pool = request.app.state.db_pool
+    rows = await pool.fetch(
+        "SELECT id, thread_key, message_id, name, mime_type, created_at "
+        "FROM attachments WHERE thread_key = $1 ORDER BY created_at",
+        thread_key,
+    )
+    return [
+        {
+            "id": row["id"],
+            "name": row["name"],
+            "mime_type": row["mime_type"],
+            "message_id": row["message_id"],
+            "created_at": row["created_at"].isoformat() if row["created_at"] else None,
+        }
+        for row in rows
+    ]
+
+
+@router.post("/upload")
+async def upload_attachment(request: Request):
+    """Upload a file directly to the attachments table.
+
+    Body (JSON):
+        thread_key: str (required)
+        name: str (required) — filename
+        mime_type: str (required)
+        data: str (required) — base64-encoded file content
+        message_id: str (optional) — associated chat_message id
+        source_url: str (optional) — original URL the file was downloaded from
+    """
+    body = await request.json()
+
+    thread_key = body.get("thread_key")
+    name = body.get("name")
+    mime_type = body.get("mime_type")
+    data_b64 = body.get("data")
+
+    if not all([thread_key, name, mime_type, data_b64]):
+        raise HTTPException(
+            status_code=422,
+            detail="thread_key, name, mime_type, and data are required",
+        )
+
+    _enforce_sandbox_thread_scope(request, thread_key)
+
+    try:
+        raw_bytes = base64.b64decode(data_b64)
+    except Exception:
+        raise HTTPException(status_code=422, detail="data is not valid base64")
+
+    att_id = f"att-{uuid.uuid4().hex[:16]}"
+    message_id = body.get("message_id")
+    source_url = body.get("source_url")
+
+    pool = request.app.state.db_pool
+    await pool.execute(
+        "INSERT INTO attachments (id, thread_key, message_id, name, mime_type, data) "
+        "VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (id) DO NOTHING",
+        att_id, thread_key, message_id, name, mime_type, raw_bytes,
+    )
+    log.info(
+        "attachment_uploaded",
+        id=att_id,
+        thread_key=thread_key,
+        name=name,
+        mime_type=mime_type,
+        size=len(raw_bytes),
+        source_url=source_url,
+    )
+    return {
+        "id": att_id,
+        "name": name,
+        "mime_type": mime_type,
+        "download_url": f"/agent/attachments/{att_id}/download",
+    }
+
+
+@router.get("/{attachment_id}/download")
+async def download_attachment(request: Request, attachment_id: str):
+    """Download attachment raw bytes."""
+    pool = request.app.state.db_pool
+    row = await pool.fetchrow(
+        "SELECT data, mime_type, name FROM attachments WHERE id = $1",
+        attachment_id,
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="Attachment not found")
+    return Response(
+        content=row["data"],
+        media_type=row["mime_type"],
+        headers={"Content-Disposition": f'attachment; filename="{row["name"]}"'},
+    )

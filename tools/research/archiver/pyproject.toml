@@ -1,0 +1,23 @@
+[project]
+name = "archiver"
+description = "Document extraction via Reducto for investment materials"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "typer>=0.12.0",
+    "browser-use-sdk>=2.0.14",
+    "httpx>=0.28.1",
+    "pillow>=12.1.0",
+    "playwright>=1.58.0",
+    "python-dotenv>=1.2.1",
+    "requests>=2.32.5",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.ai-v2]
+module = "client.py"
+hosts = ["platform.reducto.ai", "docs.google.com", "drive.google.com"]
+secrets = ["REDUCTO_API_KEY", "BROWSER_USE_API_KEY"]

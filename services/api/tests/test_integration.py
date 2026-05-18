@@ -1,0 +1,559 @@
+"""Integration tests for the Centaur API.
+
+Covers:
+- Message buffer endpoints (POST/GET /agent/messages)
+- Attachment endpoints (GET /agent/attachments, download)
+- Harness protocol helpers (_flushed_to_messages, messages_to_content_blocks, build_user_input)
+- Harness command builder (build_harness_cmd)
+- Session context builder (_build_session_context)
+- Status endpoint (GET /agent/status)
+
+DB-backed tests require the ephemeral Postgres from conftest.py.
+Pure-function tests run without any infrastructure.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+
+async def _seed_assignment(db_pool, thread_key: str, generation: int = 1) -> None:
+    await db_pool.execute(
+        "INSERT INTO agent_runtime_assignments ("
+        "thread_key, assignment_generation, runtime_id, harness, engine, "
+        "persona_id, prompt_ref, effective_agents_md_sha256, state"
+        ") VALUES ($1, $2, $3, 'amp', 'amp', NULL, 'harness:amp', 'sha', 'active')",
+        thread_key,
+        generation,
+        f"rt-{thread_key}-{generation}",
+    )
+
+
+# ── Test 1: Message buffer endpoints ─────────────────────────────────────────
+
+
+class TestPostMessages:
+    """Tests for POST /agent/messages endpoint."""
+
+    @pytest.mark.asyncio
+    async def test_post_single_message(self, client, db_pool, api_key):
+        """POST /agent/messages with a single message."""
+        thread_key = "test:msg-1"
+        await _seed_assignment(db_pool, thread_key)
+        resp = await client.post(
+            "/agent/messages",
+            headers={"Authorization": f"Bearer {api_key}"},
+            json={
+                "thread_key": thread_key,
+                "assignment_generation": 1,
+                "role": "user",
+                "parts": [{"type": "text", "text": "hello"}],
+            },
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["ok"] is True
+        assert data["inserted"] == 1
+
+    @pytest.mark.asyncio
+    async def test_post_batch_messages(self, client, db_pool, api_key):
+        """POST /agent/messages with multiple messages in batch."""
+        thread_key = "test:msg-batch-1"
+        await _seed_assignment(db_pool, thread_key)
+        messages = [
+            {
+                "role": "user",
+                "parts": [{"type": "text", "text": f"batch msg {i}"}],
+                "user_id": "U456",
+                "message_id": f"msg-batch-{i}",
+            }
+            for i in range(3)
+        ]
+        resp = await client.post(
+            "/agent/messages",
+            headers={"Authorization": f"Bearer {api_key}"},
+            json={
+                "thread_key": thread_key,
+                "assignment_generation": 1,
+                "messages": messages,
+            },
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["ok"] is True
+        assert data["inserted"] == 3
+
+    @pytest.mark.asyncio
+    async def test_get_messages_empty(self, client, api_key):
+        """GET for nonexistent thread returns empty list."""
+        resp = await client.get(
+            "/agent/messages",
+            params={"thread_key": "test:empty"},
+            headers={"Authorization": f"Bearer {api_key}"},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["messages"] == []
+        assert data["has_more"] is False
+
+    @pytest.mark.asyncio
+    async def test_get_messages_roundtrip(self, client, db_pool, api_key):
+        """POST then GET returns the same message."""
+        import json
+
+        thread = "test:roundtrip-1"
+        await _seed_assignment(db_pool, thread)
+        await client.post(
+            "/agent/messages",
+            headers={"Authorization": f"Bearer {api_key}"},
+            json={
+                "thread_key": thread,
+                "assignment_generation": 1,
+                "message_id": "msg-roundtrip",
+                "role": "user",
+                "parts": [{"type": "text", "text": "roundtrip check"}],
+                "user_id": "U789",
+            },
+        )
+        resp = await client.get(
+            "/agent/messages",
+            params={"thread_key": thread},
+            headers={"Authorization": f"Bearer {api_key}"},
+        )
+        assert resp.status_code == 200
+        msgs = resp.json()["messages"]
+        assert len(msgs) == 1
+        assert msgs[0]["role"] == "user"
+        # parts may come back as a JSON string or parsed list depending on codec
+        parts = msgs[0]["parts"]
+        if isinstance(parts, str):
+            parts = json.loads(parts)
+        assert parts == [{"type": "text", "text": "roundtrip check"}]
+        assert msgs[0]["user_id"] == "U789"
+
+    @pytest.mark.asyncio
+    async def test_message_dedup(self, client, db_pool, api_key):
+        """Same slack_ts = same message ID = no duplicate insert."""
+        thread_key = "test:dedup-1"
+        await _seed_assignment(db_pool, thread_key)
+        for _ in range(2):
+            await client.post(
+                "/agent/messages",
+                headers={"Authorization": f"Bearer {api_key}"},
+                json={
+                    "thread_key": thread_key,
+                    "assignment_generation": 1,
+                    "message_id": "msg-dedup",
+                    "parts": [{"type": "text", "text": "hello"}],
+                    "metadata": {"slack_ts": "1234567890.123456"},
+                },
+            )
+        resp = await client.get(
+            "/agent/messages",
+            params={"thread_key": thread_key},
+            headers={"Authorization": f"Bearer {api_key}"},
+        )
+        assert len(resp.json()["messages"]) == 1
+
+    @pytest.mark.asyncio
+    async def test_missing_thread_key(self, client, api_key):
+        """POST without thread_key returns 422."""
+        resp = await client.post(
+            "/agent/messages",
+            headers={"Authorization": f"Bearer {api_key}"},
+            json={
+                "parts": [{"type": "text", "text": "no thread key"}],
+            },
+        )
+        assert resp.status_code == 422
+
+    @pytest.mark.asyncio
+    async def test_loopback_bypasses_auth(self, client, db_pool):
+        """ASGI transport (localhost) bypasses auth — verifies loopback trust."""
+        thread_key = "test:loopback-auth"
+        await _seed_assignment(db_pool, thread_key)
+        resp = await client.post(
+            "/agent/messages",
+            json={
+                "thread_key": thread_key,
+                "assignment_generation": 1,
+                "parts": [{"type": "text", "text": "no key"}],
+            },
+        )
+        assert resp.status_code == 200
+
+    @pytest.mark.asyncio
+    async def test_get_messages_pagination(self, client, db_pool, api_key):
+        """GET with limit returns paginated results."""
+        thread = "test:pagination-1"
+        await _seed_assignment(db_pool, thread)
+        for i in range(5):
+            await client.post(
+                "/agent/messages",
+                headers={"Authorization": f"Bearer {api_key}"},
+                json={
+                    "thread_key": thread,
+                    "assignment_generation": 1,
+                    "message_id": f"msg-page-{i}",
+                    "parts": [{"type": "text", "text": f"page msg {i}"}],
+                    "metadata": {"slack_ts": f"1000000000.{i:06d}"},
+                },
+            )
+        resp = await client.get(
+            "/agent/messages",
+            params={"thread_key": thread, "limit": "2"},
+            headers={"Authorization": f"Bearer {api_key}"},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert len(data["messages"]) == 2
+        assert data["has_more"] is True
+
+
+# ── Test 2: Attachment endpoints ─────────────────────────────────────────────
+
+
+class TestAttachments:
+    """Tests for GET /agent/attachments and download."""
+
+    @pytest.mark.asyncio
+    async def test_list_attachments_empty(self, client, api_key):
+        """Listing attachments for unknown thread returns empty list."""
+        resp = await client.get(
+            "/agent/attachments",
+            params={"thread_key": "test:no-att"},
+            headers={"Authorization": f"Bearer {api_key}"},
+        )
+        assert resp.status_code == 200
+        assert resp.json() == []
+
+    @pytest.mark.asyncio
+    async def test_download_attachment_not_found(self, client, api_key):
+        """Downloading a nonexistent attachment returns 404."""
+        resp = await client.get(
+            "/agent/attachments/nonexistent/download",
+            headers={"Authorization": f"Bearer {api_key}"},
+        )
+        assert resp.status_code == 404
+
+
+# ── Test 3: Harness protocol integration ─────────────────────────────────────
+
+
+class TestFlushedToMessages:
+    """Tests for _flushed_to_messages helper."""
+
+    def test_basic_conversion(self):
+        """DB rows with list parts convert correctly."""
+        from api.agent import _flushed_to_messages
+
+        rows = [
+            {"role": "user", "parts": [{"type": "text", "text": "hi"}], "user_id": "U123"},
+        ]
+        msgs = _flushed_to_messages(rows)
+        assert len(msgs) == 1
+        assert msgs[0]["role"] == "user"
+        assert msgs[0]["parts"] == [{"type": "text", "text": "hi"}]
+        assert msgs[0]["user_id"] == "U123"
+
+    def test_string_parts_parsed(self):
+        """Parts stored as JSON string are parsed."""
+        from api.agent import _flushed_to_messages
+
+        rows = [
+            {"role": "user", "parts": '[{"type": "text", "text": "world"}]', "user_id": None},
+        ]
+        msgs = _flushed_to_messages(rows)
+        assert msgs[0]["parts"] == [{"type": "text", "text": "world"}]
+        assert "user_id" not in msgs[0]
+
+    def test_mixed_rows(self):
+        """Rows with and without user_id, list and string parts."""
+        from api.agent import _flushed_to_messages
+
+        rows = [
+            {"role": "user", "parts": [{"type": "text", "text": "hi"}], "user_id": "U123"},
+            {"role": "user", "parts": '[{"type": "text", "text": "world"}]', "user_id": None},
+        ]
+        msgs = _flushed_to_messages(rows)
+        assert len(msgs) == 2
+        assert msgs[0]["user_id"] == "U123"
+        assert msgs[1]["parts"] == [{"type": "text", "text": "world"}]
+
+
+class TestMessagesToContentBlocksWithAttachmentRef:
+    """Integration-level tests for messages_to_content_blocks."""
+
+    def test_attachment_ref_download_instruction(self):
+        """DB message with attachment_ref → download instruction."""
+        from api.sandbox.harness_protocol import messages_to_content_blocks
+
+        msgs = [{
+            "role": "user",
+            "parts": [
+                {"type": "text", "text": "check this"},
+                {
+                    "type": "attachment_ref",
+                    "id": "att-1",
+                    "name": "doc.pdf",
+                    "mime_type": "application/pdf",
+                },
+            ],
+            "user_id": "U999",
+        }]
+        blocks = messages_to_content_blocks(msgs)
+        assert len(blocks) == 2
+        assert blocks[0]["text"] == "<@U999>: check this"
+        assert "/agent/attachments/att-1/download" in blocks[1]["text"]
+        assert "att-1" in blocks[1]["text"]
+
+
+# ── Test 4: build_user_input ─────────────────────────────────────────────────
+
+
+class TestBuildUserInput:
+    """Tests for build_user_input format."""
+
+    def test_build_user_input_format(self):
+        from api.sandbox.harness_protocol import build_user_input
+
+        result = build_user_input([{"type": "text", "text": "hello"}])
+        assert result == {
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": [{"type": "text", "text": "hello"}],
+            },
+        }
+
+
+# ── Test 5: build_harness_cmd ───────────────────────────────────────────────
+
+
+class TestBuildHarnessCmd:
+    """Tests for build_harness_cmd."""
+
+    def test_codex(self):
+        from api.sandbox.config import build_harness_cmd
+
+        cmd = build_harness_cmd("codex")
+        assert cmd == ["codex-app-wrapper"]
+
+    def test_claude_code(self):
+        from api.sandbox.config import build_harness_cmd
+
+        cmd = build_harness_cmd("claude-code")
+        assert cmd == ["claude-app-wrapper"]
+
+    def test_claude_code_with_model(self):
+        from api.sandbox.config import build_harness_cmd
+
+        # Model selection is wired through the CLAUDE_MODEL env var injected
+        # by the sandbox backend so the wrapper can apply it to --model.
+        cmd = build_harness_cmd("claude-code", model="opus")
+        assert cmd == ["claude-app-wrapper"]
+
+    def test_unknown_engine(self):
+        from api.sandbox.config import build_harness_cmd
+
+        cmd = build_harness_cmd("pi-mono")
+        assert cmd == ["sleep", "infinity"]
+
+    def test_container_env_honors_amp_mode_override(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        from api.sandbox.config import container_env
+
+        monkeypatch.delenv("AGENT_LOCAL_DEV", raising=False)
+        monkeypatch.setenv("AGENT_API_URL", "http://api.internal:8000")
+        monkeypatch.setenv("FIREWALL_HOST", "firewall.internal")
+        monkeypatch.setenv("AMP_MODE", "smart")
+
+        env = container_env("thread-key", "sandbox-id", "firewall.internal")
+
+        assert "AMP_MODE=smart" in env
+
+    def test_container_env_includes_claude_hardening(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        from api.sandbox.config import container_env
+
+        monkeypatch.delenv("AGENT_LOCAL_DEV", raising=False)
+        monkeypatch.setenv("AGENT_API_URL", "http://api.internal:8000")
+        monkeypatch.setenv("FIREWALL_HOST", "firewall.internal")
+
+        env = container_env("thread-key", "sandbox-id", "firewall.internal")
+
+        assert "ANTHROPIC_API_KEY=ANTHROPIC_API_KEY" in env
+        assert "CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1" in env
+        assert "CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL=1" in env
+        assert "DISABLE_ERROR_REPORTING=1" in env
+        assert "DISABLE_FEEDBACK_COMMAND=1" in env
+        assert "DISABLE_GROWTHBOOK=1" in env
+        assert "DISABLE_UPDATES=1" in env
+        assert "CLAUDE_CODE_PROXY_RESOLVES_HOSTS=1" in env
+        assert "CLAUDE_CODE_CERT_STORE=bundled,system" in env
+        assert "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1" not in env
+        assert "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1" not in env
+        assert "CLAUDE_CODE_ENABLE_OPUS_4_7_FAST_MODE=1" not in env
+
+
+class TestResolveHarnessProfile:
+    def test_persona_uses_declared_engine_unless_harness_overrides(self, monkeypatch):
+        import sys
+        from types import ModuleType, SimpleNamespace
+
+        from api.agent import _resolve_harness_profile
+
+        personas = {
+            "invest": SimpleNamespace(
+                name="invest",
+                engine="codex",
+                default_repo="centaur-overlay",
+            )
+        }
+        app_module = ModuleType("api.app")
+        app_module.get_tool_manager = lambda: SimpleNamespace(
+            get_persona=lambda name: personas.get(name)
+        )
+        monkeypatch.setitem(sys.modules, "api.app", app_module)
+
+        assert _resolve_harness_profile(None, persona="invest") == (
+            "codex",
+            "invest",
+            "centaur-overlay",
+        )
+        assert _resolve_harness_profile("claude-code", persona="invest") == (
+            "claude-code",
+            "invest",
+            "centaur-overlay",
+        )
+
+    def test_unknown_harness_or_persona_is_rejected(self, monkeypatch):
+        import sys
+        from types import ModuleType, SimpleNamespace
+
+        from api.agent import _resolve_harness_profile
+
+        app_module = ModuleType("api.app")
+        app_module.get_tool_manager = lambda: SimpleNamespace(
+            get_persona=lambda _name: None
+        )
+        monkeypatch.setitem(sys.modules, "api.app", app_module)
+
+        with pytest.raises(ValueError, match="Unknown harness"):
+            _resolve_harness_profile("invest")
+        with pytest.raises(ValueError, match="Unknown persona"):
+            _resolve_harness_profile("codex", persona="invest")
+
+
+class TestSpawnAndMessageAlias:
+    @pytest.mark.asyncio
+    async def test_message_alias(self, client, db_pool, api_key):
+        thread_key = "test:message-alias-1"
+        await _seed_assignment(db_pool, thread_key)
+        resp = await client.post(
+            "/agent/message",
+            headers={"Authorization": f"Bearer {api_key}"},
+            json={
+                "thread_key": thread_key,
+                "assignment_generation": 1,
+                "role": "user",
+                "parts": [{"type": "text", "text": "hello alias"}],
+            },
+        )
+        assert resp.status_code == 200
+        assert resp.json()["ok"] is True
+
+
+# ── Test 6: _build_session_context ───────────────────────────────────────────
+
+
+class TestBuildSessionContext:
+    """Tests for _build_session_context."""
+
+    def test_slack_platform(self):
+        from api.agent import _build_session_context
+
+        ctx = _build_session_context("test:1", platform="slack", user_id="U123")
+        assert "Slack Formatting Rules" in ctx
+        assert "<@U123>" in ctx
+        assert "test:1" in ctx
+
+    def test_no_platform(self):
+        from api.agent import _build_session_context
+
+        ctx = _build_session_context("test:1")
+        assert "Slack" not in ctx
+        assert "test:1" in ctx
+
+    def test_slack_no_user_id(self):
+        from api.agent import _build_session_context
+
+        ctx = _build_session_context("test:1", platform="slack")
+        assert "Slack Formatting Rules" in ctx
+        assert "tag the requester" not in ctx
+
+    def test_contains_timestamp(self):
+        from api.agent import _build_session_context
+
+        ctx = _build_session_context("test:1")
+        assert "Date/Time" in ctx
+
+
+# ── Test 7: Status endpoint ──────────────────────────────────────────────────
+
+
+class TestStatus:
+    """Tests for GET /agent/status."""
+
+    @pytest.mark.asyncio
+    async def test_status_not_found(self, client, api_key):
+        """Status for unknown thread returns not_found."""
+        resp = await client.get(
+            "/agent/status",
+            params={"key": "test:nonexistent"},
+            headers={"Authorization": f"Bearer {api_key}"},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "not_found"
+
+    @pytest.mark.asyncio
+    async def test_status_pending_messages_count(self, client, db_pool, api_key):
+        """Status includes pending_messages count."""
+        thread = "test:status-pending-1"
+        await _seed_assignment(db_pool, thread)
+        await client.post(
+            "/agent/messages",
+            headers={"Authorization": f"Bearer {api_key}"},
+            json={
+                "thread_key": thread,
+                "assignment_generation": 1,
+                "parts": [{"type": "text", "text": "pending msg"}],
+            },
+        )
+        resp = await client.get(
+            "/agent/status",
+            params={"key": thread},
+            headers={"Authorization": f"Bearer {api_key}"},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["pending_messages"] >= 1
+
+
+class TestDeprecatedEndpoints:
+    @pytest.mark.asyncio
+    async def test_legacy_agent_connect_returns_gone(self, client):
+        resp = await client.post("/agent/connect")
+        assert resp.status_code == 410
+        assert resp.json()["code"] == "LEGACY_ENDPOINT_REMOVED"
+
+    @pytest.mark.asyncio
+    async def test_legacy_agent_reconnect_returns_gone(self, client):
+        resp = await client.post("/agent/reconnect")
+        assert resp.status_code == 410
+        assert resp.json()["code"] == "LEGACY_ENDPOINT_REMOVED"

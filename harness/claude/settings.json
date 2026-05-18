@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "defaultMode": "bypassPermissions",
+    "additionalDirectories": [
+      "/home/agent/workspace",
+      "/home/agent/uploads"
+    ]
+  },
+  "includeCoAuthoredBy": false,
+  "cleanupPeriodDays": 1,
+  "viewMode": "verbose"
+}

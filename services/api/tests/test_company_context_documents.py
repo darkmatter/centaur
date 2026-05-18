@@ -1,0 +1,276 @@
+from __future__ import annotations
+
+import datetime as dt
+import importlib
+import json
+from typing import Any
+
+import pytest
+import pytest_asyncio
+
+
+class FakeCtx:
+    def __init__(self, db_pool, run_id: str = "wfr-test-slack-context-documents"):
+        self._pool = db_pool
+        self.run_id = run_id
+        self.logs: list[tuple[str, dict[str, Any]]] = []
+
+    def log(self, msg: str, **kwargs: Any) -> None:
+        self.logs.append((msg, kwargs))
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def _clear_company_context_tables(db_pool):
+    await db_pool.execute(
+        "TRUNCATE TABLE company_context_documents, slack_sync_backfill_jobs, slack_sync_checkpoints, "
+        "slack_sync_messages, slack_sync_runs, slack_sync_users, slack_sync_channels, "
+        "workflow_runs CASCADE",
+    )
+    yield
+
+
+def test_schedule_defaults_to_four_hour_interval(monkeypatch):
+    monkeypatch.delenv("SLACK_ETL_ENABLED", raising=False)
+    monkeypatch.delenv("COMPANY_CONTEXT_DOCUMENTS_ENABLED", raising=False)
+    monkeypatch.delenv("COMPANY_CONTEXT_DOCUMENTS_INTERVAL_SECONDS", raising=False)
+
+    from workflows import company_context_documents
+
+    reloaded = importlib.reload(company_context_documents)
+
+    assert reloaded.SCHEDULE == {
+        "schedule_id": "company_context_documents",
+        "interval_seconds": 14400,
+        "enabled": True,
+        "no_delivery": True,
+    }
+
+
+def test_schedule_respects_env_overrides(monkeypatch):
+    monkeypatch.setenv("SLACK_ETL_ENABLED", "true")
+    monkeypatch.setenv("COMPANY_CONTEXT_DOCUMENTS_ENABLED", "false")
+    monkeypatch.setenv("COMPANY_CONTEXT_DOCUMENTS_INTERVAL_SECONDS", "300")
+
+    from workflows import company_context_documents
+
+    reloaded = importlib.reload(company_context_documents)
+
+    assert reloaded.SCHEDULE["enabled"] is False
+    assert reloaded.SCHEDULE["interval_seconds"] == 300
+
+
+async def _seed_slack_basics(db_pool) -> None:
+    await db_pool.execute(
+        "INSERT INTO slack_sync_channels (channel_id, channel_name, is_syncable) "
+        "VALUES ('C_PUBLIC', 'team-eng', TRUE), ('C_OTHER', 'general', TRUE)",
+    )
+    await db_pool.execute(
+        "INSERT INTO slack_sync_users (user_id, user_name, real_name, display_name) "
+        "VALUES "
+        "('U1', 'alice', 'Alice Example', 'Alice'), "
+        "('U2', 'bob', 'Bob Example', 'Bob'), "
+        "('U3', 'carol', 'Carol Example', 'Carol')",
+    )
+
+
+async def _insert_message(
+    db_pool,
+    *,
+    channel_id: str = "C_PUBLIC",
+    message_ts: str,
+    occurred_at: dt.datetime,
+    updated_at: dt.datetime,
+    user_id: str,
+    text: str,
+    thread_ts: str | None = None,
+    parent_message_ts: str | None = None,
+    reply_count: int = 0,
+) -> None:
+    await db_pool.execute(
+        "INSERT INTO slack_sync_messages ("
+        "channel_id, message_ts, occurred_at, thread_ts, parent_message_ts, "
+        "is_thread_root, user_id, text, permalink, reply_count, raw_payload, "
+        "updated_at, last_seen_at"
+        ") VALUES ("
+        "$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, '{}'::jsonb, $11, $11"
+        ")",
+        channel_id,
+        message_ts,
+        occurred_at,
+        thread_ts,
+        parent_message_ts,
+        bool(thread_ts and thread_ts == message_ts),
+        user_id,
+        text,
+        f"https://slack.com/archives/{channel_id}/p{message_ts.replace('.', '')}",
+        reply_count,
+        updated_at,
+    )
+
+
+@pytest.mark.asyncio
+async def test_projects_channel_day_and_thread_documents(db_pool):
+    from workflows import company_context_documents
+
+    await _seed_slack_basics(db_pool)
+    base = dt.datetime(2026, 5, 6, 12, 0, tzinfo=dt.timezone.utc)
+    updated = dt.datetime(2026, 5, 7, 10, 0, tzinfo=dt.timezone.utc)
+    thread_ts = "1770000000.000000"
+    messages = [
+        ("1770000000.000000", "U1", "Root asks <@U2> about BM25", None, 4),
+        ("1770000001.000000", "U2", "We should use hybrid search", thread_ts, 0),
+        ("1770000002.000000", "U3", "Decision: keep docs in Postgres", thread_ts, 0),
+        ("1770000003.000000", "U1", "Use #team-eng context", thread_ts, 0),
+        ("1770000004.000000", "U2", "Ship pg_search separately", thread_ts, 0),
+    ]
+    for offset, (message_ts, user_id, text, parent_ts, reply_count) in enumerate(messages):
+        await _insert_message(
+            db_pool,
+            message_ts=message_ts,
+            occurred_at=base + dt.timedelta(minutes=offset),
+            updated_at=updated + dt.timedelta(seconds=offset),
+            user_id=user_id,
+            text=text,
+            thread_ts=thread_ts,
+            parent_message_ts=parent_ts,
+            reply_count=reply_count,
+        )
+
+    result = await company_context_documents.handler(
+        company_context_documents.Input(watermark_overlap_seconds=0),
+        FakeCtx(db_pool),
+    )
+
+    assert result["status"] == "completed"
+    assert result["changed_messages"] == 5
+    assert result["documents_upserted"] == 2
+    assert result["channel_day_documents"] == 1
+    assert result["thread_candidates"] == 1
+
+    rows = await db_pool.fetch(
+        "SELECT document_id, source_type, title, body, url, author_name, metadata "
+        "FROM company_context_documents ORDER BY source_type",
+    )
+    assert [row["source_type"] for row in rows] == ["slack_channel_day", "slack_thread"]
+
+    channel_day = rows[0]
+    assert channel_day["document_id"] == "slack:channel_day:C_PUBLIC:2026-05-06"
+    assert channel_day["title"] == "#team-eng - 2026-05-06"
+    assert "Alice Example - 2026-05-06 12:00:00 UTC - 4 replies" in channel_day["body"]
+    assert "@Bob Example" in channel_day["body"]
+    assert json.loads(channel_day["metadata"])["aggregation"] == "channel_day"
+
+    thread = rows[1]
+    assert thread["document_id"] == f"slack:thread:C_PUBLIC:{thread_ts}"
+    assert thread["title"] == "Root asks @Bob Example about BM25"
+    assert thread["author_name"] == "Alice Example"
+    assert thread["url"] == "https://slack.com/archives/C_PUBLIC/p1770000000000000"
+    assert "Participants: Alice Example, Bob Example, Carol Example" in thread["body"]
+    assert json.loads(thread["metadata"])["reply_count"] == 4
+
+
+@pytest.mark.asyncio
+async def test_projects_documents_without_user_rows(db_pool):
+    from workflows import company_context_documents
+
+    await db_pool.execute(
+        "INSERT INTO slack_sync_channels (channel_id, channel_name, is_syncable) "
+        "VALUES ('C_PUBLIC', 'team-eng', TRUE)",
+    )
+    base = dt.datetime(2026, 5, 6, 12, 0, tzinfo=dt.timezone.utc)
+    updated = dt.datetime(2026, 5, 7, 10, 0, tzinfo=dt.timezone.utc)
+    thread_ts = "1770000000.000000"
+    messages = [
+        ("1770000000.000000", "UMISSING1", "Root mentions <@UMISSING2>", None, 4),
+        ("1770000001.000000", "UMISSING2", "Reply one", thread_ts, 0),
+        ("1770000002.000000", "UMISSING3", "Reply two", thread_ts, 0),
+        ("1770000003.000000", "UMISSING1", "Reply three", thread_ts, 0),
+        ("1770000004.000000", "UMISSING2", "Reply four", thread_ts, 0),
+    ]
+    for offset, (message_ts, user_id, text, parent_ts, reply_count) in enumerate(messages):
+        await _insert_message(
+            db_pool,
+            message_ts=message_ts,
+            occurred_at=base + dt.timedelta(minutes=offset),
+            updated_at=updated + dt.timedelta(seconds=offset),
+            user_id=user_id,
+            text=text,
+            thread_ts=thread_ts,
+            parent_message_ts=parent_ts,
+            reply_count=reply_count,
+        )
+
+    result = await company_context_documents.handler(
+        company_context_documents.Input(watermark_overlap_seconds=0),
+        FakeCtx(db_pool),
+    )
+
+    assert result["status"] == "completed"
+    assert result["documents_upserted"] == 2
+
+    rows = await db_pool.fetch(
+        "SELECT source_type, title, body, author_name, metadata "
+        "FROM company_context_documents ORDER BY source_type",
+    )
+    assert [row["source_type"] for row in rows] == ["slack_channel_day", "slack_thread"]
+    assert "@UMISSING2" in rows[0]["body"]
+    assert "UMISSING1 - 2026-05-06 12:00:00 UTC - 4 replies" in rows[0]["body"]
+    assert rows[1]["title"] == "Root mentions @UMISSING2"
+    assert rows[1]["author_name"] == "UMISSING1"
+    assert json.loads(rows[1]["metadata"])["participants"] == [
+        "UMISSING1",
+        "UMISSING2",
+        "UMISSING3",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_uses_previous_successful_watermark_for_incremental_projection(db_pool):
+    from workflows import company_context_documents
+
+    await _seed_slack_basics(db_pool)
+    watermark = dt.datetime(2026, 5, 7, 10, 0, tzinfo=dt.timezone.utc)
+    await db_pool.execute(
+        "INSERT INTO workflow_runs ("
+        "run_id, workflow_name, workflow_version, request_hash, root_run_id, status, "
+        "output_json, completed_at"
+        ") VALUES ("
+        "'wfr-previous', 'company_context_documents', 'test', 'hash', 'wfr-previous', "
+        "'completed', $1::jsonb, $2"
+        ")",
+        json.dumps({"watermark": watermark.isoformat()}),
+        watermark,
+    )
+    await _insert_message(
+        db_pool,
+        message_ts="1769900000.000000",
+        occurred_at=dt.datetime(2026, 5, 1, 12, 0, tzinfo=dt.timezone.utc),
+        updated_at=watermark - dt.timedelta(minutes=10),
+        user_id="U1",
+        text="Old message",
+    )
+    await _insert_message(
+        db_pool,
+        message_ts="1770000000.000000",
+        occurred_at=dt.datetime(2026, 5, 6, 12, 0, tzinfo=dt.timezone.utc),
+        updated_at=watermark + dt.timedelta(minutes=5),
+        user_id="U2",
+        text="New message",
+    )
+
+    result = await company_context_documents.handler(
+        company_context_documents.Input(watermark_overlap_seconds=0),
+        FakeCtx(db_pool, run_id="wfr-current"),
+    )
+
+    assert result["changed_messages"] == 1
+    assert result["documents_upserted"] == 1
+    assert await db_pool.fetchval(
+        "SELECT COUNT(*) FROM company_context_documents",
+    ) == 1
+    doc = await db_pool.fetchrow(
+        "SELECT document_id, body FROM company_context_documents",
+    )
+    assert doc["document_id"] == "slack:channel_day:C_PUBLIC:2026-05-06"
+    assert "New message" in doc["body"]
+    assert "Old message" not in doc["body"]

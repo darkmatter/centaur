@@ -1,0 +1,464 @@
+import { Hono, type Context, type MiddlewareHandler } from 'hono'
+import { ulid } from '@std/ulid'
+import { showRoutes } from 'hono/dev'
+import { timeout } from 'hono/timeout'
+import { requestId } from 'hono/request-id'
+import { prettyJSON } from 'hono/pretty-json'
+import { startFinalDeliveryPoller } from './centaur/final-delivery'
+import { CentaurHandoff } from './centaur/handoff'
+import { loadConfig } from './config'
+import { AgentSessionRenderer } from './slack/agent-session'
+import { authorizeSlackOrg } from './slack/authorization'
+import { CodexSessionRenderer, codexFooter } from './slack/codex-session'
+import { EventDeduper, slackDedupKey } from './slack/dedup'
+import { EnvSlackInstallationStore, SlackClientResolver } from './slack/installations'
+import { normalizeSlackEnvelope } from './slack/normalize'
+import { markdownToStreamChunks } from './slack/render'
+import { verifySlackSignature } from './slack/signature'
+import type { SlackEnvelope } from './slack/types'
+import type { AnyBlock, AnyChunk } from '@slack/types'
+
+const config = loadConfig()
+const resolver = new SlackClientResolver(
+  new EnvSlackInstallationStore({
+    token: config.SLACK_BOT_TOKEN
+  })
+)
+const handoff = new CentaurHandoff(config)
+const deduper = new EventDeduper(config.SLACK_EVENT_DEDUP_TTL_MS)
+
+void resolver
+  .resolve({})
+  .then(({ client }) => startFinalDeliveryPoller(config, client))
+  .catch(error => {
+    console.error('final_delivery_poller_start_failed', error)
+  })
+
+type Variables = {
+  slackRawBody: string
+}
+
+type WaitUntilContext = {
+  waitUntil(promise: Promise<unknown>): void
+}
+
+export const app = new Hono<{ Variables: Variables }>()
+  .use(prettyJSON())
+  .use('*', async (c, next) => {
+    await next()
+    console.log('http_request', c.req.method, c.req.path, c.res.status)
+  })
+  .use('*', timeout(5_000))
+  .use(
+    requestId({
+      headerName: 'X-Slackbot-Request-ID',
+      generator: () => ulid()
+    })
+  )
+
+app
+  .get('/health', c =>
+    c.json({
+      ok: true,
+      service: 'slackbot',
+      commit: process.env.COMMIT_SHA ?? 'local'
+    })
+  )
+  .get('/health/ready', c => c.redirect('/health'))
+
+const apiKeyMiddleware: MiddlewareHandler<{ Variables: Variables }> = async (c, next) => {
+  if (!config.SLACKBOT_API_KEY) {
+    return c.json({ ok: false, error: 'slackbot_api_key_not_configured' }, 503)
+  }
+  const authorization = c.req.header('authorization') ?? ''
+  if (authorization !== `Bearer ${config.SLACKBOT_API_KEY}`) {
+    return c.json({ ok: false, error: 'unauthorized' }, 401)
+  }
+  await next()
+}
+
+const slackSignatureMiddleware: MiddlewareHandler<{ Variables: Variables }> = async (c, next) => {
+  const rawBody = await c.req.raw.text()
+  const verification = verifySlackSignature({
+    rawBody,
+    signingSecret: config.SLACK_SIGNING_SECRET,
+    signature: c.req.header('x-slack-signature') ?? null,
+    timestamp: c.req.header('x-slack-request-timestamp') ?? null,
+    maxAgeSeconds: config.SLACK_SIGNATURE_MAX_AGE_SECONDS
+  })
+  if (!verification.ok) {
+    return c.json({ ok: false, error: verification.reason }, verification.status)
+  }
+  c.set('slackRawBody', rawBody)
+  await next()
+}
+
+const slackHandler = async (c: Context<{ Variables: Variables }>) => {
+  const envelope = parseSlackBody(c.get('slackRawBody'), c.req.header('content-type'))
+  if (!envelope) return c.json({ ok: false, error: 'invalid_slack_payload' }, 400)
+  if (envelope.type === 'url_verification') return c.json({ challenge: envelope.challenge })
+
+  const event = envelope.event
+  const key = slackDedupKey({
+    eventId: envelope.event_id,
+    teamId: envelope.team_id,
+    channelId: typeof event?.channel === 'string' ? event.channel : undefined,
+    messageTs: typeof event?.ts === 'string' ? event.ts : undefined
+  })
+  if (!deduper.checkAndRemember(key)) {
+    return c.json({ ok: true, duplicate: true })
+  }
+
+  runInBackground(c, processSlackEvent(envelope))
+  return c.json({ ok: true })
+}
+
+app.post(config.CENTAUR_SLACK_EVENTS_PATH, slackSignatureMiddleware, slackHandler)
+app.post('/api/slack/events', slackSignatureMiddleware, slackHandler)
+app.post('/api/slack/actions', slackSignatureMiddleware, slackHandler)
+app.post('/api/slack/options', slackSignatureMiddleware, slackHandler)
+app.post('/api/slack/commands', slackSignatureMiddleware, slackHandler)
+app.post('/api/webhooks/slack', slackSignatureMiddleware, slackHandler)
+
+app.post('/api/slack/messages', apiKeyMiddleware, async c => {
+  const body = await c.req.json<{
+    channel: string
+    thread_ts?: string
+    text: string
+    blocks?: AnyBlock[]
+  }>()
+  const { client } = await resolver.resolve({})
+  const response = await client.chat.postMessage({
+    channel: body.channel,
+    thread_ts: body.thread_ts,
+    text: body.text,
+    blocks: body.blocks
+  })
+  if (!response.ok) return c.json(response, 502)
+  return c.json({ ok: true, channel: response.channel, ts: response.ts })
+})
+
+app.patch('/api/slack/messages', apiKeyMiddleware, async c => {
+  const body = await c.req.json<{
+    channel: string
+    ts: string
+    text: string
+    blocks?: AnyBlock[]
+  }>()
+  const { client } = await resolver.resolve({})
+  try {
+    const response = await client.chat.update({
+      channel: body.channel,
+      ts: body.ts,
+      text: body.text,
+      blocks: body.blocks
+    })
+    if (!response.ok) return c.json(response, 502)
+    return c.json({ ok: true, channel: response.channel, ts: response.ts })
+  } catch (error) {
+    return slackApiErrorResponse(c, error)
+  }
+})
+
+app.delete('/api/slack/messages', apiKeyMiddleware, async c => {
+  const body = await c.req.json<{
+    channel: string
+    ts: string
+  }>()
+  const { client } = await resolver.resolve({})
+  try {
+    const response = await client.chat.delete({ channel: body.channel, ts: body.ts })
+    if (!response.ok) return c.json(response, 502)
+    return c.json({ ok: true, channel: response.channel, ts: response.ts })
+  } catch (error) {
+    return slackApiErrorResponse(c, error)
+  }
+})
+
+app.get('/api/slack/conversations/replies', apiKeyMiddleware, async c => {
+  const channel = c.req.query('channel')
+  const ts = c.req.query('ts')
+  const limitRaw = c.req.query('limit')
+  if (!channel || !ts) return c.json({ ok: false, error: 'missing_channel_or_ts' }, 400)
+  const limit = limitRaw ? Number(limitRaw) : 20
+  const { client } = await resolver.resolve({})
+  try {
+    const response = await client.conversations.replies({
+      channel,
+      ts,
+      limit: Number.isFinite(limit) ? limit : 20
+    })
+    if (!response.ok) return c.json(response, 502)
+    return c.json(response)
+  } catch (error) {
+    return slackApiErrorResponse(c, error)
+  }
+})
+
+app.post('/api/slack/streams/start', apiKeyMiddleware, async c => {
+  const body = await c.req.json<{
+    channel: string
+    thread_ts: string
+    markdown?: string
+    chunks?: AnyChunk[]
+    recipient_team_id?: string
+    recipient_user_id?: string
+    task_display_mode?: 'plan' | 'timeline'
+  }>()
+  const { client } = await resolver.resolve({})
+  try {
+    const response = await client.chat.startStream({
+      channel: body.channel,
+      thread_ts: body.thread_ts,
+      chunks: body.chunks ?? markdownToStreamChunks(body.markdown ?? ' '),
+      recipient_team_id: body.recipient_team_id,
+      recipient_user_id: body.recipient_user_id,
+      task_display_mode: body.task_display_mode
+    })
+    if (!response.ok) return c.json(response, 502)
+    return c.json({ ok: true, channel: response.channel, ts: response.ts })
+  } catch (error) {
+    return slackApiErrorResponse(c, error)
+  }
+})
+
+app.post('/api/slack/streams/append', apiKeyMiddleware, async c => {
+  const body = await c.req.json<{
+    channel: string
+    ts: string
+    markdown?: string
+    chunks?: AnyChunk[]
+  }>()
+  const { client } = await resolver.resolve({})
+  try {
+    const response = await client.chat.appendStream({
+      channel: body.channel,
+      ts: body.ts,
+      chunks: body.chunks ?? markdownToStreamChunks(body.markdown ?? ' ')
+    })
+    if (!response.ok) return c.json(response, 502)
+    return c.json({ ok: true, channel: response.channel, ts: response.ts })
+  } catch (error) {
+    return slackApiErrorResponse(c, error)
+  }
+})
+
+app.post('/api/slack/streams/stop', apiKeyMiddleware, async c => {
+  const body = await c.req.json<{
+    channel: string
+    ts: string
+    markdown?: string
+    chunks?: AnyChunk[]
+    blocks?: AnyBlock[]
+  }>()
+  const { client } = await resolver.resolve({})
+  try {
+    const response = await client.chat.stopStream({
+      channel: body.channel,
+      ts: body.ts,
+      chunks: body.chunks ?? markdownToStreamChunks(body.markdown ?? ' '),
+      blocks: body.blocks
+    })
+    if (!response.ok) return c.json(response, 502)
+    return c.json({ ok: true, channel: response.channel, ts: response.ts })
+  } catch (error) {
+    return slackApiErrorResponse(c, error)
+  }
+})
+
+app.post('/api/slack/agent-sessions', apiKeyMiddleware, async c => {
+  const body = await c.req.json<{
+    channel: string
+    parent_ts: string
+    recipient_team_id: string
+    recipient_user_id: string
+    title?: string
+  }>()
+  const { client } = await resolver.resolve({})
+  try {
+    const result = await new AgentSessionRenderer(client).open({
+      channel: body.channel,
+      parentTs: body.parent_ts,
+      recipientTeamId: body.recipient_team_id,
+      recipientUserId: body.recipient_user_id,
+      title: body.title
+    })
+    return c.json({ ok: true, session_id: result.sessionId })
+  } catch (error) {
+    return slackApiErrorResponse(c, error)
+  }
+})
+
+app.post('/api/slack/agent-sessions/:session_id/text', apiKeyMiddleware, async c => {
+  const body = await c.req.json<{ markdown: string }>()
+  const { client } = await resolver.resolve({})
+  try {
+    await new AgentSessionRenderer(client).text(c.req.param('session_id'), body.markdown)
+    return c.json({ ok: true })
+  } catch (error) {
+    return slackApiErrorResponse(c, error)
+  }
+})
+
+app.post('/api/slack/agent-sessions/:session_id/step', apiKeyMiddleware, async c => {
+  const body = await c.req.json<{
+    id: string
+    title: string
+    status?: 'pending' | 'in_progress' | 'complete' | 'error'
+    details?: string
+    output?: string
+  }>()
+  const { client } = await resolver.resolve({})
+  try {
+    await new AgentSessionRenderer(client).step(c.req.param('session_id'), body)
+    return c.json({ ok: true })
+  } catch (error) {
+    return slackApiErrorResponse(c, error)
+  }
+})
+
+app.post('/api/slack/agent-sessions/:session_id/done', apiKeyMiddleware, async c => {
+  const body = await c.req.json<{ footer?: string; thread_id?: string }>()
+  const { client } = await resolver.resolve({})
+  try {
+    const footer = body.footer ?? (body.thread_id ? codexFooter(body.thread_id) : undefined)
+    await new AgentSessionRenderer(client).done(c.req.param('session_id'), footer)
+    return c.json({ ok: true })
+  } catch (error) {
+    return slackApiErrorResponse(c, error)
+  }
+})
+
+app.post('/api/slack/agent-sessions/:session_id/harness-event', apiKeyMiddleware, async c => {
+  const body = await c.req.json<{ event: unknown }>()
+  const { client } = await resolver.resolve({})
+  try {
+    const result = await new CodexSessionRenderer(client).event(
+      c.req.param('session_id'),
+      body.event
+    )
+    return c.json({ ok: true, ...result })
+  } catch (error) {
+    return slackApiErrorResponse(c, error)
+  }
+})
+
+app.post('/api/slack/assistant/status', apiKeyMiddleware, async c => {
+  const body = await c.req.json<{
+    channel_id: string
+    thread_ts: string
+    status: string
+    loading_messages?: string[]
+  }>()
+  const { client } = await resolver.resolve({})
+  const response = await client.assistant.threads.setStatus({
+    channel_id: body.channel_id,
+    thread_ts: body.thread_ts,
+    status: body.status,
+    loading_messages: body.loading_messages
+  })
+  if (!response.ok) return c.json(response, 502)
+  return c.json({ ok: true })
+})
+
+app.post('/api/slack/assistant/title', apiKeyMiddleware, async c => {
+  const body = await c.req.json<{
+    channel_id: string
+    thread_ts: string
+    title: string
+  }>()
+  const { client } = await resolver.resolve({})
+  const response = await client.assistant.threads.setTitle({
+    channel_id: body.channel_id,
+    thread_ts: body.thread_ts,
+    title: body.title
+  })
+  if (!response.ok) return c.json(response, 502)
+  return c.json({ ok: true })
+})
+
+if (process.env.NODE_ENV === 'development') showRoutes(app)
+
+export default {
+  port: config.PORT,
+  fetch: app.fetch
+}
+
+async function processSlackEvent(envelope: SlackEnvelope): Promise<void> {
+  const authorization = authorizeSlackOrg({
+    envelope,
+    allowedExternalTeamIds: config.SLACKBOT_EXTERNAL_ORG_ALLOWLIST
+  })
+  if (!authorization.ok) {
+    console.warn('slack_event_ignored_external_org_not_allowlisted', {
+      external_team_id: authorization.externalTeamId,
+      team_id: envelope.team_id,
+      event_id: envelope.event_id
+    })
+    return
+  }
+
+  const { client, installation } = await resolver.resolve({
+    teamId: envelope.team_id,
+    enterpriseId: envelope.enterprise_id
+  })
+  const normalized = await normalizeSlackEnvelope({
+    envelope,
+    botUserId: installation.botUserId,
+    client
+  })
+  if (!normalized) return
+  if (!normalized.is_mention) return
+
+  const result = await handoff.emit(normalized)
+  if (!result.ok) {
+    if (result.status === 409) {
+      console.warn('centaur_slack_handoff_conflict', result.body)
+      return
+    }
+    throw new Error(`Centaur Slack handoff failed: ${result.status}`)
+  }
+}
+
+function slackApiErrorResponse(c: Context, error: unknown) {
+  const data = (error as { data?: unknown })?.data
+  if (data && typeof data === 'object') return c.json(data, 502)
+  return c.json(
+    { ok: false, error: error instanceof Error ? error.message : 'slack_api_error' },
+    502
+  )
+}
+
+function runInBackground(c: Context, promise: Promise<void>): void {
+  const guarded = promise.catch((error: unknown) => {
+    console.error('slack_event_processing_failed', error)
+  })
+  const executionCtx = getExecutionContext(c)
+  if (executionCtx) {
+    executionCtx.waitUntil(guarded)
+    return
+  }
+  void guarded
+}
+
+function getExecutionContext(c: Context): WaitUntilContext | null {
+  try {
+    return c.executionCtx
+  } catch {
+    return null
+  }
+}
+
+function parseSlackBody(rawBody: string, contentType: string | undefined): SlackEnvelope | null {
+  try {
+    if (contentType?.includes('application/x-www-form-urlencoded')) {
+      const form = new URLSearchParams(rawBody)
+      const payload = form.get('payload')
+      if (payload) return JSON.parse(payload) as SlackEnvelope
+      return Object.fromEntries(form) as SlackEnvelope
+    }
+    return JSON.parse(rawBody) as SlackEnvelope
+  } catch {
+    return null
+  }
+}

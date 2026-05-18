@@ -1,0 +1,35 @@
+{
+  "name": "slackbot",
+  "version": "0.0.0",
+  "license": "MIT",
+  "type": "module",
+  "imports": {
+    "#*": "./src/*",
+    "#package.json": "./package.json"
+  },
+  "scripts": {
+    "dev": "bun --hot --watch src/index.ts",
+    "format": "oxfmt --config='oxfmt.config.ts' --write",
+    "lint": "oxlint --config='oxlint.config.ts' --type-aware --type-check --fix-dangerously",
+    "check": "bun format && bun lint",
+    "check:types": "bun tsgo --project tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@lmnr-ai/lmnr": "^0.8.23",
+    "@slack/types": "^2.19.0",
+    "@slack/web-api": "^7.15.2",
+    "@std/ulid": "npm:@jsr/std__ulid",
+    "hono": "^4.12.18",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@total-typescript/ts-reset": "^0.6.1",
+    "@types/bun": "^1.3.13",
+    "@types/node": "^25.7.0",
+    "@typescript/native-preview": "^7.0.0-dev.20260512.1",
+    "oxfmt": "^0.49.0",
+    "oxlint": "^1.64.0",
+    "oxlint-tsgolint": "^0.22.1",
+    "typescript": "^6.0.3"
+  }
+}

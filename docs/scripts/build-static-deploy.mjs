@@ -120,17 +120,3 @@ async function renderRoutes(port) {
 
 run('npm', ['run', 'build'])
 patchPreviewBundle()
-
-const port = await freePort()
-const preview = spawn(
-  'npm',
-  ['run', 'preview', '--', '--host', '127.0.0.1', '--port', String(port)],
-  { stdio: 'inherit' },
-)
-
-try {
-  await waitForPreview(port)
-  await renderRoutes(port)
-} finally {
-  preview.kill()
-}

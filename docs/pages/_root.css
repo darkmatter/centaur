@@ -598,41 +598,83 @@ a.home-lockup-link {
   width: 100%;
 }
 
-.home-media-section {
-  margin-top: clamp(32px, 4dvh, 44px);
-}
-
-.home-media-grid {
+/* "Below the fold" feature sections: a stacked pair of two-column splits
+ * (copy + image) that alternate left/right across the page. Section 1
+ * leads with copy on the left; section 2 leads with copy on the right
+ * so the eye zig-zags down the page instead of marching in one column. */
+.home-feature {
+  align-items: center;
   display: grid;
-  gap: clamp(28px, 4vw, 56px);
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  margin: clamp(32px, 4dvh, 44px) auto 0;
-  max-width: 1440px;
+  gap: clamp(36px, 5vw, 80px);
+  grid-template-columns: minmax(0, 0.95fr) minmax(0, 1.05fr);
+  margin: clamp(48px, 6dvh, 84px) auto 0;
+  max-width: 1280px;
   width: 100%;
 }
 
-.home-media-grid .home-media-section {
+/* Visual sits in the second column for the copy-left variant and in the
+ * first column for the copy-right variant. Source order already matches
+ * (copy first vs visual first) so we don't need `order:` overrides on
+ * desktop — the grid auto-flow handles it. */
+
+.home-feature-copy {
+  align-items: flex-start;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.home-feature-copy h2 {
+  color: #f7f7f2;
+  font-family: var(--centaur-manual-display);
+  font-size: clamp(2rem, 3.4vw, 3rem);
+  font-weight: 500;
+  line-height: 1;
   margin: 0;
-  max-width: none;
 }
 
-.home-media-grid .home-overview-heading {
-  grid-template-columns: 1fr;
+.home-feature-copy p {
+  color: #d0d0c8;
+  font-size: 1.1rem;
+  letter-spacing: -0.01em;
+  line-height: 1.5;
+  margin: 0;
+  max-width: 460px;
 }
 
-.home-media-link {
+.home-feature-cta {
+  color: var(--centaur-accent);
+  font-family: var(--centaur-sans);
+  font-size: 0.95rem;
+  font-weight: 550;
+  letter-spacing: 0.01em;
+  margin-top: 4px;
+  text-decoration: none;
+}
+
+.home-feature-cta:hover {
+  color: var(--centaur-accent-hover);
+}
+
+.home-feature-visual {
   color: inherit;
   display: block;
   text-decoration: none;
 }
 
-.home-media-link:focus-visible {
+.home-feature-visual:focus-visible {
   outline: 2px solid var(--centaur-accent);
   outline-offset: 6px;
 }
 
-.home-media-link:hover .home-architecture-diagram img {
+.home-feature-visual:hover .home-architecture-diagram img {
   border-color: rgba(255, 255, 255, 0.28);
+}
+
+.home-feature-visual .home-architecture-diagram {
+  margin: 0;
+  max-width: 100%;
+  padding-top: 0;
 }
 
 .home-overview-heading {
@@ -707,13 +749,6 @@ a.home-lockup-link {
   margin: clamp(44px, 6dvh, 72px) auto 0;
   max-width: 75%;
   padding-top: clamp(28px, 4dvh, 44px);
-}
-
-.home-media-section .home-architecture-diagram {
-  margin-left: 0;
-  margin-right: auto;
-  margin-top: 30px;
-  padding-top: 0;
 }
 
 .home-architecture-diagram img {
@@ -1398,9 +1433,34 @@ a.home-lockup-link {
     max-width: 980px;
   }
 
-  .home-media-grid {
+  /* Below tablet width, the alternating split collapses into a centered
+   * single column. Copy stacks above visual on both sections so the
+   * reading order stays predictable; the visual is capped at 65vw so it
+   * doesn't dominate the column on tall portrait viewports. */
+  .home-feature {
+    gap: 28px;
     grid-template-columns: 1fr;
-    max-width: 980px;
+    margin-inline: auto;
+    max-width: 720px;
+    text-align: center;
+  }
+
+  .home-feature-copy {
+    align-items: center;
+  }
+
+  .home-feature-copy p {
+    margin-inline: auto;
+  }
+
+  .home-feature-copy-right .home-feature-copy {
+    order: -1;
+  }
+
+  .home-feature-visual {
+    margin-inline: auto;
+    max-width: 65vw;
+    width: 100%;
   }
 
   .home-overview-heading {

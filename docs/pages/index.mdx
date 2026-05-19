@@ -79,29 +79,29 @@ import ThreadPanel from '../components/ThreadPanel'
 
   </section>
 
-  <div className="home-media-grid">
-    <section className="home-overview home-media-section" aria-labelledby="home-extensible-title">
-      <a className="home-media-link" href="/extend/overlay" aria-labelledby="home-extensible-title">
-        <div className="home-overview-heading">
-          <h2 id="home-extensible-title">Extensible by default</h2>
-        </div>
+  <section className="home-feature home-feature-copy-left" aria-labelledby="home-extensible-title">
+    <div className="home-feature-copy">
+      <h2 id="home-extensible-title">Extensible by default</h2>
+      <p>Compose your own tools, workflows, skills, and prompts on top of the open-source kernel. Overlays let teams extend agents without forking the core.</p>
+      <a className="home-feature-cta" href="/extend/overlay">Read the overlay guide →</a>
+    </div>
+    <a className="home-feature-visual" href="/extend/overlay" aria-labelledby="home-extensible-title">
+      <figure className="home-architecture-diagram">
+        <img src="/brand/containers.svg" alt="Centaur deployment layout: the open-source kernel wrapped by an organization overlay and a per-app repository." />
+      </figure>
+    </a>
+  </section>
 
-        <figure className="home-architecture-diagram">
-          <img src="/brand/containers.svg" alt="Centaur deployment layout: the open-source kernel wrapped by an organization overlay and a per-app repository." />
-        </figure>
-      </a>
-    </section>
-
-    <section className="home-overview home-media-section" aria-labelledby="home-architecture-title">
-      <a className="home-media-link" href="/architecture" aria-labelledby="home-architecture-title">
-        <div className="home-overview-heading">
-          <h2 id="home-architecture-title">Modular Architecture</h2>
-        </div>
-
-        <figure className="home-architecture-diagram">
-          <img src="/brand/architecture.svg" alt="Centaur architecture: ingress, durable control plane, isolated execution, capabilities, secrets, and controlled egress." />
-        </figure>
-      </a>
-    </section>
-  </div>
+  <section className="home-feature home-feature-copy-right" aria-labelledby="home-architecture-title">
+    <a className="home-feature-visual" href="/architecture" aria-labelledby="home-architecture-title">
+      <figure className="home-architecture-diagram">
+        <img src="/brand/architecture.svg" alt="Centaur architecture: ingress, durable control plane, isolated execution, capabilities, secrets, and controlled egress." />
+      </figure>
+    </a>
+    <div className="home-feature-copy">
+      <h2 id="home-architecture-title">Modular Architecture</h2>
+      <p>Durable control plane, isolated execution, and credential-safe egress. Each layer is independently observable, replaceable, and self-hosted inside your boundary.</p>
+      <a className="home-feature-cta" href="/architecture">Walk the architecture →</a>
+    </div>
+  </section>
 </main>

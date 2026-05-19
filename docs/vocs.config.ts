@@ -23,6 +23,8 @@ export default defineConfig({
   title: 'Centaur',
   titleTemplate: '%s - Centaur',
   description: 'The production control plane for shared AI agents, tools, workflows, and sandboxes.',
+  accentColor: '#00E100',
+  colorScheme: 'dark',
   // Browser-tab favicon: standalone centaur mark only (no background frame).
   // Vocs emits a per-scheme <link rel="icon"> pair so the tab shows the
   // black silhouette on light chrome and the white silhouette on dark.
@@ -126,26 +128,4 @@ export default defineConfig({
     },
   },
   sidebar,
-  theme: {
-    accentColor: {
-      light: '#00E100',
-      dark: '#00E100',
-    },
-    colorScheme: 'dark',
-    variables: {
-      color: {
-        background: {
-          light: '#ffffff',
-          dark: '#050505',
-        },
-        text: {
-          light: '#050505',
-          dark: '#f7f7f2',
-        },
-      },
-      content: {
-        width: '920px',
-      },
-    },
-  },
 })

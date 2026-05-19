@@ -1,13 +1,14 @@
 :root {
+  color-scheme: dark;
   --centaur-accent: #00E100;
   --centaur-accent-hover: #35f335;
   --centaur-accent-soft: rgba(0, 225, 0, 0.14);
-  --centaur-bg: light-dark(#ffffff, #101012);
-  --centaur-code: light-dark(#f6f6f7, #0b0b0d);
-  --centaur-line: light-dark(rgba(0, 0, 0, 0.12), rgba(255, 255, 255, 0.12));
-  --centaur-muted: light-dark(#727278, #9b9ba1);
-  --centaur-soft: light-dark(rgba(0, 0, 0, 0.035), rgba(255, 255, 255, 0.055));
-  --centaur-text: light-dark(#101012, #ffffff);
+  --centaur-bg: #101012;
+  --centaur-code: #0b0b0d;
+  --centaur-line: rgba(255, 255, 255, 0.12);
+  --centaur-muted: #9b9ba1;
+  --centaur-soft: rgba(255, 255, 255, 0.055);
+  --centaur-text: #ffffff;
   --centaur-sans: 'PolySans Var', system-ui, sans-serif;
   --centaur-serif: 'Iowan Old Style', 'Apple Garamond', Georgia, serif;
   --centaur-display: 'Sagittaire Display', var(--centaur-serif);
@@ -293,8 +294,7 @@ body,
   letter-spacing: 0;
 }
 
-:root,
-:root.dark {
+:root {
   --vocs-color_background: #050506;
   --vocs-color_background2: #0b0b0d;
   --vocs-color_background3: #111114;

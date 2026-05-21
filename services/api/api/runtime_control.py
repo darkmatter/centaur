@@ -296,10 +296,28 @@ def _canonical_event_extends_tool_timeout(event: dict[str, Any]) -> bool:
     if event_type != "command_execution":
         return False
     status = str(event.get("status") or "").strip().lower()
-    if status in {"working", "running", "in_progress", "progress"}:
+    if status in {"working", "running", "in_progress", "inprogress", "progress"}:
         return True
     output = event.get("aggregated_output")
     return isinstance(output, str) and bool(output.strip())
+
+
+def _raw_event_extends_tool_timeout(event: dict[str, Any]) -> bool:
+    event_type = str(event.get("type") or "")
+    if event_type not in {
+        "item.started",
+        "item.updated",
+        "item.commandExecution.outputDelta",
+    }:
+        return False
+    if event_type == "item.commandExecution.outputDelta":
+        return bool(str(event.get("delta") or "").strip())
+    item = event.get("item") if isinstance(event.get("item"), dict) else {}
+    item_type = str(item.get("type") or "")
+    if item_type not in {"commandExecution", "command_execution"}:
+        return False
+    status = str(item.get("status") or "").strip().lower()
+    return status in {"", "working", "running", "in_progress", "inprogress", "progress"}
 
 
 def _progress_silence_timeout_s(
@@ -309,6 +327,8 @@ def _progress_silence_timeout_s(
     observations: ExecutionObservationAccumulator | None,
 ) -> float:
     if observations and observations.active_tool_use_ids:
+        return _tool_silence_timeout_s()
+    if _raw_event_extends_tool_timeout(event):
         return _tool_silence_timeout_s()
     parts = flatten_event_parts(event)
     if any(part.get("type") == "tool_use" for part in parts):

@@ -97,6 +97,27 @@ def test_non_codex_live_delivery_keeps_existing_behavior():
     assert _slackbot_live_events("amp", event, [event]) == [event]
 
 
+def test_codex_command_started_extends_silence_timeout():
+    from api.runtime_control import (
+        EXECUTION_TOOL_SILENCE_TIMEOUT_S,
+        _progress_silence_timeout_s,
+    )
+
+    event = {
+        "type": "item.started",
+        "item": {
+            "type": "commandExecution",
+            "status": "inProgress",
+            "command": "bun run typecheck",
+        },
+    }
+
+    assert (
+        _progress_silence_timeout_s(event, canonical_events=[event], observations=None)
+        >= EXECUTION_TOOL_SILENCE_TIMEOUT_S
+    )
+
+
 def test_slackbot_streamed_answer_chars_requires_positive_integer_offset():
     from api.runtime_control import _slackbot_streamed_answer_chars
 

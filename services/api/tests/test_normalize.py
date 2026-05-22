@@ -164,6 +164,21 @@ class TestCodex:
         )
         assert result == [{"type": "error", "error": "boom"}]
 
+    def test_error_event_uses_error_field(self):
+        result = normalize_harness_event(
+            "codex",
+            {
+                "type": "error",
+                "error": "Error running remote compact task: 502 Bad Gateway",
+            },
+        )
+        assert result == [
+            {
+                "type": "error",
+                "error": "Error running remote compact task: 502 Bad Gateway",
+            }
+        ]
+
 
 class TestPiMono:
     def test_session(self):

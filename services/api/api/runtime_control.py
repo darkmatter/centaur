@@ -2753,6 +2753,7 @@ async def _process_execution_impl(pool, row: dict[str, Any]) -> None:
 
     turn_done_event: dict[str, Any] | None = None
     latest_terminal_result_text = ""
+    latest_stream_error_text = ""
     slackbot_streamed_answer_chars = 0
     pending_event: asyncio.Task | None = None
     stream = _stream_stdout(
@@ -2843,6 +2844,12 @@ async def _process_execution_impl(pool, row: dict[str, Any]) -> None:
             if payload.get("session_id"):
                 harness_thread_id = str(payload.get("session_id") or "")
             canonical_events = normalize_harness_event(engine, payload)
+            for canonical_event in canonical_events:
+                if canonical_event.get("type") != "error":
+                    continue
+                stream_error = canonical_event.get("error")
+                if isinstance(stream_error, str) and stream_error.strip():
+                    latest_stream_error_text = stream_error.strip()
             for canonical_event in canonical_events:
                 if canonical_event.get("type") != "result":
                     continue
@@ -3136,6 +3143,12 @@ async def _process_execution_impl(pool, row: dict[str, Any]) -> None:
     error_text = turn_done_event.get("error")
     if not isinstance(error_text, str):
         error_text = ""
+    if (
+        not error_text.strip()
+        and not result_text.strip()
+        and latest_stream_error_text
+    ):
+        error_text = latest_stream_error_text
     is_error = bool(turn_done_event.get("is_error")) or bool(error_text)
     if is_error:
         terminal_reason = "harness_error"
@@ -3184,6 +3197,19 @@ async def _process_execution_impl(pool, row: dict[str, Any]) -> None:
             terminal_reason=terminal_reason,
             result_text=result_text,
             error_text=combined_error,
+        )
+        return
+
+    if (
+        not result_text.strip()
+        and not slackbot_text_sent
+        and slackbot_streamed_answer_chars <= 0
+    ):
+        await _finalize_execution(
+            status="failed_permanent",
+            terminal_reason="empty_final_result",
+            result_text="",
+            error_text="execution completed without final text",
         )
         return
 

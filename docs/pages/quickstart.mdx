@@ -84,8 +84,8 @@ bun run auth:bootstrap
 ```
 
 The command writes only secret payload values to `.env.local`. Source that file
-before `just bootstrap-secrets` so `CODEX_AUTH_JSON` and
-`CLAUDE_CREDENTIALS_JSON`, when present, are copied into the separate
+before `just bootstrap-secrets` so `CODEX_AUTH_JSON` and the Claude Code OAuth
+refresh-token fields, when present, are copied into the separate
 `centaur-harness-auth` Secret. They are not added to `centaur-infra-env`,
 which the API consumes with `envFrom`.
 
@@ -97,8 +97,9 @@ bun run auth:bootstrap -- --login
 
 That opt-in mode streams `codex login --device-auth` or
 `claude auth login`. For Claude on macOS, bootstrap imports the Claude Code
-Keychain credential into `CLAUDE_CREDENTIALS_JSON`; on Linux, it imports
-`$CLAUDE_CONFIG_DIR/.credentials.json` or `~/.claude/.credentials.json`.
+Keychain credential and writes the refresh token for iron-proxy; on Linux, it
+imports `$CLAUDE_CONFIG_DIR/.credentials.json` or
+`~/.claude/.credentials.json`.
 
 Enable local auth only for deployments that need it:
 
@@ -109,11 +110,11 @@ sandbox:
     CLAUDE_USE_LOCAL_AUTH: "true"
 ```
 
-The API mounts auth payloads only into the matching engine's sandbox:
-Codex pods receive Codex auth, Claude pods receive Claude auth, and Amp pods
+The API scopes auth payloads to the matching engine: Codex pods receive Codex
+auth, Claude proxy pods receive Claude refresh-token material, and Amp pods
 receive neither. This is less isolated than the default [iron-proxy](https://docs.iron.sh)
-API-key path because the provider CLI login state is reconstructed inside the
-sandbox filesystem.
+API-key path because provider CLI login state is available to the provider
+runtime instead of staying solely in the normal API-key secret source.
 
 The default harness is `codex`, so `OPENAI_API_KEY` must exist in the configured
 secret source before Slack agent turns can complete. Use explicit harness

@@ -102,9 +102,9 @@ accordingly. See [Security](/security) for the full threat model.
 
 Codex and Claude Code can use local CLI auth state instead of the API-key
 path. This is meant for deployments that need Codex subscriptions or Claude
-Code subscription/card auth. It is not automatic and is not handled by
-[iron-proxy](https://docs.iron.sh): the sandbox reconstructs the provider's
-local auth files so the CLI starts as logged in.
+Code subscription/card auth. It is not automatic. Codex reconstructs its local
+auth file inside matching sandboxes; Claude Code uses a refresh token through
+[iron-proxy](https://docs.iron.sh) by default.
 
 For local development, run:
 
@@ -133,7 +133,9 @@ harnessAuth:
 | Secret | Used for |
 |--------|----------|
 | `CODEX_AUTH_JSON` | Codex local auth file reconstruction. |
-| `CLAUDE_CREDENTIALS_JSON` | Claude Code Linux credentials file reconstruction. |
+| `CLAUDE_CODE_OAUTH_CLIENT_ID` | Claude Code public OAuth client id for iron-proxy. |
+| `CLAUDE_CODE_OAUTH_REFRESH_TOKEN` | Claude Code OAuth refresh token for iron-proxy. |
+| `CLAUDE_CREDENTIALS_JSON` | Claude Code file-mode credentials reconstruction. |
 
 Then enable only the providers you intend to use:
 
@@ -146,10 +148,10 @@ sandbox:
 
 The Kubernetes sandbox backend mounts auth payloads from Secret references, not
 literal PodSpec values, and scopes them by engine: Codex pods receive only
-Codex auth, Claude pods receive only Claude auth, and Amp receives none. If a
-local auth payload is missing, the entrypoint preserves the normal API-key
-fallback path. Do not put these payloads in `centaur-infra-env`; the API pod
-imports that Secret with `envFrom`.
+Codex auth, Claude proxy pods receive only Claude OAuth material, and Amp
+receives none. If a local auth payload is missing, the entrypoint preserves the
+normal API-key fallback path. Do not put these payloads in `centaur-infra-env`;
+the API pod imports that Secret with `envFrom`.
 
 Claude Code subscription credentials contain a rotating refresh token, so they
 are best treated as a narrow opt-in path rather than fleet auth. Prefer Console

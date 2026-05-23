@@ -42,7 +42,7 @@ from api.sandbox.config import (
     sandbox_env_flag,
 )
 from api.sandbox.prompt_assembly import assemble_prompt
-from api.tool_manager import HttpSecret, PgDsnSecret, SecretDef
+from api.tool_manager import OAuthFieldSource, OAuthTokenSecret, PgDsnSecret, SecretDef
 
 log = structlog.get_logger()
 
@@ -56,6 +56,8 @@ _SANDBOX_HARNESS_AUTH_DIR = "/harness-auth"
 _PROXY_LABEL = "centaur.ai/iron-proxy"
 _API_PROXY_POD_NAME = "centaur-api-proxy"
 _API_PROXY_SANDBOX_ID = "api"
+_CLAUDE_CODE_OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+_CLAUDE_CODE_OAUTH_TOKEN_ENDPOINT = "https://platform.claude.com/v1/oauth/token"
 
 
 def _harness_auth_secret_name() -> str:
@@ -99,12 +101,25 @@ def _harness_proxy_auth_secrets(engine: str) -> list[SecretDef]:
         return []
     if engine == "claude-code":
         return [
-            HttpSecret(
-                name="ANTHROPIC_AUTH_TOKEN",
-                secret_ref="CLAUDE_CODE_OAUTH_ACCESS_TOKEN",
+            OAuthTokenSecret(
+                name="CLAUDE_CODE_OAUTH",
+                grant="refresh_token",
                 hosts=("api.anthropic.com",),
-                match_headers=("Authorization",),
-                source_kind="env",
+                fields=(
+                    (
+                        "client_id",
+                        OAuthFieldSource(
+                            "CLAUDE_CODE_OAUTH_CLIENT_ID", source_kind="env"
+                        ),
+                    ),
+                    (
+                        "refresh_token",
+                        OAuthFieldSource(
+                            "CLAUDE_CODE_OAUTH_REFRESH_TOKEN", source_kind="env"
+                        ),
+                    ),
+                ),
+                token_endpoint=_CLAUDE_CODE_OAUTH_TOKEN_ENDPOINT,
             )
         ]
     return []
@@ -114,7 +129,7 @@ def _harness_proxy_auth_env_keys(engine: str) -> tuple[str, ...]:
     if not _harness_uses_proxy_auth(engine):
         return ()
     if engine == "claude-code":
-        return ("CLAUDE_CODE_OAUTH_ACCESS_TOKEN",)
+        return ("CLAUDE_CODE_OAUTH_CLIENT_ID", "CLAUDE_CODE_OAUTH_REFRESH_TOKEN")
     return ()
 
 

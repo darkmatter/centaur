@@ -19,8 +19,10 @@ set to onepassword-connect in the Helm values):
   OP_CONNECT_TOKEN             Connect API token; added to centaur-infra-env
   CODEX_AUTH_JSON              Codex local auth payload; added to centaur-harness-auth
   CLAUDE_CREDENTIALS_JSON      Claude Code credentials payload; added to centaur-harness-auth
-  CLAUDE_CODE_OAUTH_ACCESS_TOKEN
-                               Claude Code bearer; added to centaur-harness-auth
+  CLAUDE_CODE_OAUTH_CLIENT_ID
+                               Claude Code public OAuth client id; added to centaur-harness-auth
+  CLAUDE_CODE_OAUTH_REFRESH_TOKEN
+                               Claude Code OAuth refresh token; added to centaur-harness-auth
 EOF
 }
 
@@ -93,7 +95,8 @@ optional_secret_env_names=(
 harness_auth_env_names=(
   CODEX_AUTH_JSON
   CLAUDE_CREDENTIALS_JSON
-  CLAUDE_CODE_OAUTH_ACCESS_TOKEN
+  CLAUDE_CODE_OAUTH_CLIENT_ID
+  CLAUDE_CODE_OAUTH_REFRESH_TOKEN
 )
 
 kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f - >/dev/null

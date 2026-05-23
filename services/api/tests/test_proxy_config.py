@@ -787,6 +787,38 @@ def test_render_oauth_token_field_omits_json_key_for_whole_secret(
     assert tokens[0]["client_id"] == {"type": "env", "var": "OAUTH_CLIENT_ID"}
 
 
+def test_render_oauth_token_field_can_force_env_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("FIREWALL_MANAGER_SECRET_SOURCE", "onepassword")
+    secrets = [
+        OAuthTokenSecret(
+            name="OAUTH_APP",
+            grant="client_credentials",
+            hosts=("api.example.com",),
+            fields=(
+                (
+                    "client_id",
+                    OAuthFieldSource("OAUTH_CLIENT_ID", source_kind="env"),
+                ),
+                (
+                    "client_secret",
+                    OAuthFieldSource("OAUTH_CLIENT_SECRET", source_kind="env"),
+                ),
+            ),
+        )
+    ]
+    cfg = yaml.safe_load(render_proxy_yaml(secrets))
+    tokens = next(
+        t for t in cfg["transforms"] if t["name"] == "oauth_token"
+    )["config"]["tokens"]
+    assert tokens[0]["client_id"] == {"type": "env", "var": "OAUTH_CLIENT_ID"}
+    assert tokens[0]["client_secret"] == {
+        "type": "env",
+        "var": "OAUTH_CLIENT_SECRET",
+    }
+
+
 def test_render_oauth_token_merges_entries_by_token_identity() -> None:
     secrets = [
         OAuthTokenSecret(
@@ -985,7 +1017,10 @@ def test_render_emits_postgres_listeners_with_env_refs(
     ]
     cfg = yaml.safe_load(render_proxy_yaml(secrets))
     listeners = cfg["postgres"]
-    assert [l["name"] for l in listeners] == ["analytics_pg", "database_url"]
+    assert [listener["name"] for listener in listeners] == [
+        "analytics_pg",
+        "database_url",
+    ]
     assert listeners[0]["listen"] == "0.0.0.0:5432"
     assert listeners[1]["listen"] == "0.0.0.0:5433"
     # upstream.dsn uses the secret_ref directly so iron-proxy can resolve it

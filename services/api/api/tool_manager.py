@@ -169,11 +169,13 @@ class OAuthFieldSource:
 
     ``secret_ref`` names the secret holding the value. ``json_key``, when set,
     pulls a single key out of a JSON-encoded secret; when unset the whole
-    secret value is used.
+    secret value is used. ``source_kind`` can override the proxy's default
+    secret source for this field.
     """
 
     secret_ref: str
     json_key: str | None = None
+    source_kind: str = ""
 
 
 @dataclass(frozen=True)

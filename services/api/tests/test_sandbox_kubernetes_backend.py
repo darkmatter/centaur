@@ -16,6 +16,7 @@ from api.sandbox.kubernetes import (
     STDOUT_CHANNEL,
 )
 from api.sandbox.registry import auto_configure
+from api.tool_manager import OAuthFieldSource
 
 
 class FakeCoreApi:
@@ -164,7 +165,8 @@ def _default_per_sandbox_proxy_env(monkeypatch: pytest.MonkeyPatch) -> None:
         "CLAUDE_USE_LOCAL_AUTH",
         "CLAUDE_CREDENTIALS_JSON",
         "CLAUDE_CREDENTIALS_JSON_FILE",
-        "CLAUDE_CODE_OAUTH_ACCESS_TOKEN",
+        "CLAUDE_CODE_OAUTH_CLIENT_ID",
+        "CLAUDE_CODE_OAUTH_REFRESH_TOKEN",
         "ANTHROPIC_AUTH_TOKEN",
         "CLAUDE_CONFIG_DIR",
         "HARNESS_LOCAL_AUTH_TRANSPORT",
@@ -307,7 +309,8 @@ def test_container_env_filters_raw_local_auth_from_extra_env(
         "CODEX_PROXY_AUTH": "true",
         "CLAUDE_USE_LOCAL_AUTH": "true",
         "CLAUDE_CREDENTIALS_JSON": "claude-secret",
-        "CLAUDE_CODE_OAUTH_ACCESS_TOKEN": "claude-token",
+        "CLAUDE_CODE_OAUTH_CLIENT_ID": "claude-client-id",
+        "CLAUDE_CODE_OAUTH_REFRESH_TOKEN": "claude-refresh-token",
         "ANTHROPIC_AUTH_TOKEN": "anthropic-token",
         "HARNESS_LOCAL_AUTH_TRANSPORT": "file",
     }
@@ -377,13 +380,18 @@ def test_harness_proxy_auth_secrets_are_engine_scoped(
     claude = _harness_proxy_auth_secrets("claude-code")
 
     assert _harness_proxy_auth_secrets("codex") == []
-    assert [(secret.name, secret.secret_ref, secret.hosts) for secret in claude] == [
-        (
-            "ANTHROPIC_AUTH_TOKEN",
-            "CLAUDE_CODE_OAUTH_ACCESS_TOKEN",
-            ("api.anthropic.com",),
-        )
-    ]
+    assert len(claude) == 1
+    secret = claude[0]
+    assert secret.name == "CLAUDE_CODE_OAUTH"
+    assert secret.grant == "refresh_token"
+    assert secret.hosts == ("api.anthropic.com",)
+    assert secret.token_endpoint == "https://platform.claude.com/v1/oauth/token"
+    assert dict(secret.fields) == {
+        "client_id": OAuthFieldSource("CLAUDE_CODE_OAUTH_CLIENT_ID", source_kind="env"),
+        "refresh_token": OAuthFieldSource(
+            "CLAUDE_CODE_OAUTH_REFRESH_TOKEN", source_kind="env"
+        ),
+    }
     assert _harness_proxy_auth_secrets("amp") == []
 
     monkeypatch.setenv("HARNESS_LOCAL_AUTH_TRANSPORT", "file")
@@ -401,18 +409,31 @@ def test_proxy_pod_spec_can_receive_harness_auth_keys(
         [],
         {},
         restart_policy="Never",
-        harness_auth_env_keys=("CLAUDE_CODE_OAUTH_ACCESS_TOKEN",),
+        harness_auth_env_keys=(
+            "CLAUDE_CODE_OAUTH_CLIENT_ID",
+            "CLAUDE_CODE_OAUTH_REFRESH_TOKEN",
+        ),
     )
 
     assert spec["containers"][0]["envFrom"] == [
         {"secretRef": {"name": "centaur-infra-env"}},
     ]
     assert {
-        "name": "CLAUDE_CODE_OAUTH_ACCESS_TOKEN",
+        "name": "CLAUDE_CODE_OAUTH_CLIENT_ID",
         "valueFrom": {
             "secretKeyRef": {
                 "name": "custom-harness-auth",
-                "key": "CLAUDE_CODE_OAUTH_ACCESS_TOKEN",
+                "key": "CLAUDE_CODE_OAUTH_CLIENT_ID",
+                "optional": True,
+            }
+        },
+    } in spec["containers"][0]["env"]
+    assert {
+        "name": "CLAUDE_CODE_OAUTH_REFRESH_TOKEN",
+        "valueFrom": {
+            "secretKeyRef": {
+                "name": "custom-harness-auth",
+                "key": "CLAUDE_CODE_OAUTH_REFRESH_TOKEN",
                 "optional": True,
             }
         },

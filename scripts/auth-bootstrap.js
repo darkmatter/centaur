@@ -11,6 +11,7 @@ const envFile = resolve(
 );
 const home = homedir();
 const loginRequested = process.argv.slice(2).includes("--login");
+const CLAUDE_CODE_OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 
 function readJson(path) {
   if (!existsSync(path)) return null;
@@ -62,7 +63,11 @@ function claudeCredentialsFromValue(path, value) {
   ) {
     throw new Error(`${path} does not look like Claude Code OAuth credentials`);
   }
-  return { path, value: JSON.stringify(credentials), accessToken: oauth.accessToken };
+  return {
+    path,
+    value: JSON.stringify(credentials),
+    refreshToken: oauth.refreshToken,
+  };
 }
 
 function claudeCredentialsFromFile(path) {
@@ -85,18 +90,19 @@ function claudeCredentialsFromKeychain() {
 }
 
 function claudeCredentialsPayload() {
+  const configDir = process.env.CLAUDE_CONFIG_DIR
+    ? resolve(process.env.CLAUDE_CONFIG_DIR)
+    : resolve(home, ".claude");
+  const localCredentials =
+    claudeCredentialsFromFile(resolve(configDir, ".credentials.json")) ||
+    claudeCredentialsFromKeychain();
+  if (localCredentials) return localCredentials;
+
   const envPayload = (process.env.CLAUDE_CREDENTIALS_JSON || "").trim();
   if (envPayload) {
     return claudeCredentialsFromValue("CLAUDE_CREDENTIALS_JSON", envPayload);
   }
-
-  const configDir = process.env.CLAUDE_CONFIG_DIR
-    ? resolve(process.env.CLAUDE_CONFIG_DIR)
-    : resolve(home, ".claude");
-  return (
-    claudeCredentialsFromFile(resolve(configDir, ".credentials.json")) ||
-    claudeCredentialsFromKeychain()
-  );
+  return null;
 }
 
 const updates = {};
@@ -124,15 +130,21 @@ if (codex) {
 const claudeCredentials = claudeCredentialsPayload();
 if (claudeCredentials) {
   updates.CLAUDE_CREDENTIALS_JSON = claudeCredentials.value;
-  updates.CLAUDE_CODE_OAUTH_ACCESS_TOKEN = claudeCredentials.accessToken;
+  updates.CLAUDE_CODE_OAUTH_CLIENT_ID = CLAUDE_CODE_OAUTH_CLIENT_ID;
+  updates.CLAUDE_CODE_OAUTH_REFRESH_TOKEN = claudeCredentials.refreshToken;
   imported.push([
     "Claude Code credentials",
     "CLAUDE_CREDENTIALS_JSON",
     claudeCredentials.path,
   ]);
   imported.push([
-    "Claude Code access token",
-    "CLAUDE_CODE_OAUTH_ACCESS_TOKEN",
+    "Claude Code OAuth refresh token",
+    "CLAUDE_CODE_OAUTH_REFRESH_TOKEN",
+    claudeCredentials.path,
+  ]);
+  imported.push([
+    "Claude Code OAuth client id",
+    "CLAUDE_CODE_OAUTH_CLIENT_ID",
     claudeCredentials.path,
   ]);
 } else {
@@ -177,14 +189,18 @@ if (loginRequested && loginCommands.length > 0) {
       if (credentials) {
         upsertEnvValues(envFile, {
           CLAUDE_CREDENTIALS_JSON: credentials.value,
-          CLAUDE_CODE_OAUTH_ACCESS_TOKEN: credentials.accessToken,
+          CLAUDE_CODE_OAUTH_CLIENT_ID: CLAUDE_CODE_OAUTH_CLIENT_ID,
+          CLAUDE_CODE_OAUTH_REFRESH_TOKEN: credentials.refreshToken,
         });
         console.log(`Wrote ${envFile}`);
         console.log(
           `Claude Code credentials: imported ${credentials.path} into CLAUDE_CREDENTIALS_JSON=[redacted]`,
         );
         console.log(
-          `Claude Code access token: imported ${credentials.path} into CLAUDE_CODE_OAUTH_ACCESS_TOKEN=[redacted]`,
+          `Claude Code OAuth refresh token: imported ${credentials.path} into CLAUDE_CODE_OAUTH_REFRESH_TOKEN=[redacted]`,
+        );
+        console.log(
+          `Claude Code OAuth client id: imported ${credentials.path} into CLAUDE_CODE_OAUTH_CLIENT_ID=[redacted]`,
         );
       } else {
         console.error("Claude: login completed but Claude Code credentials were not found.");

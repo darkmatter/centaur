@@ -145,8 +145,9 @@ Sandboxes receive placeholder values and [iron-proxy](https://docs.iron.sh)
 injects the real credentials only on approved outbound requests.
 
 Codex and Claude Code can also use local CLI OAuth/subscription auth, but that
-path is explicit opt-in because it reconstructs provider login files inside the
-matching sandbox. To import local auth payloads into `.env.local`, run:
+path is explicit opt-in. Codex reconstructs its login file inside matching
+sandboxes; Claude Code uses its refresh token through iron-proxy by default.
+To import local auth payloads into `.env.local`, run:
 
 ```bash
 bun run auth:bootstrap

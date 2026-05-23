@@ -48,9 +48,10 @@ Secret from your shell environment.
 
 Most harness credentials should stay in [iron-proxy](https://docs.iron.sh)'s
 secret source as API keys. Codex and Claude Code local OAuth/subscription auth
-is different: their CLIs require local auth files. When enabled, Centaur mounts
-opaque auth payloads from a separate harness auth Secret into the matching
-sandbox and the entrypoint reconstructs those files.
+is different: Codex requires a local auth file, while Claude Code can use a
+refresh token minted by iron-proxy. When enabled, Centaur reads opaque auth
+payloads from a separate harness auth Secret and scopes them to the matching
+provider runtime.
 
 Use `bun run auth:bootstrap` to import local payloads into `.env.local`, then
 `source .env.local` before `just bootstrap-secrets`. Use
@@ -62,16 +63,18 @@ Optional payload keys:
 | Secret | Notes |
 |--------|-------|
 | `CODEX_AUTH_JSON` | Copied from `~/.codex/auth.json`. |
-| `CLAUDE_CREDENTIALS_JSON` | Claude Code subscription credentials from macOS Keychain, `$CLAUDE_CONFIG_DIR/.credentials.json`, or `~/.claude/.credentials.json`. |
+| `CLAUDE_CODE_OAUTH_CLIENT_ID` | Claude Code public OAuth client id for iron-proxy. |
+| `CLAUDE_CODE_OAUTH_REFRESH_TOKEN` | Claude Code OAuth refresh token imported from macOS Keychain, `$CLAUDE_CONFIG_DIR/.credentials.json`, or `~/.claude/.credentials.json`. |
+| `CLAUDE_CREDENTIALS_JSON` | Optional Claude Code credentials payload for file transport. |
 
 `just bootstrap-secrets` writes those payloads to `centaur-harness-auth`, not
 `centaur-infra-env`, so the API pod does not receive raw local OAuth payloads
 through its `envFrom` import.
 
 Enable use with sandbox flags such as `CODEX_USE_LOCAL_AUTH=true` and
-`CLAUDE_USE_LOCAL_AUTH=true`. These payloads are intentionally available inside
-the selected provider's sandbox, unlike [iron-proxy](https://docs.iron.sh)
-API-key substitution.
+`CLAUDE_USE_LOCAL_AUTH=true`. Codex auth is intentionally available inside the
+selected Codex sandbox. Claude proxy auth is available to that sandbox's
+iron-proxy sidecar instead of the sandbox container itself.
 
 Claude Code subscription credentials contain a refresh token that can rotate.
 Use Console API keys or an auth helper/gateway for fleet-style concurrency.

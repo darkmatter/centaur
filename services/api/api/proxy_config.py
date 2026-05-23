@@ -202,7 +202,7 @@ def _build_field_source(field: OAuthFieldSource) -> dict[str, Any]:
     Resolves the secret like any other source, then appends ``json_key`` when
     the field is pulled out of a JSON-encoded secret.
     """
-    source = _build_source(field.secret_ref)
+    source = _build_source(field.secret_ref, field.source_kind)
     if field.json_key is not None:
         source["json_key"] = field.json_key
     return source

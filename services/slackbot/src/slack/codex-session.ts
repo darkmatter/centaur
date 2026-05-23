@@ -1,7 +1,8 @@
+import { createHash } from 'crypto'
 import type { WebClient } from '@slack/web-api'
 import { slackReplyLimits } from '../constants'
+import { logInfo } from '../logging'
 import { AgentSessionRenderer } from './agent-session'
-import { thinkingContextBlock } from './render'
 import {
   clipLines,
   preformatted as pre,
@@ -30,12 +31,14 @@ type CodexSessionState = {
   stepCounter: number
   nextCommandIndex: number
   commentaryText: string
+  commentaryByItemId: Map<string, string>
   answerText: string
   firstBufferedTextAt: number | null
   streamedCommentaryText: string
   streamedAnswerText: string
-  thinkingPublished: boolean
+  deliveredAnswerChars: number
   agentMessagePhase: AgentMessagePhase | null
+  agentMessagePhaseByItemId: Map<string, AgentMessagePhase>
   planText: string
   taskByUseId: Map<string, HarnessTask>
   commandOutputById: Map<string, string>
@@ -44,8 +47,16 @@ type CodexSessionState = {
   done: boolean
 }
 
+type CompletedCodexSessionState = {
+  threadId: string
+  streamedAnswerChars: number
+  completedAt: number
+}
+
 const states = new Map<string, CodexSessionState>()
+const completedStates = new Map<string, CompletedCodexSessionState>()
 const PRE_STREAM_GRACE_MS = 500
+const COMPLETED_STATE_TTL_MS = 10 * 60 * 1000
 
 export class CodexSessionRenderer {
   private readonly renderer: AgentSessionRenderer
@@ -54,7 +65,21 @@ export class CodexSessionRenderer {
     this.renderer = new AgentSessionRenderer(client)
   }
 
-  async event(agentSessionId: string, event: any): Promise<{ threadId?: string; done: boolean }> {
+  async event(
+    agentSessionId: string,
+    event: any
+  ): Promise<{ threadId?: string; done: boolean; streamedAnswerChars: number }> {
+    const completed = completedState(agentSessionId)
+    if (completed) {
+      if (isTerminalTurnEvent(event)) {
+        logCodexTerminalEventIgnoredAfterDone(agentSessionId, event, completed)
+      }
+      return {
+        threadId: completed.threadId || undefined,
+        done: true,
+        streamedAnswerChars: completed.streamedAnswerChars
+      }
+    }
     const state = getState(agentSessionId)
     if (event?.session_id) state.threadId = String(event.session_id)
     if (event?.thread_id) state.threadId = String(event.thread_id)
@@ -159,13 +184,26 @@ export class CodexSessionRenderer {
 
     const assistantMessage = assistantText(event)
     if (assistantMessage) {
-      const buffer = activeAssistantBuffer(state, event)
+      const buffer = activeAssistantBuffer(state, event, agentSessionId)
       const current = buffer === 'answer' ? state.answerText : state.commentaryText
       const delta = messageDelta(current, assistantMessage)
       if (delta) {
-        if (buffer === 'answer') state.answerText += delta
-        else state.commentaryText += delta
+        if (buffer === 'answer') {
+          logSuspiciousAnswerDelta(agentSessionId, event, state, {
+            current,
+            incoming: assistantMessage,
+            delta
+          })
+          state.answerText += delta
+        } else {
+          state.commentaryText += delta
+          trackCommentaryText(state, event, delta)
+        }
         await this.publishPendingAssistantText(agentSessionId, state)
+      }
+      if (buffer === 'commentary' && event?.type === 'item.completed') {
+        upsertThinkingTask(state, event)
+        await this.publishActivitySummary(agentSessionId, state)
       }
     }
 
@@ -173,7 +211,7 @@ export class CodexSessionRenderer {
     if (reasoningMessage) {
       const task: HarnessTask = {
         id: `reasoning-${++state.stepCounter}`,
-        title: 'Reasoning',
+        title: 'Thinking',
         status: 'complete',
         details: [section([text(reasoningMessage)])],
         output: []
@@ -183,17 +221,26 @@ export class CodexSessionRenderer {
     }
 
     if (isTerminalTurnEvent(event)) {
-      if (typeof event.result === 'string' && !state.answerText.trim()) {
-        const resultText = event.result.trim()
-        if (resultText) {
-          state.answerText += resultText
-          await this.publishPendingAssistantText(agentSessionId, state, { force: true })
-        }
+      const resultText = terminalResultText(event)
+      const willClose = Boolean(resultText || event?.type !== 'result')
+      logCodexTerminalEventReceived(agentSessionId, event, state, {
+        resultText,
+        willClose
+      })
+      if (resultText && !state.answerText.trim()) {
+        state.answerText += resultText
+        await this.publishPendingAssistantText(agentSessionId, state, { force: true })
       }
-      await this.done(agentSessionId)
+      if (willClose) {
+        await this.done(agentSessionId)
+      }
     }
 
-    return { threadId: state.threadId || undefined, done: state.done }
+    return {
+      threadId: state.threadId || undefined,
+      done: state.done,
+      streamedAnswerChars: state.deliveredAnswerChars
+    }
   }
 
   async done(agentSessionId: string, threadId?: string): Promise<void> {
@@ -201,15 +248,22 @@ export class CodexSessionRenderer {
     if (state.done) return
     if (threadId) state.threadId = threadId
     state.done = true
+    completeThinkingTasks(state)
     completeOpenTasks(state)
     await this.publishActivitySummary(agentSessionId, state, { final: true })
     await this.publishPendingAssistantText(agentSessionId, state, { force: true })
-    await this.renderer.done(agentSessionId, {
-      streamFinalUpdates: false,
+    const { streamedTextChars } = await this.renderer.done(agentSessionId, {
+      streamFinalUpdates: true,
       commentaryMarkdown: state.commentaryText,
       answerMarkdown: state.answerText
     })
+    state.deliveredAnswerChars = streamedTextChars
     state.done = true
+    completedStates.set(agentSessionId, {
+      threadId: state.threadId,
+      streamedAnswerChars: state.deliveredAnswerChars,
+      completedAt: Date.now()
+    })
     states.delete(agentSessionId)
   }
 
@@ -247,6 +301,7 @@ export class CodexSessionRenderer {
     ) {
       state.firstBufferedTextAt = Date.now()
     }
+    state.streamedCommentaryText = state.commentaryText
     const hasPlan = state.taskByUseId.size > 0
     const graceExpired =
       state.firstBufferedTextAt !== null &&
@@ -254,25 +309,18 @@ export class CodexSessionRenderer {
     const canStream = hasPlan || opts.force || graceExpired
     if (!canStream) return
 
-    const pendingCommentary = state.commentaryText.slice(state.streamedCommentaryText.length)
-    if (pendingCommentary && shouldFlushThinking(pendingCommentary, opts.force)) {
-      const delta = state.commentaryText.slice(state.streamedCommentaryText.length)
-      const thinkingBlock = thinkingContextBlock(delta, { heading: !state.thinkingPublished })
-      if (thinkingBlock) {
-        await this.renderer.blocks(agentSessionId, [thinkingBlock], { planPrefix: hasPlan })
-      }
-      state.streamedCommentaryText = state.commentaryText
-      state.thinkingPublished = true
-    }
     if (state.commentaryText.length > state.streamedCommentaryText.length) return
     if (state.answerText.length <= state.streamedAnswerText.length) return
     const delta = state.answerText.slice(state.streamedAnswerText.length)
     if (!delta) return
-    state.streamedAnswerText = state.answerText
-    await this.renderer.textDelta(agentSessionId, delta, {
+    const acceptedChars = await this.renderer.textDelta(agentSessionId, delta, {
       force: opts.force ?? false,
       planPrefix: hasPlan
     })
+    if (acceptedChars > 0) {
+      state.streamedAnswerText += delta.slice(0, acceptedChars)
+      state.deliveredAnswerChars = this.renderer.streamedTextChars(agentSessionId)
+    }
   }
 
   private async publishStructuredPlan(
@@ -313,12 +361,14 @@ function getState(agentSessionId: string): CodexSessionState {
       stepCounter: 0,
       nextCommandIndex: 0,
       commentaryText: '',
+      commentaryByItemId: new Map(),
       answerText: '',
       firstBufferedTextAt: null,
       streamedCommentaryText: '',
       streamedAnswerText: '',
-      thinkingPublished: false,
+      deliveredAnswerChars: 0,
       agentMessagePhase: null,
+      agentMessagePhaseByItemId: new Map(),
       planText: '',
       taskByUseId: new Map(),
       commandOutputById: new Map(),
@@ -347,6 +397,12 @@ function trackAgentMessageLifecycle(event: any, state: CodexSessionState): void 
   const phase = agentMessageItemPhase(event?.item)
   if (!phase) return
   state.agentMessagePhase = phase
+  const id = agentMessageEventId(event)
+  if (id) state.agentMessagePhaseByItemId.set(id, phase)
+}
+
+function agentMessageEventId(event: any): string {
+  return String(event?.itemId ?? event?.item_id ?? event?.item?.id ?? '')
 }
 
 /** Codex may emit several commentary agentMessages in one turn; keep a blank line between them. */
@@ -358,8 +414,68 @@ function ensureCommentarySegmentBreak(event: any, state: CodexSessionState): voi
   state.commentaryText = current.endsWith('\n') ? `${current}\n` : `${current}\n\n`
 }
 
-function activeAssistantBuffer(state: CodexSessionState, event: any): 'commentary' | 'answer' {
+function commentaryItemId(event: any): string {
+  return String(event?.itemId ?? event?.item_id ?? event?.item?.id ?? '')
+}
+
+function trackCommentaryText(state: CodexSessionState, event: any, delta: string): void {
+  const id = commentaryItemId(event)
+  if (!id) return
+  state.commentaryByItemId.set(id, `${state.commentaryByItemId.get(id) ?? ''}${delta}`)
+}
+
+function upsertThinkingTask(state: CodexSessionState, event: any): void {
+  const id = commentaryItemId(event)
+  if (!id) return
+  const body = String(event?.item?.text ?? state.commentaryByItemId.get(id) ?? '').trim()
+  if (!body) return
+  const taskId = `thinking-${id}`
+  state.commentaryByItemId.set(id, body)
+  state.taskByUseId.set(taskId, {
+    id: taskId,
+    title: 'Thinking',
+    status: 'complete',
+    details: [section([text(body)])],
+    output: []
+  })
+}
+
+function completeThinkingTasks(state: CodexSessionState): void {
+  for (const [id, body] of state.commentaryByItemId) {
+    upsertThinkingTask(state, { item: { id, text: body } })
+  }
+}
+
+function activeAssistantBuffer(
+  state: CodexSessionState,
+  event: any,
+  agentSessionId: string
+): 'commentary' | 'answer' {
   if (event?.type === 'item.agentMessage.delta' || event?.type === 'item.completed') {
+    const codexId = agentMessageEventId(event)
+    const itemPhase = state.agentMessagePhaseByItemId.get(codexId)
+    if (itemPhase) return itemPhase === 'final_answer' ? 'answer' : 'commentary'
+    if (
+      event?.type === 'item.completed' &&
+      (event?.item?.type === 'agentMessage' || event?.item?.type === 'agent_message') &&
+      state.taskByUseId.size > 0
+    ) {
+      logInfo('slack_codex_unphased_final_agent_message_classified', {
+        agent_session_id: agentSessionId,
+        centaur_thread_key: event?.centaur_thread_key,
+        execution_id: event?.centaur_execution_id,
+        assignment_generation: event?.centaur_assignment_generation,
+        codex_id: codexId,
+        codex_item_id: codexId,
+        codex_item_type: event?.item?.type,
+        codex_session_id: state.threadId || event?.session_id || event?.thread_id,
+        task_count: state.taskByUseId.size,
+        commentary_chars: state.commentaryText.length,
+        answer_chars: state.answerText.length,
+        item_text_chars: String(event?.item?.text ?? '').length
+      })
+      return 'answer'
+    }
     return state.agentMessagePhase === 'final_answer' ? 'answer' : 'commentary'
   }
   return 'answer'
@@ -393,18 +509,130 @@ function messageDelta(current: string, incoming: string): string {
   return incoming
 }
 
+function logSuspiciousAnswerDelta(
+  agentSessionId: string,
+  event: any,
+  state: CodexSessionState,
+  texts: { current: string; incoming: string; delta: string }
+): void {
+  const { current, incoming, delta } = texts
+  if (current.length <= 200 || incoming.length <= 200 || delta.length <= 200) return
+
+  const incomingHead = incoming.slice(0, 200)
+  const currentTail = current.slice(-200)
+  const currentContainsIncomingHead = current.includes(incomingHead)
+  const incomingContainsCurrentTail = incoming.includes(currentTail)
+  const largeIncomingRelativeToCurrent = incoming.length > current.length * 0.75
+  const largeDeltaRelativeToCurrent = delta.length > current.length * 0.5
+
+  if (
+    !currentContainsIncomingHead &&
+    !incomingContainsCurrentTail &&
+    !largeIncomingRelativeToCurrent &&
+    !largeDeltaRelativeToCurrent
+  ) {
+    return
+  }
+
+  logInfo('slack_codex_suspicious_answer_delta', {
+    agent_session_id: agentSessionId,
+    centaur_thread_key: event?.centaur_thread_key,
+    execution_id: event?.centaur_execution_id,
+    assignment_generation: event?.centaur_assignment_generation,
+    event_type: event?.type,
+    codex_id: agentMessageEventId(event),
+    codex_item_id: agentMessageEventId(event),
+    codex_item_type: event?.item?.type,
+    codex_item_phase: event?.item?.phase,
+    codex_session_id: state.threadId || event?.session_id || event?.thread_id,
+    current_answer_chars: current.length,
+    incoming_chars: incoming.length,
+    delta_chars: delta.length,
+    answer_chars_after: current.length + delta.length,
+    streamed_answer_chars: state.deliveredAnswerChars,
+    current_hash: textHash(current),
+    incoming_hash: textHash(incoming),
+    delta_hash: textHash(delta),
+    current_contains_incoming_head: currentContainsIncomingHead,
+    incoming_contains_current_tail: incomingContainsCurrentTail,
+    large_incoming_relative_to_current: largeIncomingRelativeToCurrent,
+    large_delta_relative_to_current: largeDeltaRelativeToCurrent
+  })
+}
+
+function textHash(value: string): string {
+  return createHash('sha256').update(value).digest('hex').slice(0, 16)
+}
+
 function reasoningText(event: any): string {
   if (event?.type !== 'reasoning') return ''
   return String(event.text ?? event.thinking ?? '')
 }
 
-function shouldFlushThinking(delta: string, force = false): boolean {
-  if (force) return true
-  return /(?:[.!?]\s*|\n\n)$/.test(delta)
-}
-
 function isTerminalTurnEvent(event: any): boolean {
   return event?.type === 'result' || event?.type === 'turn.done' || event?.type === 'turn.completed'
+}
+
+function terminalResultText(event: any): string {
+  for (const key of ['result', 'result_text', 'text', 'final_text']) {
+    const value = event?.[key]
+    if (typeof value !== 'string') continue
+    const text = value.trim()
+    if (text) return text
+  }
+  return ''
+}
+
+function completedState(agentSessionId: string): CompletedCodexSessionState | undefined {
+  const completed = completedStates.get(agentSessionId)
+  if (!completed) return undefined
+  if (Date.now() - completed.completedAt > COMPLETED_STATE_TTL_MS) {
+    completedStates.delete(agentSessionId)
+    return undefined
+  }
+  return completed
+}
+
+function logCodexTerminalEventReceived(
+  agentSessionId: string,
+  event: any,
+  state: CodexSessionState,
+  opts: { resultText: string; willClose: boolean }
+): void {
+  logInfo('slack_codex_terminal_event_received', {
+    agent_session_id: agentSessionId,
+    centaur_thread_key: event?.centaur_thread_key,
+    execution_id: event?.centaur_execution_id,
+    assignment_generation: event?.centaur_assignment_generation,
+    event_type: event?.type,
+    codex_session_id: state.threadId || event?.session_id || event?.thread_id,
+    already_completed: false,
+    will_close: opts.willClose,
+    result_text_chars: opts.resultText.length,
+    answer_chars_before_event: state.answerText.length,
+    streamed_answer_chars_before_event: state.deliveredAnswerChars,
+    task_count: state.taskByUseId.size
+  })
+}
+
+function logCodexTerminalEventIgnoredAfterDone(
+  agentSessionId: string,
+  event: any,
+  completed: CompletedCodexSessionState
+): void {
+  logInfo('slack_codex_terminal_event_ignored_after_done', {
+    agent_session_id: agentSessionId,
+    centaur_thread_key: event?.centaur_thread_key,
+    execution_id: event?.centaur_execution_id,
+    assignment_generation: event?.centaur_assignment_generation,
+    event_type: event?.type,
+    codex_session_id: completed.threadId || event?.session_id || event?.thread_id,
+    already_completed: true,
+    will_close: false,
+    result_text_chars: terminalResultText(event).length,
+    streamed_answer_chars_at_completion: completed.streamedAnswerChars,
+    completed_age_ms: Date.now() - completed.completedAt
+  })
 }
 
 function toolUses(event: any): any[] {
@@ -535,21 +763,22 @@ function changedActivityTaskUpdates(
     let details: StreamRichText | undefined
     let output: StreamRichText | undefined
     if (opts.final) {
-      if (!state.emittedActivityRunByTaskId.has(task.id)) {
+      if (task.details.length && !state.emittedActivityRunByTaskId.has(task.id)) {
         state.emittedActivityRunByTaskId.add(task.id)
         details = activityRunBlock(task)
       }
-      if (!state.emittedActivityOutputByTaskId.has(task.id)) {
+      if (task.output.length && !state.emittedActivityOutputByTaskId.has(task.id)) {
         state.emittedActivityOutputByTaskId.add(task.id)
         output = activityOutputBlock(task)
       }
-    } else if (!state.emittedActivityRunByTaskId.has(task.id)) {
+    } else if (task.details.length && !state.emittedActivityRunByTaskId.has(task.id)) {
       state.emittedActivityRunByTaskId.add(task.id)
       details = activityRunBlock(task)
     }
     if (
       !opts.final &&
       task.status === 'complete' &&
+      task.output.length &&
       !state.emittedActivityOutputByTaskId.has(task.id)
     ) {
       state.emittedActivityOutputByTaskId.add(task.id)
@@ -568,18 +797,17 @@ function changedActivityTaskUpdates(
 }
 
 function activityRunBlock(task: HarnessTask): StreamRichText {
+  if (task.title === 'Thinking' && task.details.length) {
+    return richText(task.details)
+  }
   const command = firstPreformattedBody(task.details)
   if (command) {
     return richText([pre(command, shellLanguage(firstPreformattedLanguage(task.details)))])
   }
-  const body = task.details.length ? elementsToPlainText(task.details) : task.title
-  return richText([pre(body, 'text')])
+  return richText(task.details)
 }
 
 function activityOutputBlock(task: HarnessTask): StreamRichText {
-  if (!task.output.length) {
-    return richText([pre('Done', 'text')])
-  }
   return richText([
     pre(elementsToPlainText(task.output), firstPreformattedLanguage(task.output) ?? 'text')
   ])
@@ -602,9 +830,8 @@ function shellLanguage(language: string | undefined): string {
   return language === 'bash' || !language ? 'sh' : language
 }
 
-function shellLanguageForCommand(command: string): string {
-  if (command.startsWith('call ')) return 'sh'
-  return languageFromContent(command)
+function shellLanguageForCommand(_command: string): string {
+  return 'sh'
 }
 
 function commandOutputDelta(event: any): { id: string; delta: string } | null {

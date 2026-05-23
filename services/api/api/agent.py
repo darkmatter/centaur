@@ -18,6 +18,7 @@ import asyncio
 import contextlib
 import json
 import os
+import re
 import time
 import uuid
 from collections.abc import AsyncIterator
@@ -39,6 +40,17 @@ from api.sandbox.registry import get_backend
 from api.trace_context import get_or_create_thread_trace_id
 
 log = structlog.get_logger()
+
+_GITHUB_HANDLE_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$")
+_GITHUB_URL_RE = re.compile(
+    r"(?:https?://)?github\.com/([A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?)",
+    re.IGNORECASE,
+)
+_GITHUB_LABEL_RE = re.compile(r"\bgithub\b", re.IGNORECASE)
+_GITHUB_PREFIX_RE = re.compile(
+    r"\bgithub\b\s*(?:username|user|handle|profile)?\s*[:/@-]?\s*@?([A-Za-z0-9][A-Za-z0-9-]{0,38})",
+    re.IGNORECASE,
+)
 
 _VALID_STDOUT_EVENT_TYPES = frozenset(
     {
@@ -531,18 +543,210 @@ async def _get_last_delivered_id(thread_key: str) -> str | None:
     return row["last_delivered_id"] if row else None
 
 
-async def _insert_system_message(thread_key: str, platform: str) -> None:
+async def _get_latest_thread_user_id(thread_key: str) -> str | None:
+    """Return the most recent user id recorded for this thread.
+
+    Slack turns can surface the requester in several durable rows depending on
+    where execution is when prompt context is assembled. Prefer the newest row
+    across those sources so the session context does not depend on one caller
+    preserving one specific delivery field.
+    """
+    pool = _get_pool()
+    row = await pool.fetchrow(
+        "WITH candidates AS ("
+        "  SELECT COALESCE(user_id, metadata->>'user_id') AS user_id, created_at, 1 AS source_rank "
+        "  FROM chat_messages "
+        "  WHERE thread_key = $1 AND role = 'user' "
+        "  UNION ALL "
+        "  SELECT COALESCE(metadata->>'user_id', delivery->>'recipient_user_id', delivery->>'user_id') "
+        "    AS user_id, created_at, 2 AS source_rank "
+        "  FROM agent_execution_requests "
+        "  WHERE thread_key = $1 "
+        "  UNION ALL "
+        "  SELECT COALESCE(input_json->>'user_id', input_json#>>'{delivery,recipient_user_id}', "
+        "    input_json#>>'{delivery,user_id}') AS user_id, created_at, 3 AS source_rank "
+        "  FROM workflow_runs "
+        "  WHERE thread_key = $1 AND workflow_name = 'slack_thread_turn' "
+        ") "
+        "SELECT user_id FROM candidates "
+        "WHERE user_id IS NOT NULL AND btrim(user_id) <> '' "
+        "ORDER BY created_at DESC, source_rank ASC "
+        "LIMIT 1",
+        thread_key,
+    )
+    user_id = row["user_id"] if row else None
+    if not user_id:
+        return None
+    return str(user_id).strip() or None
+
+
+def _valid_github_handle(value: str) -> str | None:
+    candidate = value.strip().strip("@").strip()
+    candidate = candidate.rstrip("/").split("/", 1)[0]
+    return candidate if _GITHUB_HANDLE_RE.match(candidate) else None
+
+
+def _extract_github_handle_from_slack_profile(
+    profile: dict[str, Any],
+) -> tuple[str | None, str | None, str]:
+    """Return (handle, source, unavailable_reason) from Slack profile fields."""
+    custom_fields = profile.get("custom_fields")
+    if not isinstance(custom_fields, dict) or not custom_fields:
+        return None, None, "no GitHub custom field found on Slack profile"
+
+    saw_github_field = False
+    for label, raw_value in custom_fields.items():
+        label_text = str(label or "").strip()
+        value = str(raw_value or "").strip()
+        if not value:
+            continue
+
+        label_mentions_github = bool(_GITHUB_LABEL_RE.search(label_text))
+        value_mentions_github = bool(_GITHUB_LABEL_RE.search(value))
+        if not label_mentions_github and not value_mentions_github:
+            continue
+        saw_github_field = True
+
+        source = (
+            f'Slack profile custom field "{label_text}"'
+            if label_text
+            else "Slack profile custom field"
+        )
+        url_match = _GITHUB_URL_RE.search(value)
+        if url_match:
+            handle = _valid_github_handle(url_match.group(1))
+            if handle:
+                return f"@{handle}", source, ""
+
+        prefixed_match = _GITHUB_PREFIX_RE.search(value)
+        if prefixed_match:
+            handle = _valid_github_handle(prefixed_match.group(1))
+            if handle:
+                return f"@{handle}", source, ""
+
+        if label_mentions_github:
+            handle = _valid_github_handle(value)
+            if handle:
+                return f"@{handle}", source, ""
+
+    if saw_github_field:
+        return (
+            None,
+            None,
+            "GitHub profile field did not contain a valid GitHub handle",
+        )
+    return None, None, "no GitHub custom field found on Slack profile"
+
+
+async def _resolve_requester_identity(
+    *,
+    platform: str | None,
+    user_id: str | None,
+) -> dict[str, str | bool] | None:
+    if not user_id or (platform or "").lower() != "slack":
+        return None
+
+    identity: dict[str, str | bool] = {
+        "slack_user_id": user_id,
+        "slack_mention": f"<@{user_id}>",
+    }
+    try:
+        from api.app import get_tool_manager
+
+        profile = await get_tool_manager().call_tool_raw(
+            "slack", "get_user_profile", {"user_id": user_id}
+        )
+    except Exception as exc:
+        log.warning(
+            "requester_identity_lookup_failed",
+            platform=platform,
+            user_id=user_id,
+            error=str(exc),
+        )
+        identity.update(
+            {
+                "github_handle_verified": False,
+                "github_handle_unavailable_reason": "Slack profile could not be fetched",
+            }
+        )
+        return identity
+
+    if not isinstance(profile, dict) or profile.get("error"):
+        error = str(profile.get("error") or "Slack profile could not be fetched")
+        log.warning(
+            "requester_identity_lookup_failed",
+            platform=platform,
+            user_id=user_id,
+            error=error,
+        )
+        identity.update(
+            {
+                "github_handle_verified": False,
+                "github_handle_unavailable_reason": "Slack profile could not be fetched",
+            }
+        )
+        return identity
+
+    handle, source, reason = _extract_github_handle_from_slack_profile(profile)
+    if handle:
+        identity.update(
+            {
+                "github_handle": handle,
+                "github_handle_source": source or "Slack profile custom field",
+                "github_handle_verified": True,
+            }
+        )
+    else:
+        identity.update(
+            {
+                "github_handle_verified": False,
+                "github_handle_unavailable_reason": reason,
+            }
+        )
+    return identity
+
+
+async def _insert_system_message(
+    thread_key: str,
+    platform: str | None,
+    *,
+    user_id: str | None = None,
+) -> None:
     """Insert a static system message with platform formatting rules (idempotent)."""
     pool = _get_pool()
-    msg_id = f"system-{thread_key}-{platform}"
-    context = _build_session_context(thread_key, platform=platform)
+    effective_platform = platform or ("slack" if thread_key.startswith("slack:") else None)
+    msg_id = f"system-{thread_key}-{effective_platform or 'generic'}"
+    effective_user_id = user_id or await _get_latest_thread_user_id(thread_key)
+    requester_identity = await _resolve_requester_identity(
+        platform=effective_platform,
+        user_id=effective_user_id,
+    )
+    context = _build_session_context(
+        thread_key,
+        platform=effective_platform,
+        user_id=effective_user_id,
+        requester_identity=requester_identity,
+    )
+    log.info(
+        "session_context_prepared",
+        thread_key=thread_key,
+        platform=effective_platform,
+        explicit_user_id=bool(user_id),
+        effective_user_id=bool(effective_user_id),
+        requester_identity=bool(requester_identity),
+        github_handle_verified=bool(
+            requester_identity and requester_identity.get("github_handle_verified")
+        ),
+    )
     await pool.execute(
         "INSERT INTO chat_messages (id, thread_key, role, parts, metadata) "
         "VALUES ($1, $2, 'system', $3::jsonb, '{}'::jsonb) "
-        "ON CONFLICT (id) DO NOTHING",
+        "ON CONFLICT (id) DO UPDATE SET parts = EXCLUDED.parts "
+        "WHERE $4::boolean",
         msg_id,
         thread_key,
         json.dumps([{"type": "text", "text": context}]),
+        bool(effective_user_id),
     )
 
 
@@ -755,6 +959,7 @@ def _build_session_context(
     *,
     platform: str | None = None,
     user_id: str | None = None,
+    requester_identity: dict[str, str | bool] | None = None,
 ) -> str:
     """Build session context to append to the system prompt.
 
@@ -773,6 +978,52 @@ def _build_session_context(
     if platform:
         lines.append(f"- **Platform**: {platform}")
 
+    if requester_identity:
+        lines.extend(
+            [
+                "",
+                "## Requester Identity",
+                "",
+                f"- Slack user ID: {requester_identity['slack_user_id']}",
+                f"- Slack mention: {requester_identity['slack_mention']}",
+            ]
+        )
+        if requester_identity.get("github_handle_verified"):
+            github_handle = requester_identity["github_handle"]
+            github_login = github_handle.removeprefix("@")
+            lines.extend(
+                [
+                    "- GitHub handle from Slack profile: "
+                    f"{github_handle}",
+                    "- GitHub handle source: "
+                    f"{requester_identity['github_handle_source']}",
+                    "- GitHub handle verified: yes",
+                    "",
+                    "## GitHub PR Attribution",
+                    "",
+                    "- If you create a GitHub PR for this Slack request, "
+                    f"the PR body MUST contain this standalone line: `Prompted by: {github_handle}`",
+                    "- This is a GitHub PR body requirement, not a Slack response mention rule.",
+                    "- Assign the PR to the requester when possible: "
+                    f"`{github_login}`",
+                ]
+            )
+        else:
+            lines.extend(
+                [
+                    "- GitHub handle from Slack profile: unavailable",
+                    "- GitHub handle unavailable reason: "
+                    f"{requester_identity['github_handle_unavailable_reason']}",
+                    "- GitHub handle verified: no",
+                    "",
+                    "## GitHub PR Attribution",
+                    "",
+                    "- If you create a GitHub PR for this Slack request, do not infer a GitHub "
+                    "username from Slack display name, real name, or email.",
+                    "- Omit the `Prompted by` line unless a verified GitHub handle is present.",
+                ]
+            )
+
     if platform and platform.lower() == "slack":
         lines.extend(
             [
@@ -786,11 +1037,14 @@ def _build_session_context(
                 "- Prefer concise, well-structured markdown; long replies may be split across multiple Slack messages",
                 "- Markdown tables are allowed and may render as native Slack tables when the structure is clean",
                 "- NEVER put links/URLs inside code blocks (``` ```) — they won't be clickable. Use markdown tables or plain text with `[text](url)` links instead",
+                "- For links to Slack threads or messages, always use the canonical `https://slack.com/archives/{CHANNEL_ID}/p{TS_WITHOUT_DOT}` form. Slack redirects this to the correct workspace. Do not invent or hardcode a `<workspace>.slack.com` subdomain.",
             ]
         )
         if user_id:
             lines.append(
-                f"- After completing a long task, tag the requester with their real Slack mention: <@{user_id}>"
+                "- For Slack replies after completing a long task, tag the requester with "
+                f"their real Slack mention: <@{user_id}>. This Slack reply rule does not "
+                "replace GitHub PR attribution requirements."
             )
 
     lines.extend(["", "---", ""])
@@ -1025,6 +1279,7 @@ async def stream_connect(
     session: SandboxSession,
     *,
     platform: str | None = None,
+    user_id: str | None = None,
 ) -> AsyncIterator[dict]:
     """Attach to a sandbox's stdout and return a persistent SSE wire.
 
@@ -1034,8 +1289,13 @@ async def stream_connect(
     """
     rt = _get_runtime(session.sandbox_id)
 
-    if platform:
-        await _insert_system_message(session.thread_key, platform)
+    effective_platform = platform or ("slack" if session.thread_key.startswith("slack:") else None)
+    if effective_platform:
+        await _insert_system_message(
+            session.thread_key,
+            effective_platform,
+            user_id=user_id,
+        )
 
     backend = get_backend()
     await backend.attach(session)
@@ -1122,8 +1382,13 @@ async def inject_stdin(
     """
     rt = _get_runtime(session.sandbox_id)
 
-    if platform:
-        await _insert_system_message(session.thread_key, platform)
+    effective_platform = platform or ("slack" if session.thread_key.startswith("slack:") else None)
+    if effective_platform:
+        await _insert_system_message(
+            session.thread_key,
+            effective_platform,
+            user_id=user_id,
+        )
 
     last_delivered_id = await _get_last_delivered_id(session.thread_key)
     flushed = await _flush_pending(session.thread_key, last_delivered_id)

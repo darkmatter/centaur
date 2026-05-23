@@ -32,6 +32,7 @@ from zoneinfo import ZoneInfo
 
 import structlog
 
+from api.agent import _insert_system_message
 from api import slackbot_client
 from api.runtime_control import (
     ControlPlaneError,
@@ -972,30 +973,49 @@ async def _compute_agent_session_header(
     )
 
 
+def _history_has_assistant_message(history_messages: Any) -> bool:
+    if not isinstance(history_messages, list):
+        return False
+    return any(
+        isinstance(item, dict)
+        and str(item.get("role") or "").strip().lower() == "assistant"
+        for item in history_messages
+    )
+
+
+async def _thread_has_prior_slack_agent_reply(pool, thread_key: str) -> bool:
+    if await pool.fetchval(
+        "SELECT EXISTS (SELECT 1 FROM agent_execution_requests "
+        "WHERE thread_key = $1 AND COALESCE(delivery->>'platform', '') = 'slack' "
+        "AND COALESCE(metadata->>'slackbot_agent_session_id', '') <> '')",
+        thread_key,
+    ):
+        return True
+    return bool(
+        await pool.fetchval(
+            "SELECT EXISTS (SELECT 1 FROM agent_message_requests "
+            "WHERE thread_key = $1 AND event_json->>'type' = 'assistant')",
+            thread_key,
+        )
+    )
+
+
+async def _should_show_agent_session_header(
+    pool,
+    *,
+    thread_key: str,
+    history_messages: Any,
+) -> bool:
+    if _history_has_assistant_message(history_messages):
+        return False
+    return not await _thread_has_prior_slack_agent_reply(pool, thread_key)
+
+
 def _assignment_display_engine(active: dict[str, Any]) -> str | None:
     engine = _nonempty(active.get("engine"))
     if engine:
         return engine
     return _nonempty(active.get("harness"))
-
-
-def _display_harness_label(harness: str | None, persona: str | None) -> str | None:
-    """Best human-readable name for the runtime that ran.
-
-    Prefers an explicit ``harness`` override; falls back to the persona's
-    declared engine; finally returns ``None`` if nothing is known. Useful
-    for user-facing error messages where we don't want to hard-code a
-    specific engine name (e.g. ``"Failed to start the Codex runtime"`` is
-    wrong when the active engine is amp/claude-code/pi-mono).
-    """
-    label = _nonempty(harness)
-    if label:
-        return label
-    if persona:
-        engine = _persona_default_engine(persona)
-        if engine:
-            return engine
-    return None
 
 
 def _persona_default_engine(persona_id: str) -> str | None:
@@ -1160,23 +1180,7 @@ async def do_agent_turn(
             effective_delivery = dict(run_in.get("delivery") or {})
         effective_history = history_messages or run_in.get("history_messages") or []
         selector = {"persona_id": persona, "harness": harness}
-
-        session_title = await _compute_agent_session_title(
-            ctx._pool, effective_thread_key, selector,
-        )
-        session_header = await _compute_agent_session_header(
-            ctx._pool, effective_thread_key, selector,
-        )
-        slackbot_session_id = await slackbot_client.open_agent_session(
-            delivery=effective_delivery,
-            metadata=effective_metadata,
-            thread_key=effective_thread_key,
-            title=session_title,
-            header=session_header,
-        )
-        if slackbot_session_id:
-            effective_metadata["slackbot_agent_session_id"] = slackbot_session_id
-            effective_metadata["slackbot_live_delivery"] = True
+        slackbot_session_id: str | None = None
 
         try:
             spawn = await spawn_assignment(
@@ -1189,21 +1193,73 @@ async def do_agent_turn(
                 agents_md_override=agents_md_override,
             )
         except Exception as exc:
-            if slackbot_session_id:
-                # Surface the actual harness/engine name in the error instead of
-                # the hard-coded "Codex" — every harness path lands here, not
-                # just codex. Falls back to "agent" when no display name is
-                # available so the message stays readable.
-                runtime_label = (
-                    _display_harness_label(harness, persona) or "agent"
+            try:
+                failure_session_id = await slackbot_client.open_agent_session(
+                    delivery=effective_delivery,
+                    metadata=effective_metadata,
+                    thread_key=effective_thread_key,
+                    title="Centaur",
+                    header=None,
                 )
-                await slackbot_client.session_text(
-                    slackbot_session_id,
-                    f"Failed to start the {runtime_label} runtime: {exc}",
+                if failure_session_id:
+                    await slackbot_client.session_text(
+                        failure_session_id,
+                        f"Failed to start the runtime: {exc}",
+                    )
+                    await slackbot_client.session_done(failure_session_id)
+            except Exception:
+                log.warning(
+                    "workflow_spawn_failure_session_failed",
+                    workflow_run_id=ctx.run_id,
+                    thread_key=effective_thread_key,
+                    exc_info=True,
                 )
-                await slackbot_client.session_done(slackbot_session_id)
             raise
         ag = int(spawn["assignment_generation"])
+
+        session_title = await _compute_agent_session_title(
+            ctx._pool, effective_thread_key, selector,
+        )
+        session_header = (
+            await _compute_agent_session_header(
+                ctx._pool,
+                effective_thread_key,
+                selector,
+            )
+            if await _should_show_agent_session_header(
+                ctx._pool,
+                thread_key=effective_thread_key,
+                history_messages=effective_history,
+            )
+            else None
+        )
+        slackbot_session_id = await slackbot_client.open_agent_session(
+            delivery=effective_delivery,
+            metadata=effective_metadata,
+            thread_key=effective_thread_key,
+            title=session_title,
+            header=session_header,
+        )
+        if slackbot_session_id:
+            effective_metadata["slackbot_agent_session_id"] = slackbot_session_id
+            effective_metadata["slackbot_live_delivery"] = True
+
+        effective_platform = str(effective_delivery.get("platform") or "").strip().lower()
+        if effective_platform == "slack" or effective_thread_key.startswith("slack:"):
+            requester_user_id = (
+                str(
+                    effective_delivery.get("recipient_user_id")
+                    or effective_delivery.get("user_id")
+                    or effective_metadata.get("user_id")
+                    or "",
+                ).strip()
+                or None
+            )
+            await _insert_system_message(
+                effective_thread_key,
+                effective_platform or "slack",
+                user_id=requester_user_id,
+            )
 
         if isinstance(effective_history, list):
             backfilled = 0
@@ -1224,6 +1280,13 @@ async def do_agent_turn(
                     continue
                 history_parts = [p for p in history_parts if isinstance(p, dict)]
                 if not history_parts:
+                    skipped += 1
+                    continue
+                if await _message_request_exists(
+                    ctx._pool,
+                    thread_key=effective_thread_key,
+                    message_id=history_message_id,
+                ):
                     skipped += 1
                     continue
                 history_role = str(item.get("role") or "user").strip().lower()
@@ -1321,6 +1384,21 @@ async def do_agent_turn(
 
     # Not terminal yet — suspend and wait for notify_execution_terminal
     raise SuspendWorkflow(status="waiting")
+
+
+async def _message_request_exists(
+    pool,
+    *,
+    thread_key: str,
+    message_id: str,
+) -> bool:
+    row = await pool.fetchrow(
+        "SELECT 1 FROM agent_message_requests "
+        "WHERE thread_key = $1 AND message_id = $2",
+        thread_key,
+        message_id,
+    )
+    return row is not None
 
 
 # ── Handler discovery ─────────────────────────────────────────────────
@@ -1783,6 +1861,17 @@ async def _insert_workflow_run(
         )
         if existing:
             if existing["request_hash"] != req_hash:
+                keys = ",".join(sorted(str(key) for key in run_input.keys()))
+                log.warning(
+                    "workflow_idempotency_payload_mismatch",
+                    workflow_name=workflow_name,
+                    trigger_key=trigger_key,
+                    thread_key=run_input.get("thread_key"),
+                    input_keys=keys,
+                    existing_request_hash_prefix=str(existing["request_hash"])[:12],
+                    request_hash_prefix=req_hash[:12],
+                    run_id=str(existing["run_id"]),
+                )
                 raise ControlPlaneError(
                     "IDEMPOTENCY_PAYLOAD_MISMATCH",
                     "trigger_key was already used with a different payload",

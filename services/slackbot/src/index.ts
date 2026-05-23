@@ -17,8 +17,10 @@ import { EnvSlackInstallationStore, SlackClientResolver } from './slack/installa
 import { normalizeSlackEnvelope } from './slack/normalize'
 import { markdownToStreamChunks } from './slack/render'
 import { verifySlackSignature } from './slack/signature'
-import type { SlackEnvelope } from './slack/types'
+import { shouldAckWithReaction } from './slack/trivial-ack'
+import type { NormalizedSlackEvent, SlackEnvelope } from './slack/types'
 import type { AnyBlock, AnyChunk } from '@slack/types'
+import type { WebClient } from '@slack/web-api'
 
 const config = loadConfig()
 // This is the existing deployments/runtime alert channel wired by the Helm
@@ -26,8 +28,10 @@ const config = loadConfig()
 const deploymentAlertChannel = config.RUNTIME_ERROR_ALERT_CHANNEL.trim()
 const resolver = new SlackClientResolver(
   new EnvSlackInstallationStore({
-    token: config.SLACK_BOT_TOKEN
-  })
+    token: config.SLACK_BOT_TOKEN,
+    slackApiUrl: config.SLACK_API_URL
+  }),
+  { slackApiUrl: config.SLACK_API_URL }
 )
 const handoff = new CentaurHandoff(config)
 const deduper = new EventDeduper(config.SLACK_EVENT_DEDUP_TTL_MS)
@@ -275,7 +279,7 @@ app.post('/api/slack/streams/stop', apiKeyMiddleware, async c => {
     const response = await client.chat.stopStream({
       channel: body.channel,
       ts: body.ts,
-      chunks: body.chunks ?? markdownToStreamChunks(body.markdown ?? ' '),
+      chunks: body.chunks ?? (body.markdown ? markdownToStreamChunks(body.markdown) : undefined),
       blocks: body.blocks
     })
     if (!response.ok) return c.json(response, 502)
@@ -512,6 +516,11 @@ async function processSlackEvent(envelope: SlackEnvelope): Promise<void> {
   if (!normalized) return
   if (!normalized.is_mention) return
 
+  if (shouldAckWithReaction(normalized)) {
+    await ackWithReaction(client, normalized)
+    return
+  }
+
   const result = await handoff.emit(normalized)
   if (!result.ok) {
     if (result.status === 409) {
@@ -519,6 +528,24 @@ async function processSlackEvent(envelope: SlackEnvelope): Promise<void> {
       return
     }
     throw new Error(`Centaur Slack handoff failed: ${result.status}`)
+  }
+}
+
+const TRIVIAL_ACK_REACTION = 'ok_hand'
+
+async function ackWithReaction(client: WebClient, event: NormalizedSlackEvent): Promise<void> {
+  try {
+    await client.reactions.add({
+      channel: event.channel_id,
+      timestamp: event.slack?.message_ts ?? event.thread_ts,
+      name: TRIVIAL_ACK_REACTION
+    })
+  } catch (error) {
+    logWarn('slack_trivial_ack_reaction_failed', {
+      channel_id: event.channel_id,
+      thread_ts: event.thread_ts,
+      error: error instanceof Error ? error.message : String(error)
+    })
   }
 }
 

@@ -19,7 +19,7 @@ ironProxy:
   image:
     repository: centaur-iron-proxy
     tag: latest
-    pullPolicy: IfNotPresent
+    pullPolicy: Always
   service:
     proxyPort: 8080
     managementPort: 9092
@@ -55,7 +55,7 @@ api:
   image:
     repository: centaur-api
     tag: latest
-    pullPolicy: IfNotPresent
+    pullPolicy: Always
   executionWorkerEnabled: false
   workflowWorkerEnabled: true
   warmPoolEnabled: false
@@ -102,7 +102,7 @@ sandbox:
   image:
     repository: centaur-agent
     tag: latest
-    pullPolicy: IfNotPresent
+    pullPolicy: Always
   runtimeClassName: ""
   reposPath: ""
   extraEnv: {}
@@ -138,7 +138,7 @@ slackbot:
   image:
     repository: centaur-slackbot
     tag: latest
-    pullPolicy: IfNotPresent
+    pullPolicy: Always
   runtimeErrorAlertChannel: ""
   extraEnv: {}
   resources: {}
@@ -162,6 +162,7 @@ postgres:
     enabled: true
     size: 20Gi
     storageClassName: ""
+    subPath: ""
   resources: {}
 
 laminar:

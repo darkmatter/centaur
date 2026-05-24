@@ -89,8 +89,9 @@ refresh-token fields, when present, are copied into the separate
 `centaur-harness-auth` Secret. They are not added to `centaur-infra-env`,
 which the API consumes with `envFrom`.
 
-Run bootstrap on the host, not inside a sandbox. On macOS it reads the Claude
-Code credential from Keychain, which is not available inside sandbox pods.
+Run bootstrap from the host shell, not inside a restricted sandbox. On macOS it
+reads the Claude Code credential from Keychain, which is not available inside
+sandbox pods.
 
 If local auth is missing, run the command it prints, or use:
 

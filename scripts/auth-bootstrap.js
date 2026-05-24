@@ -12,7 +12,7 @@ const envFile = resolve(
 const home = homedir();
 const loginRequested = process.argv.slice(2).includes("--login");
 const CLAUDE_CODE_OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
-const CLAUDE_CODE_OAUTH_SCOPES =
+const CLAUDE_CODE_OAUTH_DEFAULT_SCOPES =
   "user:file_upload user:inference user:mcp_servers user:profile user:sessions:claude_code";
 
 function readJson(path) {
@@ -54,6 +54,17 @@ function codexPayload() {
   return { path, value: JSON.stringify(auth) };
 }
 
+function claudeOauthScopes(oauth) {
+  if (
+    Array.isArray(oauth?.scopes) &&
+    oauth.scopes.length > 0 &&
+    oauth.scopes.every((scope) => typeof scope === "string" && scope.trim())
+  ) {
+    return oauth.scopes.map((scope) => scope.trim()).join(" ");
+  }
+  return CLAUDE_CODE_OAUTH_DEFAULT_SCOPES;
+}
+
 function claudeCredentialsFromValue(path, value) {
   const credentials = typeof value === "string" ? JSON.parse(value) : value;
   const oauth = credentials?.claudeAiOauth;
@@ -69,6 +80,7 @@ function claudeCredentialsFromValue(path, value) {
     path,
     value: JSON.stringify(credentials),
     refreshToken: oauth.refreshToken,
+    scopes: claudeOauthScopes(oauth),
   };
 }
 
@@ -133,7 +145,7 @@ const claudeCredentials = claudeCredentialsPayload();
 if (claudeCredentials) {
   updates.CLAUDE_CODE_OAUTH_CLIENT_ID = CLAUDE_CODE_OAUTH_CLIENT_ID;
   updates.CLAUDE_CODE_OAUTH_REFRESH_TOKEN = claudeCredentials.refreshToken;
-  updates.CLAUDE_CODE_OAUTH_SCOPES = CLAUDE_CODE_OAUTH_SCOPES;
+  updates.CLAUDE_CODE_OAUTH_SCOPES = claudeCredentials.scopes;
   imported.push([
     "Claude Code OAuth refresh token",
     "CLAUDE_CODE_OAUTH_REFRESH_TOKEN",
@@ -192,7 +204,7 @@ if (loginRequested && loginCommands.length > 0) {
         upsertEnvValues(envFile, {
           CLAUDE_CODE_OAUTH_CLIENT_ID: CLAUDE_CODE_OAUTH_CLIENT_ID,
           CLAUDE_CODE_OAUTH_REFRESH_TOKEN: credentials.refreshToken,
-          CLAUDE_CODE_OAUTH_SCOPES: CLAUDE_CODE_OAUTH_SCOPES,
+          CLAUDE_CODE_OAUTH_SCOPES: credentials.scopes,
         });
         console.log(`Wrote ${envFile}`);
         console.log(

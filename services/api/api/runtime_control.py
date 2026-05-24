@@ -20,6 +20,7 @@ from api.agent import (
     _stream_stdout,
     get_or_spawn,
     inject_stdin,
+    replay_inflight_turn,
     steer_stdin,
     stop_session,
 )
@@ -2451,13 +2452,15 @@ async def _process_execution_impl(pool, row: dict[str, Any]) -> None:
         record_execution_watchdog_timeout(harness, "silence_deadline_exceeded")
         return
 
+    prior_runtime_id = assignment["runtime_id"]
     session = await get_or_spawn(
         thread_key,
         assignment["harness"],
         engine=assignment["engine"],
         persona=assignment["persona_id"],
     )
-    if session.sandbox_id != assignment["runtime_id"]:
+    sandbox_changed = session.sandbox_id != prior_runtime_id
+    if sandbox_changed:
         await pool.execute(
             "UPDATE agent_runtime_assignments SET runtime_id = $1, updated_at = NOW() "
             "WHERE thread_key = $2 AND assignment_generation = $3",
@@ -2471,6 +2474,17 @@ async def _process_execution_impl(pool, row: dict[str, Any]) -> None:
         await _write_agents_override(session.sandbox_id, str(assignment_override))
 
     if durable_turn_id:
+        if sandbox_changed:
+            replay = await replay_inflight_turn(session)
+            log.info(
+                "execution_inflight_turn_replayed_after_recycle",
+                execution_id=execution_id,
+                thread_key=thread_key,
+                prior_runtime_id=prior_runtime_id[:12],
+                new_runtime_id=session.sandbox_id[:12],
+                replayed=bool(replay.get("replayed")),
+            )
+            silence_deadline = await _touch_execution_progress(pool, execution_id)
         await _heartbeat_execution_lease(pool, execution_id)
         if silence_deadline <= dt.datetime.now(dt.timezone.utc):
             silence_deadline = await _touch_execution_progress(pool, execution_id)

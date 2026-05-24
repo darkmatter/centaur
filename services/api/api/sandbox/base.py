@@ -101,6 +101,15 @@ class SandboxBackend(abc.ABC):
     async def status(self, session: SandboxSession) -> str:
         """Return sandbox status: 'running', 'stopped', 'gone', etc."""
 
+    async def runtime_image_tags(self, session: SandboxSession) -> tuple[str, str]:
+        """Return ``(agent_image, overlay_image)`` for the running sandbox.
+
+        Implementations should read these from the actual sandbox runtime so
+        that callers can detect when an existing sandbox is running an older
+        image than the current deployment expects. Default: unknown.
+        """
+        return "", ""
+
     async def close_streams(self, session: SandboxSession) -> None:
         """Close any open streams. Default: no-op."""
 

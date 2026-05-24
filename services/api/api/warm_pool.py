@@ -17,7 +17,8 @@ from pathlib import Path
 
 import structlog
 
-from api.agent import _get_runtime
+from api.agent import _get_runtime, _sandbox_image_drift
+from api.vm_metrics import record_sandbox_recycled
 from api.deps import mint_sandbox_token
 from api.sandbox.base import SandboxSession
 from api.sandbox.prompt_assembly import assemble_prompt
@@ -127,9 +128,7 @@ async def replenish() -> int:
                     backend.status_by_id(warm.sandbox_id),
                     timeout=POOL_BACKEND_TIMEOUT,
                 )
-                if st == "running" and (time.time() - warm.created_at) < 3600:
-                    alive.append(warm)
-                else:
+                if st != "running" or (time.time() - warm.created_at) >= 3600:
                     log.info(
                         "warm_pool_evicted",
                         sandbox=warm.sandbox_id[:12],
@@ -141,6 +140,29 @@ async def replenish() -> int:
                             backend.stop_by_id(warm.sandbox_id),
                             timeout=POOL_BACKEND_TIMEOUT,
                         )
+                    continue
+                probe = SandboxSession(
+                    sandbox_id=warm.sandbox_id,
+                    thread_key="",
+                    harness=POOL_HARNESS,
+                    engine=warm.engine,
+                )
+                drift = await _sandbox_image_drift(backend, probe)
+                if drift:
+                    log.info(
+                        "warm_pool_evicted_stale_image",
+                        sandbox=warm.sandbox_id[:12],
+                        age_s=round(time.time() - warm.created_at),
+                        drift_kind=drift,
+                    )
+                    record_sandbox_recycled(drift_kind=drift, path="warm_sweep")
+                    with contextlib.suppress(Exception):
+                        await asyncio.wait_for(
+                            backend.stop_by_id(warm.sandbox_id),
+                            timeout=POOL_BACKEND_TIMEOUT,
+                        )
+                    continue
+                alive.append(warm)
             except Exception:
                 log.info("warm_pool_evicted_error", sandbox=warm.sandbox_id[:12])
         if len(alive) != len(_pool):
@@ -337,6 +359,27 @@ async def claim_container(
         return None
     if st != "running":
         log.warning("warm_container_dead_on_claim", sandbox=warm.sandbox_id[:12])
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(
+                backend.stop_by_id(warm.sandbox_id),
+                timeout=POOL_BACKEND_TIMEOUT,
+            )
+        return None
+
+    probe = SandboxSession(
+        sandbox_id=warm.sandbox_id,
+        thread_key=thread_key,
+        harness=harness,
+        engine=warm.engine,
+    )
+    drift = await _sandbox_image_drift(backend, probe)
+    if drift:
+        log.info(
+            "warm_container_evicted_stale_image_on_claim",
+            sandbox=warm.sandbox_id[:12],
+            drift_kind=drift,
+        )
+        record_sandbox_recycled(drift_kind=drift, path="warm_claim")
         with contextlib.suppress(Exception):
             await asyncio.wait_for(
                 backend.stop_by_id(warm.sandbox_id),

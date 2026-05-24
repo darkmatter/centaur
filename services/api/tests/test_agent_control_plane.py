@@ -38,6 +38,77 @@ def test_slackbot_streamed_answer_chars_requires_positive_integer_offset():
     assert _slackbot_streamed_answer_chars(25) == 25
 
 
+@pytest.mark.asyncio
+async def test_sandbox_image_drift_classifies_each_side(monkeypatch):
+    from api.agent import _sandbox_image_drift
+
+    session = SandboxSession(
+        sandbox_id="rt-id",
+        thread_key="slack:C:1",
+        harness="codex",
+        engine="codex",
+    )
+
+    class _Backend:
+        def __init__(self, agent: str, overlay: str) -> None:
+            self.agent = agent
+            self.overlay = overlay
+
+        async def runtime_image_tags(self, _session):
+            return self.agent, self.overlay
+
+    monkeypatch.setenv("AGENT_IMAGE", "ghcr.io/paradigmxyz/centaur/centaur-agent:sha-new")
+    monkeypatch.setenv(
+        "CENTAUR_OVERLAY_IMAGE",
+        "ghcr.io/paradigmxyz/centaur-paradigm:sha-new-overlay",
+    )
+
+    fresh = _Backend(
+        "ghcr.io/paradigmxyz/centaur/centaur-agent:sha-new",
+        "ghcr.io/paradigmxyz/centaur-paradigm:sha-new-overlay",
+    )
+    assert await _sandbox_image_drift(fresh, session) == ""
+
+    stale_agent = _Backend(
+        "ghcr.io/paradigmxyz/centaur/centaur-agent:sha-old",
+        "ghcr.io/paradigmxyz/centaur-paradigm:sha-new-overlay",
+    )
+    assert await _sandbox_image_drift(stale_agent, session) == "agent"
+
+    stale_overlay = _Backend(
+        "ghcr.io/paradigmxyz/centaur/centaur-agent:sha-new",
+        "ghcr.io/paradigmxyz/centaur-paradigm:sha-old-overlay",
+    )
+    assert await _sandbox_image_drift(stale_overlay, session) == "overlay"
+
+    stale_both = _Backend(
+        "ghcr.io/paradigmxyz/centaur/centaur-agent:sha-old",
+        "ghcr.io/paradigmxyz/centaur-paradigm:sha-old-overlay",
+    )
+    assert await _sandbox_image_drift(stale_both, session) == "agent_and_overlay"
+
+    unset_running = _Backend("", "")
+    assert await _sandbox_image_drift(unset_running, session) == ""
+
+
+@pytest.mark.asyncio
+async def test_sandbox_image_drift_swallows_backend_errors():
+    from api.agent import _sandbox_image_drift
+
+    session = SandboxSession(
+        sandbox_id="rt-id",
+        thread_key="slack:C:1",
+        harness="codex",
+        engine="codex",
+    )
+
+    class _ExplodingBackend:
+        async def runtime_image_tags(self, _session):
+            raise RuntimeError("k8s probe failed")
+
+    assert await _sandbox_image_drift(_ExplodingBackend(), session) == ""
+
+
 def _auth(api_key: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {api_key}"}
 
@@ -3798,6 +3869,171 @@ async def test_worker_refreshes_silence_deadline_when_resuming_existing_turn(db_
     assert execution["status"] == "completed"
     assert execution["terminal_reason"] == "completed"
     assert execution["result_text"] == "done"
+
+
+@pytest.mark.asyncio
+async def test_worker_replays_inflight_turn_when_sandbox_recycled_mid_retry(db_pool):
+    from api.runtime_control import _process_execution
+
+    thread_key = f"slack:C-test:{uuid.uuid4().hex}"
+    execution_id = f"exe-{uuid.uuid4().hex[:12]}"
+    prior_runtime_id = f"rt-stale-{uuid.uuid4().hex[:8]}"
+    fresh_runtime_id = f"rt-fresh-{uuid.uuid4().hex[:8]}"
+    durable_turn_id = "turn-deadbeef00000000"
+
+    await db_pool.execute(
+        "INSERT INTO agent_runtime_assignments ("
+        "thread_key, assignment_generation, runtime_id, harness, engine, persona_id, "
+        "prompt_ref, effective_agents_md_sha256, state"
+        ") VALUES ($1, 1, $2, 'amp', 'amp', NULL, 'harness:amp', 'sha', 'active')",
+        thread_key,
+        prior_runtime_id,
+    )
+    await db_pool.execute(
+        "INSERT INTO agent_execution_requests ("
+        "execution_id, thread_key, assignment_generation, execute_id, request_hash, status, "
+        "delivery, metadata, durable_turn_id, hard_deadline_at, claimed_at, started_at"
+        ") VALUES ($1, $2, 1, 'exec-replay', 'hash-replay', 'running', '{}'::jsonb, '{}'::jsonb, "
+        "$3, NOW() + INTERVAL '10 minutes', NOW() - INTERVAL '2 minutes', NOW() - INTERVAL '2 minutes')",
+        execution_id,
+        thread_key,
+        durable_turn_id,
+    )
+    await db_pool.execute(
+        "INSERT INTO agent_final_delivery_outbox (execution_id, thread_key, delivery, state) "
+        "VALUES ($1, $2, '{}'::jsonb, 'awaiting_terminal')",
+        execution_id,
+        thread_key,
+    )
+
+    row = {
+        "execution_id": execution_id,
+        "thread_key": thread_key,
+        "assignment_generation": 1,
+        "delivery": {},
+        "durable_turn_id": durable_turn_id,
+        "hard_deadline_at": dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=10),
+    }
+    fresh_session = SandboxSession(
+        sandbox_id=fresh_runtime_id,
+        thread_key=thread_key,
+        harness="amp",
+        engine="amp",
+    )
+
+    async def _fake_stream(*_args, **_kwargs):
+        yield {
+            "data": json.dumps(
+                {"type": "turn.done", "result": "done", "is_error": False}
+            )
+        }
+
+    replay_mock = AsyncMock(
+        return_value={"ok": True, "replayed": True, "durable_turn_id": durable_turn_id}
+    )
+    inject_mock = AsyncMock()
+    backend = SimpleNamespace(attach=AsyncMock())
+    with (
+        patch(
+            "api.runtime_control.get_or_spawn",
+            new=AsyncMock(return_value=fresh_session),
+        ),
+        patch("api.runtime_control.replay_inflight_turn", replay_mock),
+        patch("api.runtime_control.inject_stdin", inject_mock),
+        patch("api.runtime_control.get_backend", return_value=backend),
+        patch(
+            "api.runtime_control._get_runtime",
+            return_value=SimpleNamespace(turn_counter=1),
+        ),
+        patch("api.runtime_control._stream_stdout", _fake_stream),
+    ):
+        await _process_execution(db_pool, row)
+
+    replay_mock.assert_awaited_once_with(fresh_session)
+    inject_mock.assert_not_awaited()
+    assignment = await db_pool.fetchrow(
+        "SELECT runtime_id FROM agent_runtime_assignments WHERE thread_key = $1",
+        thread_key,
+    )
+    assert assignment is not None
+    assert assignment["runtime_id"] == fresh_runtime_id
+
+
+@pytest.mark.asyncio
+async def test_worker_skips_replay_when_sandbox_unchanged_on_retry(db_pool):
+    from api.runtime_control import _process_execution
+
+    thread_key = f"slack:C-test:{uuid.uuid4().hex}"
+    execution_id = f"exe-{uuid.uuid4().hex[:12]}"
+    runtime_id = f"rt-same-{uuid.uuid4().hex[:8]}"
+    durable_turn_id = "turn-stayput0000000"
+
+    await db_pool.execute(
+        "INSERT INTO agent_runtime_assignments ("
+        "thread_key, assignment_generation, runtime_id, harness, engine, persona_id, "
+        "prompt_ref, effective_agents_md_sha256, state"
+        ") VALUES ($1, 1, $2, 'amp', 'amp', NULL, 'harness:amp', 'sha', 'active')",
+        thread_key,
+        runtime_id,
+    )
+    await db_pool.execute(
+        "INSERT INTO agent_execution_requests ("
+        "execution_id, thread_key, assignment_generation, execute_id, request_hash, status, "
+        "delivery, metadata, durable_turn_id, hard_deadline_at, claimed_at, started_at"
+        ") VALUES ($1, $2, 1, 'exec-same', 'hash-same', 'running', '{}'::jsonb, '{}'::jsonb, "
+        "$3, NOW() + INTERVAL '10 minutes', NOW() - INTERVAL '1 minute', NOW() - INTERVAL '1 minute')",
+        execution_id,
+        thread_key,
+        durable_turn_id,
+    )
+    await db_pool.execute(
+        "INSERT INTO agent_final_delivery_outbox (execution_id, thread_key, delivery, state) "
+        "VALUES ($1, $2, '{}'::jsonb, 'awaiting_terminal')",
+        execution_id,
+        thread_key,
+    )
+
+    row = {
+        "execution_id": execution_id,
+        "thread_key": thread_key,
+        "assignment_generation": 1,
+        "delivery": {},
+        "durable_turn_id": durable_turn_id,
+        "hard_deadline_at": dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=10),
+    }
+    same_session = SandboxSession(
+        sandbox_id=runtime_id,
+        thread_key=thread_key,
+        harness="amp",
+        engine="amp",
+    )
+
+    async def _fake_stream(*_args, **_kwargs):
+        yield {
+            "data": json.dumps(
+                {"type": "turn.done", "result": "ok", "is_error": False}
+            )
+        }
+
+    replay_mock = AsyncMock()
+    backend = SimpleNamespace(attach=AsyncMock())
+    with (
+        patch(
+            "api.runtime_control.get_or_spawn",
+            new=AsyncMock(return_value=same_session),
+        ),
+        patch("api.runtime_control.replay_inflight_turn", replay_mock),
+        patch("api.runtime_control.inject_stdin", AsyncMock()),
+        patch("api.runtime_control.get_backend", return_value=backend),
+        patch(
+            "api.runtime_control._get_runtime",
+            return_value=SimpleNamespace(turn_counter=1),
+        ),
+        patch("api.runtime_control._stream_stdout", _fake_stream),
+    ):
+        await _process_execution(db_pool, row)
+
+    replay_mock.assert_not_awaited()
 
 
 @pytest.mark.asyncio

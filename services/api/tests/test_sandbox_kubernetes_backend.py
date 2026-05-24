@@ -1172,6 +1172,117 @@ def test_kubernetes_backend_supports_warm_pool() -> None:
 
 
 @pytest.mark.asyncio
+async def test_runtime_image_tags_reads_pod_spec(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = KubernetesExecutorBackend()
+    fake_core = FakeCoreApi()
+    backend._core = fake_core
+
+    async def fake_ensure_clients() -> None:
+        return None
+
+    monkeypatch.setattr(backend, "_ensure_clients", fake_ensure_clients)
+
+    fake_core.pods_to_read.append(
+        SimpleNamespace(
+            spec=SimpleNamespace(
+                containers=[
+                    SimpleNamespace(name="iron-proxy", image="ghcr.io/iron:1"),
+                    SimpleNamespace(name="sandbox", image="ghcr.io/agent:sha-AAA"),
+                ],
+                init_containers=[
+                    SimpleNamespace(
+                        name="overlay-bootstrap",
+                        image="ghcr.io/overlay:sha-BBB",
+                    )
+                ],
+            )
+        )
+    )
+
+    session = SandboxSession(
+        sandbox_id="pod-running",
+        thread_key="slack:C123:123.456",
+        harness="codex",
+        engine="codex",
+    )
+
+    assert await backend.runtime_image_tags(session) == (
+        "ghcr.io/agent:sha-AAA",
+        "ghcr.io/overlay:sha-BBB",
+    )
+
+
+@pytest.mark.asyncio
+async def test_runtime_image_tags_handles_missing_pod(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = KubernetesExecutorBackend()
+    fake_core = FakeCoreApi()
+    backend._core = fake_core
+
+    async def fake_ensure_clients() -> None:
+        return None
+
+    monkeypatch.setattr(backend, "_ensure_clients", fake_ensure_clients)
+
+    class FakeNotFound(Exception):
+        status = 404
+
+    async def raising_read(name: str, namespace: str) -> SimpleNamespace:  # noqa: ARG001
+        raise FakeNotFound()
+
+    fake_core.read_namespaced_pod = raising_read  # type: ignore[assignment]
+
+    session = SandboxSession(
+        sandbox_id="pod-gone",
+        thread_key="slack:C123:123.456",
+        harness="codex",
+        engine="codex",
+    )
+
+    assert await backend.runtime_image_tags(session) == ("", "")
+
+
+@pytest.mark.asyncio
+async def test_runtime_image_tags_when_pod_missing_overlay_init_returns_empty_overlay(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = KubernetesExecutorBackend()
+    fake_core = FakeCoreApi()
+    backend._core = fake_core
+
+    async def fake_ensure_clients() -> None:
+        return None
+
+    monkeypatch.setattr(backend, "_ensure_clients", fake_ensure_clients)
+
+    fake_core.pods_to_read.append(
+        SimpleNamespace(
+            spec=SimpleNamespace(
+                containers=[
+                    SimpleNamespace(name="sandbox", image="ghcr.io/agent:sha-OK"),
+                ],
+                init_containers=None,
+            )
+        )
+    )
+
+    session = SandboxSession(
+        sandbox_id="pod-no-overlay",
+        thread_key="slack:C123:123.456",
+        harness="codex",
+        engine="codex",
+    )
+
+    assert await backend.runtime_image_tags(session) == (
+        "ghcr.io/agent:sha-OK",
+        "",
+    )
+
+
+@pytest.mark.asyncio
 async def test_recover_warm_returns_running_warm_pods_and_cleans_stale(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

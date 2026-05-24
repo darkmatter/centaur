@@ -337,6 +337,11 @@ WARM_POOL_CLAIMS_TOTAL = Counter(
     "Warm pool claim outcomes.",
     ["outcome"],
 )
+SANDBOX_RECYCLED_TOTAL = Counter(
+    "agent_sandbox_recycled_total",
+    "Sandboxes recycled due to running image drift.",
+    ["drift_kind", "path"],
+)
 EXECUTION_TERMINAL_TOTAL = Counter(
     "agent_execution_terminal_total",
     "Terminal execution outcomes by harness and reason.",
@@ -550,6 +555,10 @@ def record_execution_watchdog_timeout(harness: str, reason: str) -> None:
 
 def record_warm_pool_claim(outcome: str) -> None:
     WARM_POOL_CLAIMS_TOTAL.labels(outcome=outcome).inc()
+
+
+def record_sandbox_recycled(drift_kind: str, path: str) -> None:
+    SANDBOX_RECYCLED_TOTAL.labels(drift_kind=drift_kind, path=path).inc()
 
 
 def record_message_observation(role: str, text_chars: int, attachment_count: int) -> None:

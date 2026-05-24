@@ -26,7 +26,7 @@ from typing import Any
 
 import structlog
 
-from api.sandbox.base import RuntimeState, SandboxSession
+from api.sandbox.base import RuntimeState, SandboxBackend, SandboxSession
 from api.sandbox.harness_protocol import (
     build_user_input,
     extract_result,
@@ -38,6 +38,7 @@ from api.deps import mint_sandbox_token
 from api.sandbox.normalize import normalize_harness_event
 from api.sandbox.registry import get_backend
 from api.trace_context import get_or_create_thread_trace_id
+from api.vm_metrics import record_sandbox_recycled
 
 log = structlog.get_logger()
 
@@ -839,29 +840,28 @@ async def get_or_spawn(
             backend = get_backend()
             st = await backend.status(session)
             if st == "running":
-                _get_runtime(session.sandbox_id)
-                return session
-            # Container is gone — save agent_thread_id and cursor for resume, clean up row
-            old_agent_thread_id = session.agent_thread_id
-            old_last_delivered_id = session.last_delivered_id
-            old_inflight_turn_id = session.inflight_turn_id
-            old_inflight_turn_input = session.inflight_turn_input
-            old_inflight_attempts = session.inflight_attempts
-            old_last_result = session.last_result
-            old_trace_id = session.trace_id
-            await _db_delete_session(thread_key)
-            _drop_runtime(session.sandbox_id)
-        else:
-            # state is stopped/gone — clean up stale row
-            old_agent_thread_id = session.agent_thread_id
-            old_last_delivered_id = session.last_delivered_id
-            old_inflight_turn_id = session.inflight_turn_id
-            old_inflight_turn_input = session.inflight_turn_input
-            old_inflight_attempts = session.inflight_attempts
-            old_last_result = session.last_result
-            old_trace_id = session.trace_id
-            await _db_delete_session(thread_key)
-            _drop_runtime(session.sandbox_id)
+                drift = await _sandbox_image_drift(backend, session)
+                if not drift:
+                    _get_runtime(session.sandbox_id)
+                    return session
+                log.info(
+                    "sandbox_recycled_stale_image",
+                    thread_key=session.thread_key,
+                    sandbox_id=session.sandbox_id,
+                    drift_kind=drift,
+                )
+                record_sandbox_recycled(drift_kind=drift, path="session")
+                with contextlib.suppress(Exception):
+                    await backend.stop_by_id(session.sandbox_id)
+        old_agent_thread_id = session.agent_thread_id
+        old_last_delivered_id = session.last_delivered_id
+        old_inflight_turn_id = session.inflight_turn_id
+        old_inflight_turn_input = session.inflight_turn_input
+        old_inflight_attempts = session.inflight_attempts
+        old_last_result = session.last_result
+        old_trace_id = session.trace_id
+        await _db_delete_session(thread_key)
+        _drop_runtime(session.sandbox_id)
 
     pool = _get_pool()
     thread_trace_id = await get_or_create_thread_trace_id(pool, thread_key)
@@ -952,6 +952,42 @@ async def get_or_spawn(
         return winner
 
     return session
+
+
+def _current_agent_image() -> str:
+    return (os.getenv("AGENT_IMAGE") or "").strip()
+
+
+def _current_overlay_image() -> str:
+    return (os.getenv("CENTAUR_OVERLAY_IMAGE") or "").strip()
+
+
+async def _sandbox_image_drift(
+    backend: SandboxBackend, session: SandboxSession
+) -> str:
+    try:
+        agent_image, overlay_image = await backend.runtime_image_tags(session)
+    except Exception:
+        log.warning(
+            "sandbox_runtime_image_tags_failed",
+            thread_key=session.thread_key,
+            sandbox_id=session.sandbox_id,
+            exc_info=True,
+        )
+        return ""
+    current_agent = _current_agent_image()
+    current_overlay = _current_overlay_image()
+    agent_drift = bool(agent_image) and bool(current_agent) and agent_image != current_agent
+    overlay_drift = (
+        bool(overlay_image) and bool(current_overlay) and overlay_image != current_overlay
+    )
+    if agent_drift and overlay_drift:
+        return "agent_and_overlay"
+    if agent_drift:
+        return "agent"
+    if overlay_drift:
+        return "overlay"
+    return ""
 
 
 def _build_session_context(

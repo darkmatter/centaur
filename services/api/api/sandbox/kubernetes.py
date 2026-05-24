@@ -47,6 +47,7 @@ log = structlog.get_logger()
 _READY_TIMEOUT_S = int(os.getenv("KUBERNETES_SANDBOX_READY_TIMEOUT_S", "60"))
 _ATTACH_LOG_TAIL_LINES = int(os.getenv("KUBERNETES_ATTACH_LOG_TAIL_LINES", "200"))
 _CONTAINER_NAME = "sandbox"
+_OVERLAY_BOOTSTRAP_INIT_NAME = "overlay-bootstrap"
 _AGENT_UID = 1001
 _SANDBOX_OVERLAY_ROOT = "/home/agent/overlay"
 _SANDBOX_OVERLAY_DIR = f"{_SANDBOX_OVERLAY_ROOT}/org"
@@ -1134,7 +1135,7 @@ class KubernetesExecutorBackend(SandboxBackend):
             )
             init_containers.append(
                 {
-                    "name": "overlay-bootstrap",
+                    "name": _OVERLAY_BOOTSTRAP_INIT_NAME,
                     "image": overlay_image,
                     "imagePullPolicy": _overlay_image_pull_policy(),
                     "command": [
@@ -1421,6 +1422,28 @@ class KubernetesExecutorBackend(SandboxBackend):
 
     async def status(self, session: SandboxSession) -> str:
         return await self.status_by_id(session.sandbox_id)
+
+    async def runtime_image_tags(self, session: SandboxSession) -> tuple[str, str]:
+        await self._ensure_clients()
+        try:
+            pod = await self._core_api().read_namespaced_pod(
+                session.sandbox_id, _namespace()
+            )
+        except Exception as exc:
+            if self._is_not_found(exc):
+                return "", ""
+            raise
+        agent_image = ""
+        for container in getattr(pod.spec, "containers", None) or []:
+            if getattr(container, "name", None) == _CONTAINER_NAME:
+                agent_image = getattr(container, "image", "") or ""
+                break
+        overlay_image = ""
+        for init in getattr(pod.spec, "init_containers", None) or []:
+            if getattr(init, "name", None) == _OVERLAY_BOOTSTRAP_INIT_NAME:
+                overlay_image = getattr(init, "image", "") or ""
+                break
+        return agent_image, overlay_image
 
     async def status_by_id(self, sandbox_id: str) -> str:
         await self._ensure_clients()

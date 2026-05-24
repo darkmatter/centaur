@@ -103,15 +103,30 @@ accordingly. See [Security](/security) for the full threat model.
 Codex and Claude Code can use local CLI auth state instead of the API-key
 path. This is meant for deployments that need Codex subscriptions or Claude
 Code subscription/card auth. It is not automatic. Codex reconstructs its local
-auth file inside matching sandboxes; Claude Code uses a refresh token through
-[iron-proxy](https://docs.iron.sh) by default.
+auth stub inside matching sandboxes while the real auth JSON stays in
+[iron-proxy](https://docs.iron.sh); Claude Code uses a refresh token through
+[iron-proxy](https://docs.iron.sh).
 
-For local development, run:
+Run bootstrap from the host shell, not inside a restricted sandbox. On macOS,
+`auth:bootstrap` reads the Claude Code credential from Keychain, which is not
+available inside sandbox pods.
+
+For local development:
 
 ```bash
 bun run auth:bootstrap
 source .env.local
 just bootstrap-secrets
+```
+
+This imports `CODEX_AUTH_JSON` from `~/.codex/auth.json` into `.env.local`, and
+imports `CLAUDE_CODE_OAUTH_CLIENT_ID`, `CLAUDE_CODE_OAUTH_REFRESH_TOKEN`, and
+`CLAUDE_CODE_OAUTH_SCOPES` for `centaur-harness-auth` / proxy rendering. Store
+the Codex `CODEX_AUTH_JSON` value in the configured 1Password field used by
+iron-proxy writeback, usually:
+
+```text
+op://ai-agents/CODEX_AUTH_JSON/credential
 ```
 
 If local auth is missing, `auth:bootstrap` prints the exact login command. To
@@ -143,8 +158,14 @@ Then enable only the providers you intend to use:
 sandbox:
   extraEnv:
     CODEX_USE_LOCAL_AUTH: "true"
+    CODEX_AUTH_JSON_SECRET_REF: "CODEX_AUTH_JSON"
     CLAUDE_USE_LOCAL_AUTH: "true"
+    CLAUDE_CODE_OAUTH_SCOPES: "user:file_upload user:inference user:mcp_servers user:profile user:sessions:claude_code"
 ```
+
+If the Codex auth JSON lives at a full 1Password ref, set
+`CODEX_AUTH_JSON_SECRET_REF` to that ref instead, for example
+`op://ai-agents/CODEX_AUTH_JSON/credential`.
 
 The Kubernetes sandbox backend scopes auth payloads by engine: Codex auth stays
 in iron-proxy, Claude proxy pods receive only Claude OAuth material, and Amp
@@ -154,6 +175,10 @@ imports that Secret with `envFrom`.
 Claude Code subscription credentials contain a rotating refresh token, so they
 are best treated as a narrow opt-in path rather than fleet auth. Prefer Console
 API keys, `ANTHROPIC_AUTH_TOKEN`, or an auth helper/gateway for concurrent pods.
+Do not use a static `CLAUDE_CODE_OAUTH_ACCESS_TOKEN` as the durable path; it
+expires and can produce `401 Invalid authentication credentials`. If Claude
+returns `invalid_grant`, refresh local Claude auth on the host and rerun
+`bun run auth:bootstrap`.
 
 ## 4. Configure Slack
 

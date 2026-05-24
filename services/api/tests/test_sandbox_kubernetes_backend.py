@@ -333,6 +333,31 @@ def test_harness_proxy_auth_secrets_are_engine_scoped(
     assert _harness_proxy_auth_secrets("amp") == []
 
 
+def test_harness_codex_auth_ref_uses_sandbox_extra_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from api.sandbox.kubernetes import _harness_codex_auth_json_secret_ref
+
+    monkeypatch.setenv("CODEX_USE_LOCAL_AUTH", "true")
+    monkeypatch.setenv("CODEX_AUTH_JSON_SECRET_REF", "process-ref")
+    monkeypatch.setenv(
+        "KUBERNETES_SANDBOX_EXTRA_ENV",
+        json.dumps(
+            [
+                {
+                    "name": "CODEX_AUTH_JSON_SECRET_REF",
+                    "value": "op://ai-agents/CODEX_AUTH_JSON/credential",
+                }
+            ]
+        ),
+    )
+
+    assert (
+        _harness_codex_auth_json_secret_ref("codex")
+        == "op://ai-agents/CODEX_AUTH_JSON/credential"
+    )
+
+
 def test_harness_proxy_auth_secrets_uses_configured_claude_scopes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

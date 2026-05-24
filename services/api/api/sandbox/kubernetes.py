@@ -80,7 +80,7 @@ def _harness_uses_proxy_auth(engine: str) -> bool:
 
 
 def _codex_auth_json_secret_ref() -> str:
-    return (os.getenv("CODEX_AUTH_JSON_SECRET_REF") or "CODEX_AUTH_JSON").strip()
+    return (sandbox_env_value("CODEX_AUTH_JSON_SECRET_REF") or "CODEX_AUTH_JSON").strip()
 
 
 def _claude_code_oauth_scopes() -> tuple[str, ...]:

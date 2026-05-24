@@ -89,6 +89,10 @@ refresh-token fields, when present, are copied into the separate
 `centaur-harness-auth` Secret. They are not added to `centaur-infra-env`,
 which the API consumes with `envFrom`.
 
+For Codex, the default 1Password field is
+`op://ai-agents/CODEX_AUTH_JSON/credential`; set `CODEX_AUTH_JSON_SECRET_REF`
+in `sandbox.extraEnv` if your deployment uses a different item or field.
+
 Run bootstrap from the host shell, not inside a restricted sandbox. On macOS it
 reads the Claude Code credential from Keychain, which is not available inside
 sandbox pods.
@@ -111,7 +115,9 @@ Enable local auth only for deployments that need it:
 sandbox:
   extraEnv:
     CODEX_USE_LOCAL_AUTH: "true"
+    CODEX_AUTH_JSON_SECRET_REF: "CODEX_AUTH_JSON"
     CLAUDE_USE_LOCAL_AUTH: "true"
+    CLAUDE_CODE_OAUTH_SCOPES: "user:file_upload user:inference user:mcp_servers user:profile user:sessions:claude_code"
 ```
 
 The API scopes auth payloads to the matching engine: Codex auth stays in

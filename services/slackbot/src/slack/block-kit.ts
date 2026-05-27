@@ -8,6 +8,17 @@ export type SlackTaskDisplayMode = 'timeline' | 'plan' | 'dense'
 
 const MAX_BLOCKS = slackReplyLimits.message.maxBlocks
 const MAX_MARKDOWN_CHARS = slackReplyLimits.stream.markdownChunkChars
+
+// These mirror Slack's published Block Kit limits. Keep the values explicit
+// near the validator because this module guards JSON supplied to internal
+// Slackbot endpoints before it reaches Slack as chat.postMessage/chat.update
+// or chat.*Stream payloads.
+//
+// Reference:
+// - Section block: https://docs.slack.dev/reference/block-kit/blocks/section-block/
+// - Context block: https://docs.slack.dev/reference/block-kit/blocks/context-block/
+// - Markdown block: https://docs.slack.dev/reference/block-kit/blocks/markdown-block/
+// - Common block_id fields are capped at 255 chars across Block Kit blocks.
 const MAX_SECTION_TEXT_CHARS = 3_000
 const MAX_SECTION_FIELD_CHARS = 2_000
 const MAX_TEXT_OBJECT_CHARS = 3_000

@@ -782,6 +782,45 @@ describe('cluster smoke', () => {
     expect(calls[0]?.[8]).toContain(JSON.stringify({ thread_key: 'cli:test', harness: 'codex' }))
     expect(calls[0]?.[8]).not.toContain('aiv2_')
   })
+
+  it('suggests retry before logs when local smoke times out', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'centaur-cli-smoke-timeout-'))
+    const kubectl = join(root, 'kubectl')
+    writeFileSync(kubectl, `#!/bin/sh
+joined="$*"
+case "$joined" in
+  *"/agent/spawn"*) echo '{"runtime_id":"rtm-1","assignment_generation":1}' ;;
+  *"/agent/message"*) echo '{"ok":true,"message_id":"msg-1"}' ;;
+  *"/agent/execute"*) echo '{"execution_id":"exe-1","status":"queued"}' ;;
+  *"/agent/executions/exe-1"*) echo '{"status":"running","result_text":null}' ;;
+  *"/agent/threads/cli%3Acta/release"*) echo '{"ok":true,"released":true}' ;;
+  *) echo "unexpected $joined" >&2; exit 1 ;;
+esac
+`)
+    chmodSync(kubectl, 0o755)
+    const previousPath = process.env.PATH
+    process.env.PATH = `${root}:${previousPath || ''}`
+    try {
+      const { stdout, exitCode } = await runCliWithExit([
+        'smoke',
+        '--thread',
+        'cli:cta',
+        '--timeout-seconds',
+        '1',
+        '--poll-ms',
+        '1',
+        '--json',
+      ])
+      const output = JSON.parse(stdout)
+
+      expect(exitCode).toBe(1)
+      expect(output.ok).toBe(false)
+      expect(output.cta.commands[0].command).toBe('centaur smoke')
+      expect(output.cta.commands[1].command).toBe('centaur logs --component api --namespace centaur --release centaur')
+    } finally {
+      process.env.PATH = previousPath
+    }
+  })
 })
 
 describe('slackbot smoke', () => {
@@ -849,6 +888,43 @@ describe('slackbot smoke', () => {
     expect(calls[0]?.[8]).toContain('/api/webhooks/slack')
     expect(calls[0]?.[8]).toContain('Reply PONG')
     expect(calls[0]?.[8]).not.toContain('local-dev')
+  })
+
+  it('suggests retry before logs when Slackbot smoke times out', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'centaur-cli-slackbot-timeout-'))
+    const kubectl = join(root, 'kubectl')
+    writeFileSync(kubectl, `#!/bin/sh
+joined="$*"
+case "$joined" in
+  *"deploy/centaur-centaur-slackbot"*) echo '{"status":200,"text":"ok"}' ;;
+  *"/workflows/runs?thread_key=slack%3ATCLI%3ACCLI%3A1770000000.000001"*) echo '{"ok":true,"items":[]}' ;;
+  *) echo "unexpected $joined" >&2; exit 1 ;;
+esac
+`)
+    chmodSync(kubectl, 0o755)
+    const previousPath = process.env.PATH
+    process.env.PATH = `${root}:${previousPath || ''}`
+    try {
+      const { stdout, exitCode } = await runCliWithExit([
+        'slackbot',
+        'smoke',
+        '--thread-ts',
+        '1770000000.000001',
+        '--timeout-seconds',
+        '1',
+        '--poll-ms',
+        '1',
+        '--json',
+      ])
+      const output = JSON.parse(stdout)
+
+      expect(exitCode).toBe(1)
+      expect(output.ok).toBe(false)
+      expect(output.cta.commands[0].command).toBe('centaur slackbot smoke')
+      expect(output.cta.commands[1].command).toBe('centaur logs --component api --namespace centaur --release centaur')
+    } finally {
+      process.env.PATH = previousPath
+    }
   })
 })
 

@@ -544,10 +544,49 @@ function localRunVerificationCommand(
   return commandLine(parts)
 }
 
-function slackbotSmokeCommand(options: { namespace?: string; release?: string } = {}) {
+function smokeCommand(options: {
+  namespace?: string
+  release?: string
+  harness?: Harness
+  prompt?: string
+  expect?: string
+  timeoutSeconds?: number
+} = {}) {
+  const parts = ['smoke']
+  if (options.namespace && options.namespace !== 'centaur') parts.push('--namespace', options.namespace)
+  if (options.release && options.release !== 'centaur') parts.push('--release', options.release)
+  if (options.harness && options.harness !== 'codex') parts.push('--harness', options.harness)
+  if (options.prompt && options.prompt !== DEFAULT_SMOKE_PROMPT) parts.push('--prompt', options.prompt)
+  if (options.expect && options.expect !== DEFAULT_SMOKE_EXPECT) parts.push('--expect', options.expect)
+  if (options.timeoutSeconds && options.timeoutSeconds !== 300) {
+    parts.push('--timeout-seconds', String(options.timeoutSeconds))
+  }
+  return commandLine(parts)
+}
+
+function slackbotSmokeCommand(options: {
+  namespace?: string
+  release?: string
+  prompt?: string
+  expect?: string
+  teamId?: string
+  channelId?: string
+  userId?: string
+  botUserId?: string
+  timeoutSeconds?: number
+} = {}) {
   const parts = ['slackbot', 'smoke']
   if (options.namespace && options.namespace !== 'centaur') parts.push('--namespace', options.namespace)
   if (options.release && options.release !== 'centaur') parts.push('--release', options.release)
+  if (options.prompt && options.prompt !== DEFAULT_SMOKE_PROMPT) parts.push('--prompt', options.prompt)
+  if (options.expect && options.expect !== DEFAULT_SMOKE_EXPECT) parts.push('--expect', options.expect)
+  if (options.teamId && options.teamId !== 'TCLI') parts.push('--team-id', options.teamId)
+  if (options.channelId && options.channelId !== 'CCLI') parts.push('--channel-id', options.channelId)
+  if (options.userId && options.userId !== 'UCLI') parts.push('--user-id', options.userId)
+  if (options.botUserId && options.botUserId !== 'UCENTAUR') parts.push('--bot-user-id', options.botUserId)
+  if (options.timeoutSeconds && options.timeoutSeconds !== 300) {
+    parts.push('--timeout-seconds', String(options.timeoutSeconds))
+  }
   return commandLine(parts)
 }
 
@@ -2294,11 +2333,24 @@ const slackbot = Cli.create('slackbot', {
     setFailedExit(result.ok)
     return c.ok(result, {
       cta: {
-        description: result.ok ? 'Next real Slack verification step:' : 'Slackbot smoke failed; inspect these logs:',
+        description: result.ok ? 'Next real Slack verification step:' : 'Slackbot smoke failed; retry or inspect logs:',
         commands: [
           ...(result.ok
             ? []
             : [{
+                command: slackbotSmokeCommand({
+                  namespace: c.options.namespace,
+                  release: c.options.release,
+                  prompt: c.options.prompt,
+                  expect: c.options.expect,
+                  teamId: c.options.teamId,
+                  channelId: c.options.channelId,
+                  userId: c.options.userId,
+                  botUserId: c.options.botUserId,
+                  timeoutSeconds: Math.max(c.options.timeoutSeconds, 300),
+                }),
+                description: 'retry Slackbot smoke with a normal timeout',
+              }, {
                 command: commandLine([
                   'logs',
                   '--component',
@@ -2831,11 +2883,21 @@ export const app = Cli.create('centaur', {
       setFailedExit(result.ok)
       return c.ok({ ...result, slackInstruction: `Mention the Slack app in a test channel: @<bot> ${c.options.prompt}` }, {
         cta: {
-          description: result.ok ? 'Next Slack verification step:' : 'Smoke failed; inspect these logs:',
+          description: result.ok ? 'Next Slack verification step:' : 'Smoke failed; retry or inspect logs:',
           commands: [
             ...(result.ok
               ? []
               : [{
+                  command: smokeCommand({
+                    namespace: c.options.namespace,
+                    release: c.options.release,
+                    harness: c.options.harness,
+                    prompt: c.options.prompt,
+                    expect: c.options.expect,
+                    timeoutSeconds: Math.max(c.options.timeoutSeconds, 300),
+                  }),
+                  description: 'retry local agent smoke with a normal timeout',
+                }, {
                   command: commandLine([
                     'logs',
                     '--component',

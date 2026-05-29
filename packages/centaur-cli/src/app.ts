@@ -656,6 +656,14 @@ function setupPlan(options: SetupPlanOptions) {
   }
 }
 
+function setupPlanCta(plan: ReturnType<typeof setupPlan>, bin?: string) {
+  if (bin && bin !== 'centaur') return undefined
+  return {
+    description: 'Run these setup commands in order:',
+    commands: plan.commands.map(command => ({ command })),
+  }
+}
+
 function supportsBrokeredTokenStore(secretBackend: string) {
   return secretBackend === 'onepassword' || secretBackend === 'onepassword-connect'
 }
@@ -1749,7 +1757,8 @@ const integrations = Cli.create('integrations', {
       bin: z.string().default('centaur').describe('CLI executable to prefix in returned commands'),
     }),
     run(c) {
-      return setupPlan(c.options)
+      const plan = setupPlan(c.options)
+      return c.ok(plan, { cta: setupPlanCta(plan, c.options.bin) })
     },
   })
 
@@ -2159,7 +2168,8 @@ export const app = Cli.create('centaur', {
       bin: z.string().default('centaur').describe('CLI executable to prefix in returned commands'),
     }),
     run(c) {
-      return setupPlan(c.options)
+      const plan = setupPlan(c.options)
+      return c.ok(plan, { cta: setupPlanCta(plan, c.options.bin) })
     },
   })
   .command('run', {

@@ -356,6 +356,8 @@ describe('overlay scaffolding', () => {
       "centaur run 'Reply with exactly PONG and nothing else.' --local --harness codex --expect PONG --release-thread",
       'centaur slackbot smoke',
     ])
+    expect(output.cta.description).toBe('Run these setup commands in order:')
+    expect(output.cta.commands.map((command: { command: string }) => command.command)).toEqual(output.commands)
   })
 
   it('can prefix generated setup commands with the installed binary path', async () => {
@@ -369,6 +371,7 @@ describe('overlay scaffolding', () => {
     const output = JSON.parse(stdout)
     expect(output.commands).toHaveLength(7)
     expect(output.commands.every((command: string) => command.startsWith("'/tmp/Centaur CLI/centaur' "))).toBe(true)
+    expect(output.cta).toBeUndefined()
   })
 
   it('doctor warns without blocking local subscription bootstrap on read-only backends', async () => {

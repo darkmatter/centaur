@@ -31,6 +31,7 @@ export async function createPatchedSlackApi(emulator: Emulator): Promise<Patched
       if (pathname === '/api/assistant.threads.setStatus') {
         // Emulate 0.5.0 does not implement Slack assistant.threads.setStatus.
         // Remove this patch when https://emulate.dev/docs/slack lists the endpoint.
+        requests.push({ path: '/api/assistant.threads.setStatus', body: await slackBody(request) })
         return slackOk()
       }
       if (pathname === '/api/assistant.threads.setTitle') {

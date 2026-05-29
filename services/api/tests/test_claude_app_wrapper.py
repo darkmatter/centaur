@@ -205,6 +205,83 @@ def test_queued_interrupt_is_processed_while_waiting(monkeypatch) -> None:
     assert called == [True]
 
 
+def test_queued_steer_interrupts_and_runs_before_pending_input(monkeypatch) -> None:
+    wrapper = _load_wrapper()
+    sent: list[dict[str, Any]] = []
+    interrupt_emit_terminal: list[bool] = []
+    steer_input = {
+        "type": "user",
+        "steer": True,
+        "message": {
+            "role": "user",
+            "content": [{"type": "text", "text": "actually instead"}],
+        },
+    }
+
+    def fake_send(payload: dict[str, Any]) -> None:
+        sent.append(payload)
+        if len(sent) == 1:
+            wrapper.INPUTS.put(
+                {
+                    "type": "user",
+                    "message": {
+                        "role": "user",
+                        "content": [{"type": "text", "text": "queued later"}],
+                    },
+                }
+            )
+            wrapper.INPUTS.put(steer_input)
+            return
+        wrapper.TURN_DONE.set()
+
+    def fake_interrupt(*_args: object, emit_terminal: bool = True) -> None:
+        interrupt_emit_terminal.append(emit_terminal)
+        wrapper.TURN_DONE.set()
+
+    monkeypatch.setattr(wrapper, "send_to_claude", fake_send)
+    monkeypatch.setattr(wrapper, "interrupt_active_turn", fake_interrupt)
+
+    wrapper.handle_input(
+        {
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": [{"type": "text", "text": "long task"}],
+            },
+        }
+    )
+
+    assert interrupt_emit_terminal == [False]
+    next_item = wrapper.next_input()
+    assert next_item is steer_input
+    wrapper.handle_input(next_item)
+    assert sent[-1]["message"]["content"] == [
+        {"type": "text", "text": "actually instead"}
+    ]
+
+
+def test_steer_interrupt_does_not_emit_terminal_result(monkeypatch) -> None:
+    wrapper = _load_wrapper()
+    emitted: list[dict[str, Any]] = []
+
+    class FakeApp:
+        pid = os.getpid()
+
+        def poll(self) -> None:
+            return None
+
+    monkeypatch.setattr(wrapper, "APP", FakeApp())
+    monkeypatch.setattr(wrapper, "emit", lambda payload: emitted.append(payload))
+    monkeypatch.setattr(wrapper.os, "killpg", lambda *_args: None)
+    monkeypatch.setattr(wrapper.os, "getpgid", lambda pid: pid)
+
+    wrapper.TURN_DONE.clear()
+    wrapper.interrupt_active_turn(emit_terminal=False)
+
+    assert wrapper.TURN_DONE.is_set()
+    assert emitted == []
+
+
 def test_interrupt_emits_terminal_result(monkeypatch) -> None:
     wrapper = _load_wrapper()
     emitted: list[dict[str, Any]] = []

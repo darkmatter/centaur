@@ -350,6 +350,9 @@ describe(`Slack Emulate E2E (${IMPLEMENTATION})`, () => {
 
     expect(centaur.chatStreams).toEqual(['exe-wfr-1'])
     expect(centaur.delivered).toEqual(['exe-wfr-1'])
+    expect(
+      patchedSlack.requests.some(request => request.path === '/api/assistant.threads.setStatus')
+    ).toBe(true)
 
     const streamBodies = patchedSlack.requests
       .filter(request =>

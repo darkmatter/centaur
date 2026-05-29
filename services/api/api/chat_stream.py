@@ -10,11 +10,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+import shlex
 from typing import Any
 
 CHAT_STREAM_EVENT_KIND = "chat_stream_chunk"
 CHAT_STREAM_CHUNK_TYPES = frozenset({"markdown_text", "task_update", "plan_update"})
+DEFAULT_CLAUDE_CODE_MODEL = "claude-opus-4-8"
 
 _TERMINAL_EVENT_TYPES = frozenset(
     {"turn.done", "turn.completed", "execution_state", "result"}
@@ -96,6 +99,49 @@ def _chat_text_chunk(text: str) -> dict[str, Any] | None:
     return {"type": "markdown_text", "text": text}
 
 
+def _overlay_label(image: str | None) -> str | None:
+    if not image:
+        return None
+    tail = image.rsplit("/", 1)[-1].strip()
+    return tail or "overlay"
+
+
+def runtime_model_label(
+    *,
+    harness: str | None,
+    engine: str | None,
+    model: str | None = None,
+) -> str | None:
+    explicit = model.strip() if isinstance(model, str) else ""
+    if explicit:
+        return explicit
+    normalized = (engine or harness or "").strip().lower()
+    if normalized == "claude-code":
+        return (os.getenv("CLAUDE_MODEL") or DEFAULT_CLAUDE_CODE_MODEL).strip()
+    return None
+
+
+def runtime_header_chunk(
+    *,
+    harness: str | None,
+    engine: str | None,
+    persona_id: str | None,
+    model: str | None = None,
+    overlay_image: str | None = None,
+) -> dict[str, Any] | None:
+    """Return the compact top-of-stream runtime header for Chat SDK renderers."""
+
+    labels = [persona_id or "base", engine or harness or "unknown"]
+    model_label = runtime_model_label(harness=harness, engine=engine, model=model)
+    if model_label:
+        labels.append(model_label)
+    overlay = _overlay_label(overlay_image)
+    if overlay:
+        labels.append(overlay)
+    text = " · ".join(label for label in labels if label)
+    return _chat_text_chunk(f"_{text}_\n\n") if text else None
+
+
 def _task_update(
     *,
     task_id: str,
@@ -133,7 +179,8 @@ def _assistant_event_looks_canonical(event: dict[str, Any]) -> bool:
 
 def _tool_title(name: str, tool_input: dict[str, Any]) -> str:
     if name == "Bash":
-        return "Command execution"
+        command = _as_str(tool_input.get("command")) or _as_str(tool_input.get("cmd"))
+        return _command_title(command)
     if name == "Read":
         path = _as_str(tool_input.get("file_path")) or _as_str(tool_input.get("path"))
         return f"Read {path}" if path else "Read file"
@@ -146,8 +193,7 @@ def _tool_title(name: str, tool_input: dict[str, Any]) -> str:
 
 def _tool_start_output(name: str, tool_input: dict[str, Any]) -> str:
     if name == "Bash":
-        command = _as_str(tool_input.get("command")) or _as_str(tool_input.get("cmd"))
-        return f"```sh\n{command}\n```" if command else ""
+        return ""
     if not tool_input:
         return ""
     return f"```json\n{_format_json(tool_input)}\n```"
@@ -201,10 +247,34 @@ def _command_id(item: dict[str, Any]) -> str:
     )
 
 
+def _display_command(command: str) -> str:
+    command = command.strip()
+    if not command:
+        return ""
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        return command
+
+    if len(parts) >= 3 and parts[1] == "-lc":
+        shell = parts[0].rsplit("/", 1)[-1]
+        if shell in {"bash", "sh", "zsh"}:
+            return parts[2]
+
+    if len(parts) >= 4 and parts[0].rsplit("/", 1)[-1] == "env" and parts[2] == "-lc":
+        shell = parts[1].rsplit("/", 1)[-1]
+        if shell in {"bash", "sh", "zsh"}:
+            return parts[3]
+
+    return command
+
+
+def _command_title(command: str, fallback: str = "Command") -> str:
+    return _display_command(command) or fallback
+
+
 def _command_output(command: str, output: str, exit_code: Any = None) -> str:
     parts: list[str] = []
-    if command:
-        parts.append(f"```sh\n{command}\n```")
     if exit_code not in (None, 0, "0"):
         prefix = f"exit code {exit_code}"
         parts.append(prefix if not output else f"{prefix}\n{output}")
@@ -239,7 +309,7 @@ def _command_chunk_from_item(
     )
     return _task_update(
         task_id=_command_id(item),
-        title="Command execution",
+        title=_command_title(command),
         status=status,
         output=_command_output(
             command, output, item.get("exit_code", item.get("exitCode"))
@@ -296,6 +366,8 @@ class ChatStreamProjector:
         self._tool_titles: dict[str, str] = {}
         self._open_tasks: dict[str, str] = {}
         self._reasoning_text = ""
+        self._last_markdown_tail = ""
+        self._pending_text_separator = False
         self._agent_message_phase: str | None = None
         self._agent_message_phase_by_id: dict[str, str] = {}
         self._agent_text_by_id: dict[str, str] = {}
@@ -350,7 +422,12 @@ class ChatStreamProjector:
         if event_type in _TERMINAL_EVENT_TYPES:
             chunks.extend(self._project_terminal(event))
 
-        return [chunk for chunk in chunks if self.is_chat_stream_chunk(chunk)]
+        normalized: list[dict[str, Any]] = []
+        for chunk in chunks:
+            prepared = self._prepare_chunk(chunk)
+            if prepared and self.is_chat_stream_chunk(prepared):
+                normalized.append(prepared)
+        return normalized
 
     @staticmethod
     def is_chat_stream_chunk(chunk: dict[str, Any]) -> bool:
@@ -367,6 +444,28 @@ class ChatStreamProjector:
                 in {"pending", "in_progress", "complete", "error"}
             )
         return False
+
+    def _prepare_chunk(self, chunk: dict[str, Any]) -> dict[str, Any] | None:
+        chunk_type = _as_str(chunk.get("type"))
+        if chunk_type == "markdown_text":
+            text = _as_str(chunk.get("text"))
+            if not text:
+                return None
+            if (
+                self._pending_text_separator
+                and self._last_markdown_tail
+                and not self._last_markdown_tail[-1].isspace()
+                and not text[0].isspace()
+            ):
+                text = f"\n\n{text}"
+            self._pending_text_separator = False
+            self._last_markdown_tail = (self._last_markdown_tail + text)[-80:]
+            return {**chunk, "text": text}
+
+        if chunk_type in {"task_update", "plan_update"}:
+            if self._last_markdown_tail and not self._last_markdown_tail[-1].isspace():
+                self._pending_text_separator = True
+        return chunk
 
     def _project_assistant(self, event: dict[str, Any]) -> list[dict[str, Any]]:
         chunks: list[dict[str, Any]] = []
@@ -445,7 +544,7 @@ class ChatStreamProjector:
         self._open_tasks.pop(task_id, None)
         return _task_update(
             task_id=task_id,
-            title="Command execution",
+            title=_command_title(command),
             status=status,
             output=_command_output(
                 command, _as_str(event.get("aggregated_output")), exit_code
@@ -546,8 +645,9 @@ class ChatStreamProjector:
 
         if item_type in {"commandExecution", "command_execution"}:
             command_id = _command_id(item)
+            title = _command_title(_as_str(item.get("command")))
             if event_type != "item.completed":
-                self._open_tasks[command_id] = "Command execution"
+                self._open_tasks[command_id] = title
             else:
                 self._open_tasks.pop(command_id, None)
             chunks.append(_command_chunk_from_item(item, event_type=event_type))
@@ -648,10 +748,11 @@ class ChatStreamProjector:
             return None
         output = self._command_output_by_id.get(command_id, "") + delta
         self._command_output_by_id[command_id] = output
-        self._open_tasks[command_id] = "Command execution"
+        title = self._open_tasks.get(command_id, "Command output")
+        self._open_tasks[command_id] = title
         return _task_update(
             task_id=command_id,
-            title="Command execution",
+            title=title,
             status="in_progress",
             output=output,
         )

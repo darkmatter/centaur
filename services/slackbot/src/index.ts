@@ -15,7 +15,11 @@ import { showRoutes } from 'hono/dev'
 import { timeout } from 'hono/timeout'
 import { requestId } from 'hono/request-id'
 import { prettyJSON } from 'hono/pretty-json'
-import { renderWorkflowRunWithChatSdk, workflowRunIdFromBody } from './centaur/chat-sdk-renderer'
+import {
+  renderWorkflowRunWithChatSdk,
+  steeredExecutionIdFromBody,
+  workflowRunIdFromBody
+} from './centaur/chat-sdk-renderer'
 import { CentaurHandoff } from './centaur/handoff'
 import { loadConfig } from './config'
 import { logError, logInfo, logWarn } from './logging'
@@ -151,6 +155,8 @@ async function handleSlackTurn(thread: Thread, message: Message): Promise<void> 
         return
       }
 
+      void startThreadTyping(thread)
+
       const { event: normalized, result } = await handoff.emitChatMessage({
         thread,
         message,
@@ -174,6 +180,15 @@ async function handleSlackTurn(thread: Thread, message: Message): Promise<void> 
         throw new Error(`Centaur Slack handoff failed: ${result.status}`)
       }
 
+      const steeredExecutionId = steeredExecutionIdFromBody(result.body)
+      if (steeredExecutionId) {
+        logInfo('centaur_slack_handoff_steered_existing_stream', {
+          thread_key: normalized.thread_key,
+          execution_id: steeredExecutionId
+        })
+        return
+      }
+
       const runId = workflowRunIdFromBody(result.body)
       if (!runId) {
         logWarn('centaur_slack_handoff_missing_run_id', {
@@ -189,10 +204,22 @@ async function handleSlackTurn(thread: Thread, message: Message): Promise<void> 
         adapter: slackAdapter,
         fallbackThreadId: `slack:${normalized.channel_id}:${normalized.thread_ts}`,
         fallbackRecipientUserId: normalized.user_id,
-        fallbackRecipientTeamId: normalized.recipient_team_id ?? normalized.team_id
+        fallbackRecipientTeamId: normalized.recipient_team_id ?? normalized.team_id,
+        skipInitialTyping: true
       })
     }
   )
+}
+
+async function startThreadTyping(thread: Thread): Promise<void> {
+  try {
+    await thread.startTyping('Working...')
+  } catch (error) {
+    logWarn('slack_start_typing_failed', {
+      thread_id: thread.id,
+      error: error instanceof Error ? error.message : String(error)
+    })
+  }
 }
 
 async function handleFeedbackCommand(event: SlashCommandEvent): Promise<void> {

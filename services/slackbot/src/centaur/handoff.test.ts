@@ -1,5 +1,5 @@
 import { describe, expect, it, mock } from 'bun:test'
-import { CentaurHandoff, type NormalizedSlackEvent } from './handoff'
+import { CentaurHandoff, slackEventFromChatMessage, type NormalizedSlackEvent } from './handoff'
 import type { AppConfig } from '../config'
 
 const config: AppConfig = {
@@ -176,4 +176,137 @@ describe('CentaurHandoff', () => {
       globalThis.fetch = originalFetch
     }
   })
+
+  it('steers a running execution instead of starting a queued workflow run', async () => {
+    const originalFetch = globalThis.fetch
+    const calls: Array<{ path: string; init?: RequestInit; body?: unknown }> = []
+    const fetchMock = mock(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = new URL(String(input))
+      const body = typeof init?.body === 'string' ? JSON.parse(init.body) : undefined
+      calls.push({ path: url.pathname, init, body })
+      if (url.pathname.endsWith('/executions')) {
+        return new Response(
+          JSON.stringify({
+            thread_key: 'slack:T123:C123:1778883099.579529',
+            executions: [{ execution_id: 'exe-running', status: 'running' }]
+          }),
+          { status: 200 }
+        )
+      }
+      if (url.pathname.endsWith('/steer')) {
+        return new Response(JSON.stringify({ ok: true, status: 'steered' }), { status: 200 })
+      }
+      return new Response(JSON.stringify({ ok: false, error: 'unexpected' }), { status: 500 })
+    })
+    globalThis.fetch = fetchMock as any
+    try {
+      const handoff = new CentaurHandoff({ ...config, CENTAUR_API_KEY: 'aiv2_test' })
+      const event: NormalizedSlackEvent = {
+        thread_key: 'slack:T123:C123:1778883099.579529',
+        message_id: 'slack:T123:C123:1778883111.000000',
+        team_id: 'T123',
+        user_id: 'U123',
+        channel_id: 'C123',
+        thread_ts: '1778883099.579529',
+        is_mention: true,
+        parts: [{ type: 'text', text: 'actually do this instead' }],
+        slack: {
+          event_ts: '1778883111.000000',
+          message_ts: '1778883111.000000'
+        }
+      }
+
+      const result = await handoff.emit(event)
+
+      expect(result.ok).toBe(true)
+      expect(result.body).toMatchObject({
+        steered: true,
+        execution_id: 'exe-running',
+        status: 'steered'
+      })
+      expect(calls.map(call => call.path)).toEqual([
+        '/agent/threads/slack%3AT123%3AC123%3A1778883099.579529/executions',
+        '/agent/executions/exe-running/steer'
+      ])
+      expect(calls[1]?.body).toMatchObject({
+        content_blocks: [{ type: 'text', text: 'actually do this instead' }],
+        message_id: event.message_id,
+        user_id: 'U123',
+        metadata: {
+          source: 'slackbot',
+          steer_replacement: true
+        }
+      })
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  })
+
+  it('fetches bounded recent Slack history instead of paginating the whole thread', async () => {
+    const messages = [
+      slackMessage('1778883099.579529', 'Original request', 'U123'),
+      slackMessage('1778883100.000000', 'Assistant context', 'UBOT', true),
+      slackMessage('1778883110.000000', 'Prior clarification', 'U123'),
+      slackMessage('1778883111.000000', '<@UBOT> retry', 'U123'),
+      slackMessage('1778883112.000000', 'Newer message', 'U123')
+    ]
+    const fetchMessages = mock(async (_threadId: string, options: Record<string, unknown>) => {
+      expect(options).toMatchObject({
+        limit: 21,
+        direction: 'backward'
+      })
+      return { messages, nextCursor: 'cursor-that-should-not-be-followed' }
+    })
+    const thread: any = {
+      id: 'slack:C123:1778883099.579529',
+      isDM: false,
+      adapter: { fetchMessages }
+    }
+    Object.defineProperty(thread, 'allMessages', {
+      get() {
+        throw new Error('allMessages should not be used for Slack handoff history')
+      }
+    })
+
+    const event = await slackEventFromChatMessage({
+      thread,
+      message: messages[3],
+      botUserId: 'UBOT'
+    } as any)
+
+    expect(fetchMessages).toHaveBeenCalledTimes(1)
+    expect(
+      event.history_messages?.map(item =>
+        item.parts[0]?.type === 'text' ? item.parts[0].text : undefined
+      )
+    ).toEqual([
+      'Original request',
+      'Assistant context',
+      'Prior clarification'
+    ])
+  })
 })
+
+function slackMessage(ts: string, text: string, user: string, isMe = false): any {
+  return {
+    id: ts,
+    text,
+    raw: {
+      type: 'message',
+      team: 'T123',
+      channel: 'C123',
+      ts,
+      thread_ts: '1778883099.579529',
+      text,
+      user
+    },
+    author: {
+      userId: user,
+      userName: user,
+      fullName: user,
+      isBot: isMe,
+      isMe
+    },
+    attachments: []
+  }
+}

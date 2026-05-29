@@ -519,11 +519,13 @@ async def test_direct_agent_chat_stream_context_returns_chat_sdk_stream_options(
     )
 
     assert response.status_code == 200
-    assert response.json() == {
+    body = response.json()
+    assert body == {
         "execution_id": execution_id,
         "thread_key": thread_key,
         "platform": "slack",
         "thread_id": "slack:C123:1780000000.123456",
+        "runtime": body["runtime"],
         "stream_options": {
             "recipientUserId": "U123",
             "recipientTeamId": "T123",
@@ -535,4 +537,21 @@ async def test_direct_agent_chat_stream_context_returns_chat_sdk_stream_options(
                 }
             ],
         },
+    }
+    assert body["runtime"] == {
+        "harness": "amp",
+        "engine": "amp",
+        "persona_id": None,
+        "persona": None,
+        "model": None,
+        "prompt_ref": "harness:amp",
+        "effective_agents_md_sha256": body["runtime"]["effective_agents_md_sha256"],
+        "overlay": body["runtime"]["overlay"],
+    }
+    assert isinstance(body["runtime"]["effective_agents_md_sha256"], str)
+    assert body["runtime"]["overlay"].keys() == {
+        "loaded",
+        "mount_api",
+        "mount_sandbox",
+        "image",
     }

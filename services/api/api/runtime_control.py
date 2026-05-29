@@ -24,7 +24,11 @@ from api.agent import (
     steer_stdin,
     stop_session,
 )
-from api.chat_stream import CHAT_STREAM_EVENT_KIND, ChatStreamProjector
+from api.chat_stream import (
+    CHAT_STREAM_EVENT_KIND,
+    ChatStreamProjector,
+    runtime_header_chunk,
+)
 from api.harness_config import default_harness
 from api.otel import (
     add_span_event,
@@ -2675,6 +2679,22 @@ async def _process_execution_impl(pool, row: dict[str, Any]) -> None:
         event_kind="execution_started",
         event_json=execution_started_payload,
     )
+    if _delivery_platform(delivery) == "slack":
+        header_chunk = runtime_header_chunk(
+            harness=harness,
+            engine=engine,
+            persona_id=persona_id,
+            model=str(execution_metadata.get("model") or "") or None,
+            overlay_image=(os.getenv("CENTAUR_OVERLAY_IMAGE") or "").strip() or None,
+        )
+        if header_chunk:
+            await append_execution_event(
+                pool,
+                thread_key=thread_key,
+                execution_id=execution_id,
+                event_kind=CHAT_STREAM_EVENT_KIND,
+                event_json=header_chunk,
+            )
     execution_trace_metadata = _execution_laminar_metadata(
         thread_key=thread_key,
         execution_id=execution_id,

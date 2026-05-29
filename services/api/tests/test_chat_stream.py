@@ -2,6 +2,7 @@ from api.chat_stream import (
     CHAT_STREAM_CHUNK_TYPES,
     CHAT_STREAM_EVENT_KIND,
     ChatStreamProjector,
+    runtime_header_chunk,
 )
 
 
@@ -72,14 +73,13 @@ def test_projector_emits_chat_sdk_chunks_for_amp_like_tool_and_text_flow():
         {
             "type": "task_update",
             "id": "toolu_1",
-            "title": "Command execution",
+            "title": "uv run pytest services/api/tests/test_chat_stream.py",
             "status": "in_progress",
-            "output": "```sh\nuv run pytest services/api/tests/test_chat_stream.py\n```",
         },
         {
             "type": "task_update",
             "id": "toolu_1",
-            "title": "Command execution",
+            "title": "uv run pytest services/api/tests/test_chat_stream.py",
             "status": "complete",
             "output": "1 passed",
         },
@@ -277,6 +277,86 @@ def test_projector_preserves_markdown_links_for_chat_sdk_slack_streaming():
     ]
 
 
+def test_projector_separates_text_after_structured_progress():
+    chunks = _project(
+        {
+            "type": "assistant",
+            "message": {"content": [{"type": "text", "text": "Checking."}]},
+        },
+        {
+            "type": "assistant",
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "tool-1",
+                        "name": "Bash",
+                        "input": {"command": "true"},
+                    }
+                ]
+            },
+        },
+        {
+            "type": "assistant",
+            "message": {"content": [{"type": "text", "text": "Done."}]},
+        },
+    )
+
+    assert chunks[-1] == {"type": "markdown_text", "text": "\n\nDone."}
+
+
+def test_projector_uses_visible_command_title_without_markdown_ticks():
+    chunks = _project(
+        {
+            "type": "item.completed",
+            "item": {
+                "id": "cmd-call",
+                "type": "commandExecution",
+                "command": '/bin/bash -lc "call kalshi list_events --limit 2"',
+                "status": "completed",
+                "exit_code": 0,
+                "aggregated_output": '{"events":[]}',
+            },
+        },
+    )
+
+    assert chunks == [
+        {
+            "type": "task_update",
+            "id": "cmd-call",
+            "title": "call kalshi list_events --limit 2",
+            "status": "complete",
+            "output": '{"events":[]}',
+        },
+    ]
+
+
+def test_runtime_header_chunk_keeps_metadata_at_top_as_markdown():
+    assert runtime_header_chunk(
+        harness="claude-code",
+        engine="claude-code",
+        persona_id=None,
+        model="claude-opus-4-8",
+        overlay_image="ghcr.io/tempoxyz/centaur-tempo:sha-3ce166a",
+    ) == {
+        "type": "markdown_text",
+        "text": "_base · claude-code · claude-opus-4-8 · centaur-tempo:sha-3ce166a_\n\n",
+    }
+
+
+def test_runtime_header_chunk_infers_claude_code_default_model(monkeypatch):
+    monkeypatch.delenv("CLAUDE_MODEL", raising=False)
+
+    assert runtime_header_chunk(
+        harness="claude-code",
+        engine="claude-code",
+        persona_id=None,
+    ) == {
+        "type": "markdown_text",
+        "text": "_base · claude-code · claude-opus-4-8_\n\n",
+    }
+
+
 def test_projector_emits_slack_task_update_errors_for_failed_work():
     chunks = _project(
         {
@@ -314,9 +394,9 @@ def test_projector_emits_slack_task_update_errors_for_failed_work():
         {
             "type": "task_update",
             "id": "cmd-1",
-            "title": "Command execution",
+            "title": "false",
             "status": "error",
-            "output": "```sh\nfalse\n```\n\nexit code 1\nfailed",
+            "output": "exit code 1\nfailed",
         },
         {
             "type": "task_update",

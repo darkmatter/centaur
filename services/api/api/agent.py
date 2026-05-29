@@ -1556,8 +1556,8 @@ async def steer_stdin(
     """Inject a steer message into a running sandbox's stdin.
 
     Unlike inject_stdin(), this does NOT start a new turn or reset turn counters.
-    The steer message tells Amp to cancel the current tool call and process
-    the new message instead, preserving conversation context.
+    The steer message tells the harness adapter to interrupt or steer the
+    active turn and process the new message instead, preserving context.
     """
     turn_input = build_user_input(
         content_blocks,

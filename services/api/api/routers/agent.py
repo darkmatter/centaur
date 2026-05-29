@@ -17,7 +17,7 @@ from sse_starlette import EventSourceResponse, ServerSentEvent
 
 from pydantic import BaseModel
 
-from api.chat_stream import CHAT_STREAM_EVENT_KIND
+from api.chat_stream import CHAT_STREAM_EVENT_KIND, runtime_model_label
 from api.agent import (
     get_status,
     stop_session,
@@ -823,6 +823,7 @@ def _chat_sdk_stream_context_payload(
     thread_key: str,
     delivery: dict[str, Any],
     metadata: dict[str, Any],
+    assignment: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     platform = str(delivery.get("platform") or metadata.get("platform") or "")
     channel = delivery.get("channel")
@@ -850,13 +851,38 @@ def _chat_sdk_stream_context_payload(
     if isinstance(stop_blocks, list):
         stream_options["stopBlocks"] = stop_blocks
 
-    return {
+    runtime: dict[str, Any] | None = None
+    if assignment:
+        persona_id = assignment.get("persona_id")
+        runtime = {
+            "harness": assignment.get("harness"),
+            "engine": assignment.get("engine"),
+            "persona_id": persona_id,
+            "persona": _persona_payload(str(persona_id) if persona_id else None),
+            "model": runtime_model_label(
+                harness=assignment.get("harness")
+                if isinstance(assignment.get("harness"), str)
+                else None,
+                engine=assignment.get("engine")
+                if isinstance(assignment.get("engine"), str)
+                else None,
+                model=metadata.get("model") if isinstance(metadata.get("model"), str) else None,
+            ),
+            "prompt_ref": assignment.get("prompt_ref"),
+            "effective_agents_md_sha256": assignment.get("effective_agents_md_sha256"),
+            "overlay": _overlay_runtime_payload(),
+        }
+
+    payload = {
         "execution_id": execution_id,
         "thread_key": thread_key,
         "platform": platform or None,
         "thread_id": thread_id,
         "stream_options": stream_options,
     }
+    if runtime:
+        payload["runtime"] = runtime
+    return payload
 
 
 @router.get(
@@ -867,8 +893,13 @@ async def execution_chat_stream_context(request: Request, execution_id: str):
     """Return Chat SDK-ready thread id and stream options for one execution."""
     pool = request.app.state.db_pool
     row = await pool.fetchrow(
-        "SELECT thread_key, delivery, metadata FROM agent_execution_requests "
-        "WHERE execution_id = $1",
+        "SELECT e.thread_key, e.delivery, e.metadata, "
+        "a.harness, a.engine, a.persona_id, a.prompt_ref, a.effective_agents_md_sha256 "
+        "FROM agent_execution_requests e "
+        "LEFT JOIN agent_runtime_assignments a "
+        "  ON a.thread_key = e.thread_key "
+        " AND a.assignment_generation = e.assignment_generation "
+        "WHERE e.execution_id = $1",
         execution_id,
     )
     if not row:
@@ -880,6 +911,13 @@ async def execution_chat_stream_context(request: Request, execution_id: str):
         thread_key=thread_key,
         delivery=_json_dict(row["delivery"]),
         metadata=_json_dict(row["metadata"]),
+        assignment={
+            "harness": row["harness"],
+            "engine": row["engine"],
+            "persona_id": row["persona_id"],
+            "prompt_ref": row["prompt_ref"],
+            "effective_agents_md_sha256": row["effective_agents_md_sha256"],
+        },
     )
 
 

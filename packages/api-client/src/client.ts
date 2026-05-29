@@ -130,6 +130,16 @@ export interface ChatStreamContext {
   thread_key: string;
   platform?: string | null;
   thread_id?: string | null;
+  runtime?: {
+    harness?: string | null;
+    engine?: string | null;
+    persona_id?: string | null;
+    persona?: Record<string, unknown> | null;
+    model?: string | null;
+    prompt_ref?: string | null;
+    effective_agents_md_sha256?: string | null;
+    overlay?: Record<string, unknown> | null;
+  };
   stream_options: {
     recipientUserId?: string;
     recipientTeamId?: string;

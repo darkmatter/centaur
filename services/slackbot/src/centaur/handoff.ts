@@ -1,9 +1,14 @@
 import { Buffer } from 'node:buffer'
 import type { Attachment, Message, Thread } from 'chat'
 import { centaurApiKey, type AppConfig } from '../config'
+import { logInfo, logWarn } from '../logging'
 import { clientSpanOptions, injectTraceHeaders, spanAttributes, withSpan } from '../otel'
 
 const HISTORY_LIMIT = 20
+const PROMPT_SELECTOR_RE = /(^|\s)`?--[a-z][a-z0-9-]*(?=\s|`|$)/i
+const INTERRUPTIBLE_EXECUTION_STATUSES = new Set(['running'])
+const REPLACEABLE_EXECUTION_STATUSES = new Set(['queued', 'retry_wait'])
+const STEER_ACCEPTED_STATUSES = new Set(['running', 'steered'])
 
 export type NormalizedTextPart = {
   type: 'text'
@@ -61,6 +66,21 @@ export type ChatSdkSlackMessageInput = {
   botUserId?: string
 }
 
+type WorkflowRunRequestBody = {
+  workflow_name: 'slack_thread_turn'
+  trigger_key: string
+  eager_start: true
+  input: {
+    thread_key: string
+    parts: NormalizedPart[]
+    history_messages: NonNullable<NormalizedSlackEvent['history_messages']>
+    message_id: string
+    user_id: string
+    metadata: Record<string, unknown>
+    delivery: Record<string, unknown>
+  }
+}
+
 export type CentaurHandoffResult =
   | { ok: true; status: number; body: unknown }
   | { ok: false; status: number; body: unknown }
@@ -84,6 +104,20 @@ export class CentaurHandoff {
         'slack.user_id': event.user_id
       }),
       async span => {
+        const requestBody = workflowRunRequestBody(event)
+        const steerResult = await this.trySteerActiveExecution(
+          event,
+          requestBody.input.metadata as Record<string, unknown>
+        )
+        if (steerResult) {
+          spanAttributes(span, {
+            'http.response.status_code': steerResult.status,
+            'centaur.handoff.ok': steerResult.ok,
+            'centaur.handoff.steered': true
+          })
+          return steerResult
+        }
+
         const url = new URL('/workflows/runs', this.config.CENTAUR_API_URL)
         const apiKey = centaurApiKey(this.config)
         const response = await fetch(url, {
@@ -94,38 +128,7 @@ export class CentaurHandoff {
             ...injectTraceHeaders(),
             ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {})
           },
-          body: JSON.stringify({
-            workflow_name: 'slack_thread_turn',
-            trigger_key: event.message_id,
-            eager_start: true,
-            input: {
-              thread_key: event.thread_key,
-              parts: event.parts,
-              history_messages: event.history_messages ?? [],
-              message_id: event.message_id,
-              user_id: event.user_id,
-              metadata: {
-                source: 'slackbot',
-                slack: {
-                  message_ts: event.slack.message_ts,
-                  enterprise_id: event.slack.enterprise_id,
-                  user_team: event.slack.user_team,
-                  source_team: event.slack.source_team,
-                  bot_id: event.slack.bot_id,
-                  app_id: event.slack.app_id,
-                  bot_user_id: event.slack.bot_user_id
-                },
-                is_mention: event.is_mention
-              },
-              delivery: {
-                platform: 'slack',
-                channel: event.channel_id,
-                thread_ts: event.thread_ts,
-                recipient_user_id: event.user_id,
-                recipient_team_id: event.recipient_team_id ?? event.team_id
-              }
-            }
-          })
+          body: JSON.stringify(requestBody)
         })
 
         spanAttributes(span, {
@@ -138,6 +141,106 @@ export class CentaurHandoff {
     )
   }
 
+  private async trySteerActiveExecution(
+    event: NormalizedSlackEvent,
+    metadata: Record<string, unknown>
+  ): Promise<CentaurHandoffResult | null> {
+    if (hasPromptSelector(event.parts)) return null
+    const apiKey = centaurApiKey(this.config)
+    if (!apiKey) return null
+
+    try {
+      const executionsUrl = new URL(
+        `/agent/threads/${encodeURIComponent(event.thread_key)}/executions`,
+        this.config.CENTAUR_API_URL
+      )
+      executionsUrl.searchParams.set('limit', '10')
+      const executionsResponse = await fetch(executionsUrl, {
+        headers: authHeaders(apiKey)
+      })
+      if (!executionsResponse.ok) return null
+      const executionsBody = await readResponseBody(executionsResponse)
+      const executions = Array.isArray(recordValue(executionsBody).executions)
+        ? (recordValue(executionsBody).executions as Array<Record<string, unknown>>)
+        : []
+
+      const running = executions.find(execution =>
+        INTERRUPTIBLE_EXECUTION_STATUSES.has(stringField(execution.status) ?? '')
+      )
+      if (running) {
+        const executionId = stringField(running.execution_id)
+        if (!executionId) return null
+        const steerUrl = new URL(
+          `/agent/executions/${encodeURIComponent(executionId)}/steer`,
+          this.config.CENTAUR_API_URL
+        )
+        const steerResponse = await fetch(steerUrl, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            ...authHeaders(apiKey)
+          },
+          body: JSON.stringify({
+            content_blocks: event.parts,
+            message_id: event.message_id,
+            user_id: event.user_id,
+            metadata: {
+              ...metadata,
+              steer_replacement: true
+            }
+          })
+        })
+        const body = await readResponseBody(steerResponse)
+        const steerStatus = stringField(recordValue(body).status)
+        if (steerResponse.ok && STEER_ACCEPTED_STATUSES.has(steerStatus ?? '')) {
+          logInfo('centaur_slack_handoff_steered_execution', {
+            thread_key: event.thread_key,
+            execution_id: executionId,
+            message_id: event.message_id,
+            status: steerStatus
+          })
+          return {
+            ok: true,
+            status: steerResponse.status,
+            body: {
+              ...recordValue(body),
+              steered: true,
+              execution_id: executionId
+            }
+          }
+        }
+        logWarn('centaur_slack_handoff_steer_not_running', {
+          thread_key: event.thread_key,
+          execution_id: executionId,
+          status: steerStatus,
+          response_status: steerResponse.status
+        })
+        return null
+      }
+
+      for (const execution of executions) {
+        const status = stringField(execution.status) ?? ''
+        if (!REPLACEABLE_EXECUTION_STATUSES.has(status)) continue
+        const executionId = stringField(execution.execution_id)
+        if (!executionId) continue
+        const cancelUrl = new URL(
+          `/agent/executions/${encodeURIComponent(executionId)}/cancel`,
+          this.config.CENTAUR_API_URL
+        )
+        await fetch(cancelUrl, {
+          method: 'POST',
+          headers: authHeaders(apiKey)
+        })
+      }
+    } catch (error) {
+      logWarn('centaur_slack_handoff_steer_lookup_failed', {
+        thread_key: event.thread_key,
+        error: error instanceof Error ? error.message : String(error)
+      })
+    }
+    return null
+  }
+
   async emitChatMessage(input: ChatSdkSlackMessageInput): Promise<{
     event: NormalizedSlackEvent
     result: CentaurHandoffResult
@@ -146,6 +249,49 @@ export class CentaurHandoff {
     const result = await this.emit(event)
     return { event, result }
   }
+}
+
+function workflowRunRequestBody(event: NormalizedSlackEvent): WorkflowRunRequestBody {
+  return {
+    workflow_name: 'slack_thread_turn',
+    trigger_key: event.message_id,
+    eager_start: true,
+    input: {
+      thread_key: event.thread_key,
+      parts: event.parts,
+      history_messages: event.history_messages ?? [],
+      message_id: event.message_id,
+      user_id: event.user_id,
+      metadata: {
+        source: 'slackbot',
+        slack: {
+          message_ts: event.slack.message_ts,
+          enterprise_id: event.slack.enterprise_id,
+          user_team: event.slack.user_team,
+          source_team: event.slack.source_team,
+          bot_id: event.slack.bot_id,
+          app_id: event.slack.app_id,
+          bot_user_id: event.slack.bot_user_id
+        },
+        is_mention: event.is_mention
+      },
+      delivery: {
+        platform: 'slack',
+        channel: event.channel_id,
+        thread_ts: event.thread_ts,
+        recipient_user_id: event.user_id,
+        recipient_team_id: event.recipient_team_id ?? event.team_id
+      }
+    }
+  }
+}
+
+function hasPromptSelector(parts: NormalizedPart[]): boolean {
+  return parts.some(part => part.type === 'text' && PROMPT_SELECTOR_RE.test(part.text))
+}
+
+function authHeaders(apiKey: string): Record<string, string> {
+  return { Authorization: `Bearer ${apiKey}` }
 }
 
 export async function slackEventFromChatMessage(
@@ -202,7 +348,11 @@ async function historyFromThread(
   const currentTs = numericSlackTs(input.message.id)
   const collected: NonNullable<NormalizedSlackEvent['history_messages']> = []
   try {
-    for await (const message of input.thread.allMessages) {
+    const result = await input.thread.adapter.fetchMessages(input.thread.id, {
+      limit: HISTORY_LIMIT + 1,
+      direction: 'backward'
+    })
+    for (const message of result.messages) {
       if (message.id === input.message.id) continue
       if (currentTs && numericSlackTs(message.id) && numericSlackTs(message.id)! > currentTs)
         continue

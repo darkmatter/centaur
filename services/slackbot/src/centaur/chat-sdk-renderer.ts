@@ -1,4 +1,8 @@
-import { CentaurClient, type WorkflowRunAccepted } from '@centaur/api-client'
+import {
+  CentaurClient,
+  type ChatStreamChunk,
+  type WorkflowRunAccepted
+} from '@centaur/api-client'
 import type { SlackAdapter } from '@chat-adapter/slack'
 import type { StreamOptions } from 'chat'
 import { centaurApiKey, type AppConfig } from '../config'
@@ -14,12 +18,21 @@ export type ChatSdkRenderInput = {
   fallbackThreadId: string
   fallbackRecipientUserId?: string
   fallbackRecipientTeamId?: string
+  skipInitialTyping?: boolean
 }
 
 export function workflowRunIdFromBody(body: unknown): string | null {
   if (!body || typeof body !== 'object') return null
   const runId = (body as { run_id?: unknown }).run_id
   return typeof runId === 'string' && runId.trim() ? runId.trim() : null
+}
+
+export function steeredExecutionIdFromBody(body: unknown): string | null {
+  if (!body || typeof body !== 'object') return null
+  const record = body as { steered?: unknown; execution_id?: unknown }
+  if (record.steered !== true) return null
+  const executionId = record.execution_id
+  return typeof executionId === 'string' && executionId.trim() ? executionId.trim() : null
 }
 
 export async function renderWorkflowRunWithChatSdk(input: ChatSdkRenderInput): Promise<void> {
@@ -33,6 +46,9 @@ export async function renderWorkflowRunWithChatSdk(input: ChatSdkRenderInput): P
     apiUrl: input.config.CENTAUR_API_URL,
     apiKey
   })
+  if (!input.skipInitialTyping) {
+    void startTyping(input.adapter, input.fallbackThreadId, 'Working...')
+  }
   const executionId = await waitForExecutionId(api, input.runId)
   if (!executionId) return
 
@@ -50,7 +66,24 @@ export async function renderWorkflowRunWithChatSdk(input: ChatSdkRenderInput): P
       thread_id: threadId,
       platform: context.platform
     })
-    await input.adapter.stream(threadId, api.streamChatChunks({ executionId }), streamOptions)
+    const preparedStream = await streamWithTerminalFallback(
+      api.streamChatChunks({ executionId }),
+      () => api.getExecution(executionId)
+    )
+    if (preparedStream.source === 'empty') {
+      logWarn('chat_sdk_stream_skipped_no_chunks', {
+        workflow_run_id: input.runId,
+        execution_id: executionId
+      })
+      return
+    }
+    if (preparedStream.source === 'terminal_fallback') {
+      logWarn('chat_sdk_stream_using_terminal_fallback', {
+        workflow_run_id: input.runId,
+        execution_id: executionId
+      })
+    }
+    await input.adapter.stream(threadId, preparedStream.stream, streamOptions)
     await api.markFinalDelivered(executionId)
     logInfo('chat_sdk_stream_completed', {
       workflow_run_id: input.runId,
@@ -61,6 +94,70 @@ export async function renderWorkflowRunWithChatSdk(input: ChatSdkRenderInput): P
     logWarn('chat_sdk_stream_failed', {
       workflow_run_id: input.runId,
       execution_id: executionId,
+      error: error instanceof Error ? error.message : String(error)
+    })
+  }
+}
+
+export async function streamWithTerminalFallback(
+  source: AsyncIterable<ChatStreamChunk>,
+  getExecution: () => Promise<Record<string, unknown>>
+): Promise<{
+  source: 'api' | 'terminal_fallback' | 'empty'
+  stream: AsyncIterable<ChatStreamChunk>
+}> {
+  const iterator = source[Symbol.asyncIterator]()
+  const first = await iterator.next()
+  if (!first.done) {
+    return {
+      source: 'api',
+      stream: prependAsyncIterable(first.value, iterator)
+    }
+  }
+
+  const execution = await getExecution()
+  const resultText = stringValue(execution.result_text)
+  if (!resultText) {
+    return { source: 'empty', stream: emptyAsyncIterable() }
+  }
+  return {
+    source: 'terminal_fallback',
+    stream: singleChunkAsyncIterable({ type: 'markdown_text', text: resultText })
+  }
+}
+
+async function* prependAsyncIterable<T>(
+  first: T,
+  iterator: AsyncIterator<T>
+): AsyncGenerator<T, void, undefined> {
+  yield first
+  while (true) {
+    const next = await iterator.next()
+    if (next.done) return
+    yield next.value
+  }
+}
+
+async function* singleChunkAsyncIterable(
+  chunk: ChatStreamChunk
+): AsyncGenerator<ChatStreamChunk, void, undefined> {
+  yield chunk
+}
+
+async function* emptyAsyncIterable(): AsyncGenerator<ChatStreamChunk, void, undefined> {
+  return
+}
+
+async function startTyping(
+  adapter: SlackAdapter,
+  threadId: string,
+  status: string
+): Promise<void> {
+  try {
+    await adapter.startTyping(threadId, status)
+  } catch (error) {
+    logWarn('chat_sdk_start_typing_failed', {
+      thread_id: threadId,
       error: error instanceof Error ? error.message : String(error)
     })
   }

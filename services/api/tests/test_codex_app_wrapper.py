@@ -344,6 +344,47 @@ def test_emit_notification_collects_agent_message_delta_output(monkeypatch) -> N
     assert emitted[0]["type"] == "item.agentMessage.delta"
 
 
+def test_handle_input_uses_turn_steer_when_requested(monkeypatch) -> None:
+    wrapper = _load_wrapper()
+    requests: list[tuple[str, dict, float]] = []
+
+    def fake_request(method: str, params: dict, timeout: float = 30.0) -> dict:
+        requests.append((method, params, timeout))
+        return {"turnId": "turn-steered"}
+
+    monkeypatch.setattr(wrapper, "start_app_server", lambda: None)
+    monkeypatch.setattr(wrapper, "start_or_resume_thread", lambda: "thread-123")
+    monkeypatch.setattr(wrapper, "configure_trace_context_for_startup", lambda *_a: None)
+    monkeypatch.setattr(wrapper, "configure_traceparent", lambda *_a: None)
+    monkeypatch.setattr(wrapper, "configure_codex_otel_for_startup", lambda *_a: None)
+    monkeypatch.setattr(wrapper, "request", fake_request)
+
+    wrapper.ACTIVE_TURN_ID = "turn-active"
+    wrapper.handle_input(
+        {
+            "type": "user",
+            "steer": True,
+            "message": {
+                "role": "user",
+                "content": [{"type": "text", "text": "actually do this"}],
+            },
+        }
+    )
+
+    assert requests == [
+        (
+            "turn/steer",
+            {
+                "threadId": "thread-123",
+                "input": [{"type": "text", "text": "actually do this"}],
+                "expectedTurnId": "turn-active",
+            },
+            10,
+        )
+    ]
+    assert wrapper.ACTIVE_TURN_ID == "turn-steered"
+
+
 def test_main_lazy_starts_app_server_after_input(monkeypatch) -> None:
     wrapper = _load_wrapper()
     requests: list[tuple[str, dict]] = []

@@ -11,6 +11,8 @@ straight through. Layers three Centaur-specific behaviours on top:
   ``thread/goal/set`` parity.
 * SIGUSR1 and ``{"type":"interrupt"}`` cancel the active turn by SIGINT-ing
   the ``claude`` process group.
+* ``{"type":"user", "steer": true, ...}`` interrupts the active turn and
+  runs before pending non-steer inputs.
 * ``AGENTS.md`` is appended as a system prompt so Claude receives the same
   Centaur context codex reads from the workspace.
 """
@@ -122,7 +124,7 @@ def _rewrite_goal(blocks: list[Any]) -> list[Any]:
     ]
 
 
-def interrupt_active_turn(*_args: object) -> None:
+def interrupt_active_turn(*_args: object, emit_terminal: bool = True) -> None:
     active = not TURN_DONE.is_set()
     if APP is None or APP.poll() is not None:
         return
@@ -131,6 +133,8 @@ def interrupt_active_turn(*_args: object) -> None:
     except (ProcessLookupError, PermissionError) as exc:
         emit({"type": "error", "message": f"interrupt failed: {exc}"})
     if active:
+        TURN_DONE.set()
+    if active and emit_terminal:
         emit(
             {
                 "type": "result",
@@ -141,7 +145,14 @@ def interrupt_active_turn(*_args: object) -> None:
                 "terminal_reason": "interrupted",
             }
         )
-        TURN_DONE.set()
+
+
+def is_steer_input(item: object) -> bool:
+    return (
+        isinstance(item, dict)
+        and item.get("type") == "user"
+        and item.get("steer") is True
+    )
 
 
 def next_input() -> dict[str, Any] | None:
@@ -156,10 +167,15 @@ def wait_for_turn_done() -> None:
             item = INPUTS.get_nowait()
         except queue.Empty:
             continue
-        if isinstance(item, dict) and item.get("type") == "interrupt":
-            interrupt_active_turn()
-        else:
-            PENDING_INPUTS.append(item)
+        if isinstance(item, dict):
+            if item.get("type") == "interrupt":
+                interrupt_active_turn()
+                continue
+            if is_steer_input(item):
+                PENDING_INPUTS.insert(0, item)
+                interrupt_active_turn(emit_terminal=False)
+                continue
+        PENDING_INPUTS.append(item)
 
 
 def handle_input(turn_input: dict[str, Any]) -> None:

@@ -464,6 +464,7 @@ describe('deploy plans', () => {
     const commands = k3sDeploymentCommands('centaur', 'centaur', 'org/values.centaur.yaml')
 
     expect(commands[0]).toEqual(['kubectl', 'config', 'current-context'])
+    expect(commands.some(command => command.join(' ').includes('helm dependency update'))).toBe(false)
     expect(commands.at(-1)?.slice(0, 4)).toEqual(['helm', 'upgrade', '--install', 'centaur'])
     expect(commands.at(-1)?.[4]).toMatch(/contrib\/chart$/)
     expect(commands.at(-1)?.slice(5)).toEqual([
@@ -507,6 +508,23 @@ describe('deploy plans', () => {
       '--timeout',
       '10m',
     ])
+  })
+
+  it('only updates Helm chart dependencies when explicitly requested', async () => {
+    const commands = k3sDeploymentCommands('centaur', 'centaur', 'org/values.centaur.yaml', {
+      updateDependencies: true,
+    })
+
+    expect(commands.some(command => command.slice(0, 3).join(' ') === 'helm dependency update')).toBe(true)
+
+    const stdout = await runCli([
+      'deploy',
+      'k3s',
+      '--update-dependencies',
+      '--json',
+    ])
+    const output = JSON.parse(stdout)
+    expect(output.commands.some((command: string) => command.startsWith('helm dependency update '))).toBe(true)
   })
 
   it('can print a deploy plan without Helm readiness waiting', async () => {

@@ -270,6 +270,7 @@ type DeploymentCommandOptions = {
   imageSource?: ImageSource
   wait?: boolean
   timeout?: string
+  updateDependencies?: boolean
 }
 
 function secretApplyCommands(namespace: string, options: DeploymentCommandOptions = {}) {
@@ -355,7 +356,7 @@ export function kindDeploymentCommands(
     ['kubectl', 'create', 'namespace', namespace, '--dry-run=client', '-o', 'yaml'],
     ['kubectl', 'apply', '-f', '-'],
     ...secretApplyCommands(namespace, options),
-    ['helm', 'dependency', 'update', chartPath],
+    ...(options.updateDependencies ? [['helm', 'dependency', 'update', chartPath]] : []),
     helmUpgradeCommand(release, chartPath, namespace, values, options),
   ]
 }
@@ -372,7 +373,7 @@ export function k3sDeploymentCommands(
     ['kubectl', 'create', 'namespace', namespace, '--dry-run=client', '-o', 'yaml'],
     ['kubectl', 'apply', '-f', '-'],
     ...secretApplyCommands(namespace, options),
-    ['helm', 'dependency', 'update', chartPath],
+    ...(options.updateDependencies ? [['helm', 'dependency', 'update', chartPath]] : []),
     helmUpgradeCommand(release, chartPath, namespace, values, options),
   ]
 }
@@ -388,7 +389,7 @@ export function k8sDeploymentCommands(
     ['kubectl', 'create', 'namespace', namespace, '--dry-run=client', '-o', 'yaml'],
     ['kubectl', 'apply', '-f', '-'],
     ...secretApplyCommands(namespace, options),
-    ['helm', 'dependency', 'update', chartPath],
+    ...(options.updateDependencies ? [['helm', 'dependency', 'update', chartPath]] : []),
     helmUpgradeCommand(release, chartPath, namespace, values, options),
   ]
 }
@@ -1630,6 +1631,7 @@ const deploy = Cli.create('deploy', {
       secretName: z.string().default('centaur-infra-env').describe('Kubernetes Secret name for --secrets-file'),
       wait: z.boolean().default(true).describe('Wait for Kubernetes resources to become ready'),
       timeout: z.string().default('10m').describe('Helm wait timeout'),
+      updateDependencies: z.boolean().default(false).describe('Run helm dependency update before deploy'),
       apply: z.boolean().default(false).describe('Run the commands instead of printing them'),
     }),
     run(c) {
@@ -1639,6 +1641,7 @@ const deploy = Cli.create('deploy', {
         secretName: c.options.secretName,
         wait: c.options.wait,
         timeout: c.options.timeout,
+        updateDependencies: c.options.updateDependencies,
       })
       if (c.options.apply) runDeploymentCommands(commands)
       return {
@@ -1658,6 +1661,7 @@ const deploy = Cli.create('deploy', {
       secretName: z.string().default('centaur-infra-env').describe('Kubernetes Secret name for --secrets-file'),
       wait: z.boolean().default(true).describe('Wait for Kubernetes resources to become ready'),
       timeout: z.string().default('10m').describe('Helm wait timeout'),
+      updateDependencies: z.boolean().default(false).describe('Run helm dependency update before deploy'),
       apply: z.boolean().default(false).describe('Run the commands instead of printing them'),
     }),
     run(c) {
@@ -1667,6 +1671,7 @@ const deploy = Cli.create('deploy', {
         secretName: c.options.secretName,
         wait: c.options.wait,
         timeout: c.options.timeout,
+        updateDependencies: c.options.updateDependencies,
       })
       if (c.options.apply) runDeploymentCommands(commands)
       return {
@@ -1687,6 +1692,7 @@ const deploy = Cli.create('deploy', {
       secretName: z.string().default('centaur-infra-env').describe('Kubernetes Secret name for --secrets-file'),
       wait: z.boolean().default(true).describe('Wait for Kubernetes resources to become ready'),
       timeout: z.string().default('10m').describe('Helm wait timeout'),
+      updateDependencies: z.boolean().default(false).describe('Run helm dependency update before deploy'),
       apply: z.boolean().default(false).describe('Run the commands instead of printing them'),
     }),
     run(c) {
@@ -1696,6 +1702,7 @@ const deploy = Cli.create('deploy', {
         secretName: c.options.secretName,
         wait: c.options.wait,
         timeout: c.options.timeout,
+        updateDependencies: c.options.updateDependencies,
       })
       if (c.options.apply) runDeploymentCommands(commands)
       return {

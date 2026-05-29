@@ -121,6 +121,7 @@ export type ChatStreamChunk =
       id: string;
       title: string;
       status: "pending" | "in_progress" | "complete" | "error";
+      details?: string;
       output?: string;
     }
   | { type: "plan_update"; title: string };

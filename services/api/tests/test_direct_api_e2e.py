@@ -55,7 +55,9 @@ def _assert_chat_sdk_chunk(chunk: dict) -> None:
     assert isinstance(chunk.get("id"), str)
     assert isinstance(chunk.get("title"), str)
     assert chunk.get("status") in {"pending", "in_progress", "complete", "error"}
-    assert set(chunk).issubset({"type", "id", "title", "status", "output"})
+    assert set(chunk).issubset({"type", "id", "title", "status", "details", "output"})
+    if "details" in chunk:
+        assert isinstance(chunk["details"], str)
     if "output" in chunk:
         assert isinstance(chunk["output"], str)
 
@@ -430,20 +432,20 @@ async def test_direct_agent_chat_stream_emits_only_chat_sdk_chunks_for_slack_flo
             "id": "reasoning",
             "title": "Thinking",
             "status": "in_progress",
-            "output": "Thinking through the command before answering.",
         },
         {
             "type": "task_update",
             "id": "tool-1",
             "title": "Command execution",
             "status": "in_progress",
-            "output": "```sh\nprintf ready\n```",
+            "details": "```sh\nprintf ready\n```",
         },
         {
             "type": "task_update",
             "id": "tool-1",
             "title": "Command execution",
             "status": "complete",
+            "details": "```sh\nprintf ready\n```",
             "output": "ready",
         },
         {"type": "markdown_text", "text": result_text},
@@ -500,7 +502,6 @@ async def test_direct_agent_chat_stream_context_returns_chat_sdk_stream_options(
                 "thread_ts": "1780000000.123456",
                 "recipient_user_id": "U123",
                 "recipient_team_id": "T123",
-                "task_display_mode": "plan",
                 "stop_blocks": [
                     {
                         "type": "section",

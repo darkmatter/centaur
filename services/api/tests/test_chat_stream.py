@@ -24,7 +24,9 @@ def _assert_chat_sdk_chunk(chunk: dict) -> None:
     assert isinstance(chunk.get("id"), str)
     assert isinstance(chunk.get("title"), str)
     assert chunk.get("status") in {"pending", "in_progress", "complete", "error"}
-    assert set(chunk).issubset({"type", "id", "title", "status", "output"})
+    assert set(chunk).issubset({"type", "id", "title", "status", "details", "output"})
+    if "details" in chunk:
+        assert isinstance(chunk["details"], str)
     if "output" in chunk:
         assert isinstance(chunk["output"], str)
 
@@ -76,14 +78,16 @@ def test_projector_emits_chat_sdk_chunks_for_amp_like_tool_and_text_flow():
         {
             "type": "task_update",
             "id": "toolu_1",
-            "title": "uv run pytest services/api/tests/test_chat_stream.py",
+            "title": "Command execution",
             "status": "in_progress",
+            "details": "```sh\nuv run pytest services/api/tests/test_chat_stream.py\n```",
         },
         {
             "type": "task_update",
             "id": "toolu_1",
-            "title": "uv run pytest services/api/tests/test_chat_stream.py",
+            "title": "Command execution",
             "status": "complete",
+            "details": "```sh\nuv run pytest services/api/tests/test_chat_stream.py\n```",
             "output": "1 passed",
         },
         {"type": "markdown_text", "text": "Done."},
@@ -188,7 +192,6 @@ def test_projector_keeps_codex_commentary_and_answer_in_chat_sdk_chunk_shapes():
             "id": "thinking",
             "title": "Thinking: Inspecting the failing test",
             "status": "in_progress",
-            "output": "Inspecting the failing test.",
         },
         {
             "type": "task_update",
@@ -198,6 +201,66 @@ def test_projector_keeps_codex_commentary_and_answer_in_chat_sdk_chunk_shapes():
             "output": "Inspecting the failing test.",
         },
         {"type": "markdown_text", "text": "Use the API chunks."},
+    ]
+
+
+def test_projector_does_not_stream_accumulated_thinking_output_to_slack_cards():
+    chunks = _project(
+        {
+            "type": "item.started",
+            "itemId": "thinking-1",
+            "item": {"id": "thinking-1", "type": "agentMessage", "phase": "commentary"},
+        },
+        {"type": "item.agentMessage.delta", "itemId": "thinking-1", "delta": "The"},
+        {"type": "item.agentMessage.delta", "itemId": "thinking-1", "delta": " tool"},
+        {"type": "item.agentMessage.delta", "itemId": "thinking-1", "delta": " worked."},
+        {
+            "type": "item.completed",
+            "itemId": "thinking-1",
+            "item": {
+                "id": "thinking-1",
+                "type": "agentMessage",
+                "phase": "commentary",
+                "text": "The tool worked.",
+            },
+        },
+    )
+
+    thinking_chunks = [
+        chunk for chunk in chunks if chunk["type"] == "task_update" and chunk["id"] == "thinking"
+    ]
+    assert thinking_chunks == [
+        {
+            "type": "task_update",
+            "id": "thinking",
+            "title": "Thinking",
+            "status": "in_progress",
+        },
+        {
+            "type": "task_update",
+            "id": "thinking",
+            "title": "Thinking: The",
+            "status": "in_progress",
+        },
+        {
+            "type": "task_update",
+            "id": "thinking",
+            "title": "Thinking: The tool",
+            "status": "in_progress",
+        },
+        {
+            "type": "task_update",
+            "id": "thinking",
+            "title": "Thinking: The tool worked",
+            "status": "in_progress",
+        },
+        {
+            "type": "task_update",
+            "id": "thinking",
+            "title": "Thinking: The tool worked",
+            "status": "complete",
+            "output": "The tool worked.",
+        },
     ]
 
 
@@ -251,7 +314,6 @@ def test_projector_covers_every_vercel_chat_sdk_stream_chunk_type():
             "id": "thinking",
             "title": "Thinking: Thinking through the validation path",
             "status": "in_progress",
-            "output": "Thinking through the validation path.",
         },
         {"type": "markdown_text", "text": "Visible answer."},
     ]
@@ -327,9 +389,63 @@ def test_projector_uses_visible_command_title_without_markdown_ticks():
         {
             "type": "task_update",
             "id": "cmd-call",
-            "title": "call kalshi list_events --limit 2",
+            "title": "Command execution",
             "status": "complete",
+            "details": "```sh\ncall kalshi list_events --limit 2\n```",
             "output": '{"events":[]}',
+        },
+    ]
+
+
+def test_projector_does_not_stream_accumulated_command_output_to_slack_cards():
+    chunks = _project(
+        {
+            "type": "item.started",
+            "item": {
+                "id": "cmd-call",
+                "type": "commandExecution",
+                "command": "/bin/bash -lc 'call vlogs service_health'",
+                "status": "inProgress",
+            },
+        },
+        {
+            "type": "item.commandExecution.outputDelta",
+            "itemId": "cmd-call",
+            "delta": '{"status":',
+        },
+        {
+            "type": "item.commandExecution.outputDelta",
+            "itemId": "cmd-call",
+            "delta": "500}",
+        },
+        {
+            "type": "item.completed",
+            "item": {
+                "id": "cmd-call",
+                "type": "commandExecution",
+                "command": "/bin/bash -lc 'call vlogs service_health'",
+                "status": "failed",
+                "exitCode": 1,
+                "aggregatedOutput": '{"status":500}',
+            },
+        },
+    )
+
+    assert chunks == [
+        {
+            "type": "task_update",
+            "id": "cmd-call",
+            "title": "Command execution",
+            "status": "in_progress",
+            "details": "```sh\ncall vlogs service_health\n```",
+        },
+        {
+            "type": "task_update",
+            "id": "cmd-call",
+            "title": "Command execution",
+            "status": "error",
+            "details": "```sh\ncall vlogs service_health\n```",
+            "output": 'exit code 1\n{"status":500}',
         },
     ]
 
@@ -456,8 +572,9 @@ def test_projector_emits_slack_task_update_errors_for_failed_work():
         {
             "type": "task_update",
             "id": "cmd-1",
-            "title": "false",
+            "title": "Command execution",
             "status": "error",
+            "details": "```sh\nfalse\n```",
             "output": "exit code 1\nfailed",
         },
         {

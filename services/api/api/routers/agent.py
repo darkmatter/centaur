@@ -849,6 +849,8 @@ def _chat_sdk_stream_context_payload(
         stream_options["recipientTeamId"] = recipient_team_id
     if task_display_mode in {"timeline", "plan"}:
         stream_options["taskDisplayMode"] = task_display_mode
+    elif platform == "slack":
+        stream_options["taskDisplayMode"] = "plan"
     if isinstance(stop_blocks, list):
         stream_options["stopBlocks"] = stop_blocks
 

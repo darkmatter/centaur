@@ -20,6 +20,7 @@ CHAT_STREAM_CHUNK_TYPES = frozenset({"markdown_text", "task_update", "plan_updat
 DEFAULT_CLAUDE_CODE_MODEL = "claude-opus-4-8"
 CHAT_PLAN_TITLE_CHARS = 256
 CHAT_TASK_TITLE_CHARS = 128
+CHAT_TASK_DETAILS_CHARS = 500
 CHAT_TASK_OUTPUT_CHARS = 230
 
 _TERMINAL_EVENT_TYPES = frozenset(
@@ -90,6 +91,12 @@ def _truncate_text(text: str, limit: int) -> str:
 def _task_output_preview(value: Any, limit: int = CHAT_TASK_OUTPUT_CHARS) -> str:
     text = _strip_markdown_fence(_format_output(value))
     text = text.replace("\r\n", "\n").replace("\r", "\n").strip()
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return _truncate_text(text, limit)
+
+
+def _task_details_preview(value: Any, limit: int = CHAT_TASK_DETAILS_CHARS) -> str:
+    text = _format_output(value).replace("\r\n", "\n").replace("\r", "\n").strip()
     text = re.sub(r"\n{3,}", "\n\n", text)
     return _truncate_text(text, limit)
 
@@ -190,6 +197,7 @@ def _task_update(
     task_id: str,
     title: str,
     status: str,
+    details: str | None = None,
     output: str | None = None,
 ) -> dict[str, Any]:
     chunk: dict[str, Any] = {
@@ -198,6 +206,10 @@ def _task_update(
         "title": _one_line(title, CHAT_TASK_TITLE_CHARS) or "Task",
         "status": status,
     }
+    if details:
+        preview = _task_details_preview(details)
+        if preview:
+            chunk["details"] = preview
     if output:
         preview = _task_output_preview(output)
         if preview:
@@ -224,8 +236,7 @@ def _assistant_event_looks_canonical(event: dict[str, Any]) -> bool:
 
 def _tool_title(name: str, tool_input: dict[str, Any]) -> str:
     if name == "Bash":
-        command = _as_str(tool_input.get("command")) or _as_str(tool_input.get("cmd"))
-        return _command_title(command)
+        return "Command execution"
     if name == "Read":
         path = _as_str(tool_input.get("file_path")) or _as_str(tool_input.get("path"))
         return f"Read {path}" if path else "Read file"
@@ -236,12 +247,17 @@ def _tool_title(name: str, tool_input: dict[str, Any]) -> str:
     return f"Use {name or 'tool'}"
 
 
-def _tool_start_output(name: str, tool_input: dict[str, Any]) -> str:
+def _tool_details(name: str, tool_input: dict[str, Any]) -> str:
     if name == "Bash":
-        return ""
+        command = _as_str(tool_input.get("command")) or _as_str(tool_input.get("cmd"))
+        return _command_details(command)
     if not tool_input:
         return ""
     return _format_output(tool_input)
+
+
+def _tool_start_output(name: str, tool_input: dict[str, Any]) -> str:
+    return ""
 
 
 def _agent_message_event_id(event: dict[str, Any]) -> str:
@@ -314,8 +330,11 @@ def _display_command(command: str) -> str:
     return command
 
 
-def _command_title(command: str, fallback: str = "Command") -> str:
-    return _display_command(command) or fallback
+def _command_details(command: str) -> str:
+    display = _display_command(command)
+    if not display:
+        return ""
+    return f"```sh\n{_truncate_text(display, CHAT_TASK_DETAILS_CHARS - 8)}\n```"
 
 
 def _command_output(command: str, output: str, exit_code: Any = None) -> str:
@@ -354,8 +373,9 @@ def _command_chunk_from_item(
     )
     return _task_update(
         task_id=_command_id(item),
-        title=_command_title(command),
+        title="Command execution",
         status=status,
+        details=_command_details(command),
         output=_command_output(
             command, output, item.get("exit_code", item.get("exitCode"))
         ),
@@ -409,6 +429,7 @@ class ChatStreamProjector:
         self._assistant_answer_text = ""
         self._terminal_result_text = ""
         self._tool_titles: dict[str, str] = {}
+        self._tool_details: dict[str, str] = {}
         self._open_tasks: dict[str, str] = {}
         self._reasoning_text = ""
         self._last_markdown_tail = ""
@@ -522,6 +543,13 @@ class ChatStreamProjector:
                 **chunk,
                 "title": _one_line(_as_str(chunk.get("title")), CHAT_TASK_TITLE_CHARS),
             }
+            details = _as_str(chunk.get("details"))
+            if details:
+                preview = _task_details_preview(details)
+                if preview:
+                    prepared["details"] = preview
+                else:
+                    prepared.pop("details", None)
             if output:
                 preview = _task_output_preview(output)
                 if preview:
@@ -549,13 +577,16 @@ class ChatStreamProjector:
             name = _as_str(block.get("name")) or "tool"
             tool_input = _as_dict(block.get("input"))
             title = _tool_title(name, tool_input)
+            details = _tool_details(name, tool_input)
             self._tool_titles[tool_id] = title
+            self._tool_details[tool_id] = details
             self._open_tasks[tool_id] = title
             chunks.append(
                 _task_update(
                     task_id=tool_id,
                     title=title,
                     status="in_progress",
+                    details=details,
                     output=_tool_start_output(name, tool_input),
                 )
             )
@@ -569,6 +600,7 @@ class ChatStreamProjector:
             if not tool_id:
                 continue
             title = self._tool_titles.get(tool_id, "Tool result")
+            details = self._tool_details.get(tool_id, "")
             is_error = bool(record.get("is_error"))
             self._open_tasks.pop(tool_id, None)
             chunks.append(
@@ -576,6 +608,7 @@ class ChatStreamProjector:
                     task_id=tool_id,
                     title=title,
                     status="error" if is_error else "complete",
+                    details=details,
                     output=_format_output(record.get("content")),
                 )
             )
@@ -593,7 +626,6 @@ class ChatStreamProjector:
                 task_id="thinking",
                 title=title,
                 status="in_progress",
-                output=self._reasoning_text,
             )
         ]
 
@@ -609,8 +641,9 @@ class ChatStreamProjector:
         self._open_tasks.pop(task_id, None)
         return _task_update(
             task_id=task_id,
-            title=_command_title(command),
+            title="Command execution",
             status=status,
+            details=_command_details(command),
             output=_command_output(
                 command, _as_str(event.get("aggregated_output")), exit_code
             ),
@@ -710,12 +743,22 @@ class ChatStreamProjector:
 
         if item_type in {"commandExecution", "command_execution"}:
             command_id = _command_id(item)
-            title = _command_title(_as_str(item.get("command")))
+            title = "Command execution"
+            output_override = None
             if event_type != "item.completed":
                 self._open_tasks[command_id] = title
             else:
                 self._open_tasks.pop(command_id, None)
-            chunks.append(_command_chunk_from_item(item, event_type=event_type))
+                buffered_output = self._command_output_by_id.pop(command_id, "")
+                if buffered_output and not _command_item_output(item):
+                    output_override = buffered_output
+            chunks.append(
+                _command_chunk_from_item(
+                    item,
+                    event_type=event_type,
+                    output_override=output_override,
+                )
+            )
             return chunks
 
         if item_type in {"fileChange", "file_change"}:
@@ -767,7 +810,6 @@ class ChatStreamProjector:
                 task_id="thinking",
                 title=title,
                 status="in_progress",
-                output=self._agent_text_by_id[item_id],
             )
         self._answer_chars += len(text)
         return _chat_text_chunk(text)
@@ -815,14 +857,7 @@ class ChatStreamProjector:
             return None
         output = self._command_output_by_id.get(command_id, "") + delta
         self._command_output_by_id[command_id] = output
-        title = self._open_tasks.get(command_id, "Command output")
-        self._open_tasks[command_id] = title
-        return _task_update(
-            task_id=command_id,
-            title=title,
-            status="in_progress",
-            output=output,
-        )
+        return None
 
     def _project_terminal(self, event: dict[str, Any]) -> list[dict[str, Any]]:
         chunks: list[dict[str, Any]] = []

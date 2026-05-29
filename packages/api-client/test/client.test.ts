@@ -107,7 +107,7 @@ describe("CentaurClient", () => {
     const fetchMock = vi.fn(async () => sseResponse([
       "id: 21",
       "event: chat_stream_chunk",
-      'data: {"type":"task_update","id":"tool-1","title":"Command execution","status":"in_progress"}',
+      'data: {"type":"task_update","id":"tool-1","title":"Command execution","status":"in_progress","details":"```sh\\nprintf ready\\n```"}',
       "",
       "id: 22",
       "event: chat_stream_chunk",
@@ -131,6 +131,7 @@ describe("CentaurClient", () => {
         id: "tool-1",
         title: "Command execution",
         status: "in_progress",
+        details: "```sh\nprintf ready\n```",
       },
       { type: "markdown_text", text: "Done" },
     ]);

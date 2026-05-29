@@ -4,7 +4,7 @@ import { centaurApiKey, type AppConfig } from '../config'
 import { logInfo, logWarn } from '../logging'
 import { clientSpanOptions, injectTraceHeaders, spanAttributes, withSpan } from '../otel'
 
-const HISTORY_LIMIT = 20
+const HISTORY_PAGE_LIMIT = 200
 const PROMPT_SELECTOR_RE = /(^|\s)`?--[a-z][a-z0-9-]*(?=\s|`|$)/i
 const INTERRUPTIBLE_EXECUTION_STATUSES = new Set(['running'])
 const REPLACEABLE_EXECUTION_STATUSES = new Set(['queued', 'retry_wait'])
@@ -182,6 +182,7 @@ export class CentaurHandoff {
           },
           body: JSON.stringify({
             content_blocks: event.parts,
+            history_messages: event.history_messages ?? [],
             message_id: event.message_id,
             user_id: event.user_id,
             metadata: {
@@ -344,6 +345,7 @@ async function historyFromThread(
 ): Promise<NonNullable<NormalizedSlackEvent['history_messages']>> {
   const decoded = decodeSlackThreadId(input.thread.id)
   if (!decoded.threadTs) return []
+  if (input.message.id === decoded.threadTs) return []
 
   const currentTs = numericSlackTs(input.message.id)
   const collected: Array<{
@@ -352,50 +354,60 @@ async function historyFromThread(
     entry: NonNullable<NormalizedSlackEvent['history_messages']>[number]
   }> = []
   try {
-    const result = await input.thread.adapter.fetchMessages(input.thread.id, {
-      limit: HISTORY_LIMIT + 1,
-      direction: 'backward'
-    })
-    for (const [index, message] of result.messages.entries()) {
-      if (message.id === input.message.id) continue
-      const messageTs = numericSlackTs(message.id)
-      if (currentTs && messageTs && messageTs > currentTs) continue
+    let cursor: string | undefined
+    do {
+      const result = await input.thread.adapter.fetchMessages(input.thread.id, {
+        limit: HISTORY_PAGE_LIMIT,
+        direction: 'forward',
+        cursor
+      })
+      for (const message of result.messages) {
+        if (message.id === input.message.id) continue
+        const messageTs = numericSlackTs(message.id)
+        if (currentTs && messageTs && messageTs >= currentTs) continue
 
-      const parts = await partsFromMessage(message, input.botUserId)
-      if (!parts.length) continue
+        const parts = await partsFromMessage(message, input.botUserId)
+        if (!parts.length) continue
 
-      const raw = recordValue(message.raw)
-      const teamId =
-        stringField(raw.team_id) ??
-        stringField(raw.team) ??
-        stringField(raw.user_team) ??
-        stringField(raw.source_team) ??
-        'unknown'
-      const channelId = stringField(raw.channel) ?? decoded.channel
-      const userId =
-        stringField(raw.user) ??
-        stringField(recordValue(raw.bot_profile).user_id) ??
-        message.author.userId
+        const raw = recordValue(message.raw)
+        const teamId =
+          stringField(raw.team_id) ??
+          stringField(raw.team) ??
+          stringField(raw.user_team) ??
+          stringField(raw.source_team) ??
+          'unknown'
+        const channelId = stringField(raw.channel) ?? decoded.channel
+        const userId =
+          stringField(raw.user) ??
+          stringField(recordValue(raw.bot_profile).user_id) ??
+          message.author.userId
 
-      collected.push({
-        index,
-        sortTs: messageTs,
-        entry: {
-          message_id: `slack:${teamId}:${channelId}:${message.id}`,
-          role: message.author.isMe ? 'assistant' : 'user',
-          parts,
-          user_id: userId,
-          metadata: {
-            slack: {
-              message_ts: message.id,
-              is_mention: input.thread.isDM || messageMentionsBot(message, input.botUserId),
-              bot_id: stringField(raw.bot_id),
-              app_id: stringField(raw.app_id)
+        collected.push({
+          index: collected.length,
+          sortTs: messageTs,
+          entry: {
+            message_id: `slack:${teamId}:${channelId}:${message.id}`,
+            role: message.author.isMe ? 'assistant' : 'user',
+            parts,
+            user_id: userId,
+            metadata: {
+              platform: 'slack',
+              history_backfill: true,
+              slack: {
+                message_ts: message.id,
+                is_mention: input.thread.isDM || messageMentionsBot(message, input.botUserId),
+                bot_id: stringField(raw.bot_id),
+                app_id: stringField(raw.app_id)
+              }
             }
           }
-        }
-      })
-    }
+        })
+      }
+      cursor =
+        typeof result.nextCursor === 'string' && result.nextCursor.trim()
+          ? result.nextCursor
+          : undefined
+    } while (cursor)
   } catch {
     return []
   }
@@ -407,7 +419,6 @@ async function historyFromThread(
       if (right.sortTs !== null) return 1
       return left.index - right.index
     })
-    .slice(-HISTORY_LIMIT)
     .map(item => item.entry)
 }
 

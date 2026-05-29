@@ -2437,7 +2437,22 @@ async def test_steer_execution_persists_and_injects_explicit_message(db_pool):
     execution_id = f"exe-{uuid.uuid4().hex[:12]}"
     runtime_id = f"rt-{uuid.uuid4().hex[:8]}"
     message_id = f"slack:{uuid.uuid4().hex[:12]}"
+    history_message_id = f"slack:{uuid.uuid4().hex[:12]}"
     content_blocks = [{"type": "text", "text": "stop"}]
+    history_messages = [
+        {
+            "message_id": history_message_id,
+            "role": "user",
+            "parts": [{"type": "text", "text": "Original request"}],
+            "user_id": "U-prior",
+            "metadata": {"platform": "slack"},
+        },
+        {
+            "message_id": f"slack:{uuid.uuid4().hex[:12]}",
+            "role": "assistant",
+            "parts": [{"type": "text", "text": "Earlier response"}],
+        },
+    ]
 
     await db_pool.execute(
         "INSERT INTO agent_runtime_assignments ("
@@ -2473,6 +2488,7 @@ async def test_steer_execution_persists_and_injects_explicit_message(db_pool):
             db_pool,
             execution_id,
             content_blocks=content_blocks,
+            history_messages=history_messages,
             message_id=message_id,
             metadata={"platform": "slack", "user_id": "U-test"},
         )
@@ -2485,7 +2501,11 @@ async def test_steer_execution_persists_and_injects_explicit_message(db_pool):
     }
     backend.attach.assert_awaited_once()
     steer_stdin_mock.assert_awaited_once()
-    assert steer_stdin_mock.await_args.args[1] == content_blocks
+    assert steer_stdin_mock.await_args.args[1] == [
+        {"type": "text", "text": "<@U-prior>: Original request"},
+        {"type": "text", "text": "[Previous Centaur response]: Earlier response"},
+        *content_blocks,
+    ]
 
     message = await db_pool.fetchrow(
         "SELECT event_json, metadata FROM agent_message_requests "
@@ -2506,6 +2526,29 @@ async def test_steer_execution_persists_and_injects_explicit_message(db_pool):
     )
     assert event_json["message"]["content"] == content_blocks
     assert metadata["user_id"] == "U-test"
+
+    history_message = await db_pool.fetchrow(
+        "SELECT event_json, metadata FROM agent_message_requests "
+        "WHERE thread_key = $1 AND message_id = $2",
+        thread_key,
+        history_message_id,
+    )
+    assert history_message is not None
+    history_event_json = (
+        json.loads(history_message["event_json"])
+        if isinstance(history_message["event_json"], str)
+        else history_message["event_json"]
+    )
+    history_metadata = (
+        json.loads(history_message["metadata"])
+        if isinstance(history_message["metadata"], str)
+        else history_message["metadata"]
+    )
+    assert history_event_json["message"]["content"] == [
+        {"type": "text", "text": "Original request"}
+    ]
+    assert history_metadata["history_backfill"] is True
+    assert history_metadata["steer_history_backfill"] is True
 
     execution = await db_pool.fetchrow(
         "SELECT metadata FROM agent_execution_requests WHERE execution_id = $1",

@@ -143,7 +143,7 @@ async def test_create_slack_thread_turn_workflow_eager_start(
 
 
 @pytest.mark.asyncio
-async def test_slack_thread_turn_active_assignment_does_not_backfill_stop_history(
+async def test_slack_thread_turn_active_assignment_still_backfills_thread_history(
     db_pool,
 ):
     from api.workflow_engine import WorkflowContext
@@ -202,7 +202,22 @@ async def test_slack_thread_turn_active_assignment_does_not_backfill_stop_histor
     assert do_agent_turn_mock.await_args.kwargs["parts"] == [
         {"type": "text", "text": "stop"}
     ]
-    assert do_agent_turn_mock.await_args.kwargs["history_messages"] == []
+    assert do_agent_turn_mock.await_args.kwargs["history_messages"] == [
+        {
+            "message_id": "slack:T123:C123:1778885060.000100",
+            "parts": [
+                {
+                    "type": "text",
+                    "text": (
+                        f"Generate 60 haikus. Include {nonce} in every haiku. "
+                        "Number each haiku and write them in full."
+                    ),
+                },
+            ],
+            "user_id": "U123",
+            "metadata": {"platform": "slack", "history_backfill": True},
+        },
+    ]
 
 
 @pytest.mark.asyncio
@@ -357,55 +372,6 @@ async def test_slack_thread_turn_attachment_roundtrip_to_agent(
     )
     assert download.status_code == 200
     assert download.content == raw_attachment
-
-
-def test_recovery_command_paraphrases_are_recognized():
-    """Real Slack utterances observed in production should trigger recovery
-    hydration, not just the canonical 'retry' / 'continue' commands."""
-    from api.workflows.slack_thread_turn import _is_recovery_turn
-
-    paraphrases_observed_in_prod = [
-        "again",
-        "retry",
-        "continue",
-        "finish the job",
-        "look at the root of this thread",
-        "look at the root of this thread and try again",
-        "look at the root of this thread, and try again",
-        "Look at the root of this thread!",
-        "reread the thread",
-        "go again",
-        "do it again",
-        "<@U0AH5TRP0H0> again",
-        "<@U0AH5TRP0H0> please continue",
-    ]
-    for text in paraphrases_observed_in_prod:
-        assert _is_recovery_turn([{"type": "text", "text": text}]), (
-            f"Expected recovery hydration for utterance: {text!r}"
-        )
-
-    not_recovery = [
-        "retry the failing test in test_workflows.py",
-        "continue editing the document",
-        "look at the root cause of this bug",
-        "let's go again to the office",
-        "do it again but with the new params",
-        "@U0AH5TRP0H0 again",
-        "@Centaur AI again",
-        "@Centaur AI, please retry",
-        "@Centaur AI continue editing the document",
-        "@Centaur AI thanks again",
-        "@Centaur AI hey can you continue",
-        "@U0AH5TRP0H0 thanks again",
-        "@U0AH5TRP0H0 do it again but with the new params",
-        "<@U0AH5TRP0H0> thanks again",
-        "<@U0AH5TRP0H0> hey can you continue",
-        "<@U0AH5TRP0H0> look at the root cause of this bug",
-    ]
-    for text in not_recovery:
-        assert not _is_recovery_turn([{"type": "text", "text": text}]), (
-            f"Did not expect recovery hydration for utterance: {text!r}"
-        )
 
 
 @pytest.mark.parametrize(
@@ -587,229 +553,6 @@ def test_workflow_idempotency_hash_ignores_history_messages():
     )
 
 
-def test_recovery_hydration_reads_workflow_history_messages():
-    from api.workflows.slack_thread_turn import _lookup_last_unresolved_ask_from_history
-
-    prior_ask, provenance = _lookup_last_unresolved_ask_from_history(
-        [
-            {
-                "message_id": "slack:ask",
-                "parts": [{"type": "text", "text": "Original ask from Slack history"}],
-                "user_id": "U1",
-            },
-            {
-                "message_id": "slack:retry-1",
-                "parts": [{"type": "text", "text": "retry"}],
-                "user_id": "U1",
-            },
-        ],
-        user_id="U1",
-        current_message_id="slack:retry-2",
-    )
-
-    assert prior_ask == "Original ask from Slack history"
-    assert provenance["hydrated_from_message_id"] == "slack:ask"
-
-
-@pytest.mark.asyncio
-async def test_slack_thread_turn_hydrates_retry_with_last_substantive_user_ask(db_pool):
-    from api.workflow_engine import WorkflowContext
-    from api.workflows.slack_thread_turn import Input, handler
-
-    run_id = f"wfr_{uuid.uuid4().hex[:16]}"
-    thread_key = f"slack:C-test:{uuid.uuid4().hex}"
-
-    await db_pool.execute(
-        "INSERT INTO chat_messages (id, thread_key, role, parts, metadata, created_at) VALUES "
-        "($1, $2, 'user', $3::jsonb, '{}'::jsonb, NOW() - INTERVAL '3 minutes'), "
-        "($4, $2, 'assistant', $5::jsonb, '{}'::jsonb, NOW() - INTERVAL '2 minutes'), "
-        "($6, $2, 'user', $7::jsonb, '{}'::jsonb, NOW() - INTERVAL '1 minute'), "
-        "($8, $2, 'assistant', $9::jsonb, '{}'::jsonb, NOW())",
-        f"msg:{thread_key}:ask",
-        thread_key,
-        json.dumps(
-            [
-                {
-                    "type": "text",
-                    "text": "Build the storage access workflow and wire in the bucket credentials.",
-                }
-            ]
-        ),
-        f"msg:{thread_key}:assistant-1",
-        json.dumps([{"type": "text", "text": "I lost the earlier request."}]),
-        f"msg:{thread_key}:retry-1",
-        json.dumps([{"type": "text", "text": "retry"}]),
-        f"msg:{thread_key}:assistant-2",
-        json.dumps([{"type": "text", "text": "Paste the original request again."}]),
-    )
-
-    ctx = WorkflowContext(
-        pool=db_pool,
-        run_id=run_id,
-        checkpoints={},
-        lease_s=30.0,
-        worker_id="w1",
-    )
-    do_agent_turn_mock = AsyncMock(return_value={"ok": True, "execution_id": "exe-1"})
-
-    with patch("api.workflow_engine.do_agent_turn", new=do_agent_turn_mock):
-        result = await handler(
-            Input(
-                thread_key=thread_key,
-                parts=[{"type": "text", "text": "retry"}],
-                message_id="msg-current",
-            ),
-            ctx,
-        )
-
-    assert result == {"ok": True, "execution_id": "exe-1"}
-    hydrated_parts = do_agent_turn_mock.await_args.kwargs["parts"]
-    assert hydrated_parts == [
-        {
-            "type": "text",
-            "text": (
-                "Previous unresolved user request from this thread:\n"
-                "Build the storage access workflow and wire in the bucket credentials."
-            ),
-        },
-        {"type": "text", "text": "retry"},
-    ]
-
-
-@pytest.mark.asyncio
-async def test_slack_thread_turn_hydrates_slack_id_mention_prefixed_again(db_pool):
-    from api.workflow_engine import WorkflowContext
-    from api.workflows.slack_thread_turn import Input, handler
-
-    run_id = f"wfr_{uuid.uuid4().hex[:16]}"
-    thread_key = f"slack:C-test:{uuid.uuid4().hex}"
-
-    await db_pool.execute(
-        "INSERT INTO chat_messages (id, thread_key, role, parts, metadata, created_at) VALUES "
-        "($1, $2, 'user', $3::jsonb, '{}'::jsonb, NOW() - INTERVAL '3 minutes'), "
-        "($4, $2, 'assistant', $5::jsonb, '{}'::jsonb, NOW() - INTERVAL '2 minutes')",
-        f"msg:{thread_key}:ask",
-        thread_key,
-        json.dumps(
-            [
-                {
-                    "type": "text",
-                    "text": "Draft the partner update and include the shipping risks.",
-                }
-            ]
-        ),
-        f"msg:{thread_key}:assistant-1",
-        json.dumps([{"type": "text", "text": "I need the original request again."}]),
-    )
-
-    ctx = WorkflowContext(
-        pool=db_pool,
-        run_id=run_id,
-        checkpoints={},
-        lease_s=30.0,
-        worker_id="w1",
-    )
-    do_agent_turn_mock = AsyncMock(return_value={"ok": True, "execution_id": "exe-1"})
-
-    with patch("api.workflow_engine.do_agent_turn", new=do_agent_turn_mock):
-        await handler(
-            Input(
-                thread_key=thread_key,
-                parts=[{"type": "text", "text": "<@U0AH5TRP0H0> again"}],
-                message_id="msg-current",
-            ),
-            ctx,
-        )
-
-    hydrated_parts = do_agent_turn_mock.await_args.kwargs["parts"]
-    assert hydrated_parts == [
-        {
-            "type": "text",
-            "text": (
-                "Previous unresolved user request from this thread:\n"
-                "Draft the partner update and include the shipping risks."
-            ),
-        },
-        {"type": "text", "text": "<@U0AH5TRP0H0> again"},
-    ]
-
-
-@pytest.mark.asyncio
-async def test_slack_thread_turn_recovery_filters_by_user_and_cursor(db_pool):
-    """Recovery hydration must scope to the same user and only look back
-    earlier than the triggering retry message."""
-    from api.workflow_engine import WorkflowContext
-    from api.workflows.slack_thread_turn import Input, handler
-
-    run_id = f"wfr_{uuid.uuid4().hex[:16]}"
-    thread_key = f"slack:C-test:{uuid.uuid4().hex}"
-    user_a = "U-alice"
-    user_b = "U-bob"
-
-    retry_msg_id = f"msg:{thread_key}:retry"
-    await db_pool.execute(
-        "INSERT INTO chat_messages (id, thread_key, role, parts, metadata, user_id, created_at) VALUES "
-        "($1, $2, 'user', $3::jsonb, '{}'::jsonb, $4, NOW() - INTERVAL '5 minutes'), "
-        "($5, $2, 'user', $6::jsonb, '{}'::jsonb, $7, NOW() - INTERVAL '3 minutes'), "
-        "($8, $2, 'user', $9::jsonb, '{}'::jsonb, $10, NOW() - INTERVAL '2 minutes'), "
-        "($11, $2, 'user', $12::jsonb, '{}'::jsonb, $13, NOW() - INTERVAL '1 minute')",
-        f"msg:{thread_key}:alice-original",
-        thread_key,
-        json.dumps(
-            [{"type": "text", "text": "Alice original ask: build the storage workflow"}]
-        ),
-        user_a,
-        f"msg:{thread_key}:bob-meta",
-        json.dumps(
-            [
-                {
-                    "type": "text",
-                    "text": "Bob unrelated request: rename the project to Mantle",
-                }
-            ]
-        ),
-        user_b,
-        retry_msg_id,
-        json.dumps([{"type": "text", "text": "retry"}]),
-        user_a,
-        f"msg:{thread_key}:bob-after",
-        json.dumps([{"type": "text", "text": "Bob later: also fix the deploy script"}]),
-        user_b,
-    )
-
-    ctx = WorkflowContext(
-        pool=db_pool,
-        run_id=run_id,
-        checkpoints={},
-        lease_s=30.0,
-        worker_id="w1",
-    )
-    do_agent_turn_mock = AsyncMock(return_value={"ok": True, "execution_id": "exe-1"})
-
-    metadata: dict[str, object] = {}
-    with patch("api.workflow_engine.do_agent_turn", new=do_agent_turn_mock):
-        await handler(
-            Input(
-                thread_key=thread_key,
-                parts=[{"type": "text", "text": "retry"}],
-                message_id=retry_msg_id,
-                user_id=user_a,
-                metadata=metadata,
-            ),
-            ctx,
-        )
-
-    hydrated_parts = do_agent_turn_mock.await_args.kwargs["parts"]
-    assert hydrated_parts[0]["text"] == (
-        "Previous unresolved user request from this thread:\n"
-        "Alice original ask: build the storage workflow"
-    )
-    assert hydrated_parts[1]["text"] == "retry"
-    provenance = metadata.get("recovery_hydration") or {}
-    assert provenance["hydrated_from_user_id"] == user_a
-    assert provenance["hydrated_from_message_id"] == f"msg:{thread_key}:alice-original"
-
-
 @pytest.mark.asyncio
 async def test_slack_thread_turn_derives_persona_and_releases_assignment(db_pool):
     from api.workflow_engine import WorkflowContext
@@ -873,7 +616,9 @@ async def test_slack_thread_turn_derives_persona_and_releases_assignment(db_pool
 
 
 @pytest.mark.asyncio
-async def test_prompt_switch_retry_still_hydrates_prior_ask_from_history(db_pool):
+async def test_prompt_switch_retry_uses_thread_history_without_rewriting_request(
+    db_pool,
+):
     from api.workflow_engine import WorkflowContext
     from api.workflows.slack_thread_turn import Input, handler
 
@@ -929,11 +674,19 @@ async def test_prompt_switch_retry_still_hydrates_prior_ask_from_history(db_pool
                 "request in that persona."
             ),
         },
-        {
-            "type": "text",
-            "text": "Previous unresolved user request from this thread:\nOriginal investment ask",
-        },
         {"type": "text", "text": "retry"},
+    ]
+    assert do_agent_turn_mock.await_args.kwargs["history_messages"] == [
+        {
+            "message_id": "slack:prior",
+            "parts": [{"type": "text", "text": "Original investment ask"}],
+            "user_id": "U1",
+        },
+        {
+            "message_id": "slack:retry",
+            "parts": [{"type": "text", "text": "retry"}],
+            "user_id": "U1",
+        },
     ]
 
 
@@ -1030,7 +783,7 @@ async def test_slack_thread_turn_without_flag_keeps_default_harness_path(db_pool
 
 
 @pytest.mark.asyncio
-async def test_slack_thread_turn_without_flag_replays_history_only_for_new_assignment(
+async def test_slack_thread_turn_without_flag_replays_thread_history_for_active_assignment(
     db_pool,
 ):
     from api.workflow_engine import WorkflowContext
@@ -1091,7 +844,7 @@ async def test_slack_thread_turn_without_flag_replays_history_only_for_new_assig
             ctx,
         )
 
-    assert do_agent_turn_mock.await_args.kwargs["history_messages"] == []
+    assert do_agent_turn_mock.await_args.kwargs["history_messages"] == history_messages
 
 
 @pytest.mark.asyncio

@@ -230,6 +230,7 @@ describe('CentaurHandoff', () => {
       ])
       expect(calls[1]?.body).toMatchObject({
         content_blocks: [{ type: 'text', text: 'actually do this instead' }],
+        history_messages: [],
         message_id: event.message_id,
         user_id: 'U123',
         metadata: {
@@ -242,20 +243,20 @@ describe('CentaurHandoff', () => {
     }
   })
 
-  it('fetches bounded recent Slack history instead of paginating the whole thread', async () => {
-    const messages = [
+  it('paginates the Slack thread and includes every prior reply as history', async () => {
+    const firstPage = [
       slackMessage('1778883099.579529', 'Original request', 'U123'),
       slackMessage('1778883100.000000', 'Assistant context', 'UBOT', true),
-      slackMessage('1778883110.000000', 'Prior clarification', 'U123'),
+      slackMessage('1778883110.000000', 'Passive context', 'U456')
+    ]
+    const secondPage = [
+      slackMessage('1778883110.500000', 'Prior clarification', 'U123'),
       slackMessage('1778883111.000000', '<@UBOT> retry', 'U123'),
       slackMessage('1778883112.000000', 'Newer message', 'U123')
     ]
     const fetchMessages = mock(async (_threadId: string, options: Record<string, unknown>) => {
-      expect(options).toMatchObject({
-        limit: 21,
-        direction: 'backward'
-      })
-      return { messages, nextCursor: 'cursor-that-should-not-be-followed' }
+      if (options.cursor === 'page-2') return { messages: secondPage, nextCursor: undefined }
+      return { messages: firstPage, nextCursor: 'page-2' }
     })
     const thread: any = {
       id: 'slack:C123:1778883099.579529',
@@ -270,11 +271,15 @@ describe('CentaurHandoff', () => {
 
     const event = await slackEventFromChatMessage({
       thread,
-      message: messages[3],
+      message: secondPage[1],
       botUserId: 'UBOT'
     } as any)
 
-    expect(fetchMessages).toHaveBeenCalledTimes(1)
+    expect(fetchMessages).toHaveBeenCalledTimes(2)
+    expect(fetchMessages.mock.calls.map(call => call[1])).toEqual([
+      { limit: 200, direction: 'forward', cursor: undefined },
+      { limit: 200, direction: 'forward', cursor: 'page-2' }
+    ])
     expect(
       event.history_messages?.map(item =>
         item.parts[0]?.type === 'text' ? item.parts[0].text : undefined
@@ -282,6 +287,7 @@ describe('CentaurHandoff', () => {
     ).toEqual([
       'Original request',
       'Assistant context',
+      'Passive context',
       'Prior clarification'
     ])
   })
@@ -296,8 +302,8 @@ describe('CentaurHandoff', () => {
     ]
     const fetchMessages = mock(async (_threadId: string, options: Record<string, unknown>) => {
       expect(options).toMatchObject({
-        limit: 21,
-        direction: 'backward'
+        limit: 200,
+        direction: 'forward'
       })
       return { messages, nextCursor: undefined }
     })

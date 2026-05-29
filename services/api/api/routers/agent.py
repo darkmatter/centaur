@@ -187,6 +187,7 @@ class MessageRequest(BaseModel):
 
 class SteerExecutionRequest(BaseModel):
     content_blocks: list[dict[str, Any]] | None = None
+    history_messages: list[dict[str, Any]] | None = None
     message_id: str | None = None
     user_id: str | None = None
     metadata: dict[str, Any] | None = None
@@ -866,7 +867,9 @@ def _chat_sdk_stream_context_payload(
                 engine=assignment.get("engine")
                 if isinstance(assignment.get("engine"), str)
                 else None,
-                model=metadata.get("model") if isinstance(metadata.get("model"), str) else None,
+                model=metadata.get("model")
+                if isinstance(metadata.get("model"), str)
+                else None,
             ),
             "prompt_ref": assignment.get("prompt_ref"),
             "effective_agents_md_sha256": assignment.get("effective_agents_md_sha256"),
@@ -997,6 +1000,7 @@ async def steer_execution_endpoint(execution_id: str, request: Request):
         pool,
         execution_id,
         content_blocks=body.content_blocks,
+        history_messages=body.history_messages,
         message_id=body.message_id,
         metadata=metadata,
     )

@@ -141,6 +141,7 @@ describe(`Slack Emulate E2E (${IMPLEMENTATION})`, () => {
   it('includes prior Slack thread replies as history for reply mentions', async () => {
     const parent = await postUserMessage('Original request')
     await postBotMessage('Earlier assistant context', parent.ts)
+    await postUserMessage('Passive thread chatter', parent.ts)
     await postUserMessage('Prior user clarification', parent.ts)
     const current = await postUserMessage(`<@${BOT_USER_ID}> retry`, parent.ts)
     const waits: Promise<unknown>[] = []
@@ -164,10 +165,13 @@ describe(`Slack Emulate E2E (${IMPLEMENTATION})`, () => {
     await Promise.all(waits)
 
     const history = onlyRun().input.history_messages ?? []
-    expect(history.map(item => item.role)).toEqual(['user', 'assistant', 'user'])
+    expect(history.map(item => item.role)).toEqual(['user', 'assistant', 'user', 'user'])
     expect(history.flatMap(item => item.parts.map(part => part.text))).toContain('Original request')
     expect(history.flatMap(item => item.parts.map(part => part.text))).toContain(
       'Earlier assistant context'
+    )
+    expect(history.flatMap(item => item.parts.map(part => part.text))).toContain(
+      'Passive thread chatter'
     )
     expect(history.flatMap(item => item.parts.map(part => part.text))).toContain(
       'Prior user clarification'

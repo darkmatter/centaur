@@ -1439,6 +1439,7 @@ async def steer_execution(
     execution_id: str,
     *,
     content_blocks: list[dict] | None = None,
+    history_messages: list[dict[str, Any]] | None = None,
     message_id: str | None = None,
     metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
@@ -1478,8 +1479,10 @@ async def steer_execution(
         )
         return await cancel_execution(pool, execution_id)
 
+    persisted_message_blocks: list[dict] | None = None
     if content_blocks is not None:
         content_blocks = [part for part in content_blocks if isinstance(part, dict)]
+        persisted_message_blocks = content_blocks
         if message_id and content_blocks:
             if metadata and metadata.get("steer_replacement") is True:
                 await _merge_execution_metadata(
@@ -1492,6 +1495,15 @@ async def steer_execution(
                         },
                     },
                 )
+        history_content_blocks = await _backfill_history_messages_for_assignment(
+            pool,
+            thread_key=thread_key,
+            assignment_generation=assignment_generation,
+            history_messages=history_messages or [],
+            current_message_id=message_id,
+        )
+        if history_content_blocks:
+            content_blocks = [*history_content_blocks, *content_blocks]
 
     # Build content blocks from pending messages if not provided
     if content_blocks is None:
@@ -1573,10 +1585,10 @@ async def steer_execution(
             else current_status,
         }
 
-    if message_id and content_blocks:
+    if message_id and persisted_message_blocks:
         event = {
             "type": "user",
-            "message": {"role": "user", "content": content_blocks},
+            "message": {"role": "user", "content": persisted_message_blocks},
         }
         await append_message(
             pool,
@@ -1598,6 +1610,100 @@ async def steer_execution(
         "thread_key": thread_key,
         "status": "steered",
     }
+
+
+async def _agent_message_request_exists(
+    pool,
+    *,
+    thread_key: str,
+    message_id: str,
+) -> bool:
+    row = await pool.fetchrow(
+        "SELECT 1 FROM agent_message_requests "
+        "WHERE thread_key = $1 AND message_id = $2",
+        thread_key,
+        message_id,
+    )
+    return row is not None
+
+
+async def _backfill_history_messages_for_assignment(
+    pool,
+    *,
+    thread_key: str,
+    assignment_generation: int,
+    history_messages: list[dict[str, Any]],
+    current_message_id: str | None = None,
+) -> list[dict[str, Any]]:
+    if not history_messages:
+        return []
+
+    from api.sandbox.harness_protocol import messages_to_content_blocks
+
+    valid_history: list[dict[str, Any]] = []
+    for item in history_messages:
+        if not isinstance(item, dict):
+            continue
+        history_message_id = str(
+            item.get("message_id") or item.get("messageId") or ""
+        ).strip()
+        if not history_message_id or history_message_id == current_message_id:
+            continue
+        history_parts = item.get("parts")
+        if not isinstance(history_parts, list):
+            continue
+        history_parts = [part for part in history_parts if isinstance(part, dict)]
+        if not history_parts:
+            continue
+        history_role = str(item.get("role") or "user").strip().lower()
+        if history_role not in {"user", "assistant"}:
+            continue
+        history_user_id = item.get("user_id") or item.get("userId")
+        valid_history.append(
+            {
+                "role": history_role,
+                "parts": history_parts,
+                "user_id": history_user_id,
+                "history_backfill": True,
+            }
+        )
+        if await _agent_message_request_exists(
+            pool,
+            thread_key=thread_key,
+            message_id=history_message_id,
+        ):
+            continue
+        raw_history_metadata = item.get("metadata")
+        history_metadata = (
+            dict(raw_history_metadata) if isinstance(raw_history_metadata, dict) else {}
+        )
+        history_metadata.setdefault("history_backfill", True)
+        history_metadata.setdefault("steer_history_backfill", True)
+        if history_user_id and not history_metadata.get("user_id"):
+            history_metadata["user_id"] = history_user_id
+        history_event = {
+            "type": history_role,
+            "message": {"role": history_role, "content": history_parts},
+        }
+        try:
+            await append_message(
+                pool,
+                thread_key=thread_key,
+                assignment_generation=assignment_generation,
+                message_id=history_message_id,
+                event=history_event,
+                metadata=history_metadata,
+            )
+        except ControlPlaneError as exc:
+            log.warn(
+                "steer_history_backfill_skipped",
+                thread_key=thread_key,
+                message_id=history_message_id,
+                code=exc.code,
+                error=exc.message,
+            )
+
+    return messages_to_content_blocks(valid_history)
 
 
 async def release_assignment(

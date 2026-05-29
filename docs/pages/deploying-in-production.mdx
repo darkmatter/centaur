@@ -143,6 +143,9 @@ access_token`. The CLI runs the local Codex login flow, reads
 `~/.codex/auth.json`, derives CLI OAuth metadata when possible, prompts for
 any missing masked values, and writes the matching secret items to the
 selected backend.
+For non-interactive agent runs, `--from-env` accepts either a complete
+`OPENAI_CODEX_BLOB` or a simpler `OPENAI_CODEX_REFRESH_TOKEN`; local Codex
+login metadata is still used as a fallback for the client id and account id.
 
 ### Claude Auth Modes
 
@@ -188,6 +191,9 @@ To bootstrap, run `centaur secrets collect --harness claude-code
 reads the credentials file or macOS keychain item, derives CLI OAuth metadata
 when possible, prompts for any missing masked values, and writes the matching
 secret items to the selected backend.
+For non-interactive agent runs, `--from-env` accepts either a complete
+`CLAUDE_CODE_BLOB` or a simpler `CLAUDE_CODE_REFRESH_TOKEN`; local Claude Code
+login metadata is still used as a fallback for the client id.
 
 ## 4. Configure Slack
 

@@ -53,6 +53,10 @@ clipboard so you can alt-tab into Slack and paste it. `secrets collect` prompts
 for required values with masked input, runs the selected Codex or Claude Code
 login command when subscription auth is selected, and writes the collected
 values into the chosen secret backend.
+For non-interactive runs, `secrets collect --from-env --auth-mode access_token`
+can also build the broker blob from `OPENAI_CODEX_REFRESH_TOKEN` or
+`CLAUDE_CODE_REFRESH_TOKEN`, plus local Codex/Claude login metadata when
+present.
 
 `centaur run` drives the durable agent API directly: it spawns or reuses a
 thread runtime, persists the user message, enqueues execution, pipes every SSE

@@ -256,6 +256,7 @@ function readFileTextIfExists(path: string) {
 
 export function extractCodexOAuthClientIdFromText(text: string) {
   const candidates = Array.from(new Set(text.match(/app_[A-Za-z0-9]{24}/g) || []))
+    .filter(candidate => !/^app_[a-z]+$/.test(candidate))
   return candidates.length === 1 ? candidates[0] : ''
 }
 
@@ -1263,6 +1264,54 @@ function requireEnv(name: string) {
   return value
 }
 
+function requireValue(name: string, value: string) {
+  if (!value) throw new Error(`${name} is required in the environment or local CLI auth state`)
+  return value
+}
+
+type CodexSubscriptionAuth = ReturnType<typeof readCodexSubscriptionAuth>
+type ClaudeSubscriptionAuth = ReturnType<typeof readClaudeSubscriptionAuth>
+
+export function codexSubscriptionSecretsFromSources(
+  env: NodeJS.ProcessEnv,
+  auth: CodexSubscriptionAuth,
+  cliClientId = '',
+) {
+  const refreshToken = env.OPENAI_CODEX_REFRESH_TOKEN || auth.refreshToken
+  return {
+    OPENAI_CODEX_CLIENT_ID: requireValue(
+      'OPENAI_CODEX_CLIENT_ID',
+      env.OPENAI_CODEX_CLIENT_ID || auth.clientId || cliClientId,
+    ),
+    OPENAI_CODEX_BLOB: requireValue(
+      'OPENAI_CODEX_BLOB',
+      env.OPENAI_CODEX_BLOB || (refreshToken ? JSON.stringify({ refresh_token: refreshToken }) : ''),
+    ),
+    OPENAI_CODEX_ACCOUNT_ID: requireValue(
+      'OPENAI_CODEX_ACCOUNT_ID',
+      env.OPENAI_CODEX_ACCOUNT_ID || auth.accountId,
+    ),
+  }
+}
+
+export function claudeSubscriptionSecretsFromSources(
+  env: NodeJS.ProcessEnv,
+  auth: ClaudeSubscriptionAuth,
+  cliClientId = '',
+) {
+  const refreshToken = env.CLAUDE_CODE_REFRESH_TOKEN || auth.refreshToken
+  return {
+    CLAUDE_CODE_CLIENT_ID: requireValue(
+      'CLAUDE_CODE_CLIENT_ID',
+      env.CLAUDE_CODE_CLIENT_ID || auth.clientId || cliClientId,
+    ),
+    CLAUDE_CODE_BLOB: requireValue(
+      'CLAUDE_CODE_BLOB',
+      env.CLAUDE_CODE_BLOB || (refreshToken ? JSON.stringify({ refresh_token: refreshToken }) : ''),
+    ),
+  }
+}
+
 function collectSecretsFromEnv(state: {
   installMode: string
   harness: Harness
@@ -1283,14 +1332,25 @@ function collectSecretsFromEnv(state: {
   if (state.harness === 'codex' && state.authMode === 'api_key') {
     secrets.OPENAI_API_KEY = requireEnv('OPENAI_API_KEY')
   } else if (state.harness === 'codex') {
-    secrets.OPENAI_CODEX_CLIENT_ID = requireEnv('OPENAI_CODEX_CLIENT_ID')
-    secrets.OPENAI_CODEX_BLOB = requireEnv('OPENAI_CODEX_BLOB')
-    secrets.OPENAI_CODEX_ACCOUNT_ID = requireEnv('OPENAI_CODEX_ACCOUNT_ID')
+    Object.assign(
+      secrets,
+      codexSubscriptionSecretsFromSources(
+        process.env,
+        readCodexSubscriptionAuth(),
+        discoverCodexOAuthClientIdFromCli(),
+      ),
+    )
   } else if (state.authMode === 'api_key') {
     secrets.ANTHROPIC_API_KEY = requireEnv('ANTHROPIC_API_KEY')
   } else {
-    secrets.CLAUDE_CODE_CLIENT_ID = requireEnv('CLAUDE_CODE_CLIENT_ID')
-    secrets.CLAUDE_CODE_BLOB = requireEnv('CLAUDE_CODE_BLOB')
+    Object.assign(
+      secrets,
+      claudeSubscriptionSecretsFromSources(
+        process.env,
+        readClaudeSubscriptionAuth(),
+        discoverClaudeOAuthClientIdFromCli(),
+      ),
+    )
   }
   return secrets
 }
@@ -1656,10 +1716,14 @@ const secrets = Cli.create('secrets', {
       vaultPath: c.options.vaultPath || promptedBackendOptions.vaultPath,
     }
     const result = writeSecrets(c.options.backend, secrets, backendOptions)
+    const deploySecretsFile =
+      c.options.backend === 'local-env'
+        ? backendOptions.localEnvPath
+        : deploySecretsFileForBackend(c.options.backend, c.options.overlayPath)
     const nextDeployCommand = deploymentCommandForInstallMode(c.options.installMode, {
       apply: true,
       imageSource: c.options.imageSource,
-      secretsFile: deploySecretsFileForBackend(c.options.backend, c.options.overlayPath),
+      secretsFile: deploySecretsFile,
     })
     const doctorCommand = [
       'doctor',

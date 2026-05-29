@@ -6,6 +6,8 @@ import { describe, expect, it } from 'vitest'
 
 import {
   app,
+  claudeSubscriptionSecretsFromSources,
+  codexSubscriptionSecretsFromSources,
   extractClaudeOAuthClientIdFromText,
   extractCodexOAuthClientIdFromText,
   k3sDeploymentCommands,
@@ -123,7 +125,9 @@ describe('slack manifest', () => {
 describe('harness auth', () => {
   it('can derive OAuth client ids from installed CLI metadata without hardcoding them', () => {
     expect(
-      extractCodexOAuthClientIdFromText('grant_type=refresh_token&client_id=app_ABCDEFGHIJKLMNOPQRSTUVWX&scope=openid'),
+      extractCodexOAuthClientIdFromText(
+        'sdk_infoapp_namecategorysymbolicprog grant_type=refresh_token&client_id=app_ABCDEFGHIJKLMNOPQRSTUVWX&scope=openid',
+      ),
     ).toBe('app_ABCDEFGHIJKLMNOPQRSTUVWX')
     expect(
       extractClaudeOAuthClientIdFromText(
@@ -765,6 +769,89 @@ describe('slackbot smoke', () => {
 })
 
 describe('secret backends', () => {
+  it('can build Codex subscription secrets for from-env mode from local auth sources', () => {
+    expect(
+      codexSubscriptionSecretsFromSources(
+        {},
+        {
+          refreshToken: 'refresh-from-auth',
+          accountId: 'acct-from-auth',
+          clientId: '',
+        },
+        'app_ABCDEFGHIJKLMNOPQRSTUVWX',
+      ),
+    ).toEqual({
+      OPENAI_CODEX_CLIENT_ID: 'app_ABCDEFGHIJKLMNOPQRSTUVWX',
+      OPENAI_CODEX_BLOB: '{"refresh_token":"refresh-from-auth"}',
+      OPENAI_CODEX_ACCOUNT_ID: 'acct-from-auth',
+    })
+  })
+
+  it('can build Claude subscription secrets for from-env mode from a simple refresh token', () => {
+    expect(
+      claudeSubscriptionSecretsFromSources(
+        { CLAUDE_CODE_REFRESH_TOKEN: 'refresh-from-env' },
+        {
+          refreshToken: '',
+          clientId: '',
+        },
+        '11111111-2222-3333-4444-555555555555',
+      ),
+    ).toEqual({
+      CLAUDE_CODE_CLIENT_ID: '11111111-2222-3333-4444-555555555555',
+      CLAUDE_CODE_BLOB: '{"refresh_token":"refresh-from-env"}',
+    })
+  })
+
+  it('uses the actual local env path in secrets collect deploy CTAs', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'centaur-cli-collect-'))
+    const overlayPath = join(root, 'org')
+    const localEnvPath = join(root, 'custom.env')
+    const env = {
+      SLACK_BOT_TOKEN: 'xoxb-test',
+      SLACK_SIGNING_SECRET: 'sign-test',
+      SLACK_APP_TOKEN: 'xapp-test',
+      OPENAI_CODEX_CLIENT_ID: 'app_TESTCLIENTID123456789012',
+      OPENAI_CODEX_BLOB: '{"refresh_token":"refresh-test"}',
+      OPENAI_CODEX_ACCOUNT_ID: 'acct-test',
+    }
+    const previous = Object.fromEntries(
+      Object.keys(env).map(key => [key, process.env[key]]),
+    )
+    Object.assign(process.env, env)
+    try {
+      const stdout = await runCli([
+        'secrets',
+        'collect',
+        '--backend',
+        'local-env',
+        '--install-mode',
+        'local',
+        '--harness',
+        'codex',
+        '--auth-mode',
+        'access_token',
+        '--from-env',
+        '--local-env-path',
+        localEnvPath,
+        '--overlay-path',
+        overlayPath,
+        '--json',
+      ])
+      const output = JSON.parse(stdout)
+      const deploy = output.cta.commands.find((command: { command: string }) =>
+        command.command.startsWith('centaur deploy k3s '),
+      )
+      expect(deploy.command).toContain(`--secrets-file ${localEnvPath}`)
+      expect(deploy.command).not.toContain(join(overlayPath, 'secrets.local.env'))
+    } finally {
+      for (const [key, value] of Object.entries(previous)) {
+        if (value === undefined) delete process.env[key]
+        else process.env[key] = value
+      }
+    }
+  })
+
   it('preserves JSON values for kubectl env-file secrets', () => {
     const text = kubernetesEnvFile({
       OPENAI_CODEX_BLOB: '{"refresh_token":"secret"}',

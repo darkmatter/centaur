@@ -106,15 +106,6 @@ deploy:
         --set sandbox.extraEnv.CLAUDE_CODE_AUTH_MODE=${CLAUDE_CODE_AUTH_MODE}
       )
     fi
-    # Per-tool local-runner allowlist (tool-CLI migration). The API reads
-    # CENTAUR_LOCAL_TOOLS from its own env and forwards it to each sandbox; set
-    # it on the API deployment. Escape commas so Helm keeps the comma-separated
-    # list as a single value instead of splitting it into multiple keys.
-    if [[ -n "${CENTAUR_LOCAL_TOOLS:-}" ]]; then
-      extra_args+=(
-        --set-string api.extraEnv.CENTAUR_LOCAL_TOOLS="${CENTAUR_LOCAL_TOOLS//,/\\,}"
-      )
-    fi
     helm upgrade --install {{release}} {{chart}} -n {{namespace}} --create-namespace -f {{dev_values}} ${extra_args[@]+"${extra_args[@]}"}
 
 # Bring up the dev stack; pass `k3s` (just up k3s) to import local images into k3s's containerd.

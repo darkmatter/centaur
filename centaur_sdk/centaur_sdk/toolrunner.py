@@ -28,8 +28,10 @@ import json
 import os
 import re
 import sys
+import time
 import tomllib
 import types
+import urllib.request
 from collections.abc import Callable
 from dataclasses import asdict, is_dataclass
 from enum import Enum
@@ -38,12 +40,16 @@ from typing import Any
 
 from toon_format import encode as toon_encode
 
+from centaur_sdk.logging import stderr_json_logger
 from centaur_sdk.tool_sdk import (
     ToolContext,
     reset_tool_context,
     save_attachment,
     set_tool_context,
 )
+
+# Diagnostics go to stderr as JSON; the runner's stdout is the tool result.
+log = stderr_json_logger()
 
 # ---------------------------------------------------------------------------
 # Shared constants (kept in sync with the historical values in tool_manager.py)
@@ -798,6 +804,44 @@ _CLI_TOOL_ERROR = 1  # the call failed (not found / validation / exception / tim
 _CLI_USAGE_ERROR = 2  # bad arguments to centaur-tool itself
 
 
+def _emit_tool_metric(tool: str, method: str, ok: bool, duration_s: float) -> None:
+    """Best-effort POST of per-call telemetry to the API metric-ingest endpoint.
+
+    Restores the Prometheus parity that ``api.tool_manager.record_tool_call`` gave
+    the sidecar path: a local tool call has no in-process metrics registry, so the
+    runner reports ``{tool, method, success, duration_s}`` and the API records the
+    same VictoriaMetrics series. Gated on ``CENTAUR_TOOL_METRICS`` so it is inert
+    unless the sandbox opts in; never raises and never delays the call materially
+    (short timeout, emitted after the result is already printed).
+    """
+    if os.getenv("CENTAUR_TOOL_METRICS", "").strip().lower() not in ("1", "true", "yes", "on"):
+        return
+    api_key = (os.getenv("CENTAUR_API_KEY") or "").strip()
+    if not api_key:
+        return
+    try:
+        base = (os.getenv("CENTAUR_API_URL") or "http://api:8000").rstrip("/")
+        payload = json.dumps(
+            {"tool": tool, "method": method, "success": ok, "duration_s": duration_s}
+        ).encode()
+        request = urllib.request.Request(
+            f"{base}/agent/tools-data/tool-call-metric",
+            data=payload,
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"},
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=3):
+            pass
+    except Exception:
+        # Metrics are best-effort and must never fail a tool call, but a
+        # persistent failure should be visible rather than silently dropped.
+        log.warning(
+            "tool metric emission failed",
+            extra={"event": "tool_metric_emit_failed", "tool": tool, "method": method},
+            exc_info=True,
+        )
+
+
 def _tool_dirs_from_env() -> list[Path]:
     """Resolve the tool search path for the agent sandbox.
 
@@ -877,16 +921,19 @@ def main(argv: list[str] | None = None) -> int:
         return _CLI_TOOL_ERROR
 
     thread_key = os.getenv("CENTAUR_THREAD_KEY") or None
+    t0 = time.monotonic()
     try:
         rendered, ok = run_tool_status(
             tool_dir, tool, method_name, args, thread_key=thread_key, fmt="toon"
         )
     except Exception as exc:  # defensive: run_tool_status already envelopes its errors
         print(json.dumps({"error": str(exc), "tool": tool, "method": method_name}))
+        _emit_tool_metric(tool, method_name, False, time.monotonic() - t0)
         return _CLI_TOOL_ERROR
     # A definitive result: print the envelope; exit 0 on success, non-zero on a
     # tool/validation/timeout error.
     print(rendered)
+    _emit_tool_metric(tool, method_name, ok, time.monotonic() - t0)
     return _CLI_SUCCESS if ok else _CLI_TOOL_ERROR
 
 

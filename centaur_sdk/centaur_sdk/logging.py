@@ -58,6 +58,33 @@ class JsonFormatter(logging.Formatter):
         return json.dumps(payload, default=str)
 
 
+_STDERR_LOGGER_NAME = "centaur.diagnostics"
+
+
+def stderr_json_logger(
+    service_name: str = "centaur-tool",
+    *,
+    level: str | None = None,
+) -> logging.Logger:
+    """Return a diagnostic logger that emits single-line JSON to **stderr**.
+
+    Deliberately separate from *stdout* (which carries tool output / the local
+    runner's result) and isolated from the root logger (``propagate=False``), so
+    using it never reconfigures anyone else's logging. This keeps diagnostics
+    visibly distinct from output. Idempotent: safe to call from every module.
+    """
+    logger = logging.getLogger(_STDERR_LOGGER_NAME)
+    if not getattr(logger, "_centaur_stderr_configured", False):
+        resolved_level = (level or os.getenv("LOG_LEVEL", "INFO")).upper()
+        handler = logging.StreamHandler(sys.stderr)
+        handler.setFormatter(JsonFormatter(service_name))
+        logger.handlers = [handler]
+        logger.setLevel(getattr(logging, resolved_level, logging.INFO))
+        logger.propagate = False
+        logger._centaur_stderr_configured = True  # type: ignore[attr-defined]
+    return logger
+
+
 def configure_json_logging(
     service_name: str,
     *,

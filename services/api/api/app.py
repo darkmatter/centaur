@@ -44,6 +44,7 @@ from api.routers import (
     attachments as attachments_mod,
     deprecated,
     health,
+    tools_data as tools_data_mod,
     webhooks as webhooks_mod,
 )
 from api.routers import agent as agent_router_mod
@@ -480,6 +481,7 @@ app.include_router(agent_router_mod.router)
 app.include_router(workflow_router_mod.router)
 app.include_router(webhooks_mod.router)
 app.include_router(attachments_mod.router)
+app.include_router(tools_data_mod.router)
 app.include_router(admin.router)
 app.include_router(deprecated.router)
 
@@ -529,9 +531,9 @@ except ImportError:
 tool_manager = ToolManager(_tools_dirs)
 tool_manager.discover()
 app.state.tool_manager = tool_manager
-# /tools/* is served by the dedicated tool-server entrypoint
-# (``api.tool_server_app``). The API keeps its in-process ToolManager only
-# for identity (Slack profile) and persona metadata lookups.
+# Tools run as local CLIs in the sandbox; the API no longer serves /tools/*.
+# The in-process ToolManager stays for workflow tool execution (server-side, with
+# legitimate DB access) plus identity (Slack profile) and persona metadata lookups.
 
 
 def get_tool_manager() -> ToolManager:

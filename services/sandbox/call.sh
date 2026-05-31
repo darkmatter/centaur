@@ -1,13 +1,13 @@
 #!/bin/bash
-# call — token-efficient API tool caller (returns TOON)
+# call — token-efficient tool caller (returns TOON)
 # Usage:
-#   call <tool> <method> [json_body]   → POST /tools/<tool>/<method>
-#   call tools                          → GET /tools (list all)
-#   call discover <tool>               → GET /tools/<tool>
+#   call <tool> <method> [json_body]   → run tool locally via centaur-tool
+#   call tools                          → list all tools (local discovery)
+#   call discover <tool>               → describe a tool (local discovery)
+#
+# Tools run as local CLIs inside this container; agent and workflow sub-commands
+# go to the API. There is no tool-server sidecar.
 U="${CENTAUR_API_URL:-http://api:8000}"
-# Tools are served by an in-pod sidecar when CENTAUR_TOOLS_URL is set; otherwise
-# fall back to the API server. Agent and workflow calls always go to the API.
-TU="${CENTAUR_TOOLS_URL:-$U}"
 T="Accept: text/plain"
 J="Content-Type: application/json"
 
@@ -22,8 +22,7 @@ _append_no_proxy() {
 }
 
 _api_host="$(_host_from_url "$U")"
-_tools_host="$(_host_from_url "$TU")"
-_append_no_proxy "localhost,127.0.0.1,api,centaur-api,centaur-centaur-api,centaur-api-proxy,victoriametrics,victorialogs,.centaur.svc.cluster.local,${_api_host},${_tools_host}"
+_append_no_proxy "localhost,127.0.0.1,api,centaur-api,centaur-centaur-api,centaur-api-proxy,victoriametrics,victorialogs,.centaur.svc.cluster.local,${_api_host}"
 # Prefer refreshed token (written on warm-pool claim) over original env var
 _KEY="${CENTAUR_API_KEY:-}"
 if [ -f /home/agent/.api_key ]; then
@@ -38,12 +37,9 @@ tool="$1"
 method="$2"
 body="$3"
 
-# ── Local tool routing (tool-CLI migration) ──────────────────────────────────
-# When a tool is listed in CENTAUR_LOCAL_TOOLS (comma-separated, or "all"), run
-# it via the local `centaur-tool` runner inside this container instead of
-# POSTing to the tool-server sidecar. The local result is final: the runner's
-# stdout and exit code are returned as-is. There is NO fallback to the sidecar —
-# if a tool is routed locally and fails, the call fails.
+# ── Local tool runner ─────────────────────────────────────────────────────────
+# Tools run via the local `centaur-tool` runner inside this container. The local
+# result is final: the runner's stdout and exit code are returned as-is.
 #
 # The runner enforces each tool's precise per-tool timeout internally (from its
 # pyproject `[tool.centaur].timeout_s`); LOCAL_TOOL_TIMEOUT_S here is only a
@@ -51,17 +47,6 @@ body="$3"
 # in-process timeout can't catch.
 LOCAL_TOOL_BIN="${CENTAUR_TOOL_BIN:-/opt/centaur-tools/bin/centaur-tool}"
 LOCAL_TOOL_TIMEOUT_S="${CENTAUR_LOCAL_TOOL_TIMEOUT_S:-1800}"
-
-_tool_is_local() {
-  local t="$1"
-  local list="${CENTAUR_LOCAL_TOOLS:-}"
-  [ -z "$list" ] && return 1
-  [ "$list" = "all" ] && return 0
-  case ",${list}," in
-    *",${t},"*) return 0 ;;
-  esac
-  return 1
-}
 
 auth_headers=()
 if [ -n "${_KEY}" ]; then
@@ -226,36 +211,24 @@ case "$tool" in
     exit 1
     ;;
   tools)
-    # Assemble the tool listing HERE rather than letting the tool server own the
-    # union: enumerate the locally-runnable tools (described from the baked tool
-    # code), then fold in whatever the tool server still serves, with local
-    # entries winning on overlap. A missing/failing tool server just drops out,
-    # so discovery keeps working as the sidecar is decommissioned. The built-in
+    # Discovery is local: enumerate tools from the baked tool code. The built-in
     # agent sub-command is injected last.
     local_list='{}'
     if [ -x "$LOCAL_TOOL_BIN" ]; then
       local_list="$("$LOCAL_TOOL_BIN" __list 2>/dev/null)" || local_list='{}'
       [ -n "$local_list" ] || local_list='{}'
     fi
-    remote_list='{}'
-    if [ "${CENTAUR_LOCAL_TOOLS:-}" != "all" ]; then
-      if remote_resp="$(request "GET" "$TU/tools")"; then
-        remote_list="$remote_resp"
-      fi
-    fi
-    printf '%s\n%s' "$remote_list" "$local_list" \
-      | jq -s -c '.[0] + .[1] + {"agent":{"description":"Sub-agent dispatch (built-in). Use: call agent execute, call agent status, call agent runtime, call agent stop","methods":["execute","status","runtime","stop"]}}'
+    printf '%s' "$local_list" \
+      | jq -c '. + {"agent":{"description":"Sub-agent dispatch (built-in). Use: call agent execute, call agent status, call agent runtime, call agent stop","methods":["execute","status","runtime","stop"]}}'
     printf '\n'
     ;;
   discover)
     if [ "$2" = "agent" ]; then
       printf '%s\n' '{"tool":"agent","description":"Sub-agent dispatch (built-in, not a tool plugin)","methods":[{"name":"execute","description":"Spawn a sub-agent. Body: {\"thread_key\":\"task:<purpose>-<id>\",\"message\":\"...\",\"harness\":\"<persona>\"}. Returns {execution_id, status}."},{"name":"status","description":"Poll sub-agent. Usage: call agent status '\''?key=<thread_key>'\''"},{"name":"runtime","description":"Inspect active persona/overlay/available personas for a thread. Usage: call agent runtime '\''?key=<thread_key>'\''"},{"name":"stop","description":"Stop sub-agent. Body: {\"thread_key\":\"...\"}"}]}'
-    elif _tool_is_local "$2"; then
-      # Local tool: describe it from the baked tool code — no tool-server call.
+    else
+      # Describe the tool from the baked tool code — no tool-server call.
       "$LOCAL_TOOL_BIN" __describe "$2"
       exit $?
-    else
-      request "GET" "$TU/tools/$2"
     fi
     ;;
   agent)
@@ -295,24 +268,17 @@ case "$tool" in
     fi
     ;;
   *)
-    # Local-runner branch: when the tool is allowlisted, the local runner owns
-    # the call end to end — its stdout and exit code are returned verbatim, with
-    # no sidecar fallback.
-    if _tool_is_local "$tool"; then
-      # Wrap in `timeout` as a hard-kill backstop when it is available; the
-      # runner enforces each tool's precise per-tool timeout internally either
-      # way, so a missing `timeout` only drops the coarse outer guard.
-      local_timeout=()
-      if command -v timeout >/dev/null 2>&1; then
-        local_timeout=(timeout "$LOCAL_TOOL_TIMEOUT_S")
-      fi
-      "${local_timeout[@]}" "$LOCAL_TOOL_BIN" "$tool" "$method" "$body"
-      exit $?
+    # Tools run locally end to end: the runner's stdout and exit code are
+    # returned verbatim. There is no sidecar and no fallback.
+    #
+    # Wrap in `timeout` as a hard-kill backstop when it is available; the runner
+    # enforces each tool's precise per-tool timeout internally either way, so a
+    # missing `timeout` only drops the coarse outer guard.
+    local_timeout=()
+    if command -v timeout >/dev/null 2>&1; then
+      local_timeout=(timeout "$LOCAL_TOOL_TIMEOUT_S")
     fi
-    if [ -z "$body" ]; then
-      request "POST" "$TU/tools/$tool/$method"
-    else
-      request "POST" "$TU/tools/$tool/$method" "$body"
-    fi
+    "${local_timeout[@]}" "$LOCAL_TOOL_BIN" "$tool" "$method" "$body"
+    exit $?
     ;;
 esac

@@ -14,15 +14,13 @@ from pathlib import Path
 from typing import Any, ClassVar
 from urllib.parse import quote, urljoin, urlparse
 
-import structlog
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 
+from centaur_sdk.logging import stderr_json_logger
 from centaur_sdk.tool_sdk import get_tool_context, save_attachment, secret
 
-# structlog so these lines render as JSON through the tool-server's
-# configure_structlog() pipeline, like the rest of the service's logs.
-logger = structlog.get_logger()
+log = stderr_json_logger()
 
 # Cache for channel list to avoid repeated API calls
 
@@ -1729,6 +1727,14 @@ class SlackClient:
         Returns:
             Dict with channel, ts, permalink
         """
+        # When this tool runs as a local CLI inside a sandbox agent, a send into
+        # the agent's own live Slackbot thread should fold into the in-progress
+        # live reply instead of posting a duplicate. Best-effort: any failure
+        # falls through to a normal post.
+        captured = _capture_live_send(channel=channel, text=text, thread_ts=thread_ts)
+        if captured is not None and captured.get("captured"):
+            return captured
+
         channel_id = self._resolve_channel(channel)
 
         message_text = text
@@ -2004,12 +2010,15 @@ class SlackClient:
                     break
 
             if not landed and not verify_failed:
-                logger.warning(
-                    "slack_upload_file_share_dropped",
-                    file_id=file_id,
-                    channel=resolved_channel,
-                    thread_ts=effective_thread_ts,
-                    files_info=info_file,
+                log.warning(
+                    "slack upload file share dropped",
+                    extra={
+                        "event": "slack_upload_file_share_dropped",
+                        "file_id": file_id,
+                        "channel": resolved_channel,
+                        "thread_ts": effective_thread_ts,
+                        "files_info": info_file,
+                    },
                 )
 
             return {
@@ -2408,6 +2417,46 @@ def _client() -> SlackClient:
         search_token=secret("SLACK_SEARCH_TOKEN", ""),
         etl_token=secret("SLACK_ETL_TOKEN", ""),
     )
+
+
+def _capture_live_send(
+    *, channel: str, text: str, thread_ts: str | None
+) -> dict[str, Any] | None:
+    """Pre-call the API live-capture broker before posting to Slack.
+
+    Returns the capture envelope when the send folded into the agent's active
+    Slackbot live reply (caller posts nothing), else ``None`` (caller posts
+    normally). Only runs when a sandbox API key is present; never raises.
+    """
+    try:
+        api_key = secret("CENTAUR_API_KEY", "").strip()
+        if not api_key:
+            return None
+        base = secret("CENTAUR_API_URL", "http://api:8000").rstrip("/")
+        payload = json.dumps(
+            {"channel": channel, "text": text, "thread_ts": thread_ts or ""}
+        ).encode()
+        request = urllib.request.Request(
+            f"{base}/agent/tools-data/slack/capture",
+            data=payload,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {api_key}",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=15) as response:
+            result = json.loads(response.read())
+        return result if isinstance(result, dict) else None
+    except Exception:
+        # Best-effort: a capture failure must not block the send, but it should
+        # be visible rather than silently posting (and risking a duplicate).
+        log.warning(
+            "live slack capture pre-call failed; posting normally",
+            extra={"event": "slack_live_capture_failed", "channel": channel},
+            exc_info=True,
+        )
+        return None
 
 
 def get_slack_client() -> SlackClient:

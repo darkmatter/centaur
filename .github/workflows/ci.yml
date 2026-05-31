@@ -81,18 +81,13 @@ jobs:
         working-directory: services/api
         # api.config requires DATABASE_URL at import. None of these tests open a
         # real connection (they are unit/wiring/subprocess tests, none request
-        # the DB fixtures), so a deterministic dummy DSN is enough — and it is
-        # the value test_tool_server_core_pg asserts the proxied DSN inherits.
+        # the DB fixtures), so a deterministic dummy DSN is enough.
         env:
           DATABASE_URL: postgresql://app_user:pw@db:5432/ai_v2
-        # test_tool_server_core_pg reads the cached api.config.settings singleton;
-        # test_sandbox_kubernetes_backend mutates DATABASE_URL in-session, so the
-        # former runs first to read the job's DSN cleanly (pre-existing test-order
-        # coupling, unrelated to this change).
         run: |
           uv run pytest -q \
-            tests/test_tool_server_core_pg.py \
             tests/test_tool_manager.py \
+            tests/test_tools_data.py \
             tests/test_call_sh.py \
             tests/test_sandbox_kubernetes_backend.py \
             tests/test_amp_wrapper.py \

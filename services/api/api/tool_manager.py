@@ -22,10 +22,8 @@ from pathlib import Path
 from typing import Any, ClassVar
 
 import structlog
-from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import PlainTextResponse
+from fastapi import Request
 
-from api.api_keys import check_scope
 from api.otel import (
     context_from_serialized,
     mark_error,
@@ -34,33 +32,19 @@ from api.otel import (
     start_span,
 )
 from api.vm_metrics import record_tool_call
-from api.deps import get_key_info, get_sandbox_claims, verify_api_key
-from api import slackbot_client
+from api.deps import get_sandbox_claims
 from centaur_sdk import ToolContext, reset_tool_context, set_tool_context
 
-# The pure invocation core is shared with the local agent runner
-# (``centaur-tool``) so the two execution paths stay behaviorally identical.
-# These names keep their historical module-level identity here (and are
-# re-exported below) so existing importers — tests included — are unaffected.
-from centaur_sdk.toolrunner import (  # noqa: F401  (re-exported for back-compat)
+# The pure tool-invocation core is shared with the local agent runner
+# (``centaur-tool``) via centaur_sdk.toolrunner so both paths stay identical.
+from centaur_sdk.toolrunner import (
     _ATTACHMENT_EXTRACT_MIN_BYTES,
-    _BUILTIN_TYPE_NAMES,
-    _COMMON_ARGUMENT_ALIASES,
-    _DOCSTRING_BOUNDARY_MARKERS,
-    _FORBIDDEN_TOOL_ARGUMENT_NAMES,
-    _LIFECYCLE_METHODS,
-    _MAX_INLINE_TOOL_BINARY_BYTES,
-    _METHOD_DESCRIPTION_MAX_CHARS,
-    _TOOL_BINARY_PREVIEW_BYTES,
     ToolMethod,
-    _describe_method_docstring,
-    _friendly_type_name,
     _normalize_for_serialization,
     _payload_size_bytes,
     _to_toon,
     _tool_arg_validation_error,
     collect_methods,
-    describe_methods,
 )
 
 log = structlog.get_logger()
@@ -1179,62 +1163,27 @@ async def _capture_live_slack_send(
     method_name: str,
     args: dict[str, Any],
 ) -> dict[str, Any] | None:
+    """In-process live-send capture for the slack tool.
+
+    The capture decision + session hand-off live in ``api.tools_data.slack_capture``
+    so the in-process path here and the brokered ``/agent/tools-data/slack/capture``
+    endpoint (used by the local slack tool) share one source.
+    """
     if request is None or not sandbox_claims:
         return None
     if tool_name != "slack" or method_name != "send_message":
         return None
 
-    thread_key = str(sandbox_claims.get("thread_key") or "")
-    parts = thread_key.split(":")
-    if len(parts) < 4 or parts[0] != "slack":
-        return None
-    active_channel = parts[2]
-    active_thread_ts = parts[3]
-    requested_channel = str(args.get("channel") or args.get("channel_id") or "").lstrip("#")
-    requested_thread_ts = str(args.get("thread_ts") or "")
-    channel_is_id = bool(re.match(r"^[CDG][A-Z0-9]+$", requested_channel))
-    if channel_is_id and requested_channel != active_channel:
-        return None
-    if requested_thread_ts and requested_thread_ts != active_thread_ts:
-        return None
-
-    text = str(args.get("text") or args.get("message") or "").strip()
-    if not text:
-        return None
+    from api.tools_data.slack_capture import capture_live_slack_send
 
     pool = getattr(request.app.state, "db_pool", None)
-    if pool is None:
-        return None
-    session_id = await pool.fetchval(
-        "SELECT metadata->>'slackbot_agent_session_id' "
-        "FROM agent_execution_requests "
-        "WHERE thread_key = $1 "
-        "AND status = 'running' "
-        "AND ("
-        "  metadata->>'slackbot_live_delivery' = 'true' "
-        "  OR metadata->>('slackbot' || '_v' || '2_live_delivery') = 'true'"
-        ") "
-        "AND COALESCE(metadata->>'slackbot_agent_session_id', '') <> '' "
-        "ORDER BY started_at DESC NULLS LAST, created_at DESC LIMIT 1",
-        thread_key,
+    return await capture_live_slack_send(
+        pool,
+        thread_key=str(sandbox_claims.get("thread_key") or ""),
+        channel=str(args.get("channel") or args.get("channel_id") or ""),
+        thread_ts=str(args.get("thread_ts") or ""),
+        text=str(args.get("text") or args.get("message") or ""),
     )
-    session_id = str(session_id or "").strip()
-    if not session_id:
-        return None
-
-    await slackbot_client.session_text(session_id, text)
-    log.info(
-        "slack_send_message_captured",
-        thread_key=thread_key,
-        sandbox_container_id=sandbox_claims.get("container_id"),
-        slackbot_agent_session_id=session_id,
-    )
-    return {
-        "captured": True,
-        "message": "Captured into the active Slackbot live reply; no separate Slack message was posted.",
-        "channel": active_channel,
-        "thread_ts": active_thread_ts,
-    }
 
 
 async def _extract_tool_attachment(
@@ -1296,14 +1245,12 @@ async def _extract_tool_attachment(
     return out
 
 
-# ``ToolMethod``, ``_LIFECYCLE_METHODS``, the argument-validation tables and
-# ``_tool_arg_validation_error``, the serialization helpers
-# (``_normalize_for_serialization`` / ``_to_toon`` / ``_payload_size_bytes``),
-# and the discovery helpers (``_describe_method_docstring`` /
-# ``_friendly_type_name`` / ``_BUILTIN_TYPE_NAMES`` / ``describe_methods``) now
-# live in ``centaur_sdk.toolrunner`` and are imported at the top of this module.
-# Keeping a single implementation is what guarantees the local ``centaur-tool``
-# runner and this server path produce byte-identical results.
+# The argument-validation, serialization, and method-collection helpers
+# (``ToolMethod`` / ``_tool_arg_validation_error`` / ``_normalize_for_serialization``
+# / ``_to_toon`` / ``_payload_size_bytes`` / ``collect_methods``) live in
+# ``centaur_sdk.toolrunner`` and are imported at the top of this module. Keeping a
+# single implementation is what guarantees the local ``centaur-tool`` runner and
+# this server path produce byte-identical results.
 
 
 class LoadedTool:
@@ -1837,20 +1784,6 @@ class ToolManager:
     # ``centaur_sdk.toolrunner.collect_methods``.
     _collect_methods = staticmethod(collect_methods)
 
-    def describe_tool(self, tool_name: str) -> dict[str, Any]:
-        """Return full method schemas for a tool's methods."""
-        lt = self.tools.get(tool_name)
-        if not lt:
-            return {
-                "error": f"Tool '{tool_name}' not found",
-                "available": sorted(self.tools.keys()),
-            }
-        return {
-            "tool": lt.name,
-            "description": lt.description,
-            "methods": describe_methods(lt.methods),
-        }
-
     async def call_tool_raw(
         self,
         tool_name: str,
@@ -2202,129 +2135,3 @@ class ToolManager:
                 )
             finally:
                 reset_tool_context(token)
-
-    def create_rest_router(self) -> APIRouter:
-        """Create a stable FastAPI router that dispatches to tools via live lookup.
-
-        Routes are fixed at registration time — tool calls resolve through
-        ``self.tools`` at request time so hot-reloads take effect without
-        swapping routes.
-        """
-        pm = self
-        router = APIRouter(
-            prefix="/tools",
-            dependencies=[Depends(verify_api_key)],
-        )
-
-        def _require_tool_scope(request: Request, tool_name: str) -> None:
-            key_info = get_key_info(request)
-            if not check_scope(key_info, "tools", tool_name):
-                raise HTTPException(
-                    status_code=403,
-                    detail=f"API key does not have access to tool '{tool_name}'",
-                )
-
-        @router.get("")
-        async def list_tools(request: Request) -> dict:
-            key_info = get_key_info(request)
-            result = {}
-            for name, p in pm.tools.items():
-                if not check_scope(key_info, "tools", name):
-                    continue
-                required_secrets = [s for s in p.secrets if _is_replace_secret(s)]
-                if required_secrets:
-                    resolved = await _resolve_secrets(required_secrets)
-                    if len(resolved) < len(required_secrets):
-                        continue
-                result[name] = {
-                    "description": p.description,
-                    "methods": [m.method_name for m in p.methods],
-                }
-            return result
-
-        # ── Persona endpoints (registered before catch-all /{tool_name}) ─────
-
-        @router.get("/personas")
-        async def list_personas() -> dict:
-            return {
-                name: {
-                    "description": p.description,
-                    "engine": p.engine,
-                    "default_repo": p.default_repo,
-                    "has_custom_executor": p.has_custom_executor,
-                }
-                for name, p in pm.personas.items()
-            }
-
-        @router.get("/personas/{name}")
-        async def get_persona_detail(name: str) -> dict:
-            p = pm.personas.get(name)
-            if not p:
-                raise HTTPException(
-                    status_code=404, detail=f"Persona '{name}' not found"
-                )
-            return {
-                "name": p.name,
-                "description": p.description,
-                "engine": p.engine,
-                "default_repo": p.default_repo,
-                "prompt_file": p.prompt_file,
-                "has_custom_executor": p.has_custom_executor,
-                "tool_dir": str(p.tool_dir),
-            }
-
-        @router.get("/personas/{name}/prompt")
-        async def get_persona_prompt(name: str):
-            p = pm.personas.get(name)
-            if not p:
-                raise HTTPException(
-                    status_code=404, detail=f"Persona '{name}' not found"
-                )
-            return PlainTextResponse(p.prompt_content)
-
-        # ── Tool endpoints ───────────────────────────────────────────────────
-
-        @router.get("/{tool_name}")
-        async def describe_tool(tool_name: str, request: Request) -> dict:
-            _require_tool_scope(request, tool_name)
-            p = pm.tools.get(tool_name)
-            if p:
-                required_secrets = [s for s in p.secrets if _is_replace_secret(s)]
-                if required_secrets:
-                    resolved = await _resolve_secrets(required_secrets)
-                    if len(resolved) < len(required_secrets):
-                        raise HTTPException(
-                            status_code=404,
-                            detail=f"Tool '{tool_name}' is not available (missing secrets)",
-                        )
-            return pm.describe_tool(tool_name)
-
-        @router.post("/{tool_name}/{method_name}")
-        async def call_tool(tool_name: str, method_name: str, request: Request):
-            raw_body = await request.body()
-            body: dict[str, Any] = {}
-            if raw_body:
-                try:
-                    body = json.loads(raw_body)
-                except json.JSONDecodeError as exc:
-                    raise HTTPException(
-                        status_code=400, detail="Request body must be valid JSON"
-                    ) from exc
-                if not isinstance(body, dict):
-                    raise HTTPException(
-                        status_code=400, detail="Request body must be a JSON object"
-                    )
-            _require_tool_scope(request, tool_name)
-            accept = request.headers.get("accept", "")
-            want_toon = "text/plain" in accept
-            fmt = "toon" if want_toon else "json"
-            result = await pm.call_tool(
-                tool_name, method_name, body, request=request, format=fmt
-            )
-            if want_toon:
-                return PlainTextResponse(
-                    result if isinstance(result, str) else _to_toon(result)
-                )
-            return {"tool": tool_name, "method": method_name, "result": result}
-
-        return router

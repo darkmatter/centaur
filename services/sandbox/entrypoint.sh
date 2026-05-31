@@ -238,37 +238,23 @@ if [ "$CODEX_AUTH_MODE" != "access_token" ]; then
     fi
 fi
 
-# ── Install overlay (org) tool deps for locally-routed tools ─────────────────
+# ── Install overlay (org) tool deps ──────────────────────────────────────────
 # Base tool deps are baked into the /opt/centaur-tools runner venv at image
 # build time. Overlay (org) tools are mounted at runtime from a separate image,
-# so there is no build-time chance to bake them: the deps of any overlay tool
-# routed to the local runner (named in CENTAUR_LOCAL_TOOLS) must be installed
-# now. Mirrors the old tool-server-startup.sh. Best-effort — a failed install
-# surfaces as a per-tool ImportError at call time, not a sandbox failure.
-if [ -n "${CENTAUR_LOCAL_TOOLS:-}" ] \
-   && [ -n "${CENTAUR_OVERLAY_DIR:-}" ] && [ -d "${CENTAUR_OVERLAY_DIR}/tools" ] \
+# so there is no build-time chance to bake them: every overlay tool runs as a
+# local CLI, so install all of their deps now (no allowlist filter). Best-effort
+# — a failed install surfaces as a per-tool ImportError at call time, not a
+# sandbox failure.
+if [ -n "${CENTAUR_OVERLAY_DIR:-}" ] && [ -d "${CENTAUR_OVERLAY_DIR}/tools" ] \
    && [ -x /opt/centaur-tools/bin/python ] && command -v uv >/dev/null 2>&1; then
     _overlay_deps_file="$(mktemp)"
-    collect-tool-deps "${CENTAUR_OVERLAY_DIR}/tools" "${CENTAUR_LOCAL_TOOLS}" > "$_overlay_deps_file"
+    collect-tool-deps "${CENTAUR_OVERLAY_DIR}/tools" > "$_overlay_deps_file"
     if [ -s "$_overlay_deps_file" ]; then
         echo "entrypoint: installing overlay tool deps into /opt/centaur-tools" >&2
         uv pip install --python /opt/centaur-tools/bin/python -r "$_overlay_deps_file" \
             || echo "entrypoint: overlay tool dep install failed; affected tools will error at call time" >&2
     fi
     rm -f "$_overlay_deps_file"
-fi
-
-# Wait for the tool-server sidecar before signalling readiness, so the harness
-# doesn't issue its first tool call before the server is listening.
-if [ -n "${CENTAUR_TOOLS_URL:-}" ]; then
-    _tools_deadline=$(( $(date +%s) + ${CENTAUR_TOOLS_WAIT_SECONDS:-10} ))
-    until curl -fsS --noproxy '*' --max-time 2 "${CENTAUR_TOOLS_URL}/healthz" >/dev/null 2>&1; do
-        if [ "$(date +%s)" -ge "$_tools_deadline" ]; then
-            echo "tool-server /healthz not ready after ${CENTAUR_TOOLS_WAIT_SECONDS:-10}s; continuing" >&2
-            break
-        fi
-        sleep 0.5
-    done
 fi
 
 # Signal readiness

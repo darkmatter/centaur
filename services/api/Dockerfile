@@ -47,9 +47,8 @@ COPY workflows/ workflows/
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --no-dev --inexact
 
-COPY services/api/tool-server-startup.sh /app/tool-server-startup.sh
 COPY services/api/entrypoint.sh /entrypoint.sh
-RUN chmod +x /app/tool-server-startup.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
 
 EXPOSE 8000
 

@@ -166,6 +166,35 @@ def test_send_message_omits_unfurl_flags_by_default() -> None:
     assert "unfurl_media" not in fake_web_client.last_kwargs
 
 
+def test_send_message_short_circuits_when_captured(monkeypatch: pytest.MonkeyPatch) -> None:
+    import slack.client as slack_client
+
+    client, fake_web_client = _make_client()
+    monkeypatch.setattr(
+        slack_client,
+        "_capture_live_send",
+        lambda **kwargs: {"captured": True, "channel": "C9", "thread_ts": "t"},
+    )
+
+    result = client.send_message("paradigm-pulse", "hello", thread_ts="t")
+
+    assert result == {"captured": True, "channel": "C9", "thread_ts": "t"}
+    # Nothing was posted to Slack.
+    assert fake_web_client.last_kwargs is None
+
+
+def test_send_message_posts_when_not_captured(monkeypatch: pytest.MonkeyPatch) -> None:
+    import slack.client as slack_client
+
+    client, fake_web_client = _make_client()
+    monkeypatch.setattr(slack_client, "_capture_live_send", lambda **kwargs: None)
+
+    client.send_message("paradigm-pulse", "hello")
+
+    assert fake_web_client.last_kwargs is not None
+    assert fake_web_client.last_kwargs["text"] == "hello"
+
+
 def test_retry_on_ratelimit_honors_retry_after(monkeypatch: pytest.MonkeyPatch) -> None:
     client, _ = _make_client()
     now = {"value": 100.0}

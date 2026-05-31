@@ -315,3 +315,45 @@ def test_main_describe_and_call(tmp_path: Path, monkeypatch, capsys):
     assert toolrunner.main(["ghost", "x"]) == toolrunner._CLI_TOOL_ERROR
     err = json.loads(capsys.readouterr().out)
     assert err["error"] == "Tool 'ghost' not found"
+
+
+def test_emit_tool_metric_is_inert_without_opt_in(monkeypatch):
+    monkeypatch.delenv("CENTAUR_TOOL_METRICS", raising=False)
+    monkeypatch.setenv("CENTAUR_API_KEY", "sbx1.tok")
+    called: list[int] = []
+    monkeypatch.setattr(
+        toolrunner.urllib.request, "urlopen", lambda *a, **k: called.append(1)
+    )
+    toolrunner._emit_tool_metric("t", "m", True, 0.1)
+    assert called == []  # gated off → no network
+
+
+def test_emit_tool_metric_posts_when_enabled(monkeypatch):
+    monkeypatch.setenv("CENTAUR_TOOL_METRICS", "1")
+    monkeypatch.setenv("CENTAUR_API_KEY", "sbx1.tok")
+    monkeypatch.setenv("CENTAUR_API_URL", "http://api:9000")
+    captured: dict = {}
+
+    class _Resp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def fake_urlopen(req, timeout=None):
+        captured["url"] = req.full_url
+        captured["data"] = json.loads(req.data)
+        captured["auth"] = req.headers.get("Authorization")
+        return _Resp()
+
+    monkeypatch.setattr(toolrunner.urllib.request, "urlopen", fake_urlopen)
+    toolrunner._emit_tool_metric("coingecko", "price", True, 0.42)
+    assert captured["url"] == "http://api:9000/agent/tools-data/tool-call-metric"
+    assert captured["data"] == {
+        "tool": "coingecko",
+        "method": "price",
+        "success": True,
+        "duration_s": 0.42,
+    }
+    assert captured["auth"] == "Bearer sbx1.tok"

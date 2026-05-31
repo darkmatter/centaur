@@ -191,12 +191,11 @@ def container_env(
         f"CENTAUR_TRACE_ID={trace_id or ''}",
         f"AMP_MODE={amp_mode()}",
     ]
-    if (os.getenv("KUBERNETES_TOOL_SERVER_IMAGE") or "").strip():
-        tools_port = (os.getenv("KUBERNETES_TOOL_SERVER_PORT") or "8001").strip()
-        env.append(f"CENTAUR_TOOLS_URL=http://localhost:{tools_port}")
-    local_tools = (os.getenv("CENTAUR_LOCAL_TOOLS") or "").strip()
-    if local_tools:
-        env.append(f"CENTAUR_LOCAL_TOOLS={local_tools}")
+    # Tools run as local CLIs in the sandbox (no tool-server sidecar). The runner
+    # reports per-call telemetry back to the API so Prometheus parity survives;
+    # operators can set CENTAUR_TOOL_METRICS=0 to turn the emission off.
+    tool_metrics = (os.getenv("CENTAUR_TOOL_METRICS") or "1").strip()
+    env.append(f"CENTAUR_TOOL_METRICS={tool_metrics}")
     visibility = amp_thread_visibility()
     if visibility:
         env.append(f"AMP_THREAD_VISIBILITY={visibility}")

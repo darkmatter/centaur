@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 """Print the union of pyproject dependencies for tools under a directory.
 
-Used by the agent image build (base tools, no filter) and the sandbox entrypoint
-(overlay tools, filtered by the local-runner allowlist) to assemble the
-``centaur-tool`` runner's venv.
+Used by the agent image build (base tools) and the sandbox entrypoint (overlay
+tools) to assemble the ``centaur-tool`` runner's venv. Every tool runs as a
+local CLI, so both callers collect all deps; the optional allowlist arg is a
+narrowing escape hatch, not part of the normal flow.
 
 Usage:
     collect-tool-deps <tools_root> [allowlist]
 
     <tools_root>  directory scanned recursively for ``**/pyproject.toml``.
-    allowlist     optional, in the CENTAUR_LOCAL_TOOLS format:
-                    - omitted or ""  -> every tool (image build bakes all base deps)
+    allowlist     optional, comma-separated tool names:
+                    - omitted or ""  -> every tool (the default)
                     - "all"          -> every tool
                     - "a,b,c"        -> only tools whose directory name is listed
 
@@ -34,7 +35,7 @@ def collect(tools_root: str, allowlist: str) -> list[str]:
     deps: set[str] = set()
     for pyproject in root.glob("**/pyproject.toml"):
         # A tool's name is its directory name (categories sit one level up),
-        # matching how CENTAUR_LOCAL_TOOLS and the runner resolve tools.
+        # matching how the runner resolves tools.
         if not (no_filter or pyproject.parent.name in allowed):
             continue
         try:

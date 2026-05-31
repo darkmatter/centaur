@@ -6,21 +6,19 @@ from enum import Enum
 from pathlib import Path
 from typing import Optional, Union
 
-import httpx
 import pytest
-from fastapi import FastAPI
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from api.tool_manager import (  # noqa: E402
-    _LIFECYCLE_METHODS,
+from api.tool_manager import ToolManager  # noqa: E402
+from centaur_sdk.toolrunner import (  # noqa: E402
+    ToolMethod,
     _describe_method_docstring,
     _friendly_type_name,
+    _LIFECYCLE_METHODS,
     _normalize_for_serialization,
-    _tool_arg_validation_error,
     _to_toon,
-    ToolManager,
-    ToolMethod,
+    _tool_arg_validation_error,
 )
 
 
@@ -589,95 +587,6 @@ async def test_call_tool_allows_disabling_outer_timeout(
 
     await manager.call_tool("alpha", "sync_echo", {"text": "hello"})
     assert captured == [None]
-
-
-@pytest.mark.asyncio
-async def test_tool_rest_router_lists_describes_and_invokes_tools(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-):
-    from centaur_sdk.backends import registry
-
-    monkeypatch.setattr(registry, "_backend", _NullBackend())
-    tools_dir = tmp_path / "tools"
-    _write_tool(
-        tools_dir,
-        "alpha",
-        FAKE_TOOL_CLIENT,
-        description="REST alpha",
-        secrets=["REQ_TOKEN"],
-        optional_secrets=["OPT_TOKEN"],
-    )
-    manager = ToolManager(tools_dir)
-    manager.discover()
-    app = FastAPI()
-    app.include_router(manager.create_rest_router())
-
-    from fastapi import Request
-
-    from api.api_keys import APIKeyInfo
-    from api.deps import verify_api_key
-
-    async def _grant_tools_scope(request: Request) -> str:
-        request.state.api_key_info = APIKeyInfo(
-            id="test",
-            name="test",
-            key_prefix="test",
-            scopes=["tools:*"],
-            created_by="test",
-            source="localhost",
-        )
-        return "key:test"
-
-    app.dependency_overrides[verify_api_key] = _grant_tools_scope
-
-    transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        list_response = await client.get("/tools")
-        assert list_response.status_code == 200
-        assert list_response.json() == {
-            "alpha": {
-                "description": "REST alpha",
-                "methods": ["async_echo", "secret_values", "sync_echo"],
-            }
-        }
-
-        describe_response = await client.get("/tools/alpha")
-        assert describe_response.status_code == 200
-        description = describe_response.json()
-        assert description["tool"] == "alpha"
-        assert description["description"] == "REST alpha"
-        assert [method["name"] for method in description["methods"]] == [
-            "async_echo",
-            "secret_values",
-            "sync_echo",
-        ]
-
-        call_response = await client.post(
-            "/tools/alpha/sync_echo",
-            json={"text": "from rest"},
-        )
-        assert call_response.status_code == 200
-        assert call_response.json() == {
-            "tool": "alpha",
-            "method": "sync_echo",
-            "result": {"mode": "sync", "text": "from rest", "source": "base"},
-        }
-
-        secret_response = await client.post("/tools/alpha/secret_values", json={})
-        assert secret_response.status_code == 200
-        assert secret_response.json() == {
-            "tool": "alpha",
-            "method": "secret_values",
-            "result": {"required": "REQ_TOKEN", "optional": "OPT_TOKEN"},
-        }
-
-        missing_response = await client.post("/tools/alpha/missing", json={})
-        assert missing_response.status_code == 200
-        assert missing_response.json()["result"] == (
-            '{"error": "Method \'missing\' not found in tool \'alpha\'", '
-            '"available_methods": ["async_echo", "secret_values", "sync_echo"]}'
-        )
 
 
 class TestHarnessSecretSelection:

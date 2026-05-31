@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/centaur-api-server",
     "crates/centaur-sandbox-core",
     "crates/centaur-sandbox-e2e",
     "crates/centaur-sandbox-agent-k8s",
@@ -17,6 +18,7 @@ repository = "https://github.com/paradigmxyz/centaur"
 
 [workspace.dependencies]
 async-trait = "0.1"
+axum = "0.8.9"
 bytes = { version = "1", features = ["serde"] }
 centaur-sandbox-core = { path = "crates/centaur-sandbox-core" }
 centaur-sandbox-agent-k8s = { path = "crates/centaur-sandbox-agent-k8s" }
@@ -25,6 +27,7 @@ centaur-sandbox-manager = { path = "crates/centaur-sandbox-manager" }
 centaur-session-core = { path = "crates/centaur-session-core" }
 centaur-session-sqlx = { path = "crates/centaur-session-sqlx" }
 clap = { version = "4.6.1", features = ["derive", "env"] }
+futures-util = "0.3"
 k8s-openapi = { version = "0.27.1", features = ["latest"] }
 kube = "3.1.0"
 serde = { version = "1", features = ["derive"] }
@@ -34,4 +37,6 @@ strum = { version = "0.28", features = ["derive"] }
 thiserror = "2"
 time = { version = "0.3", features = ["serde"] }
 tokio = "1"
+tracing = "0.1"
+tracing-subscriber = "0.3"
 uuid = { version = "1", features = ["serde", "v4"] }

@@ -1015,7 +1015,13 @@ function emptyTurn(id: string, status: 'completed' | 'inProgress'): Turn {
 }
 
 function isTerminalCodexPayload(payload: Record<string, unknown>): boolean {
-  return payload.type === 'turn.completed' || payload.type === 'turn.failed' || payload.method === 'error'
+  return (
+    payload.type === 'turn.completed' ||
+    payload.type === 'turn.failed' ||
+    payload.method === 'turn/completed' ||
+    payload.method === 'turn/failed' ||
+    payload.method === 'error'
+  )
 }
 
 function sessionErrorNotification(event: ParsedSessionEvent): ServerNotification {

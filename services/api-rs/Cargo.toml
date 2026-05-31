@@ -1,0 +1,17 @@
+[workspace]
+members = [
+    "crates/centaur-sandbox-core",
+]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/paradigmxyz/centaur"
+
+[workspace.dependencies]
+async-trait = "0.1"
+bytes = { version = "1", features = ["serde"] }
+centaur-sandbox-core = { path = "crates/centaur-sandbox-core" }
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"

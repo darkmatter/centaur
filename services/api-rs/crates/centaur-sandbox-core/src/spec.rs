@@ -1,0 +1,179 @@
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SandboxSpec {
+    pub image: String,
+    pub command: Option<Vec<String>>,
+    pub args: Vec<String>,
+    pub env: Vec<EnvVar>,
+    pub working_dir: Option<String>,
+    pub mounts: Vec<Mount>,
+    pub resources: Option<ResourceLimits>,
+}
+
+impl SandboxSpec {
+    pub fn new(image: impl Into<String>) -> Self {
+        Self {
+            image: image.into(),
+            command: None,
+            args: Vec::new(),
+            env: Vec::new(),
+            working_dir: None,
+            mounts: Vec::new(),
+            resources: None,
+        }
+    }
+
+    pub fn command(mut self, command: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.command = Some(command.into_iter().map(Into::into).collect());
+        self
+    }
+
+    pub fn args(mut self, args: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.args = args.into_iter().map(Into::into).collect();
+        self
+    }
+
+    pub fn env(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.env.push(EnvVar::new(name, value));
+        self
+    }
+
+    pub fn working_dir(mut self, working_dir: impl Into<String>) -> Self {
+        self.working_dir = Some(working_dir.into());
+        self
+    }
+
+    pub fn mount(mut self, mount: Mount) -> Self {
+        self.mounts.push(mount);
+        self
+    }
+
+    pub fn resources(mut self, resources: ResourceLimits) -> Self {
+        self.resources = Some(resources);
+        self
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct EnvVar {
+    pub name: String,
+    pub value: String,
+}
+
+impl EnvVar {
+    pub fn new(name: impl Into<String>, value: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            value: value.into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct Mount {
+    pub kind: MountKind,
+    pub target_path: String,
+    pub read_only: bool,
+}
+
+impl Mount {
+    pub fn new(kind: MountKind, target_path: impl Into<String>) -> Self {
+        Self {
+            kind,
+            target_path: target_path.into(),
+            read_only: false,
+        }
+    }
+
+    pub fn read_only(mut self) -> Self {
+        self.read_only = true;
+        self
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum MountKind {
+    EmptyDir,
+    NamedVolume(String),
+    Bind { source_path: String },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ResourceLimits {
+    pub cpu_millis: Option<u32>,
+    pub memory_bytes: Option<u64>,
+}
+
+impl ResourceLimits {
+    pub fn new() -> Self {
+        Self {
+            cpu_millis: None,
+            memory_bytes: None,
+        }
+    }
+
+    pub fn cpu_millis(mut self, cpu_millis: u32) -> Self {
+        self.cpu_millis = Some(cpu_millis);
+        self
+    }
+
+    pub fn memory_bytes(mut self, memory_bytes: u64) -> Self {
+        self.memory_bytes = Some(memory_bytes);
+        self
+    }
+}
+
+impl Default for ResourceLimits {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ExecCommand {
+    pub argv: Vec<String>,
+    pub env: Vec<EnvVar>,
+    pub working_dir: Option<String>,
+}
+
+impl ExecCommand {
+    pub fn new(argv: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        Self {
+            argv: argv.into_iter().map(Into::into).collect(),
+            env: Vec::new(),
+            working_dir: None,
+        }
+    }
+
+    pub fn env(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.env.push(EnvVar::new(name, value));
+        self
+    }
+
+    pub fn working_dir(mut self, working_dir: impl Into<String>) -> Self {
+        self.working_dir = Some(working_dir.into());
+        self
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ExecResult {
+    pub exit_code: i32,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+}
+
+impl ExecResult {
+    pub fn new(exit_code: i32, stdout: impl Into<Vec<u8>>, stderr: impl Into<Vec<u8>>) -> Self {
+        Self {
+            exit_code,
+            stdout: stdout.into(),
+            stderr: stderr.into(),
+        }
+    }
+
+    pub fn success(&self) -> bool {
+        self.exit_code == 0
+    }
+}

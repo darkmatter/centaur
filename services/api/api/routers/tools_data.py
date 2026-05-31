@@ -18,7 +18,6 @@ from __future__ import annotations
 
 from typing import Any
 
-import structlog
 from fastapi import APIRouter, Depends, Request
 
 from api.deps import get_sandbox_claims, require_scope, verify_api_key
@@ -26,8 +25,6 @@ from api.tools_data import company_context as company_context_query
 from api.tools_data import investmemos as investmemos_query
 from api.tools_data.slack_capture import capture_live_slack_send
 from api.vm_metrics import record_tool_call
-
-log = structlog.get_logger()
 
 router = APIRouter(
     prefix="/agent/tools-data",

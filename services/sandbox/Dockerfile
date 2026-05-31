@@ -158,14 +158,14 @@ RUN if [ "$(dpkg --print-architecture)" = "amd64" ]; then \
       agent-browser install; \
     fi
 
-# ── Local tool runner venv (tool-CLI migration) ──────────────────────────────
+# ── Local tool runner venv ───────────────────────────────────────────────────
 # A dedicated venv at /opt/centaur-tools holds centaur_sdk + the union of every
 # base tool's pyproject deps so the `centaur-tool` runner can execute tools
-# locally instead of POSTing to the per-sandbox tool-server sidecar. It is kept
-# separate from the agent's system-python doc libs (numpy/pandas/Pillow, pinned
-# with --break-system-packages above) so the two never collide. centaur_sdk is
-# sourced from the local copy via [tool.uv.sources] (mirroring the API image), so
-# the agent-side and sidecar-side SDK stay byte-identical.
+# locally inside the sandbox. It is kept separate from the agent's system-python
+# doc libs (numpy/pandas/Pillow, pinned with --break-system-packages above) so
+# the two never collide. centaur_sdk is sourced from the local copy via
+# [tool.uv.sources] (mirroring the API image), so the runner and the API's
+# in-process tool path stay byte-identical.
 USER root
 RUN install -d -m 0755 -o 1001 -g 1001 /opt/centaur-tools
 USER agent

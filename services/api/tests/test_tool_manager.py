@@ -25,7 +25,7 @@ from centaur_sdk.toolrunner import (  # noqa: E402
 class TestDescribeMethodDocstring:
     """Generic agent-facing description extraction (no persona-specific cases).
 
-    Tools across personas all flow through describe_tool, which exposes
+    Tools across personas all flow through `describe_methods`, which exposes
     methods to the agent via `call discover <tool>`. Keeping the human-prose
     portion of the docstring (not just the first line) gives the agent
     enough signal to pick the right method without reading the source.

@@ -73,7 +73,7 @@ jobs:
         working-directory: services/api
         run: uv sync --group dev
 
-      # The tool-execution path (call.sh -> runner/sidecar), its packaging, and
+      # The tool-execution path (call.sh -> local runner), its packaging, and
       # the shared invocation core are otherwise uncovered by CI. These guard
       # the tool-CLI migration so a regression in dispatch, routing, arg
       # validation, TOON output, discovery, or secret resolution fails the PR.

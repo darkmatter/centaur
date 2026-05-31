@@ -5,8 +5,8 @@ a Centaur tool method: argument validation, result normalization, TOON
 encoding, method collection, and method-schema description. Both execution
 paths import these helpers so they stay behaviorally identical:
 
-- The API / tool-server sidecar (``api.tool_manager.ToolManager``) wraps them
-  with server-only concerns (FastAPI auth, OTel-from-DB, Slack live-capture,
+- The API's in-process path (``api.tool_manager.ToolManager``) wraps them with
+  server-only concerns (FastAPI auth, OTel-from-DB, Slack live-capture,
   DB-backed attachment extraction, Prometheus metrics).
 - The local agent runner (``centaur-tool <tool> <method> '<json>'``) wraps them
   with a one-shot process that loads the tool package, sets a ``ToolContext``

@@ -639,7 +639,7 @@ function normalizeCodexEvent(event: Record<string, unknown>): CanonicalEvent[] {
   }
 
   if (eventType === 'assistant') {
-    return [event]
+    return [event as CanonicalEvent]
   }
 
   if (eventType === 'error') {

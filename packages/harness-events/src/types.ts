@@ -65,3 +65,12 @@ export type CanonicalEvent =
         | 'item.reasoning.textDelta'
       [key: string]: unknown
     }
+
+export type ServerNotification = { type: string } & Record<string, any>
+
+export type RustSessionStreamEvent = {
+  eventId?: number
+  eventKind?: string
+  event?: string
+  data?: unknown
+}

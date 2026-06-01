@@ -93,8 +93,13 @@ impl SourcePolicy {
     }
 
     pub fn from_env() -> Self {
-        let kind = match std::env::var("FIREWALL_MANAGER_SECRET_SOURCE")
-            .unwrap_or_else(|_| "env".to_owned())
+        Self::from_lookup(|name| std::env::var(name).ok())
+    }
+
+    fn from_lookup(mut lookup: impl FnMut(&str) -> Option<String>) -> Self {
+        let kind = match lookup("FIREWALL_MANAGER_SECRET_SOURCE")
+            .or_else(|| lookup("KUBERNETES_FIREWALL_MANAGER_SECRET_SOURCE"))
+            .unwrap_or_else(|| "env".to_owned())
             .trim()
             .to_ascii_lowercase()
             .as_str()
@@ -105,10 +110,13 @@ impl SourcePolicy {
         };
         Self {
             kind,
-            op_vault: std::env::var("OP_VAULT").unwrap_or_else(|_| "ai-agents".to_owned()),
-            ttl: std::env::var("FIREWALL_MANAGER_SECRET_TTL").unwrap_or_else(|_| "10m".to_owned()),
-            token_broker_ttl: std::env::var("FIREWALL_MANAGER_TOKEN_BROKER_TTL")
-                .unwrap_or_else(|_| "1m".to_owned()),
+            op_vault: lookup("OP_VAULT").unwrap_or_else(|| "ai-agents".to_owned()),
+            ttl: lookup("FIREWALL_MANAGER_SECRET_TTL")
+                .or_else(|| lookup("KUBERNETES_FIREWALL_MANAGER_SECRET_TTL"))
+                .unwrap_or_else(|| "10m".to_owned()),
+            token_broker_ttl: lookup("FIREWALL_MANAGER_TOKEN_BROKER_TTL")
+                .or_else(|| lookup("KUBERNETES_FIREWALL_MANAGER_TOKEN_BROKER_TTL"))
+                .unwrap_or_else(|| "1m".to_owned()),
         }
     }
 
@@ -551,6 +559,31 @@ mod tests {
 
     fn fragment_yaml(yaml: &str) -> ProxyFragment {
         serde_yaml::from_str(yaml).unwrap()
+    }
+
+    #[test]
+    fn source_policy_reads_kubernetes_prefixed_env_fallbacks() {
+        let vars = BTreeMap::from([
+            (
+                "KUBERNETES_FIREWALL_MANAGER_SECRET_SOURCE".to_owned(),
+                "onepassword-connect".to_owned(),
+            ),
+            ("OP_VAULT".to_owned(), "prod-agents".to_owned()),
+            (
+                "KUBERNETES_FIREWALL_MANAGER_SECRET_TTL".to_owned(),
+                "20m".to_owned(),
+            ),
+            (
+                "KUBERNETES_FIREWALL_MANAGER_TOKEN_BROKER_TTL".to_owned(),
+                "45s".to_owned(),
+            ),
+        ]);
+        let policy = SourcePolicy::from_lookup(|name| vars.get(name).cloned());
+
+        assert_eq!(policy.kind, SourceKind::OnePasswordConnect);
+        assert_eq!(policy.op_vault, "prod-agents");
+        assert_eq!(policy.ttl, "20m");
+        assert_eq!(policy.token_broker_ttl, "45s");
     }
 
     fn temp_dir(name: &str) -> PathBuf {

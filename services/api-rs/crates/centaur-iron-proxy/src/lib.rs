@@ -52,7 +52,7 @@ pub enum IronProxyConfigError {
     #[error("failed to serialize iron-proxy yaml: {0}")]
     Serialize(serde_yaml::Error),
     #[error(
-        "iron-token-broker store cannot use env source for {placeholder}; configure FIREWALL_MANAGER_SECRET_SOURCE=onepassword or onepassword-connect"
+        "iron-token-broker store cannot use env source for {placeholder}; configure KUBERNETES_FIREWALL_MANAGER_SECRET_SOURCE=onepassword or onepassword-connect"
     )]
     BrokerStoreEnv { placeholder: String },
     #[error(
@@ -106,8 +106,7 @@ impl SourcePolicy {
 
     #[cfg(test)]
     fn from_lookup(mut lookup: impl FnMut(&str) -> Option<String>) -> Self {
-        let kind = match lookup("FIREWALL_MANAGER_SECRET_SOURCE")
-            .or_else(|| lookup("KUBERNETES_FIREWALL_MANAGER_SECRET_SOURCE"))
+        let kind = match lookup("KUBERNETES_FIREWALL_MANAGER_SECRET_SOURCE")
             .unwrap_or_else(|| "env".to_owned())
             .trim()
             .to_ascii_lowercase()
@@ -120,11 +119,9 @@ impl SourcePolicy {
         Self {
             kind,
             op_vault: lookup("OP_VAULT").unwrap_or_else(|| "ai-agents".to_owned()),
-            ttl: lookup("FIREWALL_MANAGER_SECRET_TTL")
-                .or_else(|| lookup("KUBERNETES_FIREWALL_MANAGER_SECRET_TTL"))
+            ttl: lookup("KUBERNETES_FIREWALL_MANAGER_SECRET_TTL")
                 .unwrap_or_else(|| "10m".to_owned()),
-            token_broker_ttl: lookup("FIREWALL_MANAGER_TOKEN_BROKER_TTL")
-                .or_else(|| lookup("KUBERNETES_FIREWALL_MANAGER_TOKEN_BROKER_TTL"))
+            token_broker_ttl: lookup("KUBERNETES_FIREWALL_MANAGER_TOKEN_BROKER_TTL")
                 .unwrap_or_else(|| "1m".to_owned()),
         }
     }
@@ -868,7 +865,7 @@ mod tests {
     }
 
     #[test]
-    fn source_policy_reads_kubernetes_prefixed_env_fallbacks() {
+    fn source_policy_reads_kubernetes_prefixed_env() {
         let vars = BTreeMap::from([
             (
                 "KUBERNETES_FIREWALL_MANAGER_SECRET_SOURCE".to_owned(),

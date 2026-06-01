@@ -1012,6 +1012,10 @@ fn proxy_env(
         "/firewall-certs/ca-cert.pem".to_owned(),
     );
     env.insert(
+        "CURL_CA_BUNDLE".to_owned(),
+        "/firewall-certs/ca-cert.pem".to_owned(),
+    );
+    env.insert(
         "SSL_CERT_FILE".to_owned(),
         "/firewall-certs/ca-cert.pem".to_owned(),
     );
@@ -1765,6 +1769,7 @@ mod tests {
             agent_env["REQUESTS_CA_BUNDLE"],
             "/firewall-certs/ca-cert.pem"
         );
+        assert_eq!(agent_env["CURL_CA_BUNDLE"], "/firewall-certs/ca-cert.pem");
         assert!(
             containers[0]
                 .volume_mounts

@@ -289,14 +289,10 @@ dependencies = [
 name = "centaur-iron-proxy"
 version = "0.1.0"
 dependencies = [
- "reqwest",
- "rustls-pemfile",
  "serde",
  "serde_yaml",
  "sha2",
  "thiserror",
- "tokio",
- "tokio-rustls",
 ]
 
 [[package]]
@@ -330,11 +326,13 @@ dependencies = [
 name = "centaur-sandbox-e2e"
 version = "0.1.0"
 dependencies = [
+ "centaur-iron-proxy",
  "centaur-sandbox-agent-k8s",
  "centaur-sandbox-core",
  "centaur-sandbox-local",
  "centaur-sandbox-manager",
  "clap",
+ "k8s-openapi",
  "kube",
  "test-case",
  "tokio",
@@ -2362,15 +2360,6 @@ dependencies = [
  "rustls-pki-types",
  "schannel",
  "security-framework",
-]
-
-[[package]]
-name = "rustls-pemfile"
-version = "2.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dce314e5fee3f39953d46bb63bb8a46d40c2f8fb7cc5a3b6cab2bde9721d6e50"
-dependencies = [
- "rustls-pki-types",
 ]
 
 [[package]]

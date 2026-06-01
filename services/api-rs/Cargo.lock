@@ -391,6 +391,7 @@ dependencies = [
 name = "centaur-session-runtime"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "centaur-sandbox-core",
  "centaur-sandbox-manager",
  "centaur-session-core",

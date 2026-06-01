@@ -5,6 +5,9 @@ kopium_version := "0.23.0"
 # Latest upstream Agent Sandbox release when this was pinned: v0.4.6.
 agent_sandbox_ref := "d0c124d4a1fded4ed4aecb92753696b4dd8de17b"
 agent_sandbox_crd_url := "https://raw.githubusercontent.com/kubernetes-sigs/agent-sandbox/" + agent_sandbox_ref + "/helm/crds/agents.x-k8s.io_sandboxes.yaml"
+agent_sandbox_template_crd_url := "https://raw.githubusercontent.com/kubernetes-sigs/agent-sandbox/" + agent_sandbox_ref + "/helm/crds/extensions.agents.x-k8s.io_sandboxtemplates.yaml"
+agent_sandbox_claim_crd_url := "https://raw.githubusercontent.com/kubernetes-sigs/agent-sandbox/" + agent_sandbox_ref + "/helm/crds/extensions.agents.x-k8s.io_sandboxclaims.yaml"
+agent_sandbox_warm_pool_crd_url := "https://raw.githubusercontent.com/kubernetes-sigs/agent-sandbox/" + agent_sandbox_ref + "/helm/crds/extensions.agents.x-k8s.io_sandboxwarmpools.yaml"
 agent_sandbox_crd_tmp := "target/codegen/agents.x-k8s.io_sandboxes.yaml"
 agent_sandbox_generated := "crates/centaur-sandbox-agent-k8s/src/generated/agents_x_k8s_io.rs"
 agent_sandbox_controller_image := "registry.k8s.io/agent-sandbox/agent-sandbox-controller:v0.4.6"
@@ -35,11 +38,17 @@ kind-e2e-up:
     if docker image inspect centaur-iron-proxy:latest >/dev/null 2>&1; then kind load docker-image --name "{{kind_e2e_cluster}}" centaur-iron-proxy:latest; fi
     mkdir -p "{{kind_e2e_tmp}}"
     curl -fsSL "{{agent_sandbox_crd_url}}" -o "{{kind_e2e_tmp}}/agents.x-k8s.io_sandboxes.yaml"
+    curl -fsSL "{{agent_sandbox_template_crd_url}}" -o "{{kind_e2e_tmp}}/extensions.agents.x-k8s.io_sandboxtemplates.yaml"
+    curl -fsSL "{{agent_sandbox_claim_crd_url}}" -o "{{kind_e2e_tmp}}/extensions.agents.x-k8s.io_sandboxclaims.yaml"
+    curl -fsSL "{{agent_sandbox_warm_pool_crd_url}}" -o "{{kind_e2e_tmp}}/extensions.agents.x-k8s.io_sandboxwarmpools.yaml"
     curl -fsSL "{{agent_sandbox_rbac_url}}" -o "{{kind_e2e_tmp}}/rbac.generated.yaml"
     curl -fsSL "{{agent_sandbox_controller_url}}" \
       | sed 's#ko://sigs.k8s.io/agent-sandbox/cmd/agent-sandbox-controller.*#{{agent_sandbox_controller_image}}#' \
       > "{{kind_e2e_tmp}}/controller.yaml"
     kubectl --context "{{kind_e2e_context}}" apply -f "{{kind_e2e_tmp}}/agents.x-k8s.io_sandboxes.yaml"
+    kubectl --context "{{kind_e2e_context}}" apply -f "{{kind_e2e_tmp}}/extensions.agents.x-k8s.io_sandboxtemplates.yaml"
+    kubectl --context "{{kind_e2e_context}}" apply -f "{{kind_e2e_tmp}}/extensions.agents.x-k8s.io_sandboxclaims.yaml"
+    kubectl --context "{{kind_e2e_context}}" apply -f "{{kind_e2e_tmp}}/extensions.agents.x-k8s.io_sandboxwarmpools.yaml"
     kubectl --context "{{kind_e2e_context}}" apply -f "{{kind_e2e_tmp}}/rbac.generated.yaml"
     kubectl --context "{{kind_e2e_context}}" apply -f "{{kind_e2e_tmp}}/controller.yaml"
     kubectl --context "{{kind_e2e_context}}" create namespace "{{kind_e2e_namespace}}" --dry-run=client -o yaml | kubectl --context "{{kind_e2e_context}}" apply -f -

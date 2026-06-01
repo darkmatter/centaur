@@ -17,7 +17,10 @@ use centaur_sandbox_core::{
 use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::core::v1::{ConfigMap, PersistentVolumeClaim, Pod, Service};
 use k8s_openapi::api::networking::v1::NetworkPolicy;
-use kube::api::{AttachParams, DeleteParams, ListParams, Patch, PatchParams, PostParams};
+use kube::api::{
+    ApiResource, AttachParams, DeleteParams, DynamicObject, GroupVersionKind, ListParams, Patch,
+    PatchParams, PostParams,
+};
 use kube::{Api, Client, Error};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -31,12 +34,18 @@ pub mod generated;
 
 const BACKEND_NAME: &str = "agent-sandbox-k8s";
 const DEFAULT_CONTAINER_NAME: &str = "agent";
+const EXTENSIONS_GROUP: &str = "extensions.agents.x-k8s.io";
+const DEFAULT_WARM_POOL_API_VERSION: &str = "v1alpha1";
 const MANAGED_LABEL: &str = "centaur.ai/managed";
 const MANAGED_BY_LABEL: &str = "centaur.ai/managed-by";
 const SANDBOX_ID_LABEL: &str = "centaur.ai/sandbox-id";
+const SANDBOX_CLAIM_LABEL: &str = "centaur.ai/sandbox-claim";
+const SANDBOX_TEMPLATE_LABEL: &str = "centaur.ai/sandbox-template";
+const SANDBOX_WARM_POOL_LABEL: &str = "centaur.ai/sandbox-warm-pool";
 const MANAGED_BY_VALUE: &str = "api-rs";
 const TOKEN_BROKER_LABEL: &str = "centaur.ai/iron-token-broker";
 const TOKEN_BROKER_CONFIG_KEY: &str = "iron-token-broker.yaml";
+const THREAD_KEY_ENV: &str = "CENTAUR_THREAD_KEY";
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -53,6 +62,7 @@ pub struct AgentSandboxConfig {
     pub service_account_name: Option<String>,
     pub state_volume: Option<StateVolumeConfig>,
     pub iron_proxy: Option<IronProxyPodConfig>,
+    pub warm_pool: Option<SandboxWarmPoolConfig>,
     pub ready_timeout: Duration,
 }
 
@@ -70,6 +80,7 @@ impl AgentSandboxConfig {
             service_account_name: None,
             state_volume: None,
             iron_proxy: None,
+            warm_pool: None,
             ready_timeout: Duration::from_secs(60),
         }
     }
@@ -141,6 +152,42 @@ impl IronProxyPodConfig {
     pub fn with_fragments(mut self, fragments: Vec<ProxyFragment>) -> Self {
         self.fragments = fragments;
         self
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SandboxWarmPoolConfig {
+    pub api_version: String,
+    pub pool_name: String,
+    pub template_name: String,
+    pub replicas: i32,
+    pub update_strategy: SandboxWarmPoolUpdateStrategy,
+}
+
+impl SandboxWarmPoolConfig {
+    pub fn new(pool_name: impl Into<String>, template_name: impl Into<String>) -> Self {
+        Self {
+            api_version: DEFAULT_WARM_POOL_API_VERSION.to_owned(),
+            pool_name: pool_name.into(),
+            template_name: template_name.into(),
+            replicas: 1,
+            update_strategy: SandboxWarmPoolUpdateStrategy::OnReplenish,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SandboxWarmPoolUpdateStrategy {
+    OnReplenish,
+    Recreate,
+}
+
+impl SandboxWarmPoolUpdateStrategy {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::OnReplenish => "OnReplenish",
+            Self::Recreate => "Recreate",
+        }
     }
 }
 
@@ -224,6 +271,29 @@ impl AgentSandboxBackend {
         Api::namespaced(self.client.clone(), &self.config.namespace)
     }
 
+    fn sandbox_templates(&self, warm_pool: &SandboxWarmPoolConfig) -> Api<DynamicObject> {
+        let resource = extension_resource(
+            &warm_pool.api_version,
+            "SandboxTemplate",
+            "sandboxtemplates",
+        );
+        Api::namespaced_with(self.client.clone(), &self.config.namespace, &resource)
+    }
+
+    fn sandbox_warm_pools(&self, warm_pool: &SandboxWarmPoolConfig) -> Api<DynamicObject> {
+        let resource = extension_resource(
+            &warm_pool.api_version,
+            "SandboxWarmPool",
+            "sandboxwarmpools",
+        );
+        Api::namespaced_with(self.client.clone(), &self.config.namespace, &resource)
+    }
+
+    fn sandbox_claims(&self, warm_pool: &SandboxWarmPoolConfig) -> Api<DynamicObject> {
+        let resource = extension_resource(&warm_pool.api_version, "SandboxClaim", "sandboxclaims");
+        Api::namespaced_with(self.client.clone(), &self.config.namespace, &resource)
+    }
+
     async fn get_sandbox(&self, id: &SandboxId) -> SandboxResult<Option<crd::Sandbox>> {
         match self.sandboxes().get(id.as_str()).await {
             Ok(sandbox) => Ok(Some(sandbox)),
@@ -263,6 +333,134 @@ impl AgentSandboxBackend {
             Err(err) if is_not_found(&err) => Ok(()),
             Err(err) => Err(map_kube_error("delete sandbox state pvc", err)),
         }
+    }
+
+    async fn reconcile_warm_pool(
+        &self,
+        spec: &SandboxSpec,
+        warm_pool: &SandboxWarmPoolConfig,
+    ) -> SandboxResult<()> {
+        let template = build_sandbox_template(warm_pool, spec, &self.config)?;
+        let pool = build_sandbox_warm_pool(warm_pool);
+        let params = PatchParams::apply(&self.config.field_manager).force();
+        self.sandbox_templates(warm_pool)
+            .patch(&warm_pool.template_name, &params, &Patch::Apply(&template))
+            .await
+            .map_err(|err| map_kube_error("apply sandbox warm-pool template", err))?;
+        self.sandbox_warm_pools(warm_pool)
+            .patch(&warm_pool.pool_name, &params, &Patch::Apply(&pool))
+            .await
+            .map_err(|err| map_kube_error("apply sandbox warm pool", err))?;
+        Ok(())
+    }
+
+    async fn create_from_warm_pool(
+        &self,
+        spec: SandboxSpec,
+        warm_pool: &SandboxWarmPoolConfig,
+    ) -> SandboxResult<SandboxHandle> {
+        validate_warm_pool_spec(&spec, &self.config)?;
+        self.reconcile_warm_pool(&spec, warm_pool).await?;
+        self.wait_for_warm_pool_ready(warm_pool).await?;
+
+        let claim_id = SandboxId::new(next_sandbox_name());
+        let claim = build_sandbox_claim(&claim_id, warm_pool, &self.config);
+        self.sandbox_claims(warm_pool)
+            .create(&PostParams::default(), &claim)
+            .await
+            .map_err(|err| map_kube_error("create sandbox warm-pool claim", err))?;
+
+        match self.wait_for_sandbox_claim(&claim_id, warm_pool).await {
+            Ok(id) => Ok(SandboxHandle::new(id, BACKEND_NAME)),
+            Err(err) => {
+                let _ = self.delete_sandbox_claim(&claim_id, warm_pool).await;
+                Err(err)
+            }
+        }
+    }
+
+    async fn wait_for_warm_pool_ready(
+        &self,
+        warm_pool: &SandboxWarmPoolConfig,
+    ) -> SandboxResult<()> {
+        if warm_pool.replicas <= 0 {
+            return Ok(());
+        }
+        let deadline = Instant::now() + self.config.ready_timeout;
+        loop {
+            let pool = self
+                .sandbox_warm_pools(warm_pool)
+                .get(&warm_pool.pool_name)
+                .await
+                .map_err(|err| map_kube_error("get sandbox warm pool", err))?;
+            if warm_pool_ready_replicas(&pool) > 0 {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(SandboxError::NotReady(format!(
+                    "sandbox warm pool {} did not report ready replicas before timeout",
+                    warm_pool.pool_name
+                )));
+            }
+            sleep(Duration::from_millis(250)).await;
+        }
+    }
+
+    async fn wait_for_sandbox_claim(
+        &self,
+        claim_id: &SandboxId,
+        warm_pool: &SandboxWarmPoolConfig,
+    ) -> SandboxResult<SandboxId> {
+        let deadline = Instant::now() + self.config.ready_timeout;
+        loop {
+            let claim = self
+                .sandbox_claims(warm_pool)
+                .get(claim_id.as_str())
+                .await
+                .map_err(|err| map_kube_error("get sandbox warm-pool claim", err))?;
+            if let Some(name) = claim_sandbox_name(&claim) {
+                let id = SandboxId::new(name);
+                self.wait_until_running(&id).await?;
+                return Ok(id);
+            }
+            if Instant::now() >= deadline {
+                return Err(SandboxError::NotReady(format!(
+                    "sandbox warm-pool claim {} was not assigned before timeout",
+                    claim_id.as_str()
+                )));
+            }
+            sleep(Duration::from_millis(250)).await;
+        }
+    }
+
+    async fn delete_sandbox_claim(
+        &self,
+        claim_id: &SandboxId,
+        warm_pool: &SandboxWarmPoolConfig,
+    ) -> SandboxResult<()> {
+        match self
+            .sandbox_claims(warm_pool)
+            .delete(claim_id.as_str(), &DeleteParams::default())
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(err) if is_not_found(&err) => Ok(()),
+            Err(err) => Err(map_kube_error("delete sandbox warm-pool claim", err)),
+        }
+    }
+
+    async fn delete_warm_pool_claim_for_sandbox(&self, id: &SandboxId) -> SandboxResult<()> {
+        let Some(warm_pool) = &self.config.warm_pool else {
+            return Ok(());
+        };
+        let Some(sandbox) = self.get_sandbox(id).await? else {
+            return Ok(());
+        };
+        for claim_name in sandbox_claim_owner_names(&sandbox) {
+            self.delete_sandbox_claim(&SandboxId::new(claim_name), warm_pool)
+                .await?;
+        }
+        Ok(())
     }
 
     fn resolve_iron_proxy(
@@ -676,6 +874,10 @@ impl SandboxBackend for AgentSandboxBackend {
     }
 
     async fn create(&self, spec: SandboxSpec) -> SandboxResult<SandboxHandle> {
+        if let Some(warm_pool) = &self.config.warm_pool {
+            return self.create_from_warm_pool(spec, warm_pool).await;
+        }
+
         let id = SandboxId::new(next_sandbox_name());
         let resolved_iron_proxy = self.resolve_iron_proxy(&id, &spec)?;
         if let Err(err) = self
@@ -740,6 +942,7 @@ impl SandboxBackend for AgentSandboxBackend {
     }
 
     async fn stop(&self, id: &SandboxId) -> SandboxResult<()> {
+        self.delete_warm_pool_claim_for_sandbox(id).await?;
         match self
             .sandboxes()
             .delete(id.as_str(), &DeleteParams::default())
@@ -799,6 +1002,151 @@ fn pod_ready(pod: &Pod) -> bool {
                 .iter()
                 .any(|condition| condition.type_ == "Ready" && condition.status == "True")
         })
+}
+
+fn extension_resource(api_version: &str, kind: &str, plural: &str) -> ApiResource {
+    ApiResource::from_gvk_with_plural(
+        &GroupVersionKind::gvk(EXTENSIONS_GROUP, api_version, kind),
+        plural,
+    )
+}
+
+fn validate_warm_pool_spec(spec: &SandboxSpec, config: &AgentSandboxConfig) -> SandboxResult<()> {
+    if config.iron_proxy.is_some() {
+        return Err(SandboxError::InvalidSpec(
+            "SandboxWarmPool mode cannot be combined with per-sandbox iron-proxy resources"
+                .to_owned(),
+        ));
+    }
+    if spec_env(spec, THREAD_KEY_ENV).is_some() {
+        return Err(SandboxError::InvalidSpec(format!(
+            "SandboxWarmPool templates cannot include per-thread {THREAD_KEY_ENV}; pass thread context with each turn instead"
+        )));
+    }
+    Ok(())
+}
+
+fn build_sandbox_template(
+    warm_pool: &SandboxWarmPoolConfig,
+    spec: &SandboxSpec,
+    config: &AgentSandboxConfig,
+) -> SandboxResult<DynamicObject> {
+    let template_id = SandboxId::new(warm_pool.template_name.clone());
+    let sandbox = build_agent_sandbox(&template_id, spec, config, None)?;
+    let mut template_spec = serde_json::to_value(&sandbox.spec).map_err(|err| {
+        SandboxError::InvalidSpec(format!("invalid sandbox warm-pool template: {err}"))
+    })?;
+    let spec_object = template_spec.as_object_mut().ok_or_else(|| {
+        SandboxError::InvalidSpec("sandbox warm-pool template spec must be an object".to_owned())
+    })?;
+    spec_object.remove("replicas");
+    spec_object.remove("shutdownPolicy");
+    spec_object.remove("shutdownTime");
+    if let Some(labels) = spec_object
+        .get_mut("podTemplate")
+        .and_then(|pod_template| pod_template.get_mut("metadata"))
+        .and_then(|metadata| metadata.get_mut("labels"))
+        .and_then(Value::as_object_mut)
+    {
+        labels.remove(SANDBOX_ID_LABEL);
+    }
+
+    let mut template = DynamicObject::new(
+        &warm_pool.template_name,
+        &extension_resource(
+            &warm_pool.api_version,
+            "SandboxTemplate",
+            "sandboxtemplates",
+        ),
+    )
+    .data(json!({ "spec": template_spec }));
+    template.metadata.labels = Some(warm_pool_labels(warm_pool));
+    template.metadata.annotations = Some(config.annotations.clone());
+    Ok(template)
+}
+
+fn build_sandbox_warm_pool(warm_pool: &SandboxWarmPoolConfig) -> DynamicObject {
+    let mut pool = DynamicObject::new(
+        &warm_pool.pool_name,
+        &extension_resource(
+            &warm_pool.api_version,
+            "SandboxWarmPool",
+            "sandboxwarmpools",
+        ),
+    )
+    .data(json!({
+        "spec": {
+            "replicas": warm_pool.replicas,
+            "sandboxTemplateRef": {
+                "name": warm_pool.template_name,
+            },
+            "updateStrategy": {
+                "type": warm_pool.update_strategy.as_str(),
+            },
+        },
+    }));
+    pool.metadata.labels = Some(warm_pool_labels(warm_pool));
+    pool
+}
+
+fn build_sandbox_claim(
+    claim_id: &SandboxId,
+    warm_pool: &SandboxWarmPoolConfig,
+    config: &AgentSandboxConfig,
+) -> DynamicObject {
+    let mut claim = DynamicObject::new(
+        claim_id.as_str(),
+        &extension_resource(&warm_pool.api_version, "SandboxClaim", "sandboxclaims"),
+    )
+    .data(json!({
+        "spec": {
+            "sandboxTemplateRef": {
+                "name": warm_pool.template_name,
+            },
+            "warmpool": warm_pool.pool_name,
+            "additionalPodMetadata": {
+                "labels": claimed_sandbox_labels(claim_id, warm_pool),
+                "annotations": config.annotations.clone(),
+            },
+        },
+    }));
+    claim.metadata.labels = Some(claim_labels(claim_id, warm_pool));
+    claim.metadata.annotations = Some(config.annotations.clone());
+    claim
+}
+
+fn claim_sandbox_name(claim: &DynamicObject) -> Option<String> {
+    claim
+        .data
+        .pointer("/status/sandbox/name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn warm_pool_ready_replicas(pool: &DynamicObject) -> i64 {
+    pool.data
+        .pointer("/status/readyReplicas")
+        .and_then(Value::as_i64)
+        .unwrap_or_default()
+}
+
+fn sandbox_claim_owner_names(sandbox: &crd::Sandbox) -> Vec<String> {
+    sandbox
+        .metadata
+        .owner_references
+        .as_ref()
+        .into_iter()
+        .flatten()
+        .filter(|owner| {
+            owner.kind == "SandboxClaim"
+                && owner
+                    .api_version
+                    .starts_with(&format!("{EXTENSIONS_GROUP}/"))
+        })
+        .map(|owner| owner.name.clone())
+        .collect()
 }
 
 fn build_agent_sandbox(
@@ -1572,6 +1920,47 @@ fn base_resource_labels(id: &SandboxId) -> BTreeMap<String, String> {
     ])
 }
 
+fn warm_pool_labels(warm_pool: &SandboxWarmPoolConfig) -> BTreeMap<String, String> {
+    BTreeMap::from([
+        (MANAGED_LABEL.to_owned(), "true".to_owned()),
+        (MANAGED_BY_LABEL.to_owned(), MANAGED_BY_VALUE.to_owned()),
+        (
+            SANDBOX_WARM_POOL_LABEL.to_owned(),
+            warm_pool.pool_name.clone(),
+        ),
+        (
+            SANDBOX_TEMPLATE_LABEL.to_owned(),
+            warm_pool.template_name.clone(),
+        ),
+    ])
+}
+
+fn claim_labels(
+    claim_id: &SandboxId,
+    warm_pool: &SandboxWarmPoolConfig,
+) -> BTreeMap<String, String> {
+    let mut labels = sandbox_labels(claim_id);
+    labels.insert(
+        SANDBOX_WARM_POOL_LABEL.to_owned(),
+        warm_pool.pool_name.clone(),
+    );
+    labels.insert(
+        SANDBOX_TEMPLATE_LABEL.to_owned(),
+        warm_pool.template_name.clone(),
+    );
+    labels.insert(SANDBOX_CLAIM_LABEL.to_owned(), claim_id.as_str().to_owned());
+    labels
+}
+
+fn claimed_sandbox_labels(
+    claim_id: &SandboxId,
+    warm_pool: &SandboxWarmPoolConfig,
+) -> BTreeMap<String, String> {
+    let mut labels = claim_labels(claim_id, warm_pool);
+    labels.remove(SANDBOX_ID_LABEL);
+    labels
+}
+
 fn insert_optional<T>(target: &mut Value, key: &str, value: Option<T>)
 where
     T: serde::Serialize,
@@ -1694,6 +2083,137 @@ mod tests {
         let image_pull_secrets = pod_spec.image_pull_secrets.as_ref().unwrap();
         assert_eq!(image_pull_secrets[0].name.as_deref(), Some("regcred"));
         assert_eq!(image_pull_secrets[1].name.as_deref(), Some("mirrorcred"));
+    }
+
+    #[test]
+    fn builds_sandbox_warm_pool_extension_objects() {
+        let mut warm_pool = SandboxWarmPoolConfig::new("centaur-warm", "centaur-warm-template");
+        warm_pool.replicas = 3;
+        warm_pool.update_strategy = SandboxWarmPoolUpdateStrategy::Recreate;
+        let spec = SandboxSpec::new("centaur-agent:latest")
+            .env("CENTAUR_API_URL", "http://api:8000")
+            .resources(ResourceLimits::new().memory_bytes(1024 * 1024 * 1024));
+        let mut config = AgentSandboxConfig::new("centaur")
+            .state_volume(StateVolumeConfig::new("/home/agent/state", "10Gi"));
+        config
+            .annotations
+            .insert("centaur.ai/test".to_owned(), "true".to_owned());
+
+        let template = build_sandbox_template(&warm_pool, &spec, &config).unwrap();
+        let pool = build_sandbox_warm_pool(&warm_pool);
+
+        let template_types = template.types.as_ref().unwrap();
+        assert_eq!(
+            template_types.api_version,
+            "extensions.agents.x-k8s.io/v1alpha1"
+        );
+        assert_eq!(template_types.kind, "SandboxTemplate");
+        assert_eq!(
+            template.metadata.labels.as_ref().unwrap()[SANDBOX_WARM_POOL_LABEL],
+            "centaur-warm"
+        );
+        assert_eq!(
+            template.metadata.annotations.as_ref().unwrap()["centaur.ai/test"],
+            "true"
+        );
+        assert!(template.data["spec"].get("replicas").is_none());
+        assert!(template.data["spec"].get("shutdownPolicy").is_none());
+        assert_eq!(
+            template.data["spec"]["podTemplate"]["spec"]["containers"][0]["image"],
+            "centaur-agent:latest"
+        );
+        assert!(
+            template.data["spec"]["podTemplate"]["metadata"]["labels"]
+                .get(SANDBOX_ID_LABEL)
+                .is_none()
+        );
+        assert_eq!(
+            template.data["spec"]["volumeClaimTemplates"][0]["metadata"]["name"],
+            "state"
+        );
+
+        let pool_types = pool.types.as_ref().unwrap();
+        assert_eq!(pool_types.kind, "SandboxWarmPool");
+        assert_eq!(pool.data["spec"]["replicas"], 3);
+        assert_eq!(
+            pool.data["spec"]["sandboxTemplateRef"]["name"],
+            "centaur-warm-template"
+        );
+        assert_eq!(pool.data["spec"]["updateStrategy"]["type"], "Recreate");
+    }
+
+    #[test]
+    fn builds_sandbox_claim_without_env_so_pool_adoption_stays_warm() {
+        let warm_pool = SandboxWarmPoolConfig::new("centaur-warm", "centaur-template");
+        let config = AgentSandboxConfig::new("centaur");
+
+        let claim = build_sandbox_claim(&SandboxId::new("asbx-claim"), &warm_pool, &config);
+
+        let claim_types = claim.types.as_ref().unwrap();
+        assert_eq!(claim_types.kind, "SandboxClaim");
+        assert_eq!(
+            claim.data["spec"]["sandboxTemplateRef"]["name"],
+            "centaur-template"
+        );
+        assert_eq!(claim.data["spec"]["warmpool"], "centaur-warm");
+        assert!(claim.data["spec"].get("env").is_none());
+        assert_eq!(
+            claim.data["spec"]["additionalPodMetadata"]["labels"][SANDBOX_CLAIM_LABEL],
+            "asbx-claim"
+        );
+    }
+
+    #[test]
+    fn reads_sandbox_warm_pool_ready_replicas() {
+        let warm_pool = SandboxWarmPoolConfig::new("centaur-warm", "centaur-template");
+        let mut pool = build_sandbox_warm_pool(&warm_pool);
+
+        assert_eq!(warm_pool_ready_replicas(&pool), 0);
+
+        pool.data["status"] = json!({"readyReplicas": 2});
+
+        assert_eq!(warm_pool_ready_replicas(&pool), 2);
+    }
+
+    #[test]
+    fn warm_pool_validation_rejects_cold_starting_inputs() {
+        let mut config = AgentSandboxConfig::new("centaur");
+        let spec = SandboxSpec::new("centaur-agent:latest").env(THREAD_KEY_ENV, "test:thread");
+
+        let error = validate_warm_pool_spec(&spec, &config).unwrap_err();
+        assert!(error.to_string().contains(THREAD_KEY_ENV));
+
+        config.iron_proxy = Some(IronProxyPodConfig::new(
+            "centaur-iron-proxy:latest",
+            "firewall-ca-cert",
+            "firewall-ca-key",
+        ));
+        let error = validate_warm_pool_spec(&SandboxSpec::new("centaur-agent:latest"), &config)
+            .unwrap_err();
+        assert!(error.to_string().contains("iron-proxy"));
+    }
+
+    #[test]
+    fn extracts_sandbox_claim_owner_names() {
+        let mut sandbox = build_agent_sandbox(
+            &SandboxId::new("asbx-adopted"),
+            &SandboxSpec::new("centaur-agent:latest"),
+            &AgentSandboxConfig::new("centaur"),
+            None,
+        )
+        .unwrap();
+        sandbox.metadata.owner_references = Some(vec![
+            k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference {
+                api_version: "extensions.agents.x-k8s.io/v1beta1".to_owned(),
+                kind: "SandboxClaim".to_owned(),
+                name: "asbx-claim".to_owned(),
+                uid: "uid-1".to_owned(),
+                block_owner_deletion: None,
+                controller: None,
+            },
+        ]);
+
+        assert_eq!(sandbox_claim_owner_names(&sandbox), ["asbx-claim"]);
     }
 
     #[test]

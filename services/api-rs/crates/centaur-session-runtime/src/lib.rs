@@ -34,6 +34,13 @@ const EVENT_STREAM_SAFETY_POLL_INTERVAL: Duration = Duration::from_secs(30);
 type SandboxSpecFactory = Arc<dyn Fn(&ThreadKey, &str) -> SandboxSpec + Send + Sync>;
 type SessionInputSink = FramedWrite<SandboxWrite, LinesCodec>;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExistingSandboxReuse {
+    Reused,
+    Resumed,
+    Missing,
+}
+
 #[derive(Clone)]
 pub struct SessionRuntime {
     store: PgSessionStore,
@@ -56,6 +63,7 @@ pub enum SandboxWorkloadMode {
         image: String,
         env: Vec<(String, String)>,
         mounts: Vec<Mount>,
+        thread_key_env: bool,
     },
 }
 
@@ -233,13 +241,15 @@ impl SessionRuntime {
         execution_id: &str,
     ) -> Result<String, SessionRuntimeError> {
         if let Some(sandbox_id) = existing_sandbox_id {
-            let id = SandboxId::new(sandbox_id);
-            match self.sandbox_runtime.manager.status(&id).await {
-                Ok(SandboxStatus::Running | SandboxStatus::Created) => {
+            match try_reuse_existing_sandbox(&self.sandbox_runtime.manager, sandbox_id).await? {
+                ExistingSandboxReuse::Reused => {
                     return Ok(sandbox_id.to_owned());
                 }
-                Ok(_) | Err(SandboxError::NotFound(_)) => {}
-                Err(error) => return Err(SessionRuntimeError::Sandbox(error)),
+                ExistingSandboxReuse::Resumed => {
+                    self.sandbox_pipes.lock().await.remove(sandbox_id);
+                    return Ok(sandbox_id.to_owned());
+                }
+                ExistingSandboxReuse::Missing => {}
             }
         }
 
@@ -316,6 +326,23 @@ impl SessionRuntime {
     }
 }
 
+async fn try_reuse_existing_sandbox(
+    manager: &SandboxManager,
+    sandbox_id: &str,
+) -> Result<ExistingSandboxReuse, SessionRuntimeError> {
+    let id = SandboxId::new(sandbox_id);
+    match manager.status(&id).await {
+        Ok(SandboxStatus::Running) => Ok(ExistingSandboxReuse::Reused),
+        Ok(SandboxStatus::Created | SandboxStatus::Suspended) => {
+            manager.resume(&id).await?;
+            Ok(ExistingSandboxReuse::Resumed)
+        }
+        Ok(SandboxStatus::Stopped | SandboxStatus::Gone | SandboxStatus::Unknown(_))
+        | Err(SandboxError::NotFound(_)) => Ok(ExistingSandboxReuse::Missing),
+        Err(error) => Err(SessionRuntimeError::Sandbox(error)),
+    }
+}
+
 impl SandboxRuntime {
     pub fn backend(backend: Arc<dyn SandboxBackend>, spec: SandboxSpec) -> Self {
         let spec_factory = move |_thread_key: &ThreadKey, _execution_id: &str| spec.clone();
@@ -357,6 +384,7 @@ impl SandboxWorkloadMode {
             image: image.into(),
             env: env.into_iter().collect(),
             mounts: Vec::new(),
+            thread_key_env: true,
         }
     }
 
@@ -368,14 +396,28 @@ impl SandboxWorkloadMode {
         self
     }
 
+    pub fn without_thread_key_env(mut self) -> Self {
+        if let Self::CodexAppServer { thread_key_env, .. } = &mut self {
+            *thread_key_env = false;
+        }
+        self
+    }
+
     fn spec(&self, thread_key: &ThreadKey) -> SandboxSpec {
         match self {
             Self::MockAppServer { image } => SandboxSpec::new(image)
                 .command(["/bin/sh", "-lc"])
                 .args([mock_app_server_script()]),
-            Self::CodexAppServer { image, env, mounts } => {
-                let mut spec =
-                    SandboxSpec::new(image).env("CENTAUR_THREAD_KEY", thread_key.as_str());
+            Self::CodexAppServer {
+                image,
+                env,
+                mounts,
+                thread_key_env,
+            } => {
+                let mut spec = SandboxSpec::new(image);
+                if *thread_key_env {
+                    spec = spec.env("CENTAUR_THREAD_KEY", thread_key.as_str());
+                }
                 for mount in mounts {
                     spec = spec.mount(mount.clone());
                 }
@@ -601,7 +643,15 @@ pub enum SessionRuntimeError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use centaur_sandbox_core::MountKind;
+    use std::{
+        collections::HashMap,
+        sync::{Arc, Mutex},
+    };
+
+    use async_trait::async_trait;
+    use centaur_sandbox_core::{
+        MountKind, ObservedSandbox, SandboxHandle, SandboxIo, SandboxResult,
+    };
 
     #[test]
     fn codex_workload_applies_mounts_and_env() {
@@ -641,5 +691,148 @@ mod tests {
                 .iter()
                 .any(|env| env.name == "CENTAUR_API_URL" && env.value == "http://api:8000")
         );
+    }
+
+    #[test]
+    fn codex_workload_can_skip_thread_key_env_for_warm_templates() {
+        let workload = SandboxWorkloadMode::codex_app_server(
+            "centaur-agent:latest",
+            [("CENTAUR_API_URL".to_owned(), "http://api:8000".to_owned())],
+        )
+        .without_thread_key_env();
+        let thread_key = ThreadKey::parse("test:thread").unwrap();
+
+        let spec = workload.spec(&thread_key);
+
+        assert!(!spec.env.iter().any(|env| env.name == "CENTAUR_THREAD_KEY"));
+        assert!(
+            spec.env
+                .iter()
+                .any(|env| env.name == "CENTAUR_API_URL" && env.value == "http://api:8000")
+        );
+    }
+
+    #[tokio::test]
+    async fn existing_suspended_sandbox_is_resumed_for_warm_reuse() {
+        let backend = Arc::new(FakeBackend::new([("sandbox-1", SandboxStatus::Suspended)]));
+        let manager = SandboxManager::new(backend.clone());
+
+        let outcome = try_reuse_existing_sandbox(&manager, "sandbox-1")
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, ExistingSandboxReuse::Resumed);
+        assert_eq!(backend.status_of("sandbox-1"), Some(SandboxStatus::Running));
+        assert_eq!(backend.operations(), ["resume:sandbox-1"]);
+    }
+
+    #[tokio::test]
+    async fn missing_existing_sandbox_is_replaced() {
+        let backend = Arc::new(FakeBackend::new([]));
+        let manager = SandboxManager::new(backend.clone());
+
+        let outcome = try_reuse_existing_sandbox(&manager, "sandbox-1")
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, ExistingSandboxReuse::Missing);
+        assert_eq!(backend.operations(), Vec::<String>::new());
+    }
+
+    struct FakeBackend {
+        statuses: Mutex<HashMap<SandboxId, SandboxStatus>>,
+        operations: Mutex<Vec<String>>,
+    }
+
+    impl FakeBackend {
+        fn new<const N: usize>(statuses: [(&str, SandboxStatus); N]) -> Self {
+            Self {
+                statuses: Mutex::new(
+                    statuses
+                        .into_iter()
+                        .map(|(id, status)| (SandboxId::from(id), status))
+                        .collect(),
+                ),
+                operations: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn status_of(&self, id: &str) -> Option<SandboxStatus> {
+            self.statuses
+                .lock()
+                .expect("status lock poisoned")
+                .get(&SandboxId::from(id))
+                .cloned()
+        }
+
+        fn operations(&self) -> Vec<String> {
+            self.operations
+                .lock()
+                .expect("operations lock poisoned")
+                .clone()
+        }
+
+        fn set_status(&self, id: &SandboxId, status: SandboxStatus) {
+            self.statuses
+                .lock()
+                .expect("status lock poisoned")
+                .insert(id.clone(), status);
+        }
+
+        fn push_operation(&self, operation: &str, id: &SandboxId) {
+            self.operations
+                .lock()
+                .expect("operations lock poisoned")
+                .push(format!("{operation}:{}", id.as_str()));
+        }
+    }
+
+    #[async_trait]
+    impl SandboxBackend for FakeBackend {
+        fn name(&self) -> &'static str {
+            "fake"
+        }
+
+        async fn create(&self, _spec: SandboxSpec) -> SandboxResult<SandboxHandle> {
+            unreachable!("reuse tests should not create sandboxes")
+        }
+
+        async fn open_io(&self, _id: &SandboxId) -> SandboxResult<SandboxIo> {
+            unreachable!("reuse tests should not open I/O")
+        }
+
+        async fn status(&self, id: &SandboxId) -> SandboxResult<SandboxStatus> {
+            Ok(self.status_of(id.as_str()).unwrap_or(SandboxStatus::Gone))
+        }
+
+        async fn observe(&self, id: &SandboxId) -> SandboxResult<ObservedSandbox> {
+            Ok(ObservedSandbox::new(
+                id.clone(),
+                self.name(),
+                self.status(id).await?,
+            ))
+        }
+
+        async fn list_observed(&self) -> SandboxResult<Vec<ObservedSandbox>> {
+            Ok(Vec::new())
+        }
+
+        async fn stop(&self, id: &SandboxId) -> SandboxResult<()> {
+            self.push_operation("stop", id);
+            self.set_status(id, SandboxStatus::Stopped);
+            Ok(())
+        }
+
+        async fn pause(&self, id: &SandboxId) -> SandboxResult<()> {
+            self.push_operation("pause", id);
+            self.set_status(id, SandboxStatus::Suspended);
+            Ok(())
+        }
+
+        async fn resume(&self, id: &SandboxId) -> SandboxResult<()> {
+            self.push_operation("resume", id);
+            self.set_status(id, SandboxStatus::Running);
+            Ok(())
+        }
     }
 }

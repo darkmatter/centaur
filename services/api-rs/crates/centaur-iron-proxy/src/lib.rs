@@ -224,6 +224,14 @@ impl CorePgListener {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PgDsnEnv {
+    pub env_name: String,
+    pub database: String,
+    pub port: u16,
+    pub password_env: String,
+}
+
 pub fn load_fragment_file(path: impl AsRef<Path>) -> Result<ProxyFragment> {
     let path = path.as_ref();
     let contents = fs::read_to_string(path).map_err(|source| IronProxyConfigError::ReadFile {
@@ -372,6 +380,51 @@ fn listen_port(value: &str) -> Option<u16> {
     value.rsplit_once(':')?.1.parse().ok()
 }
 
+pub fn pg_dsn_envs(fragments: &[ProxyFragment]) -> Vec<PgDsnEnv> {
+    let mut entries = BTreeMap::<String, PgDsnEnv>::new();
+    for listener in fragments
+        .iter()
+        .flat_map(|fragment| fragment.postgres.iter())
+    {
+        let Some(sandbox_env) = listener["sandbox_env"].as_mapping() else {
+            continue;
+        };
+        let Some(env_name) = sandbox_env
+            .get(&string_value("name"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        let Some(database) = sandbox_env
+            .get(&string_value("database"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        let Some(port) = listener["listen"].as_str().and_then(listen_port) else {
+            continue;
+        };
+        let Some(password_env) = listener["client"]["password_env"]
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        entries.entry(env_name.to_owned()).or_insert(PgDsnEnv {
+            env_name: env_name.to_owned(),
+            database: database.to_owned(),
+            port,
+            password_env: password_env.to_owned(),
+        });
+    }
+    entries.into_values().collect()
+}
+
 pub fn render_proxy_yaml(
     base_config: Option<&str>,
     fragments: &[ProxyFragment],
@@ -415,6 +468,7 @@ pub fn render_proxy_yaml_with_source_policy(
         .iter()
         .flat_map(|fragment| fragment.postgres.iter().cloned())
         .map(|mut listener| {
+            strip_centaur_postgres_extensions(&mut listener);
             resolve_placeholder_source_values(&mut listener, source_policy);
             listener
         })
@@ -524,6 +578,12 @@ fn resolve_broker_store_source(value: &mut Value, source_policy: &SourcePolicy) 
         return Err(IronProxyConfigError::BrokerStoreEnv { placeholder });
     }
     Ok(())
+}
+
+fn strip_centaur_postgres_extensions(listener: &mut Value) {
+    if let Some(map) = listener.as_mapping_mut() {
+        map.remove(&string_value("sandbox_env"));
+    }
 }
 
 fn resolve_fragment_transform_sources(mut transform: Value, source_policy: &SourcePolicy) -> Value {
@@ -894,6 +954,50 @@ mcp:
             "op://ai-agents/GITHUB_TOKEN/credential"
         );
         assert!(!rendered.contains("placeholder:"));
+    }
+
+    #[test]
+    fn extracts_pg_dsn_envs_and_strips_centaur_postgres_extensions() {
+        let fragment = fragment_yaml(
+            r#"
+postgres:
+  - name: warehouse
+    listen: 0.0.0.0:5440
+    upstream:
+      dsn:
+        placeholder: WAREHOUSE_DSN_UPSTREAM
+    client:
+      user: app_user
+      password_env: PG_PROXY_PASSWORD_WAREHOUSE
+    sandbox_env:
+      name: WAREHOUSE_DSN
+      database: warehouse
+"#,
+        );
+
+        assert_eq!(
+            pg_dsn_envs(&[fragment.clone()]),
+            vec![PgDsnEnv {
+                env_name: "WAREHOUSE_DSN".to_owned(),
+                database: "warehouse".to_owned(),
+                port: 5440,
+                password_env: "PG_PROXY_PASSWORD_WAREHOUSE".to_owned(),
+            }]
+        );
+
+        let rendered = render_proxy_yaml_with_source_policy(
+            None,
+            &[fragment],
+            None,
+            &SourcePolicy::onepassword("ai-agents", "10m"),
+        )
+        .unwrap();
+        let cfg = parse_rendered(&rendered);
+        assert!(cfg["postgres"][0]["sandbox_env"].is_null());
+        assert_eq!(
+            cfg["postgres"][0]["upstream"]["dsn"]["secret_ref"],
+            "op://ai-agents/WAREHOUSE_DSN_UPSTREAM/credential"
+        );
     }
 
     #[test]

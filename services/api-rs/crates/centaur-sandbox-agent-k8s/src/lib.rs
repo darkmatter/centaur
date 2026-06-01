@@ -23,6 +23,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::time::{Instant, sleep};
+use uuid::Uuid;
 
 pub use generated::agents_x_k8s_io as crd;
 
@@ -146,6 +147,8 @@ struct ResolvedIronProxy {
     proxy_pod_name: String,
     proxy_port: u16,
     listen_ports: Vec<u16>,
+    pg_dsn_env: BTreeMap<String, String>,
+    pg_proxy_password_env: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -293,13 +296,27 @@ impl AgentSandboxBackend {
             .map_err(|err| SandboxError::InvalidSpec(format!("iron-proxy proxy port: {err}")))?;
         let listen_ports = centaur_iron_proxy::listen_ports_from_yaml(&config_yaml)
             .map_err(|err| SandboxError::InvalidSpec(format!("iron-proxy listen ports: {err}")))?;
+        let proxy_host = iron_proxy_service_name(id);
+        let mut pg_dsn_env = BTreeMap::new();
+        let mut pg_proxy_password_env = BTreeMap::new();
+        for entry in centaur_iron_proxy::pg_dsn_envs(&fragments) {
+            let password = pg_proxy_password_env
+                .entry(entry.password_env.clone())
+                .or_insert_with(proxy_password)
+                .clone();
+            pg_dsn_env.entry(entry.env_name).or_insert_with(|| {
+                proxied_pg_url(&proxy_host, entry.port, &password, &entry.database)
+            });
+        }
         Ok(Some(ResolvedIronProxy {
             config_yaml,
             placeholder_env,
-            proxy_host: iron_proxy_service_name(id),
+            proxy_host,
             proxy_pod_name: new_iron_proxy_pod_name(id),
             proxy_port,
             listen_ports,
+            pg_dsn_env,
+            pg_proxy_password_env,
         }))
     }
 
@@ -940,6 +957,9 @@ fn env_json(spec: &SandboxSpec, resolved_iron_proxy: Option<&ResolvedIronProxy>)
         for (name, value) in &resolved_iron_proxy.placeholder_env {
             env.entry(name.clone()).or_insert_with(|| value.clone());
         }
+        for (name, value) in &resolved_iron_proxy.pg_dsn_env {
+            env.entry(name.clone()).or_insert_with(|| value.clone());
+        }
         let api_host = env
             .get("CENTAUR_API_URL")
             .and_then(|value| host_from_url(value));
@@ -995,6 +1015,14 @@ fn proxy_env(
         "/firewall-certs/ca-cert.pem".to_owned(),
     );
     env
+}
+
+fn proxied_pg_url(host: &str, port: u16, password: &str, database: &str) -> String {
+    format!("postgresql://app_user:{password}@{host}:{port}/{database}")
+}
+
+fn proxy_password() -> String {
+    Uuid::new_v4().simple().to_string()
 }
 
 fn no_proxy_value(proxy_host: &str, api_host: Option<&str>, extra_values: &[&str]) -> String {
@@ -1071,6 +1099,9 @@ fn iron_proxy_container(iron_proxy: &IronProxyPodConfig, resolved: &ResolvedIron
         );
     }
     for (name, value) in &iron_proxy.extra_env {
+        insert_env_value(&mut env, name, value);
+    }
+    for (name, value) in &resolved.pg_proxy_password_env {
         insert_env_value(&mut env, name, value);
     }
     if let Some(secret_name) = &iron_proxy.secret_env_name {
@@ -1615,6 +1646,11 @@ mod tests {
             proxy_pod_name: "asbx-test-proxy-123".to_owned(),
             proxy_port: 18080,
             listen_ports: vec![8080],
+            pg_dsn_env: BTreeMap::from([(
+                "WAREHOUSE_DSN".to_owned(),
+                "postgresql://app_user:pg-pass@asbx-test-proxy:5432/warehouse".to_owned(),
+            )]),
+            pg_proxy_password_env: BTreeMap::new(),
         };
         let spec = SandboxSpec::new("centaur-agent:latest")
             .env("CENTAUR_API_URL", "http://centaur-centaur-api:8000")
@@ -1651,6 +1687,10 @@ mod tests {
             .map(|env| (env.name.as_str(), env.value.as_deref().unwrap_or("")))
             .collect::<BTreeMap<_, _>>();
         assert_eq!(agent_env["OPENAI_API_KEY"], "OPENAI_API_KEY");
+        assert_eq!(
+            agent_env["WAREHOUSE_DSN"],
+            "postgresql://app_user:pg-pass@asbx-test-proxy:5432/warehouse"
+        );
         assert_eq!(agent_env["FIREWALL_HOST"], "asbx-test-proxy");
         assert_eq!(agent_env["FIREWALL_PROXY_PORT"], "18080");
         assert_eq!(agent_env["HTTPS_PROXY"], "http://asbx-test-proxy:18080");
@@ -1716,6 +1756,11 @@ mod tests {
             proxy_pod_name: "asbx-test-proxy-123".to_owned(),
             proxy_port: 18080,
             listen_ports: vec![5432, 8080, 18080],
+            pg_dsn_env: BTreeMap::new(),
+            pg_proxy_password_env: BTreeMap::from([(
+                "PG_PROXY_PASSWORD_WAREHOUSE".to_owned(),
+                "pg-pass".to_owned(),
+            )]),
         };
 
         let pod =
@@ -1817,6 +1862,10 @@ mod tests {
         assert_eq!(
             env["IRON_BROKER_URL"].value.as_deref(),
             Some("http://token-broker:8181")
+        );
+        assert_eq!(
+            env["PG_PROXY_PASSWORD_WAREHOUSE"].value.as_deref(),
+            Some("pg-pass")
         );
         let volumes = pod.spec.as_ref().unwrap().volumes.as_ref().unwrap();
         assert!(

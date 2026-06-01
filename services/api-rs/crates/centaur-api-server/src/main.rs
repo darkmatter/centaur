@@ -219,6 +219,12 @@ fn iron_proxy_config_from_env() -> Result<Option<IronProxyPodConfig>, ServerErro
                 .and_then(|value| parse_host_port(&value))
         })
         .unwrap_or(config.op_connect_port);
+    if let Ok(selector) = env::var("KUBERNETES_API_POD_LABEL_SELECTOR") {
+        let labels = parse_label_selector(&selector);
+        if !labels.is_empty() {
+            config.api_pod_labels = labels;
+        }
+    }
     config.harness_auth_modes = harness_auth_modes_from_env();
     push_optional_proxy_env(
         &mut config.extra_env,
@@ -269,6 +275,18 @@ fn push_optional_proxy_env(envs: &mut BTreeMap<String, String>, name: &str, valu
 
 fn parse_host_port(value: &str) -> Option<u16> {
     value.rsplit_once(':')?.1.parse().ok()
+}
+
+fn parse_label_selector(value: &str) -> BTreeMap<String, String> {
+    value
+        .split(',')
+        .filter_map(|item| {
+            let (key, value) = item.split_once('=')?;
+            let key = key.trim();
+            let value = value.trim();
+            (!key.is_empty() && !value.is_empty()).then(|| (key.to_owned(), value.to_owned()))
+        })
+        .collect()
 }
 
 fn env_bool(name: &str) -> bool {

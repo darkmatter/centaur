@@ -283,7 +283,7 @@ pub fn placeholder_env(fragments: &[ProxyFragment]) -> BTreeMap<String, String> 
                 .into_iter()
                 .flatten()
             {
-                let Some(proxy_value) = secret["replace"]["proxy_value"].as_str() else {
+                let Some(proxy_value) = secret_proxy_value(secret) else {
                     continue;
                 };
                 if proxy_value.is_empty() || proxy_value.contains('=') {
@@ -406,25 +406,27 @@ fn fill_missing_secret_sources(transform: &mut Value, source_policy: &SourcePoli
         return;
     };
     for secret in secrets {
+        let proxy_value = secret_proxy_value(secret).map(ToOwned::to_owned);
         let Some(secret_map) = secret.as_mapping_mut() else {
             continue;
         };
         if secret_map.contains_key(&string_value("source")) {
             continue;
         }
-        let Some(proxy_value) = secret_map
-            .get(&string_value("replace"))
-            .and_then(Value::as_mapping)
-            .and_then(|map| map.get(&string_value("proxy_value")))
-            .and_then(Value::as_str)
-        else {
+        let Some(proxy_value) = proxy_value else {
             continue;
         };
         secret_map.insert(
             string_value("source"),
-            source_policy.source_for(proxy_value, None),
+            source_policy.source_for(&proxy_value, None),
         );
     }
+}
+
+fn secret_proxy_value(secret: &Value) -> Option<&str> {
+    secret["replace"]["proxy_value"]
+        .as_str()
+        .or_else(|| secret["proxy_value"].as_str())
 }
 
 fn resolve_placeholder_source_values(value: &mut Value, source_policy: &SourcePolicy) {
@@ -752,6 +754,44 @@ transforms:
         assert_eq!(
             placeholder_env(&[fragment]),
             BTreeMap::from([("OPENAI_API_KEY".to_owned(), "OPENAI_API_KEY".to_owned())])
+        );
+    }
+
+    #[test]
+    fn supports_legacy_secret_proxy_value_shape() {
+        let fragment = fragment_yaml(
+            r#"
+transforms:
+  - name: secrets
+    config:
+      secrets:
+        - proxy_value: LEGACY_API_KEY
+          match_headers: ["Authorization"]
+          rules: [{ host: api.example.com }]
+"#,
+        );
+        assert_eq!(
+            placeholder_env(&[fragment.clone()]),
+            BTreeMap::from([("LEGACY_API_KEY".to_owned(), "LEGACY_API_KEY".to_owned())])
+        );
+
+        let rendered = render_proxy_yaml_with_source_policy(
+            None,
+            &[fragment],
+            None,
+            &SourcePolicy::onepassword_connect("ai-agents", "10m"),
+        )
+        .unwrap();
+        let cfg = parse_rendered(&rendered);
+        let secrets_transform = cfg["transforms"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .find(|transform| transform["name"].as_str() == Some("secrets"))
+            .unwrap();
+        assert_eq!(
+            secrets_transform["config"]["secrets"][0]["source"]["secret_ref"],
+            "op://ai-agents/LEGACY_API_KEY/credential"
         );
     }
 

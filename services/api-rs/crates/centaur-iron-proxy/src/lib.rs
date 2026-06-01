@@ -832,6 +832,80 @@ transforms:
     }
 
     #[test]
+    fn resolves_placeholders_in_non_secret_managed_transforms() {
+        let fragment = fragment_yaml(
+            r#"
+transforms:
+  - name: gcp_auth
+    config:
+      keyfile:
+        placeholder: GCP_KEYFILE_JSON
+      scopes: ["https://www.googleapis.com/auth/cloud-platform"]
+      rules: [{ host: "*.googleapis.com" }]
+  - name: oauth_token
+    config:
+      tokens:
+        - grant: refresh_token
+          client_id:
+            placeholder: GOOGLE_OAUTH_JSON
+            json_key: client_id
+          client_secret:
+            placeholder: GOOGLE_OAUTH_JSON
+            json_key: client_secret
+          refresh_token:
+            placeholder: GOOGLE_REFRESH_TOKEN
+          token_endpoint: https://oauth2.googleapis.com/token
+          token_endpoint_headers:
+            x-api-key:
+              placeholder: TOKEN_ENDPOINT_API_KEY
+          rules: [{ host: gmail.googleapis.com }]
+  - name: hmac_sign
+    config:
+      timestamp: { format: unix }
+      signature:
+        algorithm: hmac-sha256
+        key_encoding: utf8
+        output_encoding: hex
+        message: "{{.Method}}:{{.Path}}"
+      credentials:
+        signing_key:
+          placeholder: HMAC_SIGNING_KEY
+      headers:
+        - { name: x-signature, value: "{{.Signature}}" }
+      rules: [{ host: signed.example.com }]
+"#,
+        );
+        let rendered = render_proxy_yaml_with_source_policy(
+            None,
+            &[fragment],
+            None,
+            &SourcePolicy::onepassword("ai-agents", "10m"),
+        )
+        .unwrap();
+        let cfg = parse_rendered(&rendered);
+        assert_eq!(cfg["transforms"][1]["name"], "gcp_auth");
+        assert_eq!(
+            cfg["transforms"][1]["config"]["keyfile"]["secret_ref"],
+            "op://ai-agents/GCP_KEYFILE_JSON/credential"
+        );
+        let token = &cfg["transforms"][2]["config"]["tokens"][0];
+        assert_eq!(
+            token["client_id"]["secret_ref"],
+            "op://ai-agents/GOOGLE_OAUTH_JSON/credential"
+        );
+        assert_eq!(token["client_id"]["json_key"], "client_id");
+        assert_eq!(
+            token["token_endpoint_headers"]["x-api-key"]["secret_ref"],
+            "op://ai-agents/TOKEN_ENDPOINT_API_KEY/credential"
+        );
+        assert_eq!(
+            cfg["transforms"][3]["config"]["credentials"]["signing_key"]["secret_ref"],
+            "op://ai-agents/HMAC_SIGNING_KEY/credential"
+        );
+        assert!(!rendered.contains("placeholder:"));
+    }
+
+    #[test]
     fn loads_builtin_harness_fragments() {
         let codex = harness_fragment("codex", "api_key").unwrap().unwrap();
         assert_eq!(

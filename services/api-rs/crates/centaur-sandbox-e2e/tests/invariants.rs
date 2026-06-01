@@ -1,4 +1,3 @@
-use std::env;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -10,6 +9,7 @@ use centaur_sandbox_core::{
 };
 use centaur_sandbox_local::LocalSandboxBackend;
 use centaur_sandbox_manager::{DriftReason, ReconcileOutcome, SandboxManager};
+use clap::Parser;
 use kube::config::KubeConfigOptions;
 use kube::{Client, Config};
 use tokio::time::{Instant, sleep};
@@ -372,7 +372,8 @@ where
 }
 
 async fn implementations() -> Vec<SandboxImplementation> {
-    let requested = env::var("SANDBOX_E2E_IMPLS").unwrap_or_else(|_| "all".to_owned());
+    let args = E2eArgs::from_env();
+    let requested = args.sandbox_e2e_impls.as_str();
     let names = if requested.trim() == "all" {
         ALL_IMPLEMENTATIONS.to_vec()
     } else {
@@ -409,13 +410,16 @@ fn local_implementation() -> SandboxImplementation {
 }
 
 async fn agent_k8s_implementation() -> SandboxImplementation {
-    let context = env::var("SANDBOX_E2E_K8S_CONTEXT")
-        .or_else(|_| env::var("KUBE_CONTEXT"))
-        .unwrap_or_else(|_| "kind-centaur-api-rs-e2e".to_owned());
-    let namespace = env::var("SANDBOX_E2E_K8S_NAMESPACE")
-        .or_else(|_| env::var("KUBE_NAMESPACE"))
-        .unwrap_or_else(|_| "centaur-sandbox-e2e".to_owned());
-    let image = env::var("SANDBOX_E2E_K8S_IMAGE").unwrap_or_else(|_| "busybox:1.36".to_owned());
+    let args = E2eArgs::from_env();
+    let context = args
+        .sandbox_e2e_k8s_context
+        .or(args.kube_context)
+        .unwrap_or_else(|| "kind-centaur-api-rs-e2e".to_owned());
+    let namespace = args
+        .sandbox_e2e_k8s_namespace
+        .or(args.kube_namespace)
+        .unwrap_or_else(|| "centaur-sandbox-e2e".to_owned());
+    let image = args.sandbox_e2e_k8s_image;
 
     let kube_config = Config::from_kubeconfig(&KubeConfigOptions {
         context: Some(context),
@@ -438,6 +442,28 @@ async fn agent_k8s_implementation() -> SandboxImplementation {
         short_lived_spec: k8s_shell_spec(&image, "sleep 1"),
         byte_io_spec: k8s_shell_spec(&image, "cat"),
         invalid_spec: SandboxSpec::new(image).command(["/definitely-not-a-centaur-command"]),
+    }
+}
+
+#[derive(Debug, Parser)]
+struct E2eArgs {
+    #[arg(long, env = "SANDBOX_E2E_IMPLS", default_value = "all")]
+    sandbox_e2e_impls: String,
+    #[arg(long, env = "SANDBOX_E2E_K8S_CONTEXT")]
+    sandbox_e2e_k8s_context: Option<String>,
+    #[arg(long, env = "KUBE_CONTEXT")]
+    kube_context: Option<String>,
+    #[arg(long, env = "SANDBOX_E2E_K8S_NAMESPACE")]
+    sandbox_e2e_k8s_namespace: Option<String>,
+    #[arg(long, env = "KUBE_NAMESPACE")]
+    kube_namespace: Option<String>,
+    #[arg(long, env = "SANDBOX_E2E_K8S_IMAGE", default_value = "busybox:1.36")]
+    sandbox_e2e_k8s_image: String,
+}
+
+impl E2eArgs {
+    fn from_env() -> Self {
+        Self::parse_from(["centaur-sandbox-e2e"])
     }
 }
 

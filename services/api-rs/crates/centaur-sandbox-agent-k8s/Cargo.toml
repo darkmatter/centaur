@@ -9,6 +9,7 @@ repository.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
 centaur-sandbox-core.workspace = true
+clap.workspace = true
 k8s-openapi.workspace = true
 kube = { workspace = true, features = ["derive", "ws"] }
 serde.workspace = true

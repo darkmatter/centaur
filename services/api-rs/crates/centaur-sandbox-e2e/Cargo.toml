@@ -11,5 +11,6 @@ centaur-sandbox-agent-k8s.workspace = true
 centaur-sandbox-core.workspace = true
 centaur-sandbox-local.workspace = true
 centaur-sandbox-manager.workspace = true
+clap.workspace = true
 kube.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }

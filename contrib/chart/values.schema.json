@@ -94,6 +94,15 @@
       "properties": {
         "runtimeClassName": { "type": "string" },
         "reposPath": { "type": "string" },
+        "toolBuildCache": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "hostPath": { "type": "string" },
+            "mountPath": { "type": "string" },
+            "uvLinkMode": { "type": "string" }
+          }
+        },
         "resources": { "type": "object" }
       }
     },

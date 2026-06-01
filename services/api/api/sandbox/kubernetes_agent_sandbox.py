@@ -8,6 +8,7 @@ from kubernetes_asyncio import client
 from api.sandbox.base import SandboxSession
 from api.sandbox.kubernetes import (
     KubernetesExecutorBackend,
+    _append_tool_build_cache_volume,
     _namespace,
     _prompt_secret_name,
 )
@@ -97,8 +98,9 @@ class KubernetesAgentSandboxBackend(KubernetesExecutorBackend):
     def _configure_workload_volumes(
         self,
         volume_mounts: list[dict[str, Any]],
-        volumes: list[dict[str, Any]],  # noqa: ARG002
+        volumes: list[dict[str, Any]],
     ) -> None:
+        _append_tool_build_cache_volume(volume_mounts, volumes)
         if _state_volume_enabled():
             volume_mounts.append({"name": "state", "mountPath": "/home/agent/state"})
 

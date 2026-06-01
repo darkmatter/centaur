@@ -3,6 +3,9 @@
 {{- if and .Values.repoCache.enabled (not $reposPath) -}}
 {{- $reposPath = .Values.repoCache.hostPath -}}
 {{- end -}}
+{{- if and .Values.sandbox.toolBuildCache.enabled (not .Values.sandbox.toolBuildCache.hostPath) -}}
+{{- fail "sandbox.toolBuildCache.hostPath is required when sandbox.toolBuildCache.enabled=true" -}}
+{{- end -}}
 {{- if .Values.postgres.enabled }}
 apiVersion: apps/v1
 kind: StatefulSet
@@ -365,6 +368,20 @@ spec:
 {{- if $reposPath }}
             - name: REPOS_PATH
               value: {{ $reposPath | quote }}
+{{- end }}
+{{- if .Values.sandbox.toolBuildCache.enabled }}
+{{- if not (hasKey $apiExtraEnv "KUBERNETES_TOOL_BUILD_CACHE_HOST_PATH") }}
+            - name: KUBERNETES_TOOL_BUILD_CACHE_HOST_PATH
+              value: {{ .Values.sandbox.toolBuildCache.hostPath | quote }}
+{{- end }}
+{{- if not (hasKey $apiExtraEnv "KUBERNETES_TOOL_BUILD_CACHE_MOUNT_PATH") }}
+            - name: KUBERNETES_TOOL_BUILD_CACHE_MOUNT_PATH
+              value: {{ .Values.sandbox.toolBuildCache.mountPath | quote }}
+{{- end }}
+{{- if not (hasKey $apiExtraEnv "KUBERNETES_TOOL_BUILD_CACHE_UV_LINK_MODE") }}
+            - name: KUBERNETES_TOOL_BUILD_CACHE_UV_LINK_MODE
+              value: {{ .Values.sandbox.toolBuildCache.uvLinkMode | quote }}
+{{- end }}
 {{- end }}
 {{- with .Values.sandbox.extraEnv }}
 {{- $envList := list }}

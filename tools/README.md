@@ -83,6 +83,15 @@ to configure a separate GitHub PAT for the cache. Set
 `repoCache.authMode=github-token` only when you explicitly want the repo-cache
 pod to mount its own GitHub token Secret.
 
+For faster cold-starts from mounted source, enable
+`sandbox.toolBuildCache.enabled=true`. Centaur mounts the configured node-local
+hostPath at `/home/agent/.cache` and points Python (`uv`), Rust (`cargo`), and
+Go (`go`) at that cache. The first execution of a source-mounted tool still pays
+the dependency/build cost; later executions on the same node reuse package,
+module, and build artifacts across sandbox pods. This cache is a shared writable
+hostPath, so production deployments should enable it only when that isolation
+tradeoff is acceptable.
+
 ## Secrets
 
 Secrets are resolved in this order:

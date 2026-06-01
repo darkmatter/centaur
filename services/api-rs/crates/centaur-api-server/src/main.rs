@@ -16,6 +16,7 @@ use tracing::info;
 use tracing_subscriber::{EnvFilter, fmt as tracing_fmt};
 
 const SANDBOX_REPOS_MOUNT_PATH: &str = "/home/agent/github";
+const DEFAULT_TOOL_BUILD_CACHE_MOUNT_PATH: &str = "/home/agent/.cache";
 
 #[tokio::main]
 async fn main() -> Result<(), ServerError> {
@@ -113,6 +114,16 @@ fn container_workload_mode(args: &Args) -> SandboxWorkloadMode {
                     .read_only(),
                 );
             }
+            if let Some(cache_path) =
+                clean_optional_value(args.kubernetes_tool_build_cache_host_path.as_deref())
+            {
+                workload = workload.mount(Mount::new(
+                    MountKind::Bind {
+                        source_path: cache_path,
+                    },
+                    tool_build_cache_mount_path(args),
+                ));
+            }
             workload
         }
     }
@@ -179,6 +190,20 @@ struct Args {
     kubernetes_sandbox_state_volume_storage_class: Option<String>,
     #[arg(long, env = "REPOS_PATH")]
     repos_path: Option<String>,
+    #[arg(long, env = "KUBERNETES_TOOL_BUILD_CACHE_HOST_PATH")]
+    kubernetes_tool_build_cache_host_path: Option<String>,
+    #[arg(
+        long,
+        env = "KUBERNETES_TOOL_BUILD_CACHE_MOUNT_PATH",
+        default_value = DEFAULT_TOOL_BUILD_CACHE_MOUNT_PATH
+    )]
+    kubernetes_tool_build_cache_mount_path: String,
+    #[arg(
+        long,
+        env = "KUBERNETES_TOOL_BUILD_CACHE_UV_LINK_MODE",
+        default_value = "copy"
+    )]
+    kubernetes_tool_build_cache_uv_link_mode: String,
     #[arg(long, env = "CENTAUR_API_URL", default_value = "http://api:8000")]
     centaur_api_url: String,
     #[arg(long, env = "CENTAUR_API_KEY")]
@@ -513,6 +538,11 @@ fn sandbox_state_volume_from_args(args: &Args) -> Option<StateVolumeConfig> {
     Some(config)
 }
 
+fn tool_build_cache_mount_path(args: &Args) -> String {
+    clean_optional_value(Some(args.kubernetes_tool_build_cache_mount_path.as_str()))
+        .unwrap_or_else(|| DEFAULT_TOOL_BUILD_CACHE_MOUNT_PATH.to_owned())
+}
+
 fn clean_optional_value(value: Option<&str>) -> Option<String> {
     value
         .map(str::trim)
@@ -553,6 +583,20 @@ fn codex_app_server_env_template(args: &Args) -> Vec<(String, String)> {
     }
     if let Some(value) = clean_optional_value(args.codex_auth_mode.as_deref()) {
         push_env(&mut envs, "CODEX_AUTH_MODE", value);
+    }
+    if clean_optional_value(args.kubernetes_tool_build_cache_host_path.as_deref()).is_some() {
+        let mount_path = tool_build_cache_mount_path(args);
+        push_env(&mut envs, "XDG_CACHE_HOME", mount_path.clone());
+        push_env(&mut envs, "UV_CACHE_DIR", format!("{mount_path}/uv"));
+        push_env(
+            &mut envs,
+            "UV_LINK_MODE",
+            clean_optional_value(Some(args.kubernetes_tool_build_cache_uv_link_mode.as_str()))
+                .unwrap_or_else(|| "copy".to_owned()),
+        );
+        push_env(&mut envs, "CARGO_HOME", format!("{mount_path}/cargo"));
+        push_env(&mut envs, "GOCACHE", format!("{mount_path}/go-build"));
+        push_env(&mut envs, "GOMODCACHE", format!("{mount_path}/go-mod"));
     }
 
     for name in clean_values(&args.kubernetes_sandbox_passthrough_env) {
@@ -642,6 +686,44 @@ mod tests {
         assert_eq!(config.source_policy.ttl, "5m");
         assert_eq!(config.source_policy.token_broker_ttl, "30s");
         assert_eq!(config.harness_auth_modes["codex"], "access_token");
+    }
+
+    #[test]
+    fn codex_workload_mounts_tool_build_cache() {
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgresql://postgres@localhost/centaur",
+            "--kubernetes-sandbox-workload",
+            "codex-app-server",
+            "--kubernetes-tool-build-cache-host-path",
+            "/var/lib/centaur/tool-build-cache",
+            "--kubernetes-tool-build-cache-mount-path",
+            "/home/agent/.cache",
+        ])
+        .unwrap();
+
+        let workload = container_workload_mode(&args);
+        let SandboxWorkloadMode::CodexAppServer { env, mounts, .. } = workload else {
+            panic!("expected codex app server workload");
+        };
+
+        assert!(mounts.iter().any(|mount| {
+            mount.target_path == "/home/agent/.cache"
+                && !mount.read_only
+                && mount.kind
+                    == (MountKind::Bind {
+                        source_path: "/var/lib/centaur/tool-build-cache".to_owned(),
+                    })
+        }));
+
+        let env = env.into_iter().collect::<BTreeMap<_, _>>();
+        assert_eq!(env["XDG_CACHE_HOME"], "/home/agent/.cache");
+        assert_eq!(env["UV_CACHE_DIR"], "/home/agent/.cache/uv");
+        assert_eq!(env["UV_LINK_MODE"], "copy");
+        assert_eq!(env["CARGO_HOME"], "/home/agent/.cache/cargo");
+        assert_eq!(env["GOCACHE"], "/home/agent/.cache/go-build");
+        assert_eq!(env["GOMODCACHE"], "/home/agent/.cache/go-mod");
     }
 }
 

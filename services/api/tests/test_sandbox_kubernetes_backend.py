@@ -654,6 +654,40 @@ def test_tool_server_container_inherits_sandbox_extra_env(
     assert "stg-laminar-app-server" in env["NO_PROXY"]
 
 
+def test_tool_server_container_mounts_tool_build_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SANDBOX_SIGNING_KEY", "test-signing-key")
+    monkeypatch.setenv("KUBERNETES_TOOL_SERVER_IMAGE", "centaur-tools:test")
+    monkeypatch.setenv(
+        "KUBERNETES_TOOL_BUILD_CACHE_HOST_PATH",
+        "/var/lib/centaur/tool-build-cache",
+    )
+    monkeypatch.setenv("KUBERNETES_TOOL_BUILD_CACHE_MOUNT_PATH", "/home/agent/.cache")
+    monkeypatch.setenv("KUBERNETES_TOOL_BUILD_CACHE_UV_LINK_MODE", "copy")
+
+    container = _build_tool_server_container(
+        thread_key="slack:C123:123.456",
+        container_name="centaur-sandbox-pod-abc",
+        firewall_host="firewall.internal",
+        api_url="http://api.internal:8000",
+        overlay_mount=None,
+        database_url="postgres://app_user@firewall.internal:5433/centaur",
+    )
+
+    env = {item["name"]: item.get("value") for item in container["env"]}
+    assert env["XDG_CACHE_HOME"] == "/home/agent/.cache"
+    assert env["UV_CACHE_DIR"] == "/home/agent/.cache/uv"
+    assert env["UV_LINK_MODE"] == "copy"
+    assert env["CARGO_HOME"] == "/home/agent/.cache/cargo"
+    assert env["GOCACHE"] == "/home/agent/.cache/go-build"
+    assert env["GOMODCACHE"] == "/home/agent/.cache/go-mod"
+    assert {
+        "name": "tool-build-cache",
+        "mountPath": "/home/agent/.cache",
+    } in container["volumeMounts"]
+
+
 def test_tool_server_container_installs_overlay_deps_before_uvicorn(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1524,6 +1558,81 @@ async def test_create_mounts_repo_cache_host_path(
 
 
 @pytest.mark.asyncio
+async def test_create_mounts_tool_build_cache_host_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = KubernetesExecutorBackend()
+    fake_core = FakeCoreApi()
+    fake_networking = FakeNetworkingApi()
+    backend._core = fake_core
+    backend._networking = fake_networking
+
+    monkeypatch.setenv("AGENT_API_URL", "http://api.internal:8000")
+    monkeypatch.setenv("FIREWALL_HOST", "firewall.internal")
+    monkeypatch.setenv("KUBERNETES_FIREWALL_CA_SECRET_NAME", "firewall-ca")
+    monkeypatch.setenv("KUBERNETES_NAMESPACE", "centaur-sandbox")
+    monkeypatch.setenv(
+        "KUBERNETES_TOOL_BUILD_CACHE_HOST_PATH",
+        "/var/lib/centaur/tool-build-cache",
+    )
+    monkeypatch.setenv("KUBERNETES_TOOL_BUILD_CACHE_MOUNT_PATH", "/home/agent/.cache")
+    monkeypatch.setenv("KUBERNETES_TOOL_BUILD_CACHE_UV_LINK_MODE", "copy")
+    monkeypatch.setattr(
+        "api.sandbox.kubernetes._prompt_bundle",
+        lambda persona: f"prompt:{persona}",
+    )
+    monkeypatch.setattr(
+        "api.sandbox.kubernetes.container_env",
+        lambda *_args, **_kwargs: [
+            "CENTAUR_API_URL=http://api.internal:8000",
+            "CENTAUR_API_KEY=sandbox-token",
+            "XDG_CACHE_HOME=/tmp/not-the-mounted-cache",
+        ],
+    )
+
+    monkeypatch.setattr(
+        "api.sandbox.kubernetes.build_harness_cmd", lambda *_args: ["amp-wrapper"]
+    )
+    monkeypatch.setattr("api.sandbox.kubernetes.image", lambda: "centaur-agent:test")
+
+    async def fake_ensure_clients() -> None:
+        return None
+
+    async def fake_wait_ready(_pod_name: str) -> float:
+        return 0.01
+
+    monkeypatch.setattr(backend, "_ensure_clients", fake_ensure_clients)
+    monkeypatch.setattr(backend, "_wait_pod_ready", fake_wait_ready)
+    monkeypatch.setattr(backend, "_wait_ready", fake_wait_ready)
+    monkeypatch.setattr(backend, "_secrets_for_sandbox", lambda *_args: [])
+    monkeypatch.setattr(backend, "_resolved_pg_secrets", lambda _secrets: [])
+
+    await backend.create("slack:C123:123.456", "amp", "amp")
+
+    pod_body = fake_core.created_pods[1][1]
+    container = pod_body["spec"]["containers"][0]
+    env = {item["name"]: item.get("value") for item in container["env"]}
+
+    assert env["XDG_CACHE_HOME"] == "/home/agent/.cache"
+    assert env["UV_CACHE_DIR"] == "/home/agent/.cache/uv"
+    assert env["UV_LINK_MODE"] == "copy"
+    assert env["CARGO_HOME"] == "/home/agent/.cache/cargo"
+    assert env["GOCACHE"] == "/home/agent/.cache/go-build"
+    assert env["GOMODCACHE"] == "/home/agent/.cache/go-mod"
+    assert {
+        "name": "tool-build-cache",
+        "mountPath": "/home/agent/.cache",
+    } in container["volumeMounts"]
+    assert {
+        "name": "tool-build-cache",
+        "hostPath": {
+            "path": "/var/lib/centaur/tool-build-cache",
+            "type": "DirectoryOrCreate",
+        },
+    } in pod_body["spec"]["volumes"]
+
+
+@pytest.mark.asyncio
 async def test_create_can_use_agent_sandbox_with_state_volume(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1543,6 +1652,11 @@ async def test_create_can_use_agent_sandbox_with_state_volume(
     monkeypatch.setenv("KUBERNETES_SANDBOX_STATE_VOLUME_ENABLED", "1")
     monkeypatch.setenv("KUBERNETES_SANDBOX_STATE_VOLUME_SIZE", "7Gi")
     monkeypatch.setenv("KUBERNETES_SANDBOX_STATE_VOLUME_STORAGE_CLASS", "local-path")
+    monkeypatch.setenv(
+        "KUBERNETES_TOOL_BUILD_CACHE_HOST_PATH",
+        "/var/lib/centaur/tool-build-cache",
+    )
+    monkeypatch.setenv("KUBERNETES_TOOL_BUILD_CACHE_MOUNT_PATH", "/home/agent/.cache")
     monkeypatch.setattr(
         "api.sandbox.kubernetes._prompt_bundle", lambda persona: "prompt"
     )
@@ -1564,6 +1678,8 @@ async def test_create_can_use_agent_sandbox_with_state_volume(
     monkeypatch.setattr(backend, "_ensure_clients", fake_ensure_clients)
     monkeypatch.setattr(backend, "_wait_pod_ready", fake_wait_ready)
     monkeypatch.setattr(backend, "_wait_ready", fake_wait_ready)
+    monkeypatch.setattr(backend, "_secrets_for_sandbox", lambda *_args: [])
+    monkeypatch.setattr(backend, "_resolved_pg_secrets", lambda _secrets: [])
 
     session = await backend.create("slack:C123:123.456", "amp", "amp")
 
@@ -1594,6 +1710,17 @@ async def test_create_can_use_agent_sandbox_with_state_volume(
         mount["name"] == "state" and mount["mountPath"] == "/home/agent/state"
         for mount in sandbox_container["volumeMounts"]
     )
+    assert {
+        "name": "tool-build-cache",
+        "mountPath": "/home/agent/.cache",
+    } in sandbox_container["volumeMounts"]
+    assert {
+        "name": "tool-build-cache",
+        "hostPath": {
+            "path": "/var/lib/centaur/tool-build-cache",
+            "type": "DirectoryOrCreate",
+        },
+    } in pod_template["spec"]["volumes"]
     assert all(
         volume["name"] != "state" for volume in pod_template["spec"].get("volumes", [])
     )

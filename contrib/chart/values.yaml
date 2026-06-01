@@ -138,6 +138,11 @@ sandbox:
     pullPolicy: Always
   runtimeClassName: ""
   reposPath: ""
+  toolBuildCache:
+    enabled: false
+    hostPath: /var/lib/centaur/tool-build-cache
+    mountPath: /home/agent/.cache
+    uvLinkMode: copy
   extraEnv: {}
   stateVolume:
     enabled: false

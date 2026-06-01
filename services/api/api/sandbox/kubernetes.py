@@ -55,6 +55,8 @@ _CONTAINER_NAME = "sandbox"
 _AGENT_UID = 1001
 _SANDBOX_OVERLAY_ROOT = "/home/agent/overlay"
 _SANDBOX_OVERLAY_DIR = f"{_SANDBOX_OVERLAY_ROOT}/org"
+_TOOL_BUILD_CACHE_VOLUME_NAME = "tool-build-cache"
+_DEFAULT_TOOL_BUILD_CACHE_MOUNT_PATH = "/home/agent/.cache"
 # Writable dir the tool-server sidecar installs overlay tool deps into. The
 # sidecar runs as a non-root user and cannot write the root-owned /app/.venv,
 # so install-tool-deps.sh installs here with `uv pip install --target` and the
@@ -399,6 +401,79 @@ def _repos_path() -> str | None:
     return value or None
 
 
+def _tool_build_cache_host_path() -> str | None:
+    value = (os.getenv("KUBERNETES_TOOL_BUILD_CACHE_HOST_PATH") or "").strip()
+    return value or None
+
+
+def _tool_build_cache_mount_path() -> str:
+    value = (
+        os.getenv("KUBERNETES_TOOL_BUILD_CACHE_MOUNT_PATH")
+        or _DEFAULT_TOOL_BUILD_CACHE_MOUNT_PATH
+    ).strip()
+    return value or _DEFAULT_TOOL_BUILD_CACHE_MOUNT_PATH
+
+
+def _tool_build_cache_uv_link_mode() -> str:
+    value = (os.getenv("KUBERNETES_TOOL_BUILD_CACHE_UV_LINK_MODE") or "copy").strip()
+    return value or "copy"
+
+
+def _tool_build_cache_env() -> list[tuple[str, str]]:
+    mount_path = _tool_build_cache_mount_path()
+    return [
+        ("XDG_CACHE_HOME", mount_path),
+        ("UV_CACHE_DIR", f"{mount_path}/uv"),
+        ("UV_LINK_MODE", _tool_build_cache_uv_link_mode()),
+        ("CARGO_HOME", f"{mount_path}/cargo"),
+        ("GOCACHE", f"{mount_path}/go-build"),
+        ("GOMODCACHE", f"{mount_path}/go-mod"),
+    ]
+
+
+def _set_env(env: list[str], name: str, value: str) -> None:
+    prefix = f"{name}="
+    entry = f"{name}={value}"
+    for index, existing in enumerate(env):
+        if existing.startswith(prefix):
+            env[index] = entry
+            return
+    env.append(entry)
+
+
+def _apply_tool_build_cache_env(env: list[str]) -> None:
+    if not _tool_build_cache_host_path():
+        return
+    for name, value in _tool_build_cache_env():
+        _set_env(env, name, value)
+
+
+def _append_tool_build_cache_volume(
+    volume_mounts: list[dict[str, Any]],
+    volumes: list[dict[str, Any]],
+) -> None:
+    host_path = _tool_build_cache_host_path()
+    if not host_path:
+        return
+    if not any(mount.get("name") == _TOOL_BUILD_CACHE_VOLUME_NAME for mount in volume_mounts):
+        volume_mounts.append(
+            {
+                "name": _TOOL_BUILD_CACHE_VOLUME_NAME,
+                "mountPath": _tool_build_cache_mount_path(),
+            }
+        )
+    if not any(volume.get("name") == _TOOL_BUILD_CACHE_VOLUME_NAME for volume in volumes):
+        volumes.append(
+            {
+                "name": _TOOL_BUILD_CACHE_VOLUME_NAME,
+                "hostPath": {
+                    "path": host_path,
+                    "type": "DirectoryOrCreate",
+                },
+            }
+        )
+
+
 def _overlay_image() -> str | None:
     value = (os.getenv("CENTAUR_OVERLAY_IMAGE") or "").strip()
     return value or None
@@ -515,6 +590,8 @@ def _build_tool_server_container(
         {"name": "TOOL_DIRS", "value": _tool_server_tool_dirs()},
         {"name": "PLUGIN_WATCHER_ENABLED", "value": "0"},
     ]
+    if _tool_build_cache_host_path():
+        env.extend({"name": name, "value": value} for name, value in _tool_build_cache_env())
     # pg_dsn secrets reach tool code as env vars (see docstring). Add them
     # before operator extra-env so an operator override still wins, matching
     # the agent container's ordering in ``container_env``.
@@ -535,6 +612,13 @@ def _build_tool_server_container(
                 "name": "overlay-root",
                 "mountPath": overlay_mount,
                 "readOnly": True,
+            }
+        )
+    if _tool_build_cache_host_path():
+        volume_mounts.append(
+            {
+                "name": _TOOL_BUILD_CACHE_VOLUME_NAME,
+                "mountPath": _tool_build_cache_mount_path(),
             }
         )
 
@@ -902,6 +986,7 @@ class KubernetesExecutorBackend(SandboxBackend):
         volume_mounts: list[dict[str, Any]],
         volumes: list[dict[str, Any]],
     ) -> None:
+        _append_tool_build_cache_volume(volume_mounts, volumes)
         if _state_volume_enabled():
             raise ValueError(
                 "KUBERNETES_SANDBOX_STATE_VOLUME_ENABLED requires "
@@ -1503,6 +1588,7 @@ class KubernetesExecutorBackend(SandboxBackend):
             env.append(f"AGENT_PERSONA={persona}")
         if repo:
             env.append(f"AGENT_REPO={repo}")
+        _apply_tool_build_cache_env(env)
 
         labels = {
             "centaur.ai/sandbox-id": pod_name,

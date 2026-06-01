@@ -283,6 +283,16 @@ fn iron_proxy_config_from_env() -> Result<Option<IronProxyPodConfig>, ServerErro
             .or_else(|_| env::var("KUBERNETES_TOKEN_BROKER_URL"))
             .ok(),
     );
+    config.token_broker_name = env::var("SESSION_SANDBOX_IRON_BROKER_NAME")
+        .or_else(|_| env::var("KUBERNETES_TOKEN_BROKER_NAME"))
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
+    config.token_broker_configmap_name = env::var("SESSION_SANDBOX_IRON_BROKER_CONFIGMAP_NAME")
+        .or_else(|_| env::var("KUBERNETES_TOKEN_BROKER_CONFIGMAP_NAME"))
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
     Ok(Some(config))
 }
 

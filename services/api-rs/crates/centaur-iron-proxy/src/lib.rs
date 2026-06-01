@@ -21,6 +21,9 @@ pub const CODEX_API_KEY_FRAGMENT: &str =
     include_str!("../../../../iron-proxy/harness/codex-api-key.yaml");
 pub const CODEX_ACCESS_TOKEN_FRAGMENT: &str =
     include_str!("../../../../iron-proxy/harness/codex-access-token.yaml");
+pub const DEFAULT_BROKER_LISTEN_PORT: u16 = 8181;
+pub const DEFAULT_BROKER_METRICS_PORT: u16 = 9091;
+pub const BROKER_BEARER_AUTH_ENV: &str = "IRON_BROKER_TOKEN";
 
 const MANAGED_TRANSFORMS: &[&str] = &["secrets", "gcp_auth", "oauth_token", "hmac_sign"];
 
@@ -47,6 +50,14 @@ pub enum IronProxyConfigError {
     BaseNotMapping,
     #[error("failed to serialize iron-proxy yaml: {0}")]
     Serialize(serde_yaml::Error),
+    #[error(
+        "iron-token-broker store cannot use env source for {placeholder}; configure FIREWALL_MANAGER_SECRET_SOURCE=onepassword or onepassword-connect"
+    )]
+    BrokerStoreEnv { placeholder: String },
+    #[error(
+        "iron-token-broker store placeholder {placeholder} cannot use json_key because the broker writes the whole credential blob"
+    )]
+    BrokerStoreJsonKey { placeholder: String },
 }
 
 pub type Result<T> = std::result::Result<T, IronProxyConfigError>;
@@ -149,6 +160,17 @@ impl SourcePolicy {
         }
         Value::Mapping(source)
     }
+
+    fn store_source_for(&self, placeholder: &str) -> Result<Value> {
+        match self.kind {
+            SourceKind::Env => Err(IronProxyConfigError::BrokerStoreEnv {
+                placeholder: placeholder.to_owned(),
+            }),
+            SourceKind::OnePassword | SourceKind::OnePasswordConnect => {
+                Ok(self.source_for(placeholder, None))
+            }
+        }
+    }
 }
 
 impl Default for SourcePolicy {
@@ -170,13 +192,18 @@ pub struct ProxyFragment {
     pub transforms: Vec<Value>,
     #[serde(default)]
     pub postgres: Vec<Value>,
+    #[serde(default)]
+    pub broker_credentials: Vec<Value>,
     #[serde(default, flatten)]
     pub top_level: BTreeMap<String, Value>,
 }
 
 impl ProxyFragment {
     pub fn is_empty(&self) -> bool {
-        self.transforms.is_empty() && self.postgres.is_empty() && self.top_level.is_empty()
+        self.transforms.is_empty()
+            && self.postgres.is_empty()
+            && self.broker_credentials.is_empty()
+            && self.top_level.is_empty()
     }
 }
 
@@ -277,6 +304,16 @@ pub fn harness_fragment(engine: &str, auth_mode: &str) -> Result<Option<ProxyFra
 
 pub fn infra_fragment() -> Result<ProxyFragment> {
     load_fragment_str(INFRA_FRAGMENT)
+}
+
+pub fn harness_broker_fragments() -> Result<Vec<ProxyFragment>> {
+    [
+        CLAUDE_CODE_ACCESS_TOKEN_FRAGMENT,
+        CODEX_ACCESS_TOKEN_FRAGMENT,
+    ]
+    .iter()
+    .map(|contents| load_fragment_str(contents))
+    .collect()
 }
 
 pub fn placeholder_env(fragments: &[ProxyFragment]) -> BTreeMap<String, String> {
@@ -392,6 +429,101 @@ pub fn render_proxy_yaml_with_source_policy(
     }
 
     serde_yaml::to_string(&cfg).map_err(IronProxyConfigError::Serialize)
+}
+
+pub fn render_token_broker_yaml(fragments: &[ProxyFragment]) -> Result<String> {
+    render_token_broker_yaml_with_source_policy(fragments, &SourcePolicy::default())
+}
+
+pub fn render_token_broker_yaml_with_source_policy(
+    fragments: &[ProxyFragment],
+    source_policy: &SourcePolicy,
+) -> Result<String> {
+    let credentials = collect_broker_credentials(fragments, source_policy)?;
+    let cfg = mapping([
+        (
+            "listen",
+            string_value(format!(":{DEFAULT_BROKER_LISTEN_PORT}")),
+        ),
+        (
+            "metrics_listen",
+            string_value(format!(":{DEFAULT_BROKER_METRICS_PORT}")),
+        ),
+        ("bearer_auth_env", string_value(BROKER_BEARER_AUTH_ENV)),
+        (
+            "log",
+            mapping([
+                ("level", string_value("info")),
+                ("format", string_value("json")),
+            ]),
+        ),
+        ("credentials", Value::Sequence(credentials)),
+    ]);
+    serde_yaml::to_string(&cfg).map_err(IronProxyConfigError::Serialize)
+}
+
+fn collect_broker_credentials(
+    fragments: &[ProxyFragment],
+    source_policy: &SourcePolicy,
+) -> Result<Vec<Value>> {
+    let mut by_id = BTreeMap::<String, Value>::new();
+    for credential in fragments
+        .iter()
+        .flat_map(|fragment| fragment.broker_credentials.iter().cloned())
+    {
+        let id = credential["id"].as_str().map(ToOwned::to_owned);
+        let credential = resolve_broker_credential_sources(credential, source_policy)?;
+        if let Some(id) = id {
+            by_id.entry(id).or_insert(credential);
+        }
+    }
+    Ok(by_id.into_values().collect())
+}
+
+fn resolve_broker_credential_sources(
+    mut credential: Value,
+    source_policy: &SourcePolicy,
+) -> Result<Value> {
+    let Some(map) = credential.as_mapping_mut() else {
+        return Ok(credential);
+    };
+    let store_key = string_value("store");
+    if let Some(store) = map.get_mut(&store_key) {
+        resolve_broker_store_source(store, source_policy)?;
+    }
+    for (key, child) in map {
+        if key == &store_key {
+            continue;
+        }
+        resolve_placeholder_source_values(child, source_policy);
+    }
+    Ok(credential)
+}
+
+fn resolve_broker_store_source(value: &mut Value, source_policy: &SourcePolicy) -> Result<()> {
+    let Some(map) = value.as_mapping_mut() else {
+        return Ok(());
+    };
+    if let Some(placeholder) = map
+        .get(&string_value("placeholder"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+    {
+        if map.contains_key(&string_value("json_key")) {
+            return Err(IronProxyConfigError::BrokerStoreJsonKey { placeholder });
+        }
+        *value = source_policy.store_source_for(&placeholder)?;
+        return Ok(());
+    }
+    if map.get(&string_value("type")).and_then(Value::as_str) == Some("env") {
+        let placeholder = map
+            .get(&string_value("var"))
+            .and_then(Value::as_str)
+            .unwrap_or("store")
+            .to_owned();
+        return Err(IronProxyConfigError::BrokerStoreEnv { placeholder });
+    }
+    Ok(())
 }
 
 fn resolve_fragment_transform_sources(mut transform: Value, source_policy: &SourcePolicy) -> Value {
@@ -1051,6 +1183,120 @@ transforms:
         let cfg = parse_rendered(&rendered);
         let secret = &cfg["transforms"][1]["config"]["secrets"][0];
         assert_eq!(secret["source"]["ttl"], "30s");
+    }
+
+    #[test]
+    fn renders_token_broker_yaml_from_fragments() {
+        let mut fragments = harness_broker_fragments().unwrap();
+        fragments.push(fragment_yaml(
+            r#"
+broker_credentials:
+  - id: okta
+    token_endpoint: https://idp.example.com/oauth/token
+    client_id:
+      placeholder: OKTA_BUNDLE
+      json_key: client_id
+    client_secret:
+      placeholder: OKTA_BUNDLE
+      json_key: client_secret
+    token_endpoint_headers:
+      x-api-key:
+        placeholder: OKTA_API_KEY
+    store:
+      placeholder: OKTA_BLOB
+  - id: openai-codex
+    token_endpoint: https://duplicate.example.com/oauth/token
+    client_id:
+      placeholder: DUPLICATE_CLIENT_ID
+    store:
+      placeholder: DUPLICATE_BLOB
+"#,
+        ));
+
+        let rendered = render_token_broker_yaml_with_source_policy(
+            &fragments,
+            &SourcePolicy::onepassword_connect("prod-agents", "10m"),
+        )
+        .unwrap();
+        let cfg = parse_rendered(&rendered);
+        assert_eq!(cfg["listen"], ":8181");
+        assert_eq!(cfg["metrics_listen"], ":9091");
+        assert_eq!(cfg["bearer_auth_env"], BROKER_BEARER_AUTH_ENV);
+        let credentials = cfg["credentials"].as_sequence().unwrap();
+        let by_id = credentials
+            .iter()
+            .map(|credential| (credential["id"].as_str().unwrap(), credential))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            by_id.keys().copied().collect::<Vec<_>>(),
+            vec!["anthropic-claude", "okta", "openai-codex"]
+        );
+        assert_eq!(
+            by_id["anthropic-claude"]["token_endpoint"],
+            "https://console.anthropic.com/v1/oauth/token"
+        );
+        assert_eq!(
+            by_id["openai-codex"]["token_endpoint"],
+            "https://auth.openai.com/oauth/token"
+        );
+        assert_eq!(by_id["okta"]["client_id"]["type"], "1password_connect");
+        assert_eq!(
+            by_id["okta"]["client_id"]["secret_ref"],
+            "op://prod-agents/OKTA_BUNDLE/credential"
+        );
+        assert_eq!(by_id["okta"]["client_id"]["json_key"], "client_id");
+        assert_eq!(by_id["okta"]["store"]["type"], "1password_connect");
+        assert_eq!(
+            by_id["okta"]["store"]["secret_ref"],
+            "op://prod-agents/OKTA_BLOB/credential"
+        );
+        assert!(!rendered.contains("placeholder:"));
+    }
+
+    #[test]
+    fn rejects_env_backed_token_broker_store() {
+        let fragment = fragment_yaml(
+            r#"
+broker_credentials:
+  - id: openai-codex
+    token_endpoint: https://auth.openai.com/oauth/token
+    client_id:
+      placeholder: OPENAI_CODEX_CLIENT_ID
+    store:
+      placeholder: OPENAI_CODEX_BLOB
+"#,
+        );
+
+        let err = render_token_broker_yaml_with_source_policy(&[fragment], &SourcePolicy::env())
+            .unwrap_err();
+        assert!(
+            matches!(err, IronProxyConfigError::BrokerStoreEnv { placeholder } if placeholder == "OPENAI_CODEX_BLOB")
+        );
+    }
+
+    #[test]
+    fn rejects_token_broker_store_json_key() {
+        let fragment = fragment_yaml(
+            r#"
+broker_credentials:
+  - id: openai-codex
+    token_endpoint: https://auth.openai.com/oauth/token
+    client_id:
+      placeholder: OPENAI_CODEX_CLIENT_ID
+    store:
+      placeholder: OPENAI_CODEX_BUNDLE
+      json_key: refresh_token
+"#,
+        );
+
+        let err = render_token_broker_yaml_with_source_policy(
+            &[fragment],
+            &SourcePolicy::onepassword("ai-agents", "10m"),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, IronProxyConfigError::BrokerStoreJsonKey { placeholder } if placeholder == "OPENAI_CODEX_BUNDLE")
+        );
     }
 
     #[test]

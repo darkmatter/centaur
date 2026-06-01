@@ -1446,6 +1446,62 @@ transforms:
     }
 
     #[test]
+    fn access_token_harness_fragments_do_not_expose_static_api_key_placeholders() {
+        let codex_access = harness_fragment("codex", "access_token").unwrap().unwrap();
+        let claude_access = harness_fragment("claude-code", "access_token")
+            .unwrap()
+            .unwrap();
+        let fragments = vec![codex_access, claude_access];
+
+        assert!(placeholder_env(&fragments).is_empty());
+
+        let rendered = render_proxy_yaml_with_source_policy(
+            None,
+            &fragments,
+            None,
+            &SourcePolicy::onepassword_connect("prod-agents", "10m"),
+        )
+        .unwrap();
+        let cfg = parse_rendered(&rendered);
+        let secrets = cfg["transforms"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .filter(|transform| transform["name"].as_str() == Some("secrets"))
+            .flat_map(|transform| transform["config"]["secrets"].as_sequence().unwrap().iter())
+            .collect::<Vec<_>>();
+        let by_host = secrets
+            .iter()
+            .map(|secret| {
+                (
+                    secret["rules"][0]["host"].as_str().unwrap(),
+                    secret["source"]["type"].as_str().unwrap_or(""),
+                    secret,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert!(by_host.iter().any(|(host, source_type, secret)| {
+            *host == "chatgpt.com"
+                && *source_type == "token_broker"
+                && secret["source"]["credential_id"] == "openai-codex"
+        }));
+        assert!(by_host.iter().any(|(host, source_type, secret)| {
+            *host == "api.anthropic.com"
+                && *source_type == "token_broker"
+                && secret["source"]["credential_id"] == "anthropic-claude"
+        }));
+        assert!(by_host.iter().any(|(host, source_type, secret)| {
+            *host == "chatgpt.com"
+                && *source_type == "1password_connect"
+                && secret["inject"]["header"] == "chatgpt-account-id"
+        }));
+        assert!(!rendered.contains("OPENAI_API_KEY"));
+        assert!(!rendered.contains("ANTHROPIC_API_KEY"));
+        assert!(!rendered.contains("placeholder:"));
+    }
+
+    #[test]
     fn renders_token_broker_ttl_from_source_policy() {
         let fragment = fragment_yaml(
             r#"

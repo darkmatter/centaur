@@ -1620,6 +1620,28 @@ mod tests {
 
     use super::*;
 
+    fn env_values(env: &[crd::SandboxPodTemplateSpecContainersEnv]) -> BTreeMap<&str, &str> {
+        env.iter()
+            .filter_map(|item| {
+                item.value
+                    .as_deref()
+                    .map(|value| (item.name.as_str(), value))
+            })
+            .collect()
+    }
+
+    fn policy_json_by_name(policies: &[NetworkPolicy]) -> BTreeMap<String, Value> {
+        policies
+            .iter()
+            .map(|policy| {
+                (
+                    policy.metadata.name.as_deref().unwrap().to_owned(),
+                    serde_json::to_value(policy).unwrap(),
+                )
+            })
+            .collect()
+    }
+
     #[test]
     fn builds_agent_sandbox_spec_with_state_volume_and_limits() {
         let spec = SandboxSpec::new("centaur-agent:latest")
@@ -1765,6 +1787,93 @@ mod tests {
             !volumes
                 .iter()
                 .any(|volume| volume.name == "iron-proxy-config-rendered")
+        );
+    }
+
+    #[test]
+    fn security_model_agent_pod_gets_placeholders_not_proxy_secrets() {
+        let mut iron_proxy = IronProxyPodConfig::new(
+            "centaur-iron-proxy:latest",
+            "firewall-ca-cert",
+            "firewall-ca-key",
+        );
+        iron_proxy.source_policy = SourcePolicy::onepassword_connect("ai-agents", "10m");
+        iron_proxy.secret_env_name = Some("centaur-infra-env".to_owned());
+        iron_proxy.secret_env_prefix = "CENT_".to_owned();
+        iron_proxy.extra_env.insert(
+            "IRON_BROKER_URL".to_owned(),
+            "http://token-broker:8181".to_owned(),
+        );
+        let mut config = AgentSandboxConfig::new("centaur");
+        config.iron_proxy = Some(iron_proxy);
+        let resolved = ResolvedIronProxy {
+            config_yaml: "transforms: []\n".to_owned(),
+            placeholder_env: BTreeMap::from([
+                ("OPENAI_API_KEY".to_owned(), "OPENAI_API_KEY".to_owned()),
+                ("GITHUB_TOKEN".to_owned(), "GITHUB_TOKEN".to_owned()),
+            ]),
+            proxy_host: "asbx-sec-proxy".to_owned(),
+            proxy_pod_name: "asbx-sec-proxy-123".to_owned(),
+            proxy_port: 18080,
+            listen_ports: vec![18080],
+            pg_dsn_env: BTreeMap::from([(
+                "WAREHOUSE_DSN".to_owned(),
+                "postgresql://app_user:pg-pass@asbx-sec-proxy:5440/warehouse".to_owned(),
+            )]),
+            pg_proxy_password_env: BTreeMap::from([(
+                "PG_PROXY_PASSWORD_WAREHOUSE".to_owned(),
+                "pg-pass".to_owned(),
+            )]),
+        };
+        let spec = SandboxSpec::new("centaur-agent:latest")
+            .env("CENTAUR_API_URL", "http://api:8000")
+            .env("CENTAUR_API_KEY", "sbx1.placeholder")
+            .env("CENTAUR_HARNESS_KIND", "codex");
+
+        let sandbox =
+            build_agent_sandbox(&SandboxId::new("asbx-sec"), &spec, &config, Some(&resolved))
+                .unwrap();
+        let pod_spec = &sandbox.spec.pod_template.spec;
+        assert_eq!(pod_spec.automount_service_account_token, Some(false));
+        let container = &pod_spec.containers[0];
+        let env = env_values(container.env.as_ref().unwrap());
+
+        assert_eq!(env["OPENAI_API_KEY"], "OPENAI_API_KEY");
+        assert_eq!(env["GITHUB_TOKEN"], "GITHUB_TOKEN");
+        assert_eq!(
+            env["WAREHOUSE_DSN"],
+            "postgresql://app_user:pg-pass@asbx-sec-proxy:5440/warehouse"
+        );
+        assert_eq!(env["HTTPS_PROXY"], "http://asbx-sec-proxy:18080");
+        assert_eq!(env["HTTP_PROXY"], "http://asbx-sec-proxy:18080");
+
+        for proxy_only_name in [
+            "IRON_MANAGEMENT_API_KEY",
+            "OP_CONNECT_TOKEN",
+            "IRON_BROKER_TOKEN",
+            "PG_PROXY_PASSWORD_WAREHOUSE",
+        ] {
+            assert!(
+                !env.contains_key(proxy_only_name),
+                "{proxy_only_name} must stay out of the untrusted agent pod"
+            );
+        }
+
+        let volumes = pod_spec.volumes.as_ref().unwrap();
+        assert!(volumes.iter().any(|volume| {
+            volume.name == "iron-proxy-ca-cert"
+                && volume.secret.as_ref().unwrap().secret_name.as_deref()
+                    == Some("firewall-ca-cert")
+        }));
+        assert!(
+            !volumes.iter().any(|volume| volume.name == "iron-proxy-ca"),
+            "agent pod must not mount the proxy CA private key"
+        );
+        assert!(
+            !volumes
+                .iter()
+                .any(|volume| volume.name == "iron-proxy-config-rendered"),
+            "agent pod must not mount the rendered proxy policy"
         );
     }
 
@@ -1938,15 +2047,7 @@ mod tests {
 
         let policies = build_iron_proxy_network_policies(&id, &resolved, &iron_proxy).unwrap();
         assert_eq!(policies.len(), 2);
-        let policy_json = policies
-            .iter()
-            .map(|policy| {
-                (
-                    policy.metadata.name.as_deref().unwrap().to_owned(),
-                    serde_json::to_value(policy).unwrap(),
-                )
-            })
-            .collect::<BTreeMap<_, _>>();
+        let policy_json = policy_json_by_name(&policies);
         assert_eq!(
             policy_json["asbx-test-sandbox-egress"]["spec"]["podSelector"]["matchLabels"]
                 [MANAGED_LABEL],
@@ -2005,6 +2106,102 @@ mod tests {
                     == "token-broker"
                     && rule["ports"][0]["port"] == 8181)
         );
+    }
+
+    #[test]
+    fn security_model_sandbox_egress_is_limited_to_proxy_api_and_dns() {
+        let id = SandboxId::new("asbx-sec");
+        let mut iron_proxy = IronProxyPodConfig::new(
+            "centaur-iron-proxy:latest",
+            "firewall-ca-cert",
+            "firewall-ca-key",
+        );
+        iron_proxy.api_pod_labels = BTreeMap::from([("app".to_owned(), "centaur-api".to_owned())]);
+        iron_proxy.token_broker_name = Some("centaur-token-broker".to_owned());
+        let resolved = ResolvedIronProxy {
+            config_yaml: "transforms: []\n".to_owned(),
+            placeholder_env: BTreeMap::new(),
+            proxy_host: "asbx-sec-proxy".to_owned(),
+            proxy_pod_name: "asbx-sec-proxy-123".to_owned(),
+            proxy_port: 18080,
+            listen_ports: vec![18080, 5440],
+            pg_dsn_env: BTreeMap::new(),
+            pg_proxy_password_env: BTreeMap::new(),
+        };
+
+        let policies = build_iron_proxy_network_policies(&id, &resolved, &iron_proxy).unwrap();
+        let policy_json = policy_json_by_name(&policies);
+        let sandbox_egress = policy_json["asbx-sec-sandbox-egress"]["spec"]["egress"]
+            .as_array()
+            .unwrap();
+        assert_eq!(sandbox_egress.len(), 3);
+
+        assert!(sandbox_egress.iter().any(|rule| {
+            rule["to"][0]["podSelector"]["matchLabels"]["centaur.ai/iron-proxy"] == "true"
+                && rule["to"][0]["podSelector"]["matchLabels"][SANDBOX_ID_LABEL] == "asbx-sec"
+                && rule["ports"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|port| port["port"] == 18080)
+                && rule["ports"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|port| port["port"] == 5440)
+        }));
+        assert!(sandbox_egress.iter().any(|rule| {
+            rule["to"][0]["podSelector"]["matchLabels"]["app"] == "centaur-api"
+                && rule["ports"][0]["port"] == 8000
+        }));
+        assert!(sandbox_egress.iter().any(|rule| {
+            rule["to"][0]["namespaceSelector"]["matchLabels"]["kubernetes.io/metadata.name"]
+                == "kube-system"
+                && rule["ports"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|port| port["port"] == 53)
+        }));
+        assert!(
+            sandbox_egress.iter().all(|rule| rule.get("to").is_some()),
+            "sandbox egress must not contain broad IP rules"
+        );
+        assert!(
+            sandbox_egress.iter().all(|rule| {
+                !rule["ports"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|port| port["port"] == 443 || port["port"] == 5432)
+            }),
+            "direct external HTTPS/Postgres egress belongs only on the proxy policy"
+        );
+
+        let proxy_policy = &policy_json["asbx-sec-proxy-net"];
+        let proxy_ingress = proxy_policy["spec"]["ingress"].as_array().unwrap();
+        assert_eq!(proxy_ingress.len(), 1);
+        assert_eq!(
+            proxy_ingress[0]["from"][0]["podSelector"]["matchLabels"][SANDBOX_ID_LABEL],
+            "asbx-sec"
+        );
+        assert_eq!(
+            proxy_ingress[0]["from"][0]["podSelector"]["matchLabels"][MANAGED_LABEL],
+            "true"
+        );
+        let proxy_egress = proxy_policy["spec"]["egress"].as_array().unwrap();
+        assert!(proxy_egress.iter().any(|rule| {
+            rule["ports"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|port| port["port"] == 443)
+        }));
+        assert!(proxy_egress.iter().any(|rule| {
+            rule["to"][0]["podSelector"]["matchLabels"]["app.kubernetes.io/component"]
+                == "token-broker"
+                && rule["ports"][0]["port"] == 8181
+        }));
     }
 
     #[test]

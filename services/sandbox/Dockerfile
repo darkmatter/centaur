@@ -185,6 +185,7 @@ RUN install -d -m 0755 /etc/centaur
 COPY --link --chmod=644 services/sandbox/codex-auth.json /etc/centaur/codex-auth.default.json
 COPY --link --chmod=644 services/sandbox/claude-credentials.json /etc/centaur/claude-credentials.default.json
 COPY --link --chmod=755 services/sandbox/call.sh /usr/local/bin/call
+COPY --link --chmod=755 services/sandbox/centaur-tools.sh /usr/local/bin/centaur-tools
 COPY --link --chmod=755 services/sandbox/slack-upload.sh /usr/local/bin/slack-upload
 COPY --link --chmod=755 services/sandbox/md2docx.py /usr/local/bin/md2docx
 COPY --link --chmod=755 services/sandbox/amp-wrapper.py /usr/local/bin/amp-wrapper

@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use centaur_iron_proxy::ProxyFragment;
+use centaur_iron_proxy::{CorePgListener, ProxyFragment, SourcePolicy};
 use centaur_sandbox_core::{
     MountKind, ObservedSandbox, SandboxBackend, SandboxError, SandboxHandle, SandboxId, SandboxIo,
     SandboxResult, SandboxSpec, SandboxStatus,
@@ -67,44 +67,44 @@ impl AgentSandboxConfig {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct IronProxyPodConfig {
     pub image: String,
     pub image_pull_policy: Option<String>,
-    pub config_yaml: String,
-    pub placeholder_env: BTreeMap<String, String>,
+    pub fragments: Vec<ProxyFragment>,
+    pub source_policy: SourcePolicy,
+    pub core_pg: Option<CorePgListener>,
+    pub harness_auth_modes: BTreeMap<String, String>,
     pub ca_secret_name: String,
     pub env_from_secret_name: Option<String>,
     pub extra_env: BTreeMap<String, String>,
 }
 
 impl IronProxyPodConfig {
-    pub fn new(
-        image: impl Into<String>,
-        config_yaml: impl Into<String>,
-        ca_secret_name: impl Into<String>,
-    ) -> Self {
+    pub fn new(image: impl Into<String>, ca_secret_name: impl Into<String>) -> Self {
         Self {
             image: image.into(),
             image_pull_policy: None,
-            config_yaml: config_yaml.into(),
-            placeholder_env: BTreeMap::new(),
+            fragments: Vec::new(),
+            source_policy: SourcePolicy::default(),
+            core_pg: None,
+            harness_auth_modes: BTreeMap::new(),
             ca_secret_name: ca_secret_name.into(),
             env_from_secret_name: None,
             extra_env: BTreeMap::new(),
         }
     }
 
-    pub fn from_fragments(
-        image: impl Into<String>,
-        config_yaml: impl Into<String>,
-        ca_secret_name: impl Into<String>,
-        fragments: &[ProxyFragment],
-    ) -> Self {
-        let mut config = Self::new(image, config_yaml, ca_secret_name);
-        config.placeholder_env = centaur_iron_proxy::placeholder_env(fragments);
-        config
+    pub fn with_fragments(mut self, fragments: Vec<ProxyFragment>) -> Self {
+        self.fragments = fragments;
+        self
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ResolvedIronProxy {
+    config_yaml: String,
+    placeholder_env: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -204,14 +204,49 @@ impl AgentSandboxBackend {
         }
     }
 
-    async fn create_iron_proxy_configmap(&self, id: &SandboxId) -> SandboxResult<()> {
+    fn resolve_iron_proxy(&self, spec: &SandboxSpec) -> SandboxResult<Option<ResolvedIronProxy>> {
         let Some(iron_proxy) = &self.config.iron_proxy else {
+            return Ok(None);
+        };
+        let mut fragments = iron_proxy.fragments.clone();
+        if let Some(harness) = spec_env(spec, "CENTAUR_HARNESS_KIND") {
+            let auth_mode = iron_proxy
+                .harness_auth_modes
+                .get(harness)
+                .map(String::as_str)
+                .unwrap_or("api_key");
+            if let Some(fragment) = centaur_iron_proxy::harness_fragment(harness, auth_mode)
+                .map_err(|err| SandboxError::InvalidSpec(format!("iron-proxy fragment: {err}")))?
+            {
+                fragments.push(fragment);
+            }
+        }
+        let config_yaml = centaur_iron_proxy::render_proxy_yaml_with_source_policy(
+            None,
+            &fragments,
+            iron_proxy.core_pg.as_ref(),
+            &iron_proxy.source_policy,
+        )
+        .map_err(|err| SandboxError::InvalidSpec(format!("iron-proxy config: {err}")))?;
+        let placeholder_env = centaur_iron_proxy::placeholder_env(&fragments);
+        Ok(Some(ResolvedIronProxy {
+            config_yaml,
+            placeholder_env,
+        }))
+    }
+
+    async fn create_iron_proxy_configmap(
+        &self,
+        id: &SandboxId,
+        resolved: Option<&ResolvedIronProxy>,
+    ) -> SandboxResult<()> {
+        let Some(resolved) = resolved else {
             return Ok(());
         };
         let name = iron_proxy_configmap_name(id);
         let _ = self.delete_iron_proxy_configmap(id).await;
         let mut data = BTreeMap::new();
-        data.insert("proxy.yaml".to_owned(), iron_proxy.config_yaml.clone());
+        data.insert("proxy.yaml".to_owned(), resolved.config_yaml.clone());
         let mut labels = BTreeMap::new();
         labels.insert(MANAGED_BY_LABEL.to_owned(), MANAGED_BY_VALUE.to_owned());
         labels.insert(SANDBOX_ID_LABEL.to_owned(), id.as_str().to_owned());
@@ -315,8 +350,10 @@ impl SandboxBackend for AgentSandboxBackend {
 
     async fn create(&self, spec: SandboxSpec) -> SandboxResult<SandboxHandle> {
         let id = SandboxId::new(next_sandbox_name());
-        self.create_iron_proxy_configmap(&id).await?;
-        let sandbox = build_agent_sandbox(&id, &spec, &self.config)?;
+        let resolved_iron_proxy = self.resolve_iron_proxy(&spec)?;
+        self.create_iron_proxy_configmap(&id, resolved_iron_proxy.as_ref())
+            .await?;
+        let sandbox = build_agent_sandbox(&id, &spec, &self.config, resolved_iron_proxy.as_ref())?;
         let create_result = self
             .sandboxes()
             .create(&PostParams::default(), &sandbox)
@@ -436,6 +473,7 @@ fn build_agent_sandbox(
     id: &SandboxId,
     spec: &SandboxSpec,
     config: &AgentSandboxConfig,
+    resolved_iron_proxy: Option<&ResolvedIronProxy>,
 ) -> SandboxResult<crd::Sandbox> {
     let mut labels = config.labels.clone();
     labels.insert(MANAGED_BY_LABEL.to_owned(), MANAGED_BY_VALUE.to_owned());
@@ -468,7 +506,8 @@ fn build_agent_sandbox(
     insert_optional(
         &mut container,
         "env",
-        (!spec.env.is_empty() || config.iron_proxy.is_some()).then(|| env_json(spec, config)),
+        (!spec.env.is_empty() || resolved_iron_proxy.is_some())
+            .then(|| env_json(spec, resolved_iron_proxy)),
     );
     insert_optional(&mut container, "workingDir", spec.working_dir.clone());
     insert_optional(&mut container, "resources", resources_json(spec));
@@ -480,7 +519,7 @@ fn build_agent_sandbox(
             "mountPath": state_volume.mount_path,
         }));
     }
-    if config.iron_proxy.is_some() {
+    if resolved_iron_proxy.is_some() {
         volume_mounts.push(json!({
             "name": "iron-proxy-certs",
             "mountPath": "/firewall-certs",
@@ -492,12 +531,12 @@ fn build_agent_sandbox(
         "volumeMounts",
         (!volume_mounts.is_empty()).then_some(volume_mounts),
     );
-    if let Some(iron_proxy) = &config.iron_proxy {
+    if let (Some(iron_proxy), Some(_)) = (&config.iron_proxy, resolved_iron_proxy) {
         volumes.extend(iron_proxy_volumes(id, iron_proxy));
     }
 
     let mut pod_spec = json!({
-        "containers": pod_containers(container, config),
+        "containers": pod_containers(container, config, resolved_iron_proxy),
         "restartPolicy": "Never",
         "automountServiceAccountToken": false,
     });
@@ -566,13 +605,13 @@ fn mount_json(spec: &SandboxSpec) -> (Vec<Value>, Vec<Value>) {
     (volumes, mounts)
 }
 
-fn env_json(spec: &SandboxSpec, config: &AgentSandboxConfig) -> Vec<Value> {
+fn env_json(spec: &SandboxSpec, resolved_iron_proxy: Option<&ResolvedIronProxy>) -> Vec<Value> {
     let mut env = BTreeMap::<String, String>::new();
     for item in &spec.env {
         env.insert(item.name.clone(), item.value.clone());
     }
-    if let Some(iron_proxy) = &config.iron_proxy {
-        for (name, value) in &iron_proxy.placeholder_env {
+    if let Some(resolved_iron_proxy) = resolved_iron_proxy {
+        for (name, value) in &resolved_iron_proxy.placeholder_env {
             env.entry(name.clone()).or_insert_with(|| value.clone());
         }
         for (name, value) in proxy_env() {
@@ -617,9 +656,21 @@ fn proxy_env() -> BTreeMap<String, String> {
     env
 }
 
-fn pod_containers(agent_container: Value, config: &AgentSandboxConfig) -> Vec<Value> {
+fn spec_env<'a>(spec: &'a SandboxSpec, name: &str) -> Option<&'a str> {
+    spec.env
+        .iter()
+        .find(|item| item.name == name)
+        .map(|item| item.value.as_str())
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn pod_containers(
+    agent_container: Value,
+    config: &AgentSandboxConfig,
+    resolved_iron_proxy: Option<&ResolvedIronProxy>,
+) -> Vec<Value> {
     let mut containers = vec![agent_container];
-    if let Some(iron_proxy) = &config.iron_proxy {
+    if let (Some(iron_proxy), Some(_)) = (&config.iron_proxy, resolved_iron_proxy) {
         containers.push(iron_proxy_container(iron_proxy));
     }
     containers
@@ -815,7 +866,8 @@ mod tests {
         let config = AgentSandboxConfig::new("centaur")
             .state_volume(StateVolumeConfig::new("/home/agent/state", "10Gi"));
 
-        let sandbox = build_agent_sandbox(&SandboxId::new("asbx-test"), &spec, &config).unwrap();
+        let sandbox =
+            build_agent_sandbox(&SandboxId::new("asbx-test"), &spec, &config, None).unwrap();
 
         assert_eq!(sandbox.metadata.name.as_deref(), Some("asbx-test"));
         assert_eq!(sandbox.spec.replicas, Some(1));
@@ -832,6 +884,77 @@ mod tests {
         assert_eq!(container.stdin, Some(true));
         assert_eq!(container.volume_mounts.as_ref().unwrap().len(), 2);
         assert!(container.resources.as_ref().unwrap().limits.is_some());
+    }
+
+    #[test]
+    fn builds_agent_sandbox_with_iron_proxy_sidecar_and_placeholder_env() {
+        let mut config = AgentSandboxConfig::new("centaur");
+        let mut iron_proxy = IronProxyPodConfig::new("centaur-iron-proxy:latest", "firewall-ca");
+        iron_proxy.env_from_secret_name = Some("centaur-infra-env".to_owned());
+        iron_proxy.extra_env.insert(
+            "OP_CONNECT_HOST".to_owned(),
+            "http://op-connect:8080".to_owned(),
+        );
+        config.iron_proxy = Some(iron_proxy);
+        let resolved = ResolvedIronProxy {
+            config_yaml: "transforms: []\n".to_owned(),
+            placeholder_env: BTreeMap::from([(
+                "OPENAI_API_KEY".to_owned(),
+                "OPENAI_API_KEY".to_owned(),
+            )]),
+        };
+        let spec = SandboxSpec::new("centaur-agent:latest")
+            .env("CENTAUR_API_URL", "http://api:8000")
+            .env("CENTAUR_HARNESS_KIND", "codex");
+
+        let sandbox = build_agent_sandbox(
+            &SandboxId::new("asbx-test"),
+            &spec,
+            &config,
+            Some(&resolved),
+        )
+        .unwrap();
+        let pod_spec = &sandbox.spec.pod_template.spec;
+        let containers = &pod_spec.containers;
+        assert_eq!(containers.len(), 2);
+        assert_eq!(containers[0].name, "agent");
+        assert_eq!(containers[1].name, "iron-proxy");
+        assert_eq!(
+            containers[1].image.as_deref(),
+            Some("centaur-iron-proxy:latest")
+        );
+        assert_eq!(
+            containers[1].env_from.as_ref().unwrap()[0]
+                .secret_ref
+                .as_ref()
+                .unwrap()
+                .name
+                .as_deref(),
+            Some("centaur-infra-env")
+        );
+        let agent_env = containers[0]
+            .env
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|env| (env.name.as_str(), env.value.as_deref().unwrap_or("")))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(agent_env["OPENAI_API_KEY"], "OPENAI_API_KEY");
+        assert_eq!(agent_env["HTTPS_PROXY"], "http://127.0.0.1:8080");
+        assert_eq!(
+            agent_env["REQUESTS_CA_BUNDLE"],
+            "/firewall-certs/ca-cert.pem"
+        );
+        let volumes = pod_spec.volumes.as_ref().unwrap();
+        assert!(
+            volumes
+                .iter()
+                .any(|volume| volume.name == "iron-proxy-config-rendered"
+                    && volume.config_map.as_ref().unwrap().name.as_deref()
+                        == Some("asbx-test-iron-proxy"))
+        );
+        assert!(volumes.iter().any(|volume| volume.name == "iron-proxy-ca"
+            && volume.secret.as_ref().unwrap().secret_name.as_deref() == Some("firewall-ca")));
     }
 
     #[test]

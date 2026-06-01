@@ -1,7 +1,8 @@
-use std::{env, net::SocketAddr, sync::Arc, time::Duration};
+use std::{collections::BTreeMap, env, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
 use centaur_api_server::{SandboxRuntime, build_router_with_runtime};
-use centaur_sandbox_agent_k8s::{AgentSandboxBackend, AgentSandboxConfig};
+use centaur_iron_proxy::{SourcePolicy, load_fragment_files};
+use centaur_sandbox_agent_k8s::{AgentSandboxBackend, AgentSandboxConfig, IronProxyPodConfig};
 use centaur_sandbox_local::LocalSandboxBackend;
 use centaur_session_runtime::SandboxWorkloadMode;
 use centaur_session_sqlx::PgSessionStore;
@@ -51,6 +52,7 @@ async fn sandbox_runtime_from_args(args: &Args) -> Result<SandboxRuntime, Server
             let mut config = AgentSandboxConfig::new(args.session_sandbox_k8s_namespace.clone());
             config.image_pull_policy = args.session_sandbox_image_pull_policy.clone();
             config.ready_timeout = Duration::from_secs(args.session_sandbox_ready_timeout_secs);
+            config.iron_proxy = iron_proxy_config_from_env()?;
 
             let client = if let Some(context) = args.session_sandbox_k8s_context.as_deref() {
                 let kube_config = kube::Config::from_kubeconfig(&kube::config::KubeConfigOptions {
@@ -168,6 +170,79 @@ fn default_sandbox_image(workload: SandboxWorkloadKind) -> &'static str {
     }
 }
 
+fn iron_proxy_config_from_env() -> Result<Option<IronProxyPodConfig>, ServerError> {
+    let fragment_paths = iron_proxy_fragment_paths();
+    if !env_bool("SESSION_SANDBOX_IRON_PROXY_ENABLED") && fragment_paths.is_empty() {
+        return Ok(None);
+    }
+    let ca_secret_name = env::var("SESSION_SANDBOX_IRON_PROXY_CA_SECRET_NAME")
+        .or_else(|_| env::var("KUBERNETES_FIREWALL_CA_KEY_SECRET_NAME"))
+        .map_err(|_| ServerError::MissingIronProxyCaSecret)?;
+    let image = env::var("SESSION_SANDBOX_IRON_PROXY_IMAGE")
+        .or_else(|_| env::var("KUBERNETES_IRON_PROXY_IMAGE"))
+        .unwrap_or_else(|_| "centaur-iron-proxy:latest".to_owned());
+    let mut config = IronProxyPodConfig::new(image, ca_secret_name)
+        .with_fragments(load_fragment_files(&fragment_paths)?);
+    config.image_pull_policy = env::var("SESSION_SANDBOX_IRON_PROXY_IMAGE_PULL_POLICY")
+        .or_else(|_| env::var("KUBERNETES_IRON_PROXY_IMAGE_PULL_POLICY"))
+        .ok();
+    config.source_policy = SourcePolicy::from_env();
+    config.env_from_secret_name = env::var("SESSION_SANDBOX_IRON_PROXY_ENV_SECRET")
+        .or_else(|_| env::var("KUBERNETES_SECRET_ENV_NAME"))
+        .ok();
+    config.harness_auth_modes = harness_auth_modes_from_env();
+    push_optional_proxy_env(
+        &mut config.extra_env,
+        "OP_CONNECT_HOST",
+        env::var("SESSION_SANDBOX_OP_CONNECT_HOST")
+            .or_else(|_| env::var("KUBERNETES_OP_CONNECT_HOST"))
+            .ok(),
+    );
+    push_optional_proxy_env(
+        &mut config.extra_env,
+        "IRON_BROKER_URL",
+        env::var("SESSION_SANDBOX_IRON_BROKER_URL")
+            .or_else(|_| env::var("KUBERNETES_TOKEN_BROKER_URL"))
+            .ok(),
+    );
+    Ok(Some(config))
+}
+
+fn iron_proxy_fragment_paths() -> Vec<PathBuf> {
+    env::var("SESSION_SANDBOX_IRON_PROXY_FRAGMENT_PATHS")
+        .unwrap_or_default()
+        .split([',', ':'])
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .collect()
+}
+
+fn harness_auth_modes_from_env() -> BTreeMap<String, String> {
+    let mut modes = BTreeMap::new();
+    if let Ok(mode) = env::var("CODEX_AUTH_MODE") {
+        modes.insert("codex".to_owned(), mode);
+    }
+    if let Ok(mode) = env::var("CLAUDE_CODE_AUTH_MODE") {
+        modes.insert("claude-code".to_owned(), mode);
+    }
+    modes
+}
+
+fn push_optional_proxy_env(envs: &mut BTreeMap<String, String>, name: &str, value: Option<String>) {
+    if let Some(value) = value
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+    {
+        envs.insert(name.to_owned(), value);
+    }
+}
+
+fn env_bool(name: &str) -> bool {
+    env::var(name)
+        .map(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false)
+}
 fn codex_app_server_env_template(args: &Args) -> Vec<(String, String)> {
     let mut envs = Vec::new();
     push_env(
@@ -209,10 +284,16 @@ fn push_env(envs: &mut Vec<(String, String)>, name: &str, value: String) {
 
 #[derive(Debug, Error)]
 enum ServerError {
+    #[error(
+        "SESSION_SANDBOX_IRON_PROXY_CA_SECRET_NAME or KUBERNETES_FIREWALL_CA_KEY_SECRET_NAME is required when SESSION_SANDBOX_IRON_PROXY_ENABLED is set"
+    )]
+    MissingIronProxyCaSecret,
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]
     Store(#[from] centaur_session_sqlx::SessionStoreError),
+    #[error(transparent)]
+    IronProxy(#[from] centaur_iron_proxy::IronProxyConfigError),
     #[error(transparent)]
     KubeConfig(#[from] kube::config::KubeconfigError),
     #[error(transparent)]

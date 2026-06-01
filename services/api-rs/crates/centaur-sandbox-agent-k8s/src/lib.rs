@@ -364,7 +364,7 @@ impl AgentSandboxBackend {
         let Some(iron_proxy) = &self.config.iron_proxy else {
             return Ok(());
         };
-        let pod = build_iron_proxy_pod(id, &resolved.proxy_pod_name, iron_proxy)?;
+        let pod = build_iron_proxy_pod(id, &resolved.proxy_pod_name, iron_proxy, resolved)?;
         self.pods()
             .create(&PostParams::default(), &pod)
             .await
@@ -917,7 +917,7 @@ fn spec_env<'a>(spec: &'a SandboxSpec, name: &str) -> Option<&'a str> {
         .filter(|value| !value.trim().is_empty())
 }
 
-fn iron_proxy_container(iron_proxy: &IronProxyPodConfig) -> Value {
+fn iron_proxy_container(iron_proxy: &IronProxyPodConfig, resolved: &ResolvedIronProxy) -> Value {
     let mut env = BTreeMap::<String, Value>::new();
     if let Some(secret_name) = &iron_proxy.secret_env_name {
         insert_env_secret_ref(
@@ -957,15 +957,25 @@ fn iron_proxy_container(iron_proxy: &IronProxyPodConfig) -> Value {
             );
         }
     }
+    let mut container_ports = vec![
+        json!({"containerPort": resolved.proxy_port, "name": "proxy"}),
+        json!({"containerPort": 9092, "name": "management"}),
+        json!({"containerPort": 9090, "name": "health"}),
+    ];
+    for port in resolved
+        .listen_ports
+        .iter()
+        .copied()
+        .filter(|port| ![resolved.proxy_port, 9092, 9090].contains(port))
+    {
+        container_ports.push(json!({"containerPort": port, "name": format!("tcp-{port}")}));
+    }
+
     let mut container = json!({
         "name": "iron-proxy",
         "image": iron_proxy.image,
         "env": env.into_values().collect::<Vec<_>>(),
-        "ports": [
-            {"containerPort": 8080, "name": "proxy"},
-            {"containerPort": 9092, "name": "management"},
-            {"containerPort": 9090, "name": "health"}
-        ],
+        "ports": container_ports,
         "readinessProbe": {
             "httpGet": {
                 "path": "/healthz",
@@ -1075,6 +1085,7 @@ fn build_iron_proxy_pod(
     id: &SandboxId,
     pod_name: &str,
     iron_proxy: &IronProxyPodConfig,
+    resolved: &ResolvedIronProxy,
 ) -> SandboxResult<Pod> {
     let labels = iron_proxy_labels(id);
     let pod = json!({
@@ -1087,7 +1098,7 @@ fn build_iron_proxy_pod(
         "spec": {
             "automountServiceAccountToken": false,
             "restartPolicy": "Never",
-            "containers": [iron_proxy_container(iron_proxy)],
+            "containers": [iron_proxy_container(iron_proxy, resolved)],
             "volumes": iron_proxy_volumes(id, iron_proxy),
         },
     });
@@ -1515,7 +1526,8 @@ mod tests {
             listen_ports: vec![5432, 8080, 18080],
         };
 
-        let pod = build_iron_proxy_pod(&id, &resolved.proxy_pod_name, &iron_proxy).unwrap();
+        let pod =
+            build_iron_proxy_pod(&id, &resolved.proxy_pod_name, &iron_proxy, &resolved).unwrap();
         assert_eq!(pod.metadata.name.as_deref(), Some("asbx-test-proxy-123"));
         let pod_labels = pod.metadata.labels.as_ref().unwrap();
         assert_eq!(
@@ -1529,6 +1541,16 @@ mod tests {
             container.image.as_deref(),
             Some("centaur-iron-proxy:latest")
         );
+        let container_ports = container
+            .ports
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|port| (port.name.as_deref().unwrap_or(""), port.container_port))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(container_ports["proxy"], 18080);
+        assert_eq!(container_ports["tcp-5432"], 5432);
+        assert_eq!(container_ports["tcp-8080"], 8080);
         assert_eq!(
             container.env_from.as_ref().unwrap()[0]
                 .secret_ref

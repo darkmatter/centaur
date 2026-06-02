@@ -18,6 +18,15 @@ pub(crate) struct ResolvedIronProxy {
     pub(crate) pg_proxy_password_env: BTreeMap<String, String>,
 }
 
+impl ResolvedIronProxy {
+    pub(crate) fn additional_listen_ports(&self) -> impl Iterator<Item = u16> + '_ {
+        self.listen_ports
+            .iter()
+            .copied()
+            .filter(|port| *port != self.proxy_port)
+    }
+}
+
 pub(crate) fn proxied_pg_url(host: &str, port: u16, password: &str, database: &str) -> String {
     format!("postgresql://app_user:{password}@{host}:{port}/{database}")
 }

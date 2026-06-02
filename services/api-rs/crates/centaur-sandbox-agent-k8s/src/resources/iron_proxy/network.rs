@@ -5,7 +5,7 @@ use centaur_sandbox_core::SandboxId;
 use k8s_openapi::api::core::v1::{Service, ServiceSpec};
 use k8s_openapi::api::networking::v1::{
     NetworkPolicy, NetworkPolicyEgressRule, NetworkPolicyIngressRule, NetworkPolicyPeer,
-    NetworkPolicySpec,
+    NetworkPolicyPort, NetworkPolicySpec,
 };
 
 use super::config::ResolvedIronProxy;
@@ -20,14 +20,11 @@ use crate::resources::common::{
 
 pub(crate) fn build_iron_proxy_service(id: &SandboxId, resolved: &ResolvedIronProxy) -> Service {
     let mut ports = vec![service_port("proxy", resolved.proxy_port)];
-    for port in resolved
-        .listen_ports
-        .iter()
-        .copied()
-        .filter(|port| *port != resolved.proxy_port)
-    {
-        ports.push(service_port(format!("tcp-{port}"), port));
-    }
+    ports.extend(
+        resolved
+            .additional_listen_ports()
+            .map(|port| service_port(format!("tcp-{port}"), port)),
+    );
     Service {
         metadata: object_meta(iron_proxy_service_name(id), iron_proxy_labels(id)),
         spec: Some(ServiceSpec {
@@ -51,19 +48,10 @@ pub(crate) fn build_iron_proxy_network_policies(
     ]
 }
 
-fn sandbox_to_proxy_ports(
-    resolved: &ResolvedIronProxy,
-) -> Vec<k8s_openapi::api::networking::v1::NetworkPolicyPort> {
-    let mut ports = vec![network_port(resolved.proxy_port)];
-    for port in resolved
-        .listen_ports
-        .iter()
-        .copied()
-        .filter(|port| *port != resolved.proxy_port)
-    {
-        ports.push(network_port(port));
-    }
-    ports
+fn sandbox_to_proxy_ports(resolved: &ResolvedIronProxy) -> Vec<NetworkPolicyPort> {
+    std::iter::once(network_port(resolved.proxy_port))
+        .chain(resolved.additional_listen_ports().map(network_port))
+        .collect()
 }
 
 fn sandbox_egress_policy(

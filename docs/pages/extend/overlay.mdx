@@ -123,6 +123,31 @@ warm-pool claims see the latest overlay prompt and skills; running sandboxes
 refresh overlay skills in-place, and `centaur-tools` reads the current mounted
 source on each invocation.
 
+## Slack-authored overlay changes
+
+For non-engineering authoring, treat the overlay repo as the durable extension
+surface. A Slack request can create a PR against the overlay repo that adds or
+updates `.agents/skills/**`, `tools/**`, or other overlay-owned files. Merging
+that PR is enough to publish the change: repo-cache pulls the new default-branch
+commit, API-side tool discovery reloads from the live checkout, and sandboxes
+read skills and CLI tools from the same mounted source without rebuilding the
+sandbox image or restarting the API.
+
+Repo-cache removes the deployment bottleneck, but it is not a safety policy.
+Skills are instructions and can usually use a lighter review path. Tools are
+executable code and should only auto-merge after path-scoped checks pass:
+
+- the PR only changes overlay-owned paths, not base Centaur or cluster config
+- Python tools install and run with `uv tool run --isolated --from tools/<name>`
+- Rust tools build and run with the repo's declared Cargo package
+- Go tools build and run with the repo's declared module
+- secret metadata is declared in tool config, with real values still added to
+  1Password and injected through iron-proxy
+
+If a bad overlay change lands, revert it in the overlay repo. The next
+repo-cache sync rolls the live checkout forward to the revert commit, and
+future tool invocations use that source.
+
 ## Package the image
 
 Use image mode for immutable release artifacts or when the cluster cannot mount

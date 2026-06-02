@@ -1,6 +1,6 @@
 # Slackbot Regression Matrix
 
-Generated: `2026-06-02T16:55:34.870388+00:00`
+Generated: `2026-06-02T17:04:30.431814+00:00`
 
 ## Sources
 
@@ -10,7 +10,7 @@ Generated: `2026-06-02T16:55:34.870388+00:00`
 - `synthetic_input`: `local-corpus/slackbot-fuzz/synthetic-rendering-cases.json`
 - `feedback_summary`: `local-corpus/slackbot-fuzz/feedback-refresh-20260602Tfeedback/summary.json`
 - `db_snapshot`: `local-corpus/slackbot-fuzz/db-snapshot-20260602Tdb.json`
-- `api_rs_checks`: `local-corpus/slackbot-fuzz/api-rs-regression-check-20260602T1549Z.json`, `local-corpus/slackbot-fuzz/api-rs-regression-check-20260602T1600Z.json`, `local-corpus/slackbot-fuzz/api-rs-regression-check-20260602T1610Z.json`, `local-corpus/slackbot-fuzz/api-rs-regression-check-20260602T1616Z.json`, `local-corpus/slackbot-fuzz/api-rs-regression-check-20260602T1633Z.json`
+- `api_rs_checks`: `local-corpus/slackbot-fuzz/api-rs-regression-check-20260602T1549Z.json`, `local-corpus/slackbot-fuzz/api-rs-regression-check-20260602T1600Z.json`, `local-corpus/slackbot-fuzz/api-rs-regression-check-20260602T1610Z.json`, `local-corpus/slackbot-fuzz/api-rs-regression-check-20260602T1616Z.json`, `local-corpus/slackbot-fuzz/api-rs-regression-check-20260602T1633Z.json`, `local-corpus/slackbot-fuzz/api-rs-regression-check-20260602T1702Z.json`
 - `slack_checks`: `local-corpus/slackbot-fuzz/slack-regression-check-20260602T1640Z.json`, `local-corpus/slackbot-fuzz/slack-regression-check-20260602T1653Z.json`
 
 ## Failures
@@ -29,7 +29,7 @@ Generated: `2026-06-02T16:55:34.870388+00:00`
 | p0 | `renderer_final_text_missing_or_in_thinking`<br>Final-looking answer text can be lost or rendered only inside a Thinking task. | `synthetic_repro` | prod:3, synthetic:2 | packages/rendering final answer normalization<br>Slackbot v2 markdown_text emission |
 | p0 | `renderer_execution_failed_error_not_markdown`<br>Renderer produces an error close event, but Slack-visible chunks have no markdown error text. | `synthetic_repro_plus_local_seed` | local:2, prod:10, synthetic:1, db:2 | packages/rendering error finalization<br>Slackbot v2 task/error block conversion |
 | p0 | `no_rollout_found_after_retry_or_idle`<br>Idle/retry production threads later receive internal 'no rollout found' messages. Likely tied to stale runtime state or future pause/resume behavior. | `production_seed_backlog` | prod:7 | sandbox auto-pause/resume<br>runtime/session lookup after idle<br>Slackbot final error redaction |
-| p0 | `api_idle_resume_no_final_after_pause`<br>After an idle timeout pause, api-rs resumes the sandbox but the next Codex app-server turn can fail before producing a final answer. | `local_repro` | api-rs:1 | api-rs suspended sandbox resume/recreate policy<br>Codex app-server readiness after resume<br>SSE replay of failed resume turns |
+| p0 | `api_idle_resume_no_final_after_pause`<br>After an idle timeout pause, api-rs previously resumed the sandbox but the next Codex app-server turn failed before producing a final answer; the current stack passed a 5-turn pause/resume stress run, so this remains an intermittent regression target. | `local_repro_current_stack_passed_stress` | api-rs:2 | api-rs suspended sandbox resume/recreate policy<br>Codex app-server readiness after resume<br>SSE replay of failed resume turns |
 | p0 | `slack_subscribed_idle_reply_does_not_execute`<br>A reply in a subscribed Slack thread after the session is idle was appended to history without executing a new turn or producing a bot response; the local fix now executes inactive subscribed replies and keeps active-stream replies append-only. | `local_slack_repro_fixed` | slack:2 | Slackbot subscribed-thread idle reply policy<br>Slackbot append-vs-execute routing<br>Slack-visible response for idle follow-ups |
 | p1 | `blank_response_then_cancelled`<br>Production seed shows an empty bot reply followed by Request cancelled after a user reports blank response. | `production_seed` | prod:3 | Slackbot blank-final guard<br>cancellation terminal-state mapping |
 | p1 | `agent_request_failed_before_execution_started`<br>Production seeds contain repeated pre-execution failure messages, runtime issues, and stream-without-assistant errors. | `production_seed` | prod:4 | api-rs startup/runtime terminal failure persistence<br>Slackbot retry deduplication |

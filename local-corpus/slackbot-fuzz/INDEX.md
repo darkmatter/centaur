@@ -52,6 +52,10 @@ without committing large channel-history snapshots.
 - `api-rs-regression-check-20260602T1633Z.json`: live local API checks showing
   `idle_timeout_ms` now pauses an idle sandbox after terminal output, plus a reproduced open
   failure where the next turn resumes the sandbox but fails before a final answer.
+- `api-rs-regression-check-20260602T1702Z.json`: live local API check showing the current stack
+  passed a 5-turn `centaur-session-cli` pause/resume stress run on one thread: every turn emitted
+  final text, completed durably, and paused again with no `turn.failed` or
+  `session.execution_failed`.
 - `slack-regression-check-20260602T1640Z.json`: live Slack check in `#centaur-ai-zygis` showing
   idle pause works through Slackbot v2, a non-mention subscribed-thread reply after idle silently
   appends without executing, and a mention reply after idle resumes and returns a final answer.
@@ -345,10 +349,12 @@ internal rollout lookup failures in Slack.
 ### api_idle_resume_no_final_after_pause
 
 Artifact:
-`local-corpus/slackbot-fuzz/api-rs-regression-check-20260602T1633Z.json`
+- Repro: `local-corpus/slackbot-fuzz/api-rs-regression-check-20260602T1633Z.json`
+- Current-stack stress pass: `local-corpus/slackbot-fuzz/api-rs-regression-check-20260602T1702Z.json`
 
 Thread:
-`fuzz:20260602T1500Z-steering-load:api-00-api_pong`
+- Repro: `fuzz:20260602T1500Z-steering-load:api-00-api_pong`
+- Current-stack stress pass: `fuzz:resume-stress:20260602T165843Z`
 
 Observed:
 - First proof turn used `idle_timeout_ms = 2000` and completed with final answer
@@ -360,13 +366,17 @@ Observed:
 - No final answer was emitted for the resume turn. The durable execution failed at event `1401`
   with `terminal harness output reported failure`; harness text included `Reconnecting... 2/5` and
   `timeout waiting for child process to exit`.
+- A later current-stack stress pass sent five sequential `centaur-session-cli` turns on one thread
+  with `idle_timeout_ms = 2000`. Turns 2-5 all recorded `session.sandbox_resumed`, all five turns
+  emitted final sentinel text `API_RESUME_STRESS_N_OK`, all five persisted
+  `session.execution_completed`, and all five paused again. No `turn.failed` or
+  `session.execution_failed` appeared.
 
 Why this matters:
 This is a local product-path repro for the scale-oriented pause/resume path. Pausing now frees the
-running sandbox, but resume is not yet a valid user-facing recovery path for Codex app-server turns:
-the next reply can fail durably before final output. The next fix should either make resume
-reliably preserve/restart the harness, or recreate from durable thread history when a suspended
-sandbox cannot produce a healthy turn.
+running sandbox, but resume has shown at least one prior no-final failure and must remain in the
+regression set. The current stack passed a focused stress run, so the next exploration should widen
+load/concurrency before changing api-rs resume policy again.
 
 ### slack_subscribed_idle_reply_does_not_execute
 

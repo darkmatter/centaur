@@ -1,0 +1,81 @@
+{
+  "schema": "centaur.api_rs_regression_check.v1",
+  "created_at": "2026-06-02T17:02:50Z",
+  "checks": [
+    {
+      "failure_id": "api_idle_resume_no_final_after_pause",
+      "status": "current_stack_passed_stress",
+      "prior_repro_file": "local-corpus/slackbot-fuzz/api-rs-regression-check-20260602T1633Z.json",
+      "thread_key": "fuzz:resume-stress:20260602T165843Z",
+      "request": {
+        "client": "centaur-session-cli",
+        "turn_count": 5,
+        "idle_timeout_ms": 2000,
+        "max_duration_ms": 60000,
+        "message_template": "Reply with exactly API_RESUME_STRESS_{n}_OK and nothing else."
+      },
+      "observed": {
+        "sandbox_id": "asbx-1780419525308-4",
+        "executions": [
+          {
+            "turn": 1,
+            "execution_id": "exe_60496c3687c5498dbf656a81179483d0",
+            "event_range": [1521, 1542],
+            "final_text": "API_RESUME_STRESS_1_OK",
+            "resumed": false,
+            "completed_event_id": 1540,
+            "paused_event_id": 1542,
+            "status_after": "completed"
+          },
+          {
+            "turn": 2,
+            "execution_id": "exe_42d9b702f458411bbe1508de4633c8a6",
+            "event_range": [1543, 1564],
+            "final_text": "API_RESUME_STRESS_2_OK",
+            "resumed_event_id": 1544,
+            "completed_event_id": 1562,
+            "paused_event_id": 1564,
+            "status_after": "completed"
+          },
+          {
+            "turn": 3,
+            "execution_id": "exe_ec3e9d98a7464c3d8ca499a22890c032",
+            "event_range": [1565, 1587],
+            "final_text": "API_RESUME_STRESS_3_OK",
+            "resumed_event_id": 1566,
+            "completed_event_id": 1585,
+            "paused_event_id": 1587,
+            "status_after": "completed"
+          },
+          {
+            "turn": 4,
+            "execution_id": "exe_9fd94e61fd8a40c8a6f4e97d4bd57f49",
+            "event_range": [1588, 1610],
+            "final_text": "API_RESUME_STRESS_4_OK",
+            "resumed_event_id": 1589,
+            "completed_event_id": 1608,
+            "paused_event_id": 1610,
+            "status_after": "completed"
+          },
+          {
+            "turn": 5,
+            "execution_id": "exe_c6af1d4cf51d4e8ab437053b7a467695",
+            "event_range": [1611, 1632],
+            "final_text": "API_RESUME_STRESS_5_OK",
+            "resumed_event_id": 1612,
+            "completed_event_id": 1630,
+            "paused_event_id": 1632,
+            "status_after": "completed"
+          }
+        ],
+        "completed_turns": 5,
+        "resume_events": 4,
+        "pause_events": 5,
+        "execution_failed_events": 0,
+        "turn_failed_events": 0,
+        "proof_dir": "local-corpus/slackbot-fuzz/resume-stress-20260602T165843Z"
+      },
+      "regression_assertion": "Repeated replies after idle pause should resume or recreate the sandbox, emit final answer text, persist session.execution_completed, and pause again without turn.failed/session.execution_failed."
+    }
+  ]
+}

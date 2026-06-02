@@ -251,11 +251,13 @@ FAILURES: list[dict[str, Any]] = [
     {
         "failure_id": "api_idle_resume_no_final_after_pause",
         "priority": "p0",
-        "repro_status": "local_repro",
+        "repro_status": "local_repro_current_stack_passed_stress",
         "surfaces": ["api-rs", "pause-resume", "sse", "cli"],
         "summary": (
-            "After an idle timeout pause, api-rs resumes the sandbox but the next Codex "
-            "app-server turn can fail before producing a final answer."
+            "After an idle timeout pause, api-rs previously resumed the sandbox but the next "
+            "Codex app-server turn failed before producing a final answer; the current stack "
+            "passed a 5-turn pause/resume stress run, so this remains an intermittent regression "
+            "target."
         ),
         "regression_targets": [
             "api-rs suspended sandbox resume/recreate policy",

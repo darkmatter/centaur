@@ -12,11 +12,7 @@ use super::*;
 
 fn env_values(env: &[EnvVar]) -> BTreeMap<&str, &str> {
     env.iter()
-        .filter_map(|item| {
-            item.value
-                .as_deref()
-                .map(|value| (item.name.as_str(), value))
-        })
+        .filter_map(|item| Some((item.name.as_str(), item.value.as_deref()?)))
         .collect()
 }
 

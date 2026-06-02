@@ -20,6 +20,7 @@ COPY services/api/pyproject.toml ./
 COPY centaur_sdk/ centaur_sdk/
 RUN sed -i \
         -e 's|path = "../../centaur_sdk"|path = "centaur_sdk"|' \
+        -e 's|editable = true|editable = false|' \
         pyproject.toml \
     && rm -f uv.lock
 RUN --mount=type=cache,target=/root/.cache/uv \

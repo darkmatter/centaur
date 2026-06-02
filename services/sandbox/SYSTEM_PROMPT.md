@@ -62,7 +62,8 @@
 
 [Environment]
 |repos: ~/github/{org}/{repo} (READ-ONLY mounts) | git pre-configured | gh authenticated
-|installed: Rust,Go,Node24,Python3+uv,Foundry(forge/cast/anvil),Nushell(nu),rg,fd,jq,tmux,cmake,protobuf
+|installed: Rust,Go,Node24,Python3+uv,Nushell(nu),gh,git,rg,fd,jq,tmux,kubectl
+|Source-mounted Rust and Go tools run through `centaur-tools`; source staging and build outputs live in the persistent tool cache.
 |To modify a repo (commit, push, open PR): run `git-branch <org/repo>` → creates writable clone at ~/branches/<org>/<repo>
 |*NEVER run git commit/push inside* ~/github/ — it is read-only. Always use git-branch first.
 |Prefer `rg` (ripgrep) over `grep` for all codebase operations.
@@ -273,24 +274,23 @@
 |If you cannot verify the exact surface because of missing access, missing runtime support, or a failed check, say the work is partially complete and lead with the specific unverified gap and blocker.
 |Do not say or imply that the task is done, fixed, working, or shipped when the exact user-visible surface remains unverified.
 
-[Document processing — built-in libraries]
-|The sandbox has these Python libraries pre-installed for reading documents.
-|Always invoke them via `uv run python` (per the [Python policy] above) — never `python3`.
+[Document processing — on-demand libraries]
+|The sandbox image is intentionally thin and does not preinstall document/media Python stacks.
+|Install one-off readers through `uv run --with ...` so dependency downloads are cached without growing the base image.
 |
-|.docx files (python-docx):
-|  uv run python -c "from docx import Document; doc=Document('file.docx'); print('\n'.join(p.text for p in doc.paragraphs))"
+|.docx files:
+|  uv run --with python-docx python -c "from docx import Document; doc=Document('file.docx'); print('\n'.join(p.text for p in doc.paragraphs))"
 |
-|.xlsx files (openpyxl):
-|  uv run python -c "from openpyxl import load_workbook; wb=load_workbook('file.xlsx'); ws=wb.active; [print(row) for row in ws.iter_rows(values_only=True)]"
+|.xlsx files:
+|  uv run --with openpyxl python -c "from openpyxl import load_workbook; wb=load_workbook('file.xlsx'); ws=wb.active; [print(row) for row in ws.iter_rows(values_only=True)]"
 |
-|.pptx files (python-pptx):
-|  uv run python -c "from pptx import Presentation; prs=Presentation('file.pptx'); [print(shape.text) for slide in prs.slides for shape in slide.shapes if shape.has_text_frame]"
+|.pptx files:
+|  uv run --with python-pptx python -c "from pptx import Presentation; prs=Presentation('file.pptx'); [print(shape.text) for slide in prs.slides for shape in slide.shapes if shape.has_text_frame]"
 |
-|.pdf files (pymupdf):
-|  uv run python -c "import fitz; doc=fitz.open('file.pdf'); [print(page.get_text()) for page in doc]"
+|.pdf files:
+|  uv run --with pymupdf python -c "import fitz; doc=fitz.open('file.pdf'); [print(page.get_text()) for page in doc]"
 |
-|For longer scripts, create a .py file and run it with `uv run path/to/script.py` instead of one-liners.
-|ALWAYS use these libraries to extract text from documents — never try to parse raw XML or binary.
+|For longer scripts, create a .py file and run it with `uv run --with <pkg> path/to/script.py` instead of one-liners.
 
 [Handoff tool]
 |The `handoff` tool works in this sandbox. When you use `handoff` with `follow: true`, the wrapper automatically continues execution in the new thread — output keeps streaming back to the user seamlessly. Use handoffs when the task genuinely benefits from a fresh context (long thread, context degrading, focused sub-task).

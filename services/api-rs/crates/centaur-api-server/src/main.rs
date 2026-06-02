@@ -575,6 +575,7 @@ fn codex_app_server_env_template(args: &Args) -> Vec<(String, String)> {
         clean_optional_value(Some(args.centaur_api_url.as_str()))
             .unwrap_or_else(|| "http://api:8000".to_owned()),
     );
+    push_env(&mut envs, "CENTAUR_HARNESS_KIND", "codex".to_owned());
     if let Some(api_key) = clean_optional_value(args.centaur_api_key.as_deref()) {
         push_env(&mut envs, "CENTAUR_API_KEY", api_key.to_owned());
     }
@@ -718,6 +719,7 @@ mod tests {
         }));
 
         let env = env.into_iter().collect::<BTreeMap<_, _>>();
+        assert_eq!(env["CENTAUR_HARNESS_KIND"], "codex");
         assert_eq!(env["XDG_CACHE_HOME"], "/home/agent/.cache");
         assert_eq!(env["UV_CACHE_DIR"], "/home/agent/.cache/uv");
         assert_eq!(env["UV_LINK_MODE"], "copy");

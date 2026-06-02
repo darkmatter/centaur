@@ -49,6 +49,48 @@ enum Error {
         path: PathBuf,
         source: std::io::Error,
     },
+    #[error("failed to remove {path}: {source}")]
+    RemoveDir {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error("failed to read directory {path}: {source}")]
+    ReadDir {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error("failed to read entry in {path}: {source}")]
+    ReadDirEntry {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error("failed to inspect {path}: {source}")]
+    Metadata {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error("failed to copy {src} to {dst}: {source}")]
+    CopyFile {
+        src: PathBuf,
+        dst: PathBuf,
+        source: std::io::Error,
+    },
+    #[error("failed to write {path}: {source}")]
+    WriteFile {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error("failed to read link {path}: {source}")]
+    ReadLink {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error("failed to symlink {src} to {dst}: {source}")]
+    Symlink {
+        src: PathBuf,
+        dst: PathBuf,
+        source: std::io::Error,
+    },
     #[error("failed to spawn {program}: {source}")]
     Spawn {
         program: String,
@@ -61,6 +103,10 @@ enum Error {
 }
 
 type Result<T> = std::result::Result<T, Error>;
+
+const SOURCE_MARKER: &str = ".centaur-tools-source-key";
+const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+const FNV_PRIME: u64 = 0x100000001b3;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ToolRow {
@@ -213,17 +259,18 @@ where
 }
 
 fn run_python_tool(row: &ToolRow, args: &[OsString]) -> Result<i32> {
+    let tool_dir = prepare_tool_source_dir("python-src", row)?;
     let mut command = Command::new("uv");
     command
         .args(["tool", "run", "--isolated", "--from"])
-        .arg(&row.dir);
-    if let Some(sdk_path) = centaur_sdk_path(&row.dir) {
+        .arg(&tool_dir);
+    if let Some(sdk_path) = centaur_sdk_path(&tool_dir).or_else(|| centaur_sdk_path(&row.dir)) {
         command.arg("--with").arg(sdk_path);
     }
     let status = command
         .arg(&row.name)
         .args(args)
-        .current_dir(&row.dir)
+        .current_dir(&tool_dir)
         .status()
         .map_err(|source| Error::Spawn {
             program: "uv tool run".to_owned(),
@@ -232,18 +279,143 @@ fn run_python_tool(row: &ToolRow, args: &[OsString]) -> Result<i32> {
     Ok(exit_code(status))
 }
 
+fn prepare_tool_source_dir(kind: &str, row: &ToolRow) -> Result<PathBuf> {
+    let tool_dir = tool_cache_dir(kind, &row.name, &row.dir)?;
+    let source_key = source_tree_key(&row.dir)?;
+    let marker = tool_dir.join(SOURCE_MARKER);
+    if tool_dir.exists() {
+        let existing_key = fs::read_to_string(&marker).ok();
+        if existing_key.as_deref().map(str::trim) == Some(source_key.as_str()) {
+            return Ok(tool_dir);
+        }
+        fs::remove_dir_all(&tool_dir).map_err(|source| Error::RemoveDir {
+            path: tool_dir.clone(),
+            source,
+        })?;
+    }
+    copy_dir_all(&row.dir, &tool_dir)?;
+    fs::write(&marker, source_key).map_err(|source| Error::WriteFile {
+        path: marker,
+        source,
+    })?;
+    Ok(tool_dir)
+}
+
+fn source_tree_key(root: &Path) -> Result<String> {
+    let mut hash = FNV_OFFSET;
+    update_source_tree_hash(root, root, &mut hash)?;
+    Ok(format!("{hash:016x}"))
+}
+
+fn update_source_tree_hash(root: &Path, dir: &Path, hash: &mut u64) -> Result<()> {
+    let entries = fs::read_dir(dir).map_err(|source| Error::ReadDir {
+        path: dir.to_path_buf(),
+        source,
+    })?;
+    let mut entries = entries
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|source| Error::ReadDirEntry {
+            path: dir.to_path_buf(),
+            source,
+        })?;
+    entries.sort_by_key(|entry| entry.file_name());
+
+    for entry in entries {
+        let path = entry.path();
+        let rel = path.strip_prefix(root).unwrap_or(&path);
+        hash_bytes(hash, rel.as_os_str().as_encoded_bytes());
+        let file_type = entry.file_type().map_err(|source| Error::Metadata {
+            path: path.clone(),
+            source,
+        })?;
+        if file_type.is_dir() {
+            hash_bytes(hash, b"dir");
+            update_source_tree_hash(root, &path, hash)?;
+        } else if file_type.is_symlink() {
+            hash_bytes(hash, b"symlink");
+            let target = fs::read_link(&path).map_err(|source| Error::ReadLink {
+                path: path.clone(),
+                source,
+            })?;
+            hash_bytes(hash, target.as_os_str().as_encoded_bytes());
+        } else {
+            hash_bytes(hash, b"file");
+            let contents = fs::read(&path).map_err(|source| Error::ReadFile {
+                path: path.clone(),
+                source,
+            })?;
+            hash_bytes(hash, &contents);
+        }
+    }
+    Ok(())
+}
+
+fn hash_bytes(hash: &mut u64, bytes: &[u8]) {
+    for byte in bytes {
+        *hash ^= u64::from(*byte);
+        *hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    *hash ^= 0xff;
+    *hash = hash.wrapping_mul(FNV_PRIME);
+}
+
+fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
+    fs::create_dir_all(dst).map_err(|source| Error::CreateDir {
+        path: dst.to_path_buf(),
+        source,
+    })?;
+    let entries = fs::read_dir(src).map_err(|source| Error::ReadDir {
+        path: src.to_path_buf(),
+        source,
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|source| Error::ReadDirEntry {
+            path: src.to_path_buf(),
+            source,
+        })?;
+        let src_path = entry.path();
+        let dst_path = dst.join(entry.file_name());
+        let file_type = entry.file_type().map_err(|source| Error::Metadata {
+            path: src_path.clone(),
+            source,
+        })?;
+        if file_type.is_dir() {
+            copy_dir_all(&src_path, &dst_path)?;
+        } else if file_type.is_symlink() {
+            let target = fs::read_link(&src_path).map_err(|source| Error::ReadLink {
+                path: src_path.clone(),
+                source,
+            })?;
+            std::os::unix::fs::symlink(&target, &dst_path).map_err(|source| Error::Symlink {
+                src: target,
+                dst: dst_path,
+                source,
+            })?;
+        } else {
+            fs::copy(&src_path, &dst_path).map_err(|source| Error::CopyFile {
+                src: src_path,
+                dst: dst_path,
+                source,
+            })?;
+        }
+    }
+    Ok(())
+}
+
 fn run_rust_tool(row: &ToolRow, args: &[OsString]) -> Result<i32> {
+    let tool_dir = prepare_tool_source_dir("rust-src", row)?;
     let target_dir = tool_cache_dir("cargo-target", &row.name, &row.dir)?;
     fs::create_dir_all(&target_dir).map_err(|source| Error::CreateDir {
         path: target_dir.clone(),
         source,
     })?;
+    let manifest = tool_dir.join("Cargo.toml");
     let status = Command::new("cargo")
         .args(["run", "--quiet", "--manifest-path"])
-        .arg(&row.runner)
+        .arg(&manifest)
         .arg("--")
         .args(args)
-        .current_dir(&row.dir)
+        .current_dir(&tool_dir)
         .env("CARGO_TARGET_DIR", target_dir)
         .status()
         .map_err(|source| Error::Spawn {
@@ -254,6 +426,7 @@ fn run_rust_tool(row: &ToolRow, args: &[OsString]) -> Result<i32> {
 }
 
 fn run_go_tool(row: &ToolRow, args: &[OsString]) -> Result<i32> {
+    let tool_dir = prepare_tool_source_dir("go-src", row)?;
     let cache_dir = tool_cache_dir("go", &row.name, &row.dir)?;
     let build_cache = cache_dir.join("build");
     let module_cache = cache_dir.join("mod");
@@ -268,7 +441,7 @@ fn run_go_tool(row: &ToolRow, args: &[OsString]) -> Result<i32> {
     let status = Command::new("go")
         .args(["run", "-mod=readonly", "."])
         .args(args)
-        .current_dir(&row.dir)
+        .current_dir(&tool_dir)
         .env("GOCACHE", build_cache)
         .env("GOMODCACHE", module_cache)
         .status()
@@ -502,6 +675,12 @@ fn is_executable(path: &Path) -> bool {
 }
 
 fn tool_cache_dir(kind: &str, tool_name: &str, dir: &Path) -> Result<PathBuf> {
+    Ok(tool_cache_root()?
+        .join(kind)
+        .join(format!("{tool_name}-{}", stable_path_key(dir))))
+}
+
+fn tool_cache_root() -> Result<PathBuf> {
     let cache_home = std::env::var_os("XDG_CACHE_HOME")
         .map(PathBuf::from)
         .or_else(|| {
@@ -510,10 +689,7 @@ fn tool_cache_dir(kind: &str, tool_name: &str, dir: &Path) -> Result<PathBuf> {
                 .map(|home| home.join(".cache"))
         })
         .ok_or(Error::MissingHome)?;
-    Ok(cache_home
-        .join("centaur-tools")
-        .join(kind)
-        .join(format!("{tool_name}-{}", stable_path_key(dir))))
+    Ok(cache_home.join("centaur-tools"))
 }
 
 fn centaur_sdk_path(tool_dir: &Path) -> Option<PathBuf> {
@@ -550,9 +726,6 @@ fn is_python_package_dir(path: &Path) -> bool {
 }
 
 fn stable_path_key(path: &Path) -> u64 {
-    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
-    const FNV_PRIME: u64 = 0x100000001b3;
-
     let mut hash = FNV_OFFSET;
     for byte in path.as_os_str().as_encoded_bytes() {
         hash ^= u64::from(*byte);
@@ -728,6 +901,67 @@ edition = "2021"
         };
 
         assert_eq!(run_rust_tool(&row, &[OsString::from("ping")]).unwrap(), 0);
+        assert!(!temp.path("tools/rusty/Cargo.lock").exists());
+    }
+
+    #[test]
+    fn prepares_python_tool_from_cache_copy() {
+        let temp = TempTree::new("python-cache");
+        let runner = temp.write(
+            "tools/pyhello/cli.py",
+            r#"import typer
+
+app = typer.Typer()
+
+@app.command()
+def main():
+    print("ok")
+"#,
+        );
+        temp.write(
+            "tools/pyhello/pyproject.toml",
+            r#"[project]
+name = "pyhello"
+version = "0.1.0"
+dependencies = ["typer"]
+"#,
+        );
+        let row = ToolRow {
+            name: "pyhello".to_owned(),
+            dir: temp.path("tools/pyhello"),
+            summary: "CLI tool".to_owned(),
+            command_count: 1,
+            kind: RunnerKind::Python,
+            runner,
+            commands: vec!["main".to_owned()],
+        };
+
+        let prepared = prepare_tool_source_dir("python-src", &row).unwrap();
+        assert_ne!(prepared, row.dir);
+        assert!(prepared.join("cli.py").is_file());
+        assert!(prepared.join("pyproject.toml").is_file());
+        assert_eq!(
+            fs::read_to_string(prepared.join("cli.py")).unwrap(),
+            fs::read_to_string(row.dir.join("cli.py")).unwrap()
+        );
+
+        fs::write(prepared.join("sentinel"), "cached").unwrap();
+        let prepared_again = prepare_tool_source_dir("python-src", &row).unwrap();
+        assert_eq!(prepared_again, prepared);
+        assert_eq!(
+            fs::read_to_string(prepared_again.join("sentinel")).unwrap(),
+            "cached"
+        );
+
+        fs::write(row.dir.join("cli.py"), "print('changed')\n").unwrap();
+        let prepared_after_change = prepare_tool_source_dir("python-src", &row).unwrap();
+        assert_eq!(prepared_after_change, prepared);
+        assert!(!prepared_after_change.join("sentinel").exists());
+        assert_eq!(
+            fs::read_to_string(prepared_after_change.join("cli.py")).unwrap(),
+            "print('changed')\n"
+        );
+        fs::remove_dir_all(prepared).unwrap();
     }
 
     #[test]

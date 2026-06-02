@@ -3,12 +3,22 @@
 
 # Virtual environments
 .venv
+**/.venv
 
 # Node
 services/slackbot/node_modules
+**/node_modules
+
+# Local build outputs
+**/target
+**/dist
+**/build
 
 # Sandbox cached repos (4GB+)
 services/sandbox/repos
+
+# Local proof scratch space
+.proof
 
 # Caches
 .ruff_cache

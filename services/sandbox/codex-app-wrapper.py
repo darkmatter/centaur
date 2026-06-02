@@ -132,7 +132,7 @@ def start_app_server() -> None:
             "clientInfo": {"name": "centaur", "title": "Centaur", "version": "0.1.0"},
             "capabilities": {"experimentalApi": True},
         },
-        timeout=30,
+        timeout=float(os.environ.get("CODEX_APP_SERVER_INITIALIZE_TIMEOUT_SECONDS", "120")),
     )
     notify("initialized")
     APP_INITIALIZED = True

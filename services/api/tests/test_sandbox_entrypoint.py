@@ -75,7 +75,6 @@ def test_sandbox_entrypoint_bootstraps_mock_google_adc(tmp_path: Path) -> None:
             "HOME": str(home),
             "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
             "CENTAUR_HARNESS_CONFIG_DIR": str(harness_dir),
-            "CENTAUR_SKILLS_REFRESH_SECONDS": "0",
         },
     )
 
@@ -131,67 +130,8 @@ def test_sandbox_entrypoint_installs_codex_harness_config(tmp_path: Path) -> Non
             "HOME": str(home),
             "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
             "CENTAUR_HARNESS_CONFIG_DIR": str(harness_dir),
-            "CENTAUR_SKILLS_REFRESH_SECONDS": "0",
         },
     )
 
     assert result.returncode == 0, result.stderr or result.stdout
     assert result.stdout == (harness_dir / "codex" / "config.toml").read_text()
-
-
-def test_sandbox_entrypoint_live_refreshes_overlay_skills(tmp_path: Path) -> None:
-    home = tmp_path / "home"
-    harness_dir = _write_codex_harness_config(home)
-    overlay_dir = home / "github" / "paradigmxyz" / "centaur-overlay"
-    skill_dir = overlay_dir / ".agents" / "skills" / "acme-support"
-    skill_dir.mkdir(parents=True)
-    skill_file = skill_dir / "SKILL.md"
-    skill_file.write_text("version one\n")
-    result_file = home / "entrypoint-result.txt"
-
-    result = subprocess.run(
-        [
-            "bash",
-            str(ENTRYPOINT_SH),
-            "sh",
-            "-lc",
-            rf'''
-set -eu
-cleanup() {{
-    pkill -P $$ >/dev/null 2>&1 || true
-}}
-trap cleanup EXIT
-workspace_skill="$HOME/workspace/.agents/skills/acme-support/SKILL.md"
-grep -q "version one" "$workspace_skill"
-printf '%s\n' "version two" > "$CENTAUR_OVERLAY_DIR/.agents/skills/acme-support/SKILL.md"
-for _ in 1 2 3 4 5 6 7 8 9 10; do
-    if grep -q "version two" "$workspace_skill"; then
-        readlink "$HOME/workspace/.claude/skills" > "{result_file}"
-        cat "$workspace_skill" >> "{result_file}"
-        exit 0
-    fi
-    sleep 0.2
-done
-cat "$workspace_skill" > "{result_file}"
-exit 1
-''',
-        ],
-        check=False,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        text=True,
-        timeout=8,
-        env={
-            "HOME": str(home),
-            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
-            "CENTAUR_HARNESS_CONFIG_DIR": str(harness_dir),
-            "CENTAUR_OVERLAY_DIR": str(overlay_dir),
-            "CENTAUR_SKILLS_REFRESH_SECONDS": "1",
-        },
-    )
-
-    output = result_file.read_text() if result_file.exists() else ""
-    assert result.returncode == 0, output
-    symlink_target, skill_text = output.split("\n", 1)
-    assert symlink_target == str(home / "workspace" / ".agents" / "skills")
-    assert skill_text == "version two\n"

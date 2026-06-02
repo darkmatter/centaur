@@ -36,7 +36,7 @@ fn set_harness_auth_env(env: &mut EnvVars, credentials: &[CredentialRequest]) {
         let Some(auth_mode) = credential.auth_mode else {
             continue;
         };
-        env.value(name, auth_mode.as_str());
+        env.value(name, auth_mode.as_ref());
     }
 }
 

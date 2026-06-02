@@ -1,23 +1,13 @@
-use std::str::FromStr;
-
 use serde::{Deserialize, Serialize};
+use strum::{AsRefStr, EnumString};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, AsRefStr, EnumString)]
 #[serde(rename_all = "kebab-case")]
+#[strum(serialize_all = "kebab-case")]
 pub enum CredentialProfile {
     Codex,
     Amp,
     ClaudeCode,
-}
-
-impl CredentialProfile {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Codex => "codex",
-            Self::Amp => "amp",
-            Self::ClaudeCode => "claude-code",
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -43,30 +33,10 @@ impl HarnessAuthModes {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, AsRefStr, EnumString)]
 #[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
 pub enum HarnessAuthMode {
     ApiKey,
     AccessToken,
-}
-
-impl HarnessAuthMode {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::ApiKey => "api_key",
-            Self::AccessToken => "access_token",
-        }
-    }
-}
-
-impl FromStr for HarnessAuthMode {
-    type Err = String;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value {
-            "api_key" => Ok(Self::ApiKey),
-            "access_token" => Ok(Self::AccessToken),
-            _ => Err(format!("unsupported harness auth mode {value:?}")),
-        }
-    }
 }

@@ -38,7 +38,7 @@ pub(crate) fn iron_proxy_fragments_for_spec(
     for credential in &spec.credentials {
         let auth_mode = credential.auth_mode.unwrap_or(HarnessAuthMode::ApiKey);
         if let Some(fragment) =
-            centaur_iron_proxy::harness_fragment(credential.profile.as_str(), auth_mode.as_str())
+            centaur_iron_proxy::harness_fragment(credential.profile.as_ref(), auth_mode.as_ref())
                 .map_err(|err| SandboxError::InvalidSpec(format!("iron-proxy fragment: {err}")))?
         {
             fragments.push(fragment);

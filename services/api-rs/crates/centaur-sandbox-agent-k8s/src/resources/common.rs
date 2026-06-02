@@ -4,7 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use centaur_sandbox_core::SandboxSpec;
 use k8s_openapi::api::core::v1::{
-    ContainerPort, EmptyDirVolumeSource, EnvVar, HTTPGetAction, LocalObjectReference, Probe,
+    ContainerPort, EmptyDirVolumeSource, HTTPGetAction, LocalObjectReference, Probe,
     ResourceRequirements, SecretVolumeSource, ServicePort, Volume, VolumeMount,
 };
 use k8s_openapi::api::networking::v1::{
@@ -21,14 +21,6 @@ pub(crate) fn object_meta(name: impl Into<String>, labels: BTreeMap<String, Stri
     ObjectMeta {
         name: Some(name.into()),
         labels: Some(labels),
-        ..Default::default()
-    }
-}
-
-pub(super) fn env_var(name: &str, value: &str) -> EnvVar {
-    EnvVar {
-        name: name.to_owned(),
-        value: Some(value.to_owned()),
         ..Default::default()
     }
 }

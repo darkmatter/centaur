@@ -178,47 +178,9 @@ fi
 mkdir -p "$HOME_DIR/uploads"
 
 # ── Copy project skills into workspace (so `skill` tool discovers them) ──────
-WS_SKILLS="$WORKSPACE_DIR/.agents/skills"
-sync_centaur_skills() {
-    local baked_skills="$HOME_DIR/.agents/skills"
-    local mounted_centaur_skills="$HOME_DIR/centaur-skills"
-    local mounted_org_skills="$HOME_DIR/centaur-overlay-skills"
-    local overlay_tree_skills=""
-    local centaur_skills=""
-    local next_skills="${WS_SKILLS}.next.$$"
-
-    if [ -n "${CENTAUR_OVERLAY_DIR:-}" ] && [ -d "${CENTAUR_OVERLAY_DIR}/.agents/skills" ]; then
-        overlay_tree_skills="${CENTAUR_OVERLAY_DIR}/.agents/skills"
-    fi
-
-    if [ -d "$HOME_DIR/github" ]; then
-        centaur_skills="$(find "$HOME_DIR/github" -path '*/centaur/.agents/skills' -type d -print -quit 2>/dev/null || true)"
-    fi
-
-    rm -rf "$next_skills"
-    mkdir -p "$next_skills"
-    for skills_src in "$baked_skills" "$mounted_centaur_skills" "$centaur_skills" "$mounted_org_skills" "$overlay_tree_skills"; do
-        if [ -d "$skills_src" ]; then
-            cp -r "$skills_src"/. "$next_skills"/
-        fi
-    done
-
-    mkdir -p "$(dirname "$WS_SKILLS")"
-    rm -rf "$WS_SKILLS"
-    mv "$next_skills" "$WS_SKILLS"
-    mkdir -p "$WORKSPACE_DIR/.claude"
-    rm -rf "$WORKSPACE_DIR/.claude/skills"
-    ln -sf "$WS_SKILLS" "$WORKSPACE_DIR/.claude/skills"
-}
-
-sync_centaur_skills
+centaur-tools skills sync >/dev/null
 if [[ "${CENTAUR_SKILLS_REFRESH_SECONDS:-30}" =~ ^[0-9]+$ ]] && [ "${CENTAUR_SKILLS_REFRESH_SECONDS:-30}" -gt 0 ]; then
-    {
-        while true; do
-            sleep "${CENTAUR_SKILLS_REFRESH_SECONDS:-30}"
-            sync_centaur_skills || true
-        done
-    } &
+    centaur-tools skills watch --interval-seconds "${CENTAUR_SKILLS_REFRESH_SECONDS:-30}" >/dev/null 2>&1 &
 fi
 
 # ── Assemble system prompt from bind mounts ──────────────────────────────────

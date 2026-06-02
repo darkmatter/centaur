@@ -71,7 +71,7 @@ async fn sandbox_runtime_from_args(args: &Args) -> Result<SandboxRuntime, Server
             };
             let backend = Arc::new(AgentSandboxBackend::new(client, config));
 
-            Ok(container_sandbox_runtime(backend, args))
+            container_sandbox_runtime(backend, args)
         }
     }
 }
@@ -89,17 +89,23 @@ fn local_workload_mode(args: &Args) -> Result<SandboxWorkloadMode, ServerError> 
     }
 }
 
-fn container_sandbox_runtime(backend: Arc<AgentSandboxBackend>, args: &Args) -> SandboxRuntime {
-    SandboxRuntime::backend_with_workload(backend, container_workload_mode(args))
+fn container_sandbox_runtime(
+    backend: Arc<AgentSandboxBackend>,
+    args: &Args,
+) -> Result<SandboxRuntime, ServerError> {
+    Ok(SandboxRuntime::backend_with_workload(
+        backend,
+        container_workload_mode(args)?,
+    ))
 }
 
-fn container_workload_mode(args: &Args) -> SandboxWorkloadMode {
+fn container_workload_mode(args: &Args) -> Result<SandboxWorkloadMode, ServerError> {
     let image = args
         .kubernetes_agent_image
         .clone()
         .unwrap_or_else(|| default_sandbox_image(args.kubernetes_sandbox_workload).to_owned());
     match args.kubernetes_sandbox_workload {
-        SandboxWorkloadKind::Mock => SandboxWorkloadMode::mock_app_server(image),
+        SandboxWorkloadKind::Mock => Ok(SandboxWorkloadMode::mock_app_server(image)),
         SandboxWorkloadKind::CodexAppServer => {
             let mut workload =
                 SandboxWorkloadMode::codex_app_server(image, codex_app_server_env_template(args));
@@ -124,7 +130,7 @@ fn container_workload_mode(args: &Args) -> SandboxWorkloadMode {
                     tool_build_cache_mount_path(args),
                 ));
             }
-            workload
+            Ok(workload)
         }
     }
 }
@@ -190,6 +196,8 @@ struct Args {
     kubernetes_sandbox_state_volume_storage_class: Option<String>,
     #[arg(long, env = "REPOS_PATH")]
     repos_path: Option<String>,
+    #[arg(long, env = "CENTAUR_OVERLAY_REPO")]
+    centaur_overlay_repo: Option<String>,
     #[arg(long, env = "KUBERNETES_TOOL_BUILD_CACHE_HOST_PATH")]
     kubernetes_tool_build_cache_host_path: Option<String>,
     #[arg(
@@ -585,6 +593,14 @@ fn codex_app_server_env_template(args: &Args) -> Vec<(String, String)> {
     if let Some(value) = clean_optional_value(args.codex_auth_mode.as_deref()) {
         push_env(&mut envs, "CODEX_AUTH_MODE", value);
     }
+    if let Some(overlay_repo) = overlay_repo_from_args(args) {
+        push_env(&mut envs, "CENTAUR_OVERLAY_REPO", overlay_repo.clone());
+        push_env(
+            &mut envs,
+            "CENTAUR_OVERLAY_DIR",
+            format!("{SANDBOX_REPOS_MOUNT_PATH}/{overlay_repo}"),
+        );
+    }
     if clean_optional_value(args.kubernetes_tool_build_cache_host_path.as_deref()).is_some() {
         let mount_path = tool_build_cache_mount_path(args);
         push_env(&mut envs, "XDG_CACHE_HOME", mount_path.clone());
@@ -607,6 +623,16 @@ fn codex_app_server_env_template(args: &Args) -> Vec<(String, String)> {
     }
 
     envs
+}
+
+fn overlay_repo_from_args(args: &Args) -> Option<String> {
+    let repo = clean_optional_value(args.centaur_overlay_repo.as_deref())?
+        .trim_matches('/')
+        .to_owned();
+    if repo.is_empty() || clean_optional_value(args.repos_path.as_deref()).is_none() {
+        return None;
+    }
+    Some(repo)
 }
 
 fn push_env(envs: &mut Vec<(String, String)>, name: &str, value: String) {
@@ -704,7 +730,7 @@ mod tests {
         ])
         .unwrap();
 
-        let workload = container_workload_mode(&args);
+        let workload = container_workload_mode(&args).unwrap();
         let SandboxWorkloadMode::CodexAppServer { env, mounts, .. } = workload else {
             panic!("expected codex app server workload");
         };
@@ -726,6 +752,43 @@ mod tests {
         assert_eq!(env["CARGO_HOME"], "/home/agent/.cache/cargo");
         assert_eq!(env["GOCACHE"], "/home/agent/.cache/go-build");
         assert_eq!(env["GOMODCACHE"], "/home/agent/.cache/go-mod");
+    }
+
+    #[test]
+    fn codex_workload_exposes_repo_cache_overlay_to_sandbox() {
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgresql://postgres@localhost/centaur",
+            "--kubernetes-sandbox-workload",
+            "codex-app-server",
+            "--repos-path",
+            "/var/lib/centaur/repos",
+            "--centaur-overlay-repo",
+            "paradigmxyz/centaur-acme",
+        ])
+        .unwrap();
+
+        let workload = container_workload_mode(&args).unwrap();
+        let SandboxWorkloadMode::CodexAppServer { env, mounts, .. } = workload else {
+            panic!("expected codex app server workload");
+        };
+
+        assert!(mounts.iter().any(|mount| {
+            mount.target_path == SANDBOX_REPOS_MOUNT_PATH
+                && mount.read_only
+                && mount.kind
+                    == (MountKind::Bind {
+                        source_path: "/var/lib/centaur/repos".to_owned(),
+                    })
+        }));
+
+        let env = env.into_iter().collect::<BTreeMap<_, _>>();
+        assert_eq!(env["CENTAUR_OVERLAY_REPO"], "paradigmxyz/centaur-acme");
+        assert_eq!(
+            env["CENTAUR_OVERLAY_DIR"],
+            "/home/agent/github/paradigmxyz/centaur-acme"
+        );
     }
 }
 

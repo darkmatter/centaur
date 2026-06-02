@@ -3,6 +3,8 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::thread;
+use std::time::Duration;
 
 use clap::{CommandFactory, Parser, Subcommand};
 use regex::Regex;
@@ -33,8 +35,24 @@ enum Commands {
         #[arg(num_args = 0.., trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<OsString>,
     },
+    /// Sync agent skills into the active workspace.
+    Skills {
+        #[command(subcommand)]
+        command: SkillsCommand,
+    },
     /// Print command help.
     Help,
+}
+
+#[derive(Debug, Subcommand)]
+enum SkillsCommand {
+    /// Copy skills into the active workspace once.
+    Sync,
+    /// Keep the active workspace skill copy fresh.
+    Watch {
+        #[arg(long, default_value_t = 30)]
+        interval_seconds: u64,
+    },
 }
 
 #[derive(Debug, Error)]
@@ -42,6 +60,17 @@ enum Error {
     #[error("failed to read {path}: {source}")]
     ReadFile {
         path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error("failed to remove file {path}: {source}")]
+    RemoveFile {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error("failed to rename {src} to {dst}: {source}")]
+    Rename {
+        src: PathBuf,
+        dst: PathBuf,
         source: std::io::Error,
     },
     #[error("failed to create {path}: {source}")]
@@ -161,12 +190,156 @@ fn run(cli: Cli) -> Result<i32> {
         }
         Commands::Discover { tool } => discover_tool(&tool),
         Commands::Run { tool, args } => run_tool(&tool, args),
+        Commands::Skills { command } => run_skills_command(command),
         Commands::Help => {
             Cli::command().print_help().map_err(Error::PrintHelp)?;
             println!();
             Ok(0)
         }
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SkillSyncConfig {
+    home_dir: PathBuf,
+    workspace_dir: PathBuf,
+    overlay_dir: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SkillSyncReport {
+    destination: PathBuf,
+    sources: Vec<PathBuf>,
+}
+
+fn run_skills_command(command: SkillsCommand) -> Result<i32> {
+    let config = skill_sync_config_from_env()?;
+    match command {
+        SkillsCommand::Sync => {
+            let report = sync_skills(&config)?;
+            println!(
+                "{}",
+                json!({
+                    "ok": true,
+                    "destination": report.destination,
+                    "source_count": report.sources.len(),
+                })
+            );
+            Ok(0)
+        }
+        SkillsCommand::Watch { interval_seconds } => {
+            sync_skills(&config)?;
+            if interval_seconds == 0 {
+                return Ok(0);
+            }
+            loop {
+                thread::sleep(Duration::from_secs(interval_seconds));
+                sync_skills(&config)?;
+            }
+        }
+    }
+}
+
+fn skill_sync_config_from_env() -> Result<SkillSyncConfig> {
+    let home_dir = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or(Error::MissingHome)?;
+    let state_dir = std::env::var_os("CENTAUR_STATE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home_dir.join("state"));
+    let workspace_dir = if std::env::var("CENTAUR_PERSISTENT_STATE").as_deref() == Ok("1") {
+        state_dir.join("workspace")
+    } else {
+        home_dir.join("workspace")
+    };
+    let overlay_dir = std::env::var_os("CENTAUR_OVERLAY_DIR").map(PathBuf::from);
+    Ok(SkillSyncConfig {
+        home_dir,
+        workspace_dir,
+        overlay_dir,
+    })
+}
+
+fn sync_skills(config: &SkillSyncConfig) -> Result<SkillSyncReport> {
+    let sources = skill_source_dirs(config);
+    let ws_skills = config.workspace_dir.join(".agents").join("skills");
+    let next_skills = ws_skills.with_file_name(format!(
+        "{}.next.{}",
+        ws_skills
+            .file_name()
+            .unwrap_or_else(|| OsStr::new("skills"))
+            .to_string_lossy(),
+        std::process::id()
+    ));
+
+    remove_path_if_exists(&next_skills)?;
+    fs::create_dir_all(&next_skills).map_err(|source| Error::CreateDir {
+        path: next_skills.clone(),
+        source,
+    })?;
+    for source in &sources {
+        copy_dir_contents(source, &next_skills)?;
+    }
+
+    if let Some(parent) = ws_skills.parent() {
+        fs::create_dir_all(parent).map_err(|source| Error::CreateDir {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+    }
+    remove_path_if_exists(&ws_skills)?;
+    fs::rename(&next_skills, &ws_skills).map_err(|source| Error::Rename {
+        src: next_skills.clone(),
+        dst: ws_skills.clone(),
+        source,
+    })?;
+
+    let claude_dir = config.workspace_dir.join(".claude");
+    fs::create_dir_all(&claude_dir).map_err(|source| Error::CreateDir {
+        path: claude_dir.clone(),
+        source,
+    })?;
+    let claude_skills = claude_dir.join("skills");
+    remove_path_if_exists(&claude_skills)?;
+    std::os::unix::fs::symlink(&ws_skills, &claude_skills).map_err(|source| Error::Symlink {
+        src: ws_skills.clone(),
+        dst: claude_skills,
+        source,
+    })?;
+
+    Ok(SkillSyncReport {
+        destination: ws_skills,
+        sources,
+    })
+}
+
+fn skill_source_dirs(config: &SkillSyncConfig) -> Vec<PathBuf> {
+    let mut sources = Vec::new();
+    push_if_dir(&mut sources, config.home_dir.join(".agents").join("skills"));
+    push_if_dir(&mut sources, config.home_dir.join("centaur-skills"));
+    if let Some(centaur_skills) = first_centaur_repo_skills(&config.home_dir.join("github")) {
+        sources.push(centaur_skills);
+    }
+    push_if_dir(&mut sources, config.home_dir.join("centaur-overlay-skills"));
+    if let Some(overlay_dir) = &config.overlay_dir {
+        push_if_dir(&mut sources, overlay_dir.join(".agents").join("skills"));
+    }
+    sources
+}
+
+fn first_centaur_repo_skills(github_dir: &Path) -> Option<PathBuf> {
+    for org in sorted_child_dirs(github_dir) {
+        for repo in sorted_child_dirs(&org) {
+            if repo.file_name() != Some(OsStr::new("centaur")) {
+                continue;
+            }
+            let skills = repo.join(".agents").join("skills");
+            if skills.is_dir() {
+                return Some(skills);
+            }
+        }
+    }
+    None
 }
 
 fn list_tools() -> String {
@@ -446,6 +619,78 @@ fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn copy_dir_contents(src: &Path, dst: &Path) -> Result<()> {
+    fs::create_dir_all(dst).map_err(|source| Error::CreateDir {
+        path: dst.to_path_buf(),
+        source,
+    })?;
+    let entries = fs::read_dir(src).map_err(|source| Error::ReadDir {
+        path: src.to_path_buf(),
+        source,
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|source| Error::ReadDirEntry {
+            path: src.to_path_buf(),
+            source,
+        })?;
+        copy_skill_entry(&entry.path(), &dst.join(entry.file_name()))?;
+    }
+    Ok(())
+}
+
+fn copy_skill_entry(src: &Path, dst: &Path) -> Result<()> {
+    let file_type = fs::symlink_metadata(src).map_err(|source| Error::Metadata {
+        path: src.to_path_buf(),
+        source,
+    })?;
+    if file_type.is_dir() {
+        if dst.exists() && !dst.is_dir() {
+            remove_path_if_exists(dst)?;
+        }
+        fs::create_dir_all(dst).map_err(|source| Error::CreateDir {
+            path: dst.to_path_buf(),
+            source,
+        })?;
+        copy_dir_contents(src, dst)?;
+    } else if file_type.is_symlink() {
+        remove_path_if_exists(dst)?;
+        let target = fs::read_link(src).map_err(|source| Error::ReadLink {
+            path: src.to_path_buf(),
+            source,
+        })?;
+        std::os::unix::fs::symlink(&target, dst).map_err(|source| Error::Symlink {
+            src: target,
+            dst: dst.to_path_buf(),
+            source,
+        })?;
+    } else {
+        remove_path_if_exists(dst)?;
+        fs::copy(src, dst).map_err(|source| Error::CopyFile {
+            src: src.to_path_buf(),
+            dst: dst.to_path_buf(),
+            source,
+        })?;
+    }
+    Ok(())
+}
+
+fn remove_path_if_exists(path: &Path) -> Result<()> {
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return Ok(());
+    };
+    if metadata.is_dir() {
+        fs::remove_dir_all(path).map_err(|source| Error::RemoveDir {
+            path: path.to_path_buf(),
+            source,
+        })
+    } else {
+        fs::remove_file(path).map_err(|source| Error::RemoveFile {
+            path: path.to_path_buf(),
+            source,
+        })
+    }
 }
 
 fn run_rust_tool(row: &ToolRow, args: &[OsString]) -> Result<i32> {
@@ -1033,6 +1278,63 @@ acme-crm = "centaur_tool_acme_crm.cli:main"
         };
 
         assert_eq!(python_executable_name(&row, &row.dir), "acme-crm");
+    }
+
+    #[test]
+    fn syncs_overlay_skills_into_workspace_and_refreshes_changes() {
+        let temp = TempTree::new("skills-sync");
+        temp.write("home/.agents/skills/acme-support/SKILL.md", "base skill\n");
+        temp.write(
+            "home/github/paradigmxyz/centaur/.agents/skills/eng/SKILL.md",
+            "centaur skill\n",
+        );
+        temp.write(
+            "home/centaur-overlay-skills/acme-support/SKILL.md",
+            "mounted org skill\n",
+        );
+        let overlay_skill = temp.write(
+            "home/github/paradigmxyz/centaur-acme/.agents/skills/acme-support/SKILL.md",
+            "overlay skill v1\n",
+        );
+        let config = SkillSyncConfig {
+            home_dir: temp.path("home"),
+            workspace_dir: temp.path("home/workspace"),
+            overlay_dir: Some(temp.path("home/github/paradigmxyz/centaur-acme")),
+        };
+
+        let report = sync_skills(&config).unwrap();
+
+        assert_eq!(
+            report.sources,
+            vec![
+                temp.path("home/.agents/skills"),
+                temp.path("home/github/paradigmxyz/centaur/.agents/skills"),
+                temp.path("home/centaur-overlay-skills"),
+                temp.path("home/github/paradigmxyz/centaur-acme/.agents/skills"),
+            ]
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path("home/workspace/.agents/skills/acme-support/SKILL.md"))
+                .unwrap(),
+            "overlay skill v1\n"
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path("home/workspace/.agents/skills/eng/SKILL.md")).unwrap(),
+            "centaur skill\n"
+        );
+        assert_eq!(
+            fs::read_link(temp.path("home/workspace/.claude/skills")).unwrap(),
+            temp.path("home/workspace/.agents/skills")
+        );
+
+        fs::write(overlay_skill, "overlay skill v2\n").unwrap();
+        sync_skills(&config).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(temp.path("home/workspace/.agents/skills/acme-support/SKILL.md"))
+                .unwrap(),
+            "overlay skill v2\n"
+        );
     }
 
     #[test]

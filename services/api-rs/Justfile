@@ -12,11 +12,12 @@ agent_sandbox_crd_tmp := "target/codegen/agents.x-k8s.io_sandboxes.yaml"
 agent_sandbox_generated := "crates/centaur-sandbox-agent-k8s/src/generated/agents_x_k8s_io.rs"
 agent_sandbox_controller_image := "registry.k8s.io/agent-sandbox/agent-sandbox-controller:v0.4.6"
 agent_sandbox_rbac_url := "https://raw.githubusercontent.com/kubernetes-sigs/agent-sandbox/" + agent_sandbox_ref + "/k8s/rbac.generated.yaml"
+agent_sandbox_extensions_rbac_url := "https://raw.githubusercontent.com/kubernetes-sigs/agent-sandbox/" + agent_sandbox_ref + "/k8s/extensions-rbac.generated.yaml"
 agent_sandbox_controller_url := "https://raw.githubusercontent.com/kubernetes-sigs/agent-sandbox/" + agent_sandbox_ref + "/k8s/controller.yaml"
-kind_e2e_cluster := "centaur-api-rs-e2e"
-kind_e2e_context := "kind-" + kind_e2e_cluster
-kind_e2e_namespace := "centaur-sandbox-e2e"
-kind_e2e_tmp := "target/e2e"
+k3d_e2e_cluster := "centaur-api-rs-e2e"
+k3d_e2e_context := "k3d-" + k3d_e2e_cluster
+k3d_e2e_namespace := "centaur-sandbox-e2e"
+k3d_e2e_tmp := "target/e2e"
 
 default:
     just --list
@@ -31,34 +32,55 @@ codegen-agent-sandbox-crd:
     kopium --filename "{{agent_sandbox_crd_tmp}}" --api-version v1alpha1 --schema disabled --derive PartialEq > "{{agent_sandbox_generated}}"
     cargo fmt --all
 
-kind-e2e-up:
-    command -v kind >/dev/null || { echo "kind is required" >&2; exit 127; }
+k3d-e2e-up:
+    command -v k3d >/dev/null || { echo "k3d is required" >&2; exit 127; }
     command -v kubectl >/dev/null || { echo "kubectl is required" >&2; exit 127; }
-    kind get clusters | grep -qx "{{kind_e2e_cluster}}" || kind create cluster --name "{{kind_e2e_cluster}}" --wait 120s
-    if docker image inspect centaur-iron-proxy:latest >/dev/null 2>&1; then kind load docker-image --name "{{kind_e2e_cluster}}" centaur-iron-proxy:latest; fi
-    mkdir -p "{{kind_e2e_tmp}}"
-    curl -fsSL "{{agent_sandbox_crd_url}}" -o "{{kind_e2e_tmp}}/agents.x-k8s.io_sandboxes.yaml"
-    curl -fsSL "{{agent_sandbox_template_crd_url}}" -o "{{kind_e2e_tmp}}/extensions.agents.x-k8s.io_sandboxtemplates.yaml"
-    curl -fsSL "{{agent_sandbox_claim_crd_url}}" -o "{{kind_e2e_tmp}}/extensions.agents.x-k8s.io_sandboxclaims.yaml"
-    curl -fsSL "{{agent_sandbox_warm_pool_crd_url}}" -o "{{kind_e2e_tmp}}/extensions.agents.x-k8s.io_sandboxwarmpools.yaml"
-    curl -fsSL "{{agent_sandbox_rbac_url}}" -o "{{kind_e2e_tmp}}/rbac.generated.yaml"
+    k3d cluster get "{{k3d_e2e_cluster}}" >/dev/null 2>&1 || k3d cluster create "{{k3d_e2e_cluster}}" --wait
+    for i in {1..30}; do kubectl --context "{{k3d_e2e_context}}" get --raw=/readyz >/dev/null 2>&1 && break; sleep 1; if [ "$i" = 30 ]; then kubectl --context "{{k3d_e2e_context}}" get --raw=/readyz; fi; done
+    if docker image inspect centaur-iron-proxy:latest >/dev/null 2>&1; then k3d image import centaur-iron-proxy:latest --cluster "{{k3d_e2e_cluster}}"; fi
+    mkdir -p "{{k3d_e2e_tmp}}"
+    curl -fsSL "{{agent_sandbox_crd_url}}" -o "{{k3d_e2e_tmp}}/agents.x-k8s.io_sandboxes.yaml"
+    curl -fsSL "{{agent_sandbox_template_crd_url}}" -o "{{k3d_e2e_tmp}}/extensions.agents.x-k8s.io_sandboxtemplates.yaml"
+    curl -fsSL "{{agent_sandbox_claim_crd_url}}" -o "{{k3d_e2e_tmp}}/extensions.agents.x-k8s.io_sandboxclaims.yaml"
+    curl -fsSL "{{agent_sandbox_warm_pool_crd_url}}" -o "{{k3d_e2e_tmp}}/extensions.agents.x-k8s.io_sandboxwarmpools.yaml"
+    curl -fsSL "{{agent_sandbox_rbac_url}}" -o "{{k3d_e2e_tmp}}/rbac.generated.yaml"
+    curl -fsSL "{{agent_sandbox_extensions_rbac_url}}" -o "{{k3d_e2e_tmp}}/extensions-rbac.generated.yaml"
     curl -fsSL "{{agent_sandbox_controller_url}}" \
       | sed 's#ko://sigs.k8s.io/agent-sandbox/cmd/agent-sandbox-controller.*#{{agent_sandbox_controller_image}}#' \
-      > "{{kind_e2e_tmp}}/controller.yaml"
-    kubectl --context "{{kind_e2e_context}}" apply -f "{{kind_e2e_tmp}}/agents.x-k8s.io_sandboxes.yaml"
-    kubectl --context "{{kind_e2e_context}}" apply -f "{{kind_e2e_tmp}}/extensions.agents.x-k8s.io_sandboxtemplates.yaml"
-    kubectl --context "{{kind_e2e_context}}" apply -f "{{kind_e2e_tmp}}/extensions.agents.x-k8s.io_sandboxclaims.yaml"
-    kubectl --context "{{kind_e2e_context}}" apply -f "{{kind_e2e_tmp}}/extensions.agents.x-k8s.io_sandboxwarmpools.yaml"
-    kubectl --context "{{kind_e2e_context}}" apply -f "{{kind_e2e_tmp}}/rbac.generated.yaml"
-    kubectl --context "{{kind_e2e_context}}" apply -f "{{kind_e2e_tmp}}/controller.yaml"
-    kubectl --context "{{kind_e2e_context}}" create namespace "{{kind_e2e_namespace}}" --dry-run=client -o yaml | kubectl --context "{{kind_e2e_context}}" apply -f -
-    kubectl --context "{{kind_e2e_context}}" -n agent-sandbox-system rollout status deploy/agent-sandbox-controller --timeout=120s
+      | awk '{ print } /--leader-elect=true/ { print "        - --extensions=true" }' \
+      > "{{k3d_e2e_tmp}}/controller.yaml"
+    kubectl --context "{{k3d_e2e_context}}" apply -f "{{k3d_e2e_tmp}}/agents.x-k8s.io_sandboxes.yaml"
+    kubectl --context "{{k3d_e2e_context}}" apply -f "{{k3d_e2e_tmp}}/extensions.agents.x-k8s.io_sandboxtemplates.yaml"
+    kubectl --context "{{k3d_e2e_context}}" apply -f "{{k3d_e2e_tmp}}/extensions.agents.x-k8s.io_sandboxclaims.yaml"
+    kubectl --context "{{k3d_e2e_context}}" apply -f "{{k3d_e2e_tmp}}/extensions.agents.x-k8s.io_sandboxwarmpools.yaml"
+    kubectl --context "{{k3d_e2e_context}}" apply -f "{{k3d_e2e_tmp}}/rbac.generated.yaml"
+    kubectl --context "{{k3d_e2e_context}}" apply -f "{{k3d_e2e_tmp}}/extensions-rbac.generated.yaml"
+    kubectl --context "{{k3d_e2e_context}}" create clusterrolebinding agent-sandbox-controller-extensions --clusterrole=agent-sandbox-controller-extensions --serviceaccount=agent-sandbox-system:agent-sandbox-controller --dry-run=client -o yaml | kubectl --context "{{k3d_e2e_context}}" apply -f -
+    kubectl --context "{{k3d_e2e_context}}" apply -f "{{k3d_e2e_tmp}}/controller.yaml"
+    kubectl --context "{{k3d_e2e_context}}" -n agent-sandbox-system rollout status deploy/agent-sandbox-controller --timeout=120s
+    kubectl --context "{{k3d_e2e_context}}" -n agent-sandbox-system patch deploy agent-sandbox-controller --type=json --patch '[{"op":"replace","path":"/spec/template/spec/containers/0/args","value":["--leader-elect=true","--extensions=true"]}]'
+    kubectl --context "{{k3d_e2e_context}}" -n agent-sandbox-system rollout status deploy/agent-sandbox-controller --timeout=120s
+    for i in {1..60}; do \
+      args="$(kubectl --context "{{k3d_e2e_context}}" -n agent-sandbox-system get pods -l app=agent-sandbox-controller -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.status.phase}{" "}{.spec.containers[0].args}{"\n"}{end}')" ; \
+      running="$(printf '%s\n' "$args" | grep -c ' Running ' || true)" ; \
+      missing="$(printf '%s\n' "$args" | grep ' Running ' | grep -vc -- '--extensions=true' || true)" ; \
+      [ "$running" -ge 1 ] && [ "$missing" = 0 ] && break ; \
+      sleep 1 ; \
+      if [ "$i" = 60 ]; then printf '%s\n' "$args"; exit 1; fi ; \
+    done
+    kubectl --context "{{k3d_e2e_context}}" create namespace "{{k3d_e2e_namespace}}" --dry-run=client -o yaml | kubectl --context "{{k3d_e2e_context}}" apply -f -
 
-e2e-kind: kind-e2e-up
+e2e-k3d: k3d-e2e-up
     SANDBOX_E2E_IMPLS=all \
-    SANDBOX_E2E_K8S_CONTEXT="{{kind_e2e_context}}" \
-    SANDBOX_E2E_K8S_NAMESPACE="{{kind_e2e_namespace}}" \
+    SANDBOX_E2E_K8S_CONTEXT="{{k3d_e2e_context}}" \
+    SANDBOX_E2E_K8S_NAMESPACE="{{k3d_e2e_namespace}}" \
     cargo test -p centaur-sandbox-e2e -- --ignored --nocapture
 
-kind-e2e-down:
-    kind delete cluster --name "{{kind_e2e_cluster}}"
+k3d-e2e-down:
+    k3d cluster delete "{{k3d_e2e_cluster}}"
+
+kind-e2e-up: k3d-e2e-up
+
+e2e-kind: e2e-k3d
+
+kind-e2e-down: k3d-e2e-down

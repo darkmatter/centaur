@@ -10,19 +10,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-#[cfg(test)]
-use centaur_iron_proxy::SourceKind;
-use centaur_iron_proxy::{CorePgListener, ProxyFragment, SourcePolicy};
+use centaur_iron_proxy::{CorePgListener, ProxyFragment, SourceKind, SourcePolicy};
 use centaur_sandbox_core::{
     MountKind, ObservedSandbox, SandboxBackend, SandboxError, SandboxHandle, SandboxId, SandboxIo,
     SandboxResult, SandboxSpec, SandboxStatus,
 };
-#[cfg(test)]
 use k8s_openapi::api::apps::v1::Deployment;
-#[cfg(test)]
-use k8s_openapi::api::core::v1::{ConfigMap, Service};
-use k8s_openapi::api::core::v1::{PersistentVolumeClaim, Pod};
-#[cfg(test)]
+use k8s_openapi::api::core::v1::{ConfigMap, Endpoints, PersistentVolumeClaim, Pod, Service};
 use k8s_openapi::api::networking::v1::NetworkPolicy;
 use kube::api::{
     ApiResource, AttachParams, DeleteParams, DynamicObject, GroupVersionKind, ListParams, Patch,
@@ -30,11 +24,9 @@ use kube::api::{
 };
 use kube::{Api, Client, Error};
 use serde_json::{Value, json};
-#[cfg(test)]
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::time::{Instant, sleep};
-#[cfg(test)]
 use uuid::Uuid;
 
 pub use generated::agents_x_k8s_io as crd;
@@ -52,11 +44,10 @@ const SANDBOX_CLAIM_LABEL: &str = "centaur.ai/sandbox-claim";
 const SANDBOX_TEMPLATE_LABEL: &str = "centaur.ai/sandbox-template";
 const SANDBOX_WARM_POOL_LABEL: &str = "centaur.ai/sandbox-warm-pool";
 const MANAGED_BY_VALUE: &str = "api-rs";
-#[cfg(test)]
 const TOKEN_BROKER_LABEL: &str = "centaur.ai/iron-token-broker";
-#[cfg(test)]
 const TOKEN_BROKER_CONFIG_KEY: &str = "iron-token-broker.yaml";
 const THREAD_KEY_ENV: &str = "CENTAUR_THREAD_KEY";
+const SANDBOX_POD_NAME_ENV: &str = "CENTAUR_SANDBOX_POD_NAME";
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -216,7 +207,6 @@ struct ResolvedIronProxy {
     config_yaml: String,
     placeholder_env: BTreeMap<String, String>,
     proxy_host: String,
-    proxy_pod_name: String,
     proxy_port: u16,
     listen_ports: Vec<u16>,
     pg_dsn_env: BTreeMap<String, String>,
@@ -275,22 +265,22 @@ impl AgentSandboxBackend {
         Api::namespaced(self.client.clone(), &self.config.namespace)
     }
 
-    #[cfg(test)]
     fn config_maps(&self) -> Api<ConfigMap> {
         Api::namespaced(self.client.clone(), &self.config.namespace)
     }
 
-    #[cfg(test)]
+    fn endpoints(&self) -> Api<Endpoints> {
+        Api::namespaced(self.client.clone(), &self.config.namespace)
+    }
+
     fn services(&self) -> Api<Service> {
         Api::namespaced(self.client.clone(), &self.config.namespace)
     }
 
-    #[cfg(test)]
     fn network_policies(&self) -> Api<NetworkPolicy> {
         Api::namespaced(self.client.clone(), &self.config.namespace)
     }
 
-    #[cfg(test)]
     fn deployments(&self) -> Api<Deployment> {
         Api::namespaced(self.client.clone(), &self.config.namespace)
     }
@@ -363,8 +353,16 @@ impl AgentSandboxBackend {
         &self,
         spec: &SandboxSpec,
         warm_pool: &SandboxWarmPoolConfig,
-    ) -> SandboxResult<()> {
-        let template = build_sandbox_template(warm_pool, spec, &self.config)?;
+    ) -> SandboxResult<Option<ResolvedIronProxy>> {
+        let resolved_iron_proxy = self.resolve_iron_proxy(spec)?;
+        if resolved_iron_proxy.is_some() {
+            if let Some(iron_proxy) = &self.config.iron_proxy {
+                self.reconcile_token_broker(iron_proxy).await?;
+            }
+        }
+
+        let template =
+            build_sandbox_template(warm_pool, spec, &self.config, resolved_iron_proxy.as_ref())?;
         let pool = build_sandbox_warm_pool(warm_pool);
         let params = PatchParams::apply(&self.config.field_manager).force();
         self.sandbox_templates(warm_pool)
@@ -375,7 +373,7 @@ impl AgentSandboxBackend {
             .patch(&warm_pool.pool_name, &params, &Patch::Apply(&pool))
             .await
             .map_err(|err| map_kube_error("apply sandbox warm pool", err))?;
-        Ok(())
+        Ok(resolved_iron_proxy)
     }
 
     async fn create_from_warm_pool(
@@ -384,7 +382,10 @@ impl AgentSandboxBackend {
         warm_pool: &SandboxWarmPoolConfig,
     ) -> SandboxResult<SandboxHandle> {
         validate_warm_pool_spec(&spec, &self.config)?;
-        self.reconcile_warm_pool(&spec, warm_pool).await?;
+        let resolved_iron_proxy = self.reconcile_warm_pool(&spec, warm_pool).await?;
+        if let Some(resolved) = resolved_iron_proxy.clone() {
+            self.spawn_warm_pool_proxy_prewarm(warm_pool.clone(), resolved);
+        }
         self.wait_for_warm_pool_ready(warm_pool).await?;
 
         let claim_id = SandboxId::new(next_sandbox_name());
@@ -395,12 +396,79 @@ impl AgentSandboxBackend {
             .map_err(|err| map_kube_error("create sandbox warm-pool claim", err))?;
 
         match self.wait_for_sandbox_claim(&claim_id, warm_pool).await {
-            Ok(id) => Ok(SandboxHandle::new(id, BACKEND_NAME)),
+            Ok(id) => {
+                if let Some(resolved) = resolved_iron_proxy.as_ref()
+                    && let Err(err) = self
+                        .create_iron_proxy_resources(&id, &claim_id, resolved)
+                        .await
+                {
+                    let _ = self.delete_sandbox_claim(&claim_id, warm_pool).await;
+                    let _ = self.delete_iron_proxy_resources(&id).await;
+                    return Err(err);
+                }
+                if let Some(resolved) = resolved_iron_proxy.clone() {
+                    self.spawn_warm_pool_proxy_prewarm(warm_pool.clone(), resolved);
+                }
+                Ok(SandboxHandle::new(id, BACKEND_NAME))
+            }
             Err(err) => {
                 let _ = self.delete_sandbox_claim(&claim_id, warm_pool).await;
                 Err(err)
             }
         }
+    }
+
+    fn spawn_warm_pool_proxy_prewarm(
+        &self,
+        warm_pool: SandboxWarmPoolConfig,
+        resolved: ResolvedIronProxy,
+    ) {
+        let backend = self.clone();
+        tokio::spawn(async move {
+            if backend.wait_for_warm_pool_ready(&warm_pool).await.is_ok() {
+                let _ = backend
+                    .prewarm_ready_warm_pool_proxies(&warm_pool, &resolved)
+                    .await;
+            }
+        });
+    }
+
+    async fn prewarm_ready_warm_pool_proxies(
+        &self,
+        warm_pool: &SandboxWarmPoolConfig,
+        resolved: &ResolvedIronProxy,
+    ) -> SandboxResult<()> {
+        let sandboxes = self
+            .sandboxes()
+            .list(&ListParams::default())
+            .await
+            .map_err(|err| map_kube_error("list warm-pool sandboxes", err))?;
+        for sandbox in sandboxes {
+            if !is_unclaimed_warm_pool_sandbox(&sandbox, warm_pool) {
+                continue;
+            }
+            let Some(name) = sandbox.metadata.name.clone() else {
+                continue;
+            };
+            let id = SandboxId::new(name);
+            let pod_name = sandbox_pod_name(&sandbox, &id);
+            let pod = match self.pods().get(&pod_name).await {
+                Ok(pod) => pod,
+                Err(err) if is_not_found(&err) => continue,
+                Err(err) => return Err(map_kube_error("get warm-pool sandbox pod", err)),
+            };
+            if !pod_ready(&pod) {
+                continue;
+            }
+            self.create_iron_proxy_configmap(&id, Some(resolved))
+                .await?;
+            self.create_iron_proxy_service(&id, resolved).await?;
+            self.create_iron_proxy_pod(&id, resolved).await?;
+            self.wait_until_proxy_running(&iron_proxy_pod_name(&id))
+                .await?;
+            self.wait_until_proxy_endpoint_ready(&id, resolved).await?;
+        }
+        Ok(())
     }
 
     async fn wait_for_warm_pool_ready(
@@ -445,6 +513,7 @@ impl AgentSandboxBackend {
             if let Some(name) = claim_sandbox_name(&claim) {
                 let id = SandboxId::new(name);
                 self.wait_until_running(&id).await?;
+                self.label_claimed_sandbox(&id, claim_id, warm_pool).await?;
                 return Ok(id);
             }
             if Instant::now() >= deadline {
@@ -473,6 +542,35 @@ impl AgentSandboxBackend {
         }
     }
 
+    async fn label_claimed_sandbox(
+        &self,
+        id: &SandboxId,
+        claim_id: &SandboxId,
+        warm_pool: &SandboxWarmPoolConfig,
+    ) -> SandboxResult<()> {
+        let labels = adopted_sandbox_labels(id, claim_id, warm_pool);
+        let patch = Patch::Merge(json!({
+            "metadata": {
+                "labels": labels,
+            },
+        }));
+        self.sandboxes()
+            .patch(id.as_str(), &PatchParams::default(), &patch)
+            .await
+            .map_err(|err| map_kube_error("label claimed sandbox", err))?;
+
+        let sandbox = self
+            .get_sandbox(id)
+            .await?
+            .ok_or_else(|| SandboxError::NotFound(id.as_str().to_owned()))?;
+        let pod_name = sandbox_pod_name(&sandbox, id);
+        self.pods()
+            .patch(&pod_name, &PatchParams::default(), &patch)
+            .await
+            .map(|_| ())
+            .map_err(|err| map_kube_error("label claimed sandbox pod", err))
+    }
+
     async fn delete_warm_pool_claim_for_sandbox(&self, id: &SandboxId) -> SandboxResult<()> {
         let warm_pool = &self.config.warm_pool;
         let Some(sandbox) = self.get_sandbox(id).await? else {
@@ -485,12 +583,7 @@ impl AgentSandboxBackend {
         Ok(())
     }
 
-    #[cfg(test)]
-    fn resolve_iron_proxy(
-        &self,
-        id: &SandboxId,
-        spec: &SandboxSpec,
-    ) -> SandboxResult<Option<ResolvedIronProxy>> {
+    fn resolve_iron_proxy(&self, spec: &SandboxSpec) -> SandboxResult<Option<ResolvedIronProxy>> {
         let Some(iron_proxy) = &self.config.iron_proxy else {
             return Ok(None);
         };
@@ -522,7 +615,7 @@ impl AgentSandboxBackend {
             .map_err(|err| SandboxError::InvalidSpec(format!("iron-proxy proxy port: {err}")))?;
         let listen_ports = centaur_iron_proxy::listen_ports_from_yaml(&config_yaml)
             .map_err(|err| SandboxError::InvalidSpec(format!("iron-proxy listen ports: {err}")))?;
-        let proxy_host = iron_proxy_service_name(id);
+        let proxy_host = sandbox_proxy_host_template();
         let mut pg_dsn_env = BTreeMap::new();
         let mut pg_proxy_password_env = BTreeMap::new();
         for entry in centaur_iron_proxy::pg_dsn_envs(&fragments) {
@@ -538,7 +631,6 @@ impl AgentSandboxBackend {
             config_yaml,
             placeholder_env,
             proxy_host,
-            proxy_pod_name: new_iron_proxy_pod_name(id),
             proxy_port,
             listen_ports,
             pg_dsn_env,
@@ -546,7 +638,6 @@ impl AgentSandboxBackend {
         }))
     }
 
-    #[cfg(test)]
     async fn create_iron_proxy_configmap(
         &self,
         id: &SandboxId,
@@ -556,7 +647,6 @@ impl AgentSandboxBackend {
             return Ok(());
         };
         let name = iron_proxy_configmap_name(id);
-        let _ = self.delete_iron_proxy_configmap(id).await;
         let mut data = BTreeMap::new();
         data.insert("proxy.yaml".to_owned(), resolved.config_yaml.clone());
         let body = ConfigMap {
@@ -568,30 +658,31 @@ impl AgentSandboxBackend {
             data: Some(data),
             ..Default::default()
         };
-        self.config_maps()
-            .create(&PostParams::default(), &body)
-            .await
-            .map(|_| ())
-            .map_err(|err| map_kube_error("create iron-proxy configmap", err))
-    }
-
-    #[cfg(test)]
-    async fn delete_iron_proxy_configmap(&self, id: &SandboxId) -> SandboxResult<()> {
-        if self.config.iron_proxy.is_none() {
-            return Ok(());
-        }
         match self
             .config_maps()
-            .delete(&iron_proxy_configmap_name(id), &DeleteParams::default())
+            .create(&PostParams::default(), &body)
             .await
         {
             Ok(_) => Ok(()),
-            Err(err) if is_not_found(&err) => Ok(()),
-            Err(err) => Err(map_kube_error("delete iron-proxy configmap", err)),
+            Err(err) if is_already_exists(&err) => {
+                let patch = Patch::Merge(json!({
+                    "metadata": {"labels": iron_proxy_labels(id)},
+                    "data": body.data,
+                }));
+                self.config_maps()
+                    .patch(
+                        &iron_proxy_configmap_name(id),
+                        &PatchParams::default(),
+                        &patch,
+                    )
+                    .await
+                    .map(|_| ())
+                    .map_err(|err| map_kube_error("patch iron-proxy configmap", err))
+            }
+            Err(err) => Err(map_kube_error("create iron-proxy configmap", err)),
         }
     }
 
-    #[cfg(test)]
     async fn reconcile_token_broker(&self, iron_proxy: &IronProxyPodConfig) -> SandboxResult<()> {
         let Some(token_broker_name) = iron_proxy.token_broker_name.as_deref() else {
             return Ok(());
@@ -616,7 +707,6 @@ impl AgentSandboxBackend {
         Ok(())
     }
 
-    #[cfg(test)]
     async fn apply_token_broker_configmap(
         &self,
         iron_proxy: &IronProxyPodConfig,
@@ -664,7 +754,6 @@ impl AgentSandboxBackend {
         }
     }
 
-    #[cfg(test)]
     async fn patch_token_broker_config_hash(
         &self,
         token_broker_name: &str,
@@ -692,42 +781,58 @@ impl AgentSandboxBackend {
         }
     }
 
-    #[cfg(test)]
     async fn create_iron_proxy_resources(
         &self,
         id: &SandboxId,
-        resolved: Option<&ResolvedIronProxy>,
+        claim_id: &SandboxId,
+        resolved: &ResolvedIronProxy,
     ) -> SandboxResult<()> {
-        let Some(resolved) = resolved else {
-            return Ok(());
-        };
-        if let Some(iron_proxy) = &self.config.iron_proxy {
-            self.reconcile_token_broker(iron_proxy).await?;
-        }
-        self.delete_iron_proxy_resources(id).await?;
         self.create_iron_proxy_configmap(id, Some(resolved)).await?;
         self.create_iron_proxy_service(id, resolved).await?;
-        self.create_iron_proxy_network_policies(id, resolved)
-            .await?;
+        self.create_iron_proxy_network_policies(
+            id,
+            resolved,
+            &sandbox_claim_selector_labels(claim_id),
+            &sandbox_labels(id),
+        )
+        .await?;
         self.create_iron_proxy_pod(id, resolved).await?;
-        self.wait_until_proxy_running(resolved).await
+        self.wait_until_proxy_running(&iron_proxy_pod_name(id))
+            .await?;
+        self.wait_until_proxy_endpoint_ready(id, resolved).await
     }
 
-    #[cfg(test)]
     async fn create_iron_proxy_service(
         &self,
         id: &SandboxId,
         resolved: &ResolvedIronProxy,
     ) -> SandboxResult<()> {
         let service = build_iron_proxy_service(id, resolved)?;
-        self.services()
+        match self
+            .services()
             .create(&PostParams::default(), &service)
             .await
-            .map(|_| ())
-            .map_err(|err| map_kube_error("create iron-proxy service", err))
+        {
+            Ok(_) => Ok(()),
+            Err(err) if is_already_exists(&err) => {
+                let patch = Patch::Merge(json!({
+                    "metadata": {"labels": service.metadata.labels},
+                    "spec": service.spec,
+                }));
+                self.services()
+                    .patch(
+                        &iron_proxy_service_name(id),
+                        &PatchParams::default(),
+                        &patch,
+                    )
+                    .await
+                    .map(|_| ())
+                    .map_err(|err| map_kube_error("patch iron-proxy service", err))
+            }
+            Err(err) => Err(map_kube_error("create iron-proxy service", err)),
+        }
     }
 
-    #[cfg(test)]
     async fn create_iron_proxy_pod(
         &self,
         id: &SandboxId,
@@ -736,33 +841,86 @@ impl AgentSandboxBackend {
         let Some(iron_proxy) = &self.config.iron_proxy else {
             return Ok(());
         };
-        let pod = build_iron_proxy_pod(id, &resolved.proxy_pod_name, iron_proxy, resolved)?;
-        self.pods()
-            .create(&PostParams::default(), &pod)
-            .await
-            .map(|_| ())
-            .map_err(|err| map_kube_error("create iron-proxy pod", err))
+        let pod_name = iron_proxy_pod_name(id);
+        let pod = build_iron_proxy_pod(id, &pod_name, iron_proxy, resolved)?;
+        match self.pods().get(&pod_name).await {
+            Ok(existing)
+                if proxy_pod_config_hash(&existing)
+                    == Some(short_sha256(&resolved.config_yaml)) =>
+            {
+                Ok(())
+            }
+            Ok(_) => {
+                let _ = self
+                    .pods()
+                    .delete(&pod_name, &DeleteParams::default())
+                    .await;
+                self.wait_until_proxy_gone(&pod_name).await?;
+                self.pods()
+                    .create(&PostParams::default(), &pod)
+                    .await
+                    .map(|_| ())
+                    .map_err(|err| map_kube_error("create iron-proxy pod", err))
+            }
+            Err(err) if is_not_found(&err) => self
+                .pods()
+                .create(&PostParams::default(), &pod)
+                .await
+                .map(|_| ())
+                .or_else(|err| {
+                    if is_already_exists(&err) {
+                        Ok(())
+                    } else {
+                        Err(err)
+                    }
+                })
+                .map_err(|err| map_kube_error("create iron-proxy pod", err)),
+            Err(err) => Err(map_kube_error("get iron-proxy pod", err)),
+        }
     }
 
-    #[cfg(test)]
     async fn create_iron_proxy_network_policies(
         &self,
         id: &SandboxId,
         resolved: &ResolvedIronProxy,
+        sandbox_selector_labels: &BTreeMap<String, String>,
+        resource_labels: &BTreeMap<String, String>,
     ) -> SandboxResult<()> {
         let Some(iron_proxy) = &self.config.iron_proxy else {
             return Ok(());
         };
-        for policy in build_iron_proxy_network_policies(id, resolved, iron_proxy)? {
-            self.network_policies()
+        for policy in build_iron_proxy_network_policies(
+            id,
+            resolved,
+            iron_proxy,
+            sandbox_selector_labels,
+            resource_labels,
+        )? {
+            match self
+                .network_policies()
                 .create(&PostParams::default(), &policy)
                 .await
-                .map_err(|err| map_kube_error("create iron-proxy network policy", err))?;
+            {
+                Ok(_) => {}
+                Err(err) if is_already_exists(&err) => {
+                    let name = policy.metadata.name.as_deref().ok_or_else(|| {
+                        SandboxError::InvalidSpec("iron-proxy policy missing name".to_owned())
+                    })?;
+                    let patch = Patch::Merge(json!({
+                        "metadata": {"labels": policy.metadata.labels},
+                        "spec": policy.spec,
+                    }));
+                    self.network_policies()
+                        .patch(name, &PatchParams::default(), &patch)
+                        .await
+                        .map_err(|err| map_kube_error("patch iron-proxy network policy", err))?;
+                }
+                Err(err) => return Err(map_kube_error("create iron-proxy network policy", err)),
+            }
         }
         Ok(())
     }
 
-    #[cfg(test)]
     async fn delete_iron_proxy_resources(&self, id: &SandboxId) -> SandboxResult<()> {
         if self.config.iron_proxy.is_none() {
             return Ok(());
@@ -771,10 +929,13 @@ impl AgentSandboxBackend {
             .pods()
             .delete(&iron_proxy_pod_name(id), &DeleteParams::default())
             .await;
-        let _ = self.delete_iron_proxy_pods_for_sandbox(id).await;
         let _ = self
             .services()
             .delete(&iron_proxy_service_name(id), &DeleteParams::default())
+            .await;
+        let _ = self
+            .config_maps()
+            .delete(&iron_proxy_configmap_name(id), &DeleteParams::default())
             .await;
         for name in [
             iron_proxy_sandbox_egress_policy_name(id),
@@ -784,25 +945,6 @@ impl AgentSandboxBackend {
                 .network_policies()
                 .delete(&name, &DeleteParams::default())
                 .await;
-        }
-        self.delete_iron_proxy_configmap(id).await
-    }
-
-    #[cfg(test)]
-    async fn delete_iron_proxy_pods_for_sandbox(&self, id: &SandboxId) -> SandboxResult<()> {
-        let params = ListParams::default().labels(&format!(
-            "centaur.ai/iron-proxy=true,{SANDBOX_ID_LABEL}={}",
-            id.as_str()
-        ));
-        let pods = self
-            .pods()
-            .list(&params)
-            .await
-            .map_err(|err| map_kube_error("list iron-proxy pods", err))?;
-        for pod in pods.items {
-            if let Some(name) = pod.metadata.name {
-                let _ = self.pods().delete(&name, &DeleteParams::default()).await;
-            }
         }
         Ok(())
     }
@@ -829,10 +971,8 @@ impl AgentSandboxBackend {
         }
     }
 
-    #[cfg(test)]
-    async fn wait_until_proxy_running(&self, resolved: &ResolvedIronProxy) -> SandboxResult<()> {
+    async fn wait_until_proxy_running(&self, pod_name: &str) -> SandboxResult<()> {
         let deadline = Instant::now() + self.config.ready_timeout;
-        let pod_name = &resolved.proxy_pod_name;
         loop {
             match self.pods().get(pod_name).await {
                 Ok(pod) if sandbox_status_from_pod(1, Some(&pod)) == SandboxStatus::Running => {
@@ -859,6 +999,53 @@ impl AgentSandboxBackend {
                     )));
                 }
                 Err(err) => return Err(map_kube_error("wait iron-proxy pod", err)),
+            }
+        }
+    }
+
+    async fn wait_until_proxy_endpoint_ready(
+        &self,
+        id: &SandboxId,
+        resolved: &ResolvedIronProxy,
+    ) -> SandboxResult<()> {
+        let service_name = iron_proxy_service_name(id);
+        let deadline = Instant::now() + self.config.ready_timeout;
+        loop {
+            match self.endpoints().get(&service_name).await {
+                Ok(endpoints) if endpoint_has_ready_port(&endpoints, resolved.proxy_port) => {
+                    return Ok(());
+                }
+                Ok(_) if Instant::now() >= deadline => {
+                    return Err(SandboxError::NotReady(format!(
+                        "iron-proxy service {service_name} did not publish ready endpoints before timeout"
+                    )));
+                }
+                Ok(_) => sleep(Duration::from_millis(200)).await,
+                Err(err) if is_not_found(&err) && Instant::now() < deadline => {
+                    sleep(Duration::from_millis(200)).await;
+                }
+                Err(err) if is_not_found(&err) => {
+                    return Err(SandboxError::NotReady(format!(
+                        "iron-proxy service {service_name} endpoints were not created before timeout"
+                    )));
+                }
+                Err(err) => return Err(map_kube_error("wait iron-proxy endpoints", err)),
+            }
+        }
+    }
+
+    async fn wait_until_proxy_gone(&self, pod_name: &str) -> SandboxResult<()> {
+        let deadline = Instant::now() + self.config.ready_timeout;
+        loop {
+            match self.pods().get(pod_name).await {
+                Err(err) if is_not_found(&err) => return Ok(()),
+                Err(err) => return Err(map_kube_error("get iron-proxy pod", err)),
+                Ok(_) if Instant::now() >= deadline => {
+                    return Err(SandboxError::NotReady(format!(
+                        "iron-proxy pod {pod_name} was not deleted before timeout"
+                    )));
+                }
+                Ok(_) => sleep(Duration::from_millis(500)).await,
             }
         }
     }
@@ -932,8 +1119,9 @@ impl SandboxBackend for AgentSandboxBackend {
     }
 
     async fn list_observed(&self) -> SandboxResult<Vec<ObservedSandbox>> {
-        let params =
-            ListParams::default().labels(&format!("{MANAGED_BY_LABEL}={MANAGED_BY_VALUE}"));
+        let params = ListParams::default().labels(&format!(
+            "{MANAGED_BY_LABEL}={MANAGED_BY_VALUE},{SANDBOX_CLAIM_LABEL}"
+        ));
         let sandboxes = self
             .sandboxes()
             .list(&params)
@@ -952,6 +1140,7 @@ impl SandboxBackend for AgentSandboxBackend {
 
     async fn stop(&self, id: &SandboxId) -> SandboxResult<()> {
         self.delete_warm_pool_claim_for_sandbox(id).await?;
+        self.delete_iron_proxy_resources(id).await?;
         match self
             .sandboxes()
             .delete(id.as_str(), &DeleteParams::default())
@@ -1012,6 +1201,22 @@ fn pod_ready(pod: &Pod) -> bool {
         })
 }
 
+fn endpoint_has_ready_port(endpoints: &Endpoints, port: u16) -> bool {
+    endpoints.subsets.as_ref().is_some_and(|subsets| {
+        subsets.iter().any(|subset| {
+            subset
+                .addresses
+                .as_ref()
+                .is_some_and(|addresses| !addresses.is_empty())
+                && subset.ports.as_ref().is_some_and(|ports| {
+                    ports
+                        .iter()
+                        .any(|endpoint_port| endpoint_port.port == i32::from(port))
+                })
+        })
+    })
+}
+
 fn extension_resource(api_version: &str, kind: &str, plural: &str) -> ApiResource {
     ApiResource::from_gvk_with_plural(
         &GroupVersionKind::gvk(EXTENSIONS_GROUP, api_version, kind),
@@ -1019,13 +1224,7 @@ fn extension_resource(api_version: &str, kind: &str, plural: &str) -> ApiResourc
     )
 }
 
-fn validate_warm_pool_spec(spec: &SandboxSpec, config: &AgentSandboxConfig) -> SandboxResult<()> {
-    if config.iron_proxy.is_some() {
-        return Err(SandboxError::InvalidSpec(
-            "SandboxWarmPool mode cannot be combined with per-sandbox iron-proxy resources"
-                .to_owned(),
-        ));
-    }
+fn validate_warm_pool_spec(spec: &SandboxSpec, _config: &AgentSandboxConfig) -> SandboxResult<()> {
     if spec_env(spec, THREAD_KEY_ENV).is_some() {
         return Err(SandboxError::InvalidSpec(format!(
             "SandboxWarmPool templates cannot include per-thread {THREAD_KEY_ENV}; pass thread context with each turn instead"
@@ -1038,9 +1237,10 @@ fn build_sandbox_template(
     warm_pool: &SandboxWarmPoolConfig,
     spec: &SandboxSpec,
     config: &AgentSandboxConfig,
+    resolved_iron_proxy: Option<&ResolvedIronProxy>,
 ) -> SandboxResult<DynamicObject> {
     let template_id = SandboxId::new(warm_pool.template_name.clone());
-    let sandbox = build_agent_sandbox(&template_id, spec, config, None)?;
+    let sandbox = build_agent_sandbox(&template_id, spec, config, resolved_iron_proxy)?;
     let mut template_spec = serde_json::to_value(&sandbox.spec).map_err(|err| {
         SandboxError::InvalidSpec(format!("invalid sandbox warm-pool template: {err}"))
     })?;
@@ -1050,6 +1250,12 @@ fn build_sandbox_template(
     spec_object.remove("replicas");
     spec_object.remove("shutdownPolicy");
     spec_object.remove("shutdownTime");
+    if let (Some(iron_proxy), Some(_)) = (&config.iron_proxy, resolved_iron_proxy) {
+        spec_object.insert(
+            "networkPolicy".to_owned(),
+            sandbox_template_network_policy(iron_proxy),
+        );
+    }
     if let Some(labels) = spec_object
         .get_mut("podTemplate")
         .and_then(|pod_template| pod_template.get_mut("metadata"))
@@ -1057,6 +1263,9 @@ fn build_sandbox_template(
         .and_then(Value::as_object_mut)
     {
         labels.remove(SANDBOX_ID_LABEL);
+        for (name, value) in warm_pool_pod_labels(warm_pool) {
+            labels.insert(name, json!(value));
+        }
     }
 
     let mut template = DynamicObject::new(
@@ -1140,6 +1349,14 @@ fn warm_pool_ready_replicas(pool: &DynamicObject) -> i64 {
         .unwrap_or_default()
 }
 
+fn proxy_pod_config_hash(pod: &Pod) -> Option<String> {
+    pod.metadata
+        .labels
+        .as_ref()
+        .and_then(|labels| labels.get("centaur.ai/config-hash"))
+        .cloned()
+}
+
 fn sandbox_claim_owner_names(sandbox: &crd::Sandbox) -> Vec<String> {
     sandbox
         .metadata
@@ -1155,6 +1372,53 @@ fn sandbox_claim_owner_names(sandbox: &crd::Sandbox) -> Vec<String> {
         })
         .map(|owner| owner.name.clone())
         .collect()
+}
+
+fn is_unclaimed_warm_pool_sandbox(
+    sandbox: &crd::Sandbox,
+    warm_pool: &SandboxWarmPoolConfig,
+) -> bool {
+    let owned_by_pool = sandbox
+        .metadata
+        .owner_references
+        .as_ref()
+        .into_iter()
+        .flatten()
+        .any(|owner| {
+            owner.kind == "SandboxWarmPool"
+                && owner.name == warm_pool.pool_name
+                && owner
+                    .api_version
+                    .starts_with(&format!("{EXTENSIONS_GROUP}/"))
+        });
+    if !owned_by_pool {
+        return false;
+    }
+    let template_matches = sandbox
+        .metadata
+        .annotations
+        .as_ref()
+        .and_then(|annotations| annotations.get("agents.x-k8s.io/sandbox-template-ref"))
+        .is_none_or(|template| template == &warm_pool.template_name);
+    let is_claimed = sandbox
+        .metadata
+        .labels
+        .as_ref()
+        .is_some_and(|labels| labels.contains_key(SANDBOX_CLAIM_LABEL));
+    template_matches && !is_claimed
+}
+
+fn sandbox_pod_name(sandbox: &crd::Sandbox, id: &SandboxId) -> String {
+    sandbox
+        .metadata
+        .annotations
+        .as_ref()
+        .and_then(|annotations| annotations.get("agents.x-k8s.io/pod-name"))
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| id.as_str().to_owned())
 }
 
 fn build_agent_sandbox(
@@ -1194,6 +1458,11 @@ fn build_agent_sandbox(
     );
     insert_optional(
         &mut container,
+        "readinessProbe",
+        codex_app_server_readiness_probe(spec),
+    );
+    insert_optional(
+        &mut container,
         "env",
         (!spec.env.is_empty() || resolved_iron_proxy.is_some())
             .then(|| env_json(spec, resolved_iron_proxy)),
@@ -1208,7 +1477,7 @@ fn build_agent_sandbox(
             "mountPath": state_volume.mount_path,
         }));
     }
-    if let Some(iron_proxy) = &config.iron_proxy {
+    if let (Some(iron_proxy), Some(_)) = (&config.iron_proxy, resolved_iron_proxy) {
         volume_mounts.push(json!({
             "name": "iron-proxy-ca-cert",
             "mountPath": "/firewall-certs",
@@ -1276,6 +1545,23 @@ fn build_agent_sandbox(
     Ok(sandbox)
 }
 
+fn codex_app_server_readiness_probe(spec: &SandboxSpec) -> Option<Value> {
+    let args = spec.args.iter().map(String::as_str).collect::<Vec<_>>();
+    (args == ["codex", "app-server", "--listen", "stdio://"]).then(|| {
+        json!({
+            "exec": {
+                "command": [
+                    "/bin/sh",
+                    "-lc",
+                    "tr '\\0' ' ' </proc/1/cmdline | grep -q 'app-server .*--listen .*stdio://'",
+                ],
+            },
+            "periodSeconds": 1,
+            "failureThreshold": 30,
+        })
+    })
+}
+
 fn mount_json(spec: &SandboxSpec) -> (Vec<Value>, Vec<Value>) {
     let mut volumes = Vec::with_capacity(spec.mounts.len());
     let mut mounts = Vec::with_capacity(spec.mounts.len());
@@ -1310,23 +1596,45 @@ fn mount_json(spec: &SandboxSpec) -> (Vec<Value>, Vec<Value>) {
 }
 
 fn env_json(spec: &SandboxSpec, resolved_iron_proxy: Option<&ResolvedIronProxy>) -> Vec<Value> {
-    let mut env = BTreeMap::<String, String>::new();
+    let mut env = BTreeMap::<String, Value>::new();
     for item in &spec.env {
-        env.insert(item.name.clone(), item.value.clone());
+        env.insert(
+            item.name.clone(),
+            json!({"name": item.name.clone(), "value": item.value.clone()}),
+        );
     }
     if let Some(resolved_iron_proxy) = resolved_iron_proxy {
+        env.entry(SANDBOX_POD_NAME_ENV.to_owned())
+            .or_insert_with(|| {
+                json!({
+                    "name": SANDBOX_POD_NAME_ENV,
+                    "valueFrom": {
+                        "fieldRef": {
+                            "fieldPath": "metadata.name",
+                        },
+                    },
+                })
+            });
         for (name, value) in &resolved_iron_proxy.placeholder_env {
-            env.entry(name.clone()).or_insert_with(|| value.clone());
+            env.entry(name.clone())
+                .or_insert_with(|| json!({ "name": name, "value": value }));
         }
         for (name, value) in &resolved_iron_proxy.pg_dsn_env {
-            env.entry(name.clone()).or_insert_with(|| value.clone());
+            env.entry(name.clone())
+                .or_insert_with(|| json!({ "name": name, "value": value }));
         }
         let api_host = env
             .get("CENTAUR_API_URL")
-            .and_then(|value| host_from_url(value));
+            .and_then(|item| item.get("value"))
+            .and_then(Value::as_str)
+            .and_then(host_from_url);
         let no_proxy_extra = ["NO_PROXY", "no_proxy"]
             .into_iter()
-            .filter_map(|name| env.get(name).map(String::as_str))
+            .filter_map(|name| {
+                env.get(name)
+                    .and_then(|item| item.get("value"))
+                    .and_then(Value::as_str)
+            })
             .collect::<Vec<_>>();
         for (name, value) in proxy_env(
             &resolved_iron_proxy.proxy_host,
@@ -1334,12 +1642,14 @@ fn env_json(spec: &SandboxSpec, resolved_iron_proxy: Option<&ResolvedIronProxy>)
             api_host.as_deref(),
             &no_proxy_extra,
         ) {
-            env.insert(name, value);
+            env.insert(name.clone(), json!({ "name": name, "value": value }));
         }
     }
-    env.into_iter()
-        .map(|(name, value)| json!({ "name": name, "value": value }))
-        .collect()
+    env.into_values().collect()
+}
+
+fn sandbox_proxy_host_template() -> String {
+    format!("$({SANDBOX_POD_NAME_ENV})-proxy")
 }
 
 fn proxy_env(
@@ -1382,12 +1692,10 @@ fn proxy_env(
     env
 }
 
-#[cfg(test)]
 fn proxied_pg_url(host: &str, port: u16, password: &str, database: &str) -> String {
     format!("postgresql://app_user:{password}@{host}:{port}/{database}")
 }
 
-#[cfg(test)]
 fn proxy_password() -> String {
     Uuid::new_v4().simple().to_string()
 }
@@ -1449,7 +1757,6 @@ fn spec_env<'a>(spec: &'a SandboxSpec, name: &str) -> Option<&'a str> {
         .filter(|value| !value.trim().is_empty())
 }
 
-#[cfg(test)]
 fn iron_proxy_container(iron_proxy: &IronProxyPodConfig, resolved: &ResolvedIronProxy) -> Value {
     let mut env = BTreeMap::<String, Value>::new();
     if let Some(secret_name) = &iron_proxy.secret_env_name {
@@ -1463,7 +1770,7 @@ fn iron_proxy_container(iron_proxy: &IronProxyPodConfig, resolved: &ResolvedIron
         insert_env_value(
             &mut env,
             "IRON_MANAGEMENT_API_KEY",
-            "unused-local-sidecar-key",
+            "unused-local-proxy-key",
         );
     }
     for (name, value) in &iron_proxy.extra_env {
@@ -1575,7 +1882,6 @@ fn iron_proxy_container(iron_proxy: &IronProxyPodConfig, resolved: &ResolvedIron
     container
 }
 
-#[cfg(test)]
 fn insert_env_value(env: &mut BTreeMap<String, Value>, name: &str, value: impl AsRef<str>) {
     env.insert(
         name.to_owned(),
@@ -1583,7 +1889,6 @@ fn insert_env_value(env: &mut BTreeMap<String, Value>, name: &str, value: impl A
     );
 }
 
-#[cfg(test)]
 fn insert_env_secret_ref(
     env: &mut BTreeMap<String, Value>,
     name: &str,
@@ -1604,7 +1909,6 @@ fn insert_env_secret_ref(
     );
 }
 
-#[cfg(test)]
 fn iron_proxy_volumes(id: &SandboxId, iron_proxy: &IronProxyPodConfig) -> Vec<Value> {
     vec![
         json!({
@@ -1620,14 +1924,17 @@ fn iron_proxy_volumes(id: &SandboxId, iron_proxy: &IronProxyPodConfig) -> Vec<Va
     ]
 }
 
-#[cfg(test)]
 fn build_iron_proxy_pod(
     id: &SandboxId,
     pod_name: &str,
     iron_proxy: &IronProxyPodConfig,
     resolved: &ResolvedIronProxy,
 ) -> SandboxResult<Pod> {
-    let labels = iron_proxy_labels(id);
+    let mut labels = iron_proxy_labels(id);
+    labels.insert(
+        "centaur.ai/config-hash".to_owned(),
+        short_sha256(&resolved.config_yaml),
+    );
     let mut pod_spec = json!({
         "automountServiceAccountToken": false,
         "restartPolicy": "Never",
@@ -1652,7 +1959,6 @@ fn build_iron_proxy_pod(
         .map_err(|err| SandboxError::InvalidSpec(format!("invalid iron-proxy pod: {err}")))
 }
 
-#[cfg(test)]
 fn build_iron_proxy_service(
     id: &SandboxId,
     resolved: &ResolvedIronProxy,
@@ -1692,11 +1998,12 @@ fn build_iron_proxy_service(
         .map_err(|err| SandboxError::InvalidSpec(format!("invalid iron-proxy service: {err}")))
 }
 
-#[cfg(test)]
 fn build_iron_proxy_network_policies(
     id: &SandboxId,
     resolved: &ResolvedIronProxy,
     iron_proxy: &IronProxyPodConfig,
+    sandbox_selector_labels: &BTreeMap<String, String>,
+    resource_labels: &BTreeMap<String, String>,
 ) -> SandboxResult<Vec<NetworkPolicy>> {
     let mut sandbox_to_proxy_ports = vec![json!({"protocol": "TCP", "port": resolved.proxy_port})];
     for port in resolved
@@ -1712,10 +2019,10 @@ fn build_iron_proxy_network_policies(
         "kind": "NetworkPolicy",
         "metadata": {
             "name": iron_proxy_sandbox_egress_policy_name(id),
-            "labels": sandbox_labels(id),
+            "labels": resource_labels,
         },
         "spec": {
-            "podSelector": {"matchLabels": sandbox_labels(id)},
+            "podSelector": {"matchLabels": sandbox_selector_labels},
             "policyTypes": ["Egress"],
             "egress": [
                 {
@@ -1776,7 +2083,7 @@ fn build_iron_proxy_network_policies(
             "policyTypes": ["Ingress", "Egress"],
             "ingress": [
                 {
-                    "from": [{"podSelector": {"matchLabels": sandbox_labels(id)}}],
+                    "from": [{"podSelector": {"matchLabels": sandbox_selector_labels}}],
                     "ports": sandbox_to_proxy_ports,
                 }
             ],
@@ -1793,14 +2100,21 @@ fn build_iron_proxy_network_policies(
         .collect()
 }
 
-#[cfg(test)]
+fn sandbox_template_network_policy(iron_proxy: &IronProxyPodConfig) -> Value {
+    json!({
+        "ingress": [],
+        "egress": [
+            {
+                "to": [{"podSelector": {"matchLabels": iron_proxy.api_pod_labels.clone()}}],
+                "ports": [{"protocol": "TCP", "port": 8000}],
+            },
+            dns_egress_rule(),
+        ],
+    })
+}
+
 fn dns_egress_rule() -> Value {
     json!({
-        "to": [{
-            "namespaceSelector": {
-                "matchLabels": {"kubernetes.io/metadata.name": "kube-system"},
-            },
-        }],
         "ports": [
             {"protocol": "UDP", "port": 53},
             {"protocol": "TCP", "port": 53},
@@ -1808,7 +2122,6 @@ fn dns_egress_rule() -> Value {
     })
 }
 
-#[cfg(test)]
 fn iron_proxy_broker_port(iron_proxy: &IronProxyPodConfig) -> Option<u16> {
     iron_proxy
         .extra_env
@@ -1822,7 +2135,6 @@ fn iron_proxy_broker_port(iron_proxy: &IronProxyPodConfig) -> Option<u16> {
         })
 }
 
-#[cfg(test)]
 fn url_port(value: &str) -> Option<u16> {
     let without_scheme = value
         .split_once("://")
@@ -1870,42 +2182,26 @@ fn state_pvc_name(id: &SandboxId) -> String {
     format!("state-{}", id.as_str())
 }
 
-#[cfg(test)]
 fn iron_proxy_configmap_name(id: &SandboxId) -> String {
     format!("{}-iron-proxy", id.as_str())
 }
 
-#[cfg(test)]
 fn iron_proxy_pod_name(id: &SandboxId) -> String {
     format!("{}-proxy", id.as_str())
 }
 
-#[cfg(test)]
-fn new_iron_proxy_pod_name(id: &SandboxId) -> String {
-    let millis = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    let sequence = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-    format!("{}-proxy-{millis}-{sequence}", id.as_str())
-}
-
-#[cfg(test)]
 fn iron_proxy_service_name(id: &SandboxId) -> String {
     format!("{}-proxy", id.as_str())
 }
 
-#[cfg(test)]
 fn iron_proxy_sandbox_egress_policy_name(id: &SandboxId) -> String {
     format!("{}-sandbox-egress", id.as_str())
 }
 
-#[cfg(test)]
 fn iron_proxy_policy_name(id: &SandboxId) -> String {
     format!("{}-proxy-net", id.as_str())
 }
 
-#[cfg(test)]
 fn iron_token_broker_configmap_name(iron_proxy: &IronProxyPodConfig) -> SandboxResult<String> {
     if let Some(name) = iron_proxy.token_broker_configmap_name.as_deref() {
         return Ok(name.to_owned());
@@ -1918,7 +2214,6 @@ fn iron_token_broker_configmap_name(iron_proxy: &IronProxyPodConfig) -> SandboxR
     Ok(format!("{name}-config"))
 }
 
-#[cfg(test)]
 fn token_broker_labels() -> BTreeMap<String, String> {
     BTreeMap::from([
         (TOKEN_BROKER_LABEL.to_owned(), "true".to_owned()),
@@ -1935,7 +2230,10 @@ fn sandbox_labels(id: &SandboxId) -> BTreeMap<String, String> {
     labels
 }
 
-#[cfg(test)]
+fn sandbox_claim_selector_labels(claim_id: &SandboxId) -> BTreeMap<String, String> {
+    BTreeMap::from([(SANDBOX_CLAIM_LABEL.to_owned(), claim_id.as_str().to_owned())])
+}
+
 fn iron_proxy_labels(id: &SandboxId) -> BTreeMap<String, String> {
     let mut labels = base_resource_labels(id);
     labels.insert("centaur.ai/iron-proxy".to_owned(), "true".to_owned());
@@ -1964,6 +2262,15 @@ fn warm_pool_labels(warm_pool: &SandboxWarmPoolConfig) -> BTreeMap<String, Strin
     ])
 }
 
+fn warm_pool_pod_labels(warm_pool: &SandboxWarmPoolConfig) -> BTreeMap<String, String> {
+    let mut labels = warm_pool_labels(warm_pool);
+    labels.insert(
+        "app.kubernetes.io/name".to_owned(),
+        "centaur-sandbox".to_owned(),
+    );
+    labels
+}
+
 fn claim_labels(
     claim_id: &SandboxId,
     warm_pool: &SandboxWarmPoolConfig,
@@ -1990,6 +2297,24 @@ fn claimed_sandbox_labels(
     labels
 }
 
+fn adopted_sandbox_labels(
+    id: &SandboxId,
+    claim_id: &SandboxId,
+    warm_pool: &SandboxWarmPoolConfig,
+) -> BTreeMap<String, String> {
+    let mut labels = sandbox_labels(id);
+    labels.insert(
+        SANDBOX_WARM_POOL_LABEL.to_owned(),
+        warm_pool.pool_name.clone(),
+    );
+    labels.insert(
+        SANDBOX_TEMPLATE_LABEL.to_owned(),
+        warm_pool.template_name.clone(),
+    );
+    labels.insert(SANDBOX_CLAIM_LABEL.to_owned(), claim_id.as_str().to_owned());
+    labels
+}
+
 fn insert_optional<T>(target: &mut Value, key: &str, value: Option<T>)
 where
     T: serde::Serialize,
@@ -2008,7 +2333,6 @@ fn image_pull_secret_refs(names: &[String]) -> Option<Vec<Value>> {
     })
 }
 
-#[cfg(test)]
 fn short_sha256(value: &str) -> String {
     let digest = Sha256::digest(value.as_bytes());
     format!("{digest:x}").chars().take(16).collect()
@@ -2027,6 +2351,10 @@ fn is_not_found(err: &Error) -> bool {
     matches!(err, Error::Api(api_error) if api_error.code == 404)
 }
 
+fn is_already_exists(err: &Error) -> bool {
+    matches!(err, Error::Api(api_error) if api_error.code == 409)
+}
+
 fn map_kube_error(operation: &str, err: Error) -> SandboxError {
     if is_not_found(&err) {
         SandboxError::NotFound(operation.to_owned())
@@ -2038,7 +2366,9 @@ fn map_kube_error(operation: &str, err: Error) -> SandboxError {
 #[cfg(test)]
 mod tests {
     use centaur_sandbox_core::{ResourceLimits, SandboxSpec};
-    use k8s_openapi::api::core::v1::{PodCondition, PodStatus};
+    use k8s_openapi::api::core::v1::{
+        EndpointAddress, EndpointPort, EndpointSubset, PodCondition, PodStatus,
+    };
     use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 
     use super::*;
@@ -2129,7 +2459,7 @@ mod tests {
             .annotations
             .insert("centaur.ai/test".to_owned(), "true".to_owned());
 
-        let template = build_sandbox_template(&warm_pool, &spec, &config).unwrap();
+        let template = build_sandbox_template(&warm_pool, &spec, &config, None).unwrap();
         let pool = build_sandbox_warm_pool(&warm_pool);
 
         let template_types = template.types.as_ref().unwrap();
@@ -2173,6 +2503,127 @@ mod tests {
     }
 
     #[test]
+    fn builds_warm_pool_template_with_per_sandbox_iron_proxy_env() {
+        let warm_pool = SandboxWarmPoolConfig::new("centaur-warm", "centaur-warm-template");
+        let spec = SandboxSpec::new("centaur-agent:latest")
+            .env("CENTAUR_API_URL", "http://api:8000")
+            .env("NO_PROXY", "metadata.internal");
+        let mut config = AgentSandboxConfig::new("centaur");
+        config.iron_proxy = Some(IronProxyPodConfig::new(
+            "centaur-iron-proxy:latest",
+            "firewall-ca-cert",
+            "firewall-ca-key",
+        ));
+        let resolved = ResolvedIronProxy {
+            config_yaml: "transforms: []\n".to_owned(),
+            placeholder_env: BTreeMap::from([(
+                "ANTHROPIC_API_KEY".to_owned(),
+                "iron-proxy-placeholder".to_owned(),
+            )]),
+            proxy_host: sandbox_proxy_host_template(),
+            proxy_port: 18080,
+            listen_ports: vec![18080],
+            pg_dsn_env: BTreeMap::new(),
+            pg_proxy_password_env: BTreeMap::new(),
+        };
+
+        let template = build_sandbox_template(&warm_pool, &spec, &config, Some(&resolved)).unwrap();
+        let pod_template = &template.data["spec"]["podTemplate"];
+        let labels = pod_template["metadata"]["labels"].as_object().unwrap();
+        assert!(labels.get(SANDBOX_ID_LABEL).is_none());
+        assert_eq!(labels[SANDBOX_WARM_POOL_LABEL], "centaur-warm");
+        assert_eq!(labels[SANDBOX_TEMPLATE_LABEL], "centaur-warm-template");
+
+        assert_eq!(
+            pod_template["spec"]["containers"].as_array().unwrap().len(),
+            1
+        );
+        assert!(
+            pod_template["spec"]["containers"][0]["env"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["name"] == SANDBOX_POD_NAME_ENV
+                    && item["valueFrom"]["fieldRef"]["fieldPath"] == "metadata.name")
+        );
+        let env = pod_template["spec"]["containers"][0]["env"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|item| {
+                Some((
+                    item["name"].as_str()?.to_owned(),
+                    item["value"].as_str()?.to_owned(),
+                ))
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            env["HTTPS_PROXY"],
+            "http://$(CENTAUR_SANDBOX_POD_NAME)-proxy:18080"
+        );
+        assert_eq!(
+            env["HTTP_PROXY"],
+            "http://$(CENTAUR_SANDBOX_POD_NAME)-proxy:18080"
+        );
+        assert_eq!(env["FIREWALL_HOST"], "$(CENTAUR_SANDBOX_POD_NAME)-proxy");
+        assert_eq!(env["ANTHROPIC_API_KEY"], "iron-proxy-placeholder");
+        assert!(env["NO_PROXY"].contains("api"));
+        assert!(env["NO_PROXY"].contains("$(CENTAUR_SANDBOX_POD_NAME)-proxy"));
+        assert!(env["NO_PROXY"].contains("metadata.internal"));
+
+        let template_egress = template.data["spec"]["networkPolicy"]["egress"]
+            .as_array()
+            .unwrap();
+        assert!(template_egress.iter().any(|rule| {
+            rule["to"][0]["podSelector"]["matchLabels"]["app.kubernetes.io/component"] == "api"
+                && rule["ports"][0]["port"] == 8000
+        }));
+        assert!(template_egress.iter().any(|rule| {
+            rule.get("to").is_none()
+                && rule["ports"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|port| port["port"] == 53)
+        }));
+        assert!(
+            template_egress.iter().all(|rule| {
+                !rule["ports"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|port| port["port"] == 443 || port["port"] == 5432)
+            }),
+            "warm sandbox template must not allow direct external HTTPS/Postgres egress"
+        );
+    }
+
+    #[test]
+    fn codex_app_server_template_waits_for_direct_process_readiness() {
+        let warm_pool = SandboxWarmPoolConfig::new("centaur-warm", "centaur-warm-template");
+        let spec = SandboxSpec::new("centaur-agent:latest").args([
+            "codex",
+            "app-server",
+            "--listen",
+            "stdio://",
+        ]);
+        let config = AgentSandboxConfig::new("centaur");
+
+        let template = build_sandbox_template(&warm_pool, &spec, &config, None).unwrap();
+        let container = &template.data["spec"]["podTemplate"]["spec"]["containers"][0];
+
+        assert_eq!(container["args"][0], "codex");
+        assert_eq!(container["args"][1], "app-server");
+        assert!(
+            container["readinessProbe"]["exec"]["command"][2]
+                .as_str()
+                .unwrap()
+                .contains("app-server")
+        );
+        assert_eq!(container["readinessProbe"]["periodSeconds"], 1);
+    }
+
+    #[test]
     fn builds_sandbox_claim_without_env_so_pool_adoption_stays_warm() {
         let warm_pool = SandboxWarmPoolConfig::new("centaur-warm", "centaur-template");
         let config = AgentSandboxConfig::new("centaur");
@@ -2194,6 +2645,60 @@ mod tests {
     }
 
     #[test]
+    fn adopted_sandbox_labels_include_real_sandbox_id_and_claim_id() {
+        let warm_pool = SandboxWarmPoolConfig::new("centaur-warm", "centaur-template");
+        let labels = adopted_sandbox_labels(
+            &SandboxId::new("asbx-adopted"),
+            &SandboxId::new("asbx-claim"),
+            &warm_pool,
+        );
+
+        assert_eq!(labels[SANDBOX_ID_LABEL], "asbx-adopted");
+        assert_eq!(labels[SANDBOX_CLAIM_LABEL], "asbx-claim");
+        assert_eq!(labels[SANDBOX_WARM_POOL_LABEL], "centaur-warm");
+        assert_eq!(labels[SANDBOX_TEMPLATE_LABEL], "centaur-template");
+        assert_eq!(labels[MANAGED_BY_LABEL], MANAGED_BY_VALUE);
+    }
+
+    #[test]
+    fn identifies_unclaimed_warm_pool_sandboxes_for_proxy_prewarm() {
+        let warm_pool = SandboxWarmPoolConfig::new("centaur-warm", "centaur-template");
+        let config = AgentSandboxConfig::new("centaur");
+        let mut sandbox = build_agent_sandbox(
+            &SandboxId::new("centaur-warm-abcd"),
+            &SandboxSpec::new("centaur-agent:latest"),
+            &config,
+            None,
+        )
+        .unwrap();
+        sandbox.metadata.owner_references = Some(vec![
+            k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference {
+                api_version: format!("{EXTENSIONS_GROUP}/v1alpha1"),
+                kind: "SandboxWarmPool".to_owned(),
+                name: "centaur-warm".to_owned(),
+                uid: "warm-pool-uid".to_owned(),
+                ..Default::default()
+            },
+        ]);
+        sandbox.metadata.annotations = Some(BTreeMap::from([(
+            "agents.x-k8s.io/sandbox-template-ref".to_owned(),
+            "centaur-template".to_owned(),
+        )]));
+        sandbox.metadata.labels = Some(BTreeMap::new());
+
+        assert!(is_unclaimed_warm_pool_sandbox(&sandbox, &warm_pool));
+
+        sandbox
+            .metadata
+            .labels
+            .as_mut()
+            .unwrap()
+            .insert(SANDBOX_CLAIM_LABEL.to_owned(), "asbx-claim".to_owned());
+
+        assert!(!is_unclaimed_warm_pool_sandbox(&sandbox, &warm_pool));
+    }
+
+    #[test]
     fn reads_sandbox_warm_pool_ready_replicas() {
         let warm_pool = SandboxWarmPoolConfig::new("centaur-warm", "centaur-template");
         let mut pool = build_sandbox_warm_pool(&warm_pool);
@@ -2206,7 +2711,7 @@ mod tests {
     }
 
     #[test]
-    fn warm_pool_validation_rejects_cold_starting_inputs() {
+    fn warm_pool_validation_rejects_per_thread_template_inputs() {
         let mut config = AgentSandboxConfig::new("centaur");
         let spec = SandboxSpec::new("centaur-agent:latest").env(THREAD_KEY_ENV, "test:thread");
 
@@ -2218,9 +2723,7 @@ mod tests {
             "firewall-ca-cert",
             "firewall-ca-key",
         ));
-        let error = validate_warm_pool_spec(&SandboxSpec::new("centaur-agent:latest"), &config)
-            .unwrap_err();
-        assert!(error.to_string().contains("iron-proxy"));
+        validate_warm_pool_spec(&SandboxSpec::new("centaur-agent:latest"), &config).unwrap();
     }
 
     #[test]
@@ -2260,13 +2763,13 @@ mod tests {
                 "OPENAI_API_KEY".to_owned(),
                 "OPENAI_API_KEY".to_owned(),
             )]),
-            proxy_host: "asbx-test-proxy".to_owned(),
-            proxy_pod_name: "asbx-test-proxy-123".to_owned(),
+            proxy_host: sandbox_proxy_host_template(),
             proxy_port: 18080,
             listen_ports: vec![8080],
             pg_dsn_env: BTreeMap::from([(
                 "WAREHOUSE_DSN".to_owned(),
-                "postgresql://app_user:pg-pass@asbx-test-proxy:5432/warehouse".to_owned(),
+                "postgresql://app_user:pg-pass@$(CENTAUR_SANDBOX_POD_NAME)-proxy:5432/warehouse"
+                    .to_owned(),
             )]),
             pg_proxy_password_env: BTreeMap::new(),
         };
@@ -2307,12 +2810,18 @@ mod tests {
         assert_eq!(agent_env["OPENAI_API_KEY"], "OPENAI_API_KEY");
         assert_eq!(
             agent_env["WAREHOUSE_DSN"],
-            "postgresql://app_user:pg-pass@asbx-test-proxy:5432/warehouse"
+            "postgresql://app_user:pg-pass@$(CENTAUR_SANDBOX_POD_NAME)-proxy:5432/warehouse"
         );
-        assert_eq!(agent_env["FIREWALL_HOST"], "asbx-test-proxy");
+        assert_eq!(
+            agent_env["FIREWALL_HOST"],
+            "$(CENTAUR_SANDBOX_POD_NAME)-proxy"
+        );
         assert_eq!(agent_env["FIREWALL_PROXY_PORT"], "18080");
-        assert_eq!(agent_env["HTTPS_PROXY"], "http://asbx-test-proxy:18080");
-        assert!(agent_env["NO_PROXY"].contains("asbx-test-proxy"));
+        assert_eq!(
+            agent_env["HTTPS_PROXY"],
+            "http://$(CENTAUR_SANDBOX_POD_NAME)-proxy:18080"
+        );
+        assert!(agent_env["NO_PROXY"].contains("$(CENTAUR_SANDBOX_POD_NAME)-proxy"));
         assert!(agent_env["NO_PROXY"].contains("centaur-centaur-api"));
         assert!(agent_env["NO_PROXY"].contains("otel.local"));
         assert_eq!(
@@ -2367,13 +2876,13 @@ mod tests {
                 ("OPENAI_API_KEY".to_owned(), "OPENAI_API_KEY".to_owned()),
                 ("GITHUB_TOKEN".to_owned(), "GITHUB_TOKEN".to_owned()),
             ]),
-            proxy_host: "asbx-sec-proxy".to_owned(),
-            proxy_pod_name: "asbx-sec-proxy-123".to_owned(),
+            proxy_host: sandbox_proxy_host_template(),
             proxy_port: 18080,
             listen_ports: vec![18080],
             pg_dsn_env: BTreeMap::from([(
                 "WAREHOUSE_DSN".to_owned(),
-                "postgresql://app_user:pg-pass@asbx-sec-proxy:5440/warehouse".to_owned(),
+                "postgresql://app_user:pg-pass@$(CENTAUR_SANDBOX_POD_NAME)-proxy:5440/warehouse"
+                    .to_owned(),
             )]),
             pg_proxy_password_env: BTreeMap::from([(
                 "PG_PROXY_PASSWORD_WAREHOUSE".to_owned(),
@@ -2397,10 +2906,16 @@ mod tests {
         assert_eq!(env["GITHUB_TOKEN"], "GITHUB_TOKEN");
         assert_eq!(
             env["WAREHOUSE_DSN"],
-            "postgresql://app_user:pg-pass@asbx-sec-proxy:5440/warehouse"
+            "postgresql://app_user:pg-pass@$(CENTAUR_SANDBOX_POD_NAME)-proxy:5440/warehouse"
         );
-        assert_eq!(env["HTTPS_PROXY"], "http://asbx-sec-proxy:18080");
-        assert_eq!(env["HTTP_PROXY"], "http://asbx-sec-proxy:18080");
+        assert_eq!(
+            env["HTTPS_PROXY"],
+            "http://$(CENTAUR_SANDBOX_POD_NAME)-proxy:18080"
+        );
+        assert_eq!(
+            env["HTTP_PROXY"],
+            "http://$(CENTAUR_SANDBOX_POD_NAME)-proxy:18080"
+        );
 
         for proxy_only_name in [
             "IRON_MANAGEMENT_API_KEY",
@@ -2459,8 +2974,7 @@ mod tests {
         let resolved = ResolvedIronProxy {
             config_yaml: "transforms: []\n".to_owned(),
             placeholder_env: BTreeMap::new(),
-            proxy_host: "asbx-test-proxy".to_owned(),
-            proxy_pod_name: "asbx-test-proxy-123".to_owned(),
+            proxy_host: sandbox_proxy_host_template(),
             proxy_port: 18080,
             listen_ports: vec![5432, 8080, 18080],
             pg_dsn_env: BTreeMap::new(),
@@ -2471,8 +2985,8 @@ mod tests {
         };
 
         let pod =
-            build_iron_proxy_pod(&id, &resolved.proxy_pod_name, &iron_proxy, &resolved).unwrap();
-        assert_eq!(pod.metadata.name.as_deref(), Some("asbx-test-proxy-123"));
+            build_iron_proxy_pod(&id, &iron_proxy_pod_name(&id), &iron_proxy, &resolved).unwrap();
+        assert_eq!(pod.metadata.name.as_deref(), Some("asbx-test-proxy"));
         assert_eq!(
             pod.spec
                 .as_ref()
@@ -2600,13 +3114,22 @@ mod tests {
         assert_eq!(service_ports["tcp-8080"], 8080);
         assert_eq!(service_ports["tcp-5432"], 5432);
 
-        let policies = build_iron_proxy_network_policies(&id, &resolved, &iron_proxy).unwrap();
+        let claim_id = SandboxId::new("asbx-claim");
+        let sandbox_selector_labels = sandbox_claim_selector_labels(&claim_id);
+        let policies = build_iron_proxy_network_policies(
+            &id,
+            &resolved,
+            &iron_proxy,
+            &sandbox_selector_labels,
+            &sandbox_selector_labels,
+        )
+        .unwrap();
         assert_eq!(policies.len(), 2);
         let policy_json = policy_json_by_name(&policies);
         assert_eq!(
             policy_json["asbx-test-sandbox-egress"]["spec"]["podSelector"]["matchLabels"]
-                [MANAGED_LABEL],
-            "true"
+                [SANDBOX_CLAIM_LABEL],
+            "asbx-claim"
         );
         assert_eq!(
             policy_json["asbx-test-proxy-net"]["spec"]["podSelector"]["matchLabels"]["centaur.ai/iron-proxy"],
@@ -2633,9 +3156,7 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|rule| rule["to"][0]["namespaceSelector"]["matchLabels"]
-                    ["kubernetes.io/metadata.name"]
-                    == "kube-system"
+                .any(|rule| rule.get("to").is_none()
                     && rule["ports"]
                         .as_array()
                         .unwrap()
@@ -2676,15 +3197,23 @@ mod tests {
         let resolved = ResolvedIronProxy {
             config_yaml: "transforms: []\n".to_owned(),
             placeholder_env: BTreeMap::new(),
-            proxy_host: "asbx-sec-proxy".to_owned(),
-            proxy_pod_name: "asbx-sec-proxy-123".to_owned(),
+            proxy_host: sandbox_proxy_host_template(),
             proxy_port: 18080,
             listen_ports: vec![18080, 5440],
             pg_dsn_env: BTreeMap::new(),
             pg_proxy_password_env: BTreeMap::new(),
         };
 
-        let policies = build_iron_proxy_network_policies(&id, &resolved, &iron_proxy).unwrap();
+        let claim_id = SandboxId::new("asbx-claim-sec");
+        let sandbox_selector_labels = sandbox_claim_selector_labels(&claim_id);
+        let policies = build_iron_proxy_network_policies(
+            &id,
+            &resolved,
+            &iron_proxy,
+            &sandbox_selector_labels,
+            &sandbox_selector_labels,
+        )
+        .unwrap();
         let policy_json = policy_json_by_name(&policies);
         let sandbox_egress = policy_json["asbx-sec-sandbox-egress"]["spec"]["egress"]
             .as_array()
@@ -2710,8 +3239,7 @@ mod tests {
                 && rule["ports"][0]["port"] == 8000
         }));
         assert!(sandbox_egress.iter().any(|rule| {
-            rule["to"][0]["namespaceSelector"]["matchLabels"]["kubernetes.io/metadata.name"]
-                == "kube-system"
+            rule.get("to").is_none()
                 && rule["ports"]
                     .as_array()
                     .unwrap()
@@ -2719,8 +3247,15 @@ mod tests {
                     .any(|port| port["port"] == 53)
         }));
         assert!(
-            sandbox_egress.iter().all(|rule| rule.get("to").is_some()),
-            "sandbox egress must not contain broad IP rules"
+            sandbox_egress.iter().all(|rule| {
+                rule.get("to").is_some()
+                    || rule["ports"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .all(|port| port["port"] == 53)
+            }),
+            "sandbox egress must not contain broad non-DNS rules"
         );
         assert!(
             sandbox_egress.iter().all(|rule| {
@@ -2737,12 +3272,8 @@ mod tests {
         let proxy_ingress = proxy_policy["spec"]["ingress"].as_array().unwrap();
         assert_eq!(proxy_ingress.len(), 1);
         assert_eq!(
-            proxy_ingress[0]["from"][0]["podSelector"]["matchLabels"][SANDBOX_ID_LABEL],
-            "asbx-sec"
-        );
-        assert_eq!(
-            proxy_ingress[0]["from"][0]["podSelector"]["matchLabels"][MANAGED_LABEL],
-            "true"
+            proxy_ingress[0]["from"][0]["podSelector"]["matchLabels"][SANDBOX_CLAIM_LABEL],
+            "asbx-claim-sec"
         );
         let proxy_egress = proxy_policy["spec"]["egress"].as_array().unwrap();
         assert!(proxy_egress.iter().any(|rule| {
@@ -2813,6 +3344,40 @@ mod tests {
         let labels = token_broker_labels();
         assert_eq!(labels[TOKEN_BROKER_LABEL], "true");
         assert_eq!(short_sha256("abc"), "ba7816bf8f01cfea");
+    }
+
+    #[test]
+    fn endpoint_ready_port_requires_ready_address_and_matching_port() {
+        let endpoints = Endpoints {
+            subsets: Some(vec![EndpointSubset {
+                addresses: Some(vec![EndpointAddress {
+                    ip: "10.42.0.10".to_owned(),
+                    ..EndpointAddress::default()
+                }]),
+                ports: Some(vec![EndpointPort {
+                    port: 18080,
+                    ..EndpointPort::default()
+                }]),
+                ..EndpointSubset::default()
+            }]),
+            ..Endpoints::default()
+        };
+
+        assert!(endpoint_has_ready_port(&endpoints, 18080));
+        assert!(!endpoint_has_ready_port(&endpoints, 18081));
+
+        let no_ready_addresses = Endpoints {
+            subsets: Some(vec![EndpointSubset {
+                addresses: Some(Vec::new()),
+                ports: Some(vec![EndpointPort {
+                    port: 18080,
+                    ..EndpointPort::default()
+                }]),
+                ..EndpointSubset::default()
+            }]),
+            ..Endpoints::default()
+        };
+        assert!(!endpoint_has_ready_port(&no_ready_addresses, 18080));
     }
 
     fn pod_with_phase_and_ready(phase: &str, ready: bool) -> Pod {

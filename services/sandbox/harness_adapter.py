@@ -20,17 +20,12 @@ class AmpAdapter(HarnessAdapter):
         target.symlink_to(prompt.name)
 
 
-class CodexAdapter(HarnessAdapter):
-    pass
-
-
 class ClaudeCodeAdapter(HarnessAdapter):
     pass
 
 
 ADAPTERS = {
     "amp-wrapper": AmpAdapter,
-    "codex-app-wrapper": CodexAdapter,
     "claude-app-wrapper": ClaudeCodeAdapter,
 }
 

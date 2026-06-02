@@ -252,8 +252,12 @@ if [ -n "${CENTAUR_TOOLS_URL:-}" ]; then
     done
 fi
 
-# Signal readiness
-touch "$HOME_DIR/.ready"
+# Signal readiness after auth/config setup. Codex warm pools run
+# `codex app-server` directly; the Rust session runtime owns JSON-RPC
+# initialization as soon as it claims and attaches to a warm sandbox.
+READY_FILE="${CENTAUR_READY_FILE:-$HOME_DIR/.ready}"
+export CENTAUR_READY_FILE="$READY_FILE"
+touch "$READY_FILE"
 
 # ── Background: slow auth tasks ─────────────────────────────────────────────
 {

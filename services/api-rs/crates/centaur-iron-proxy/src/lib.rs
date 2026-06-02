@@ -458,6 +458,7 @@ pub fn render_proxy_yaml_with_source_policy(
         .into_iter()
         .map(|transform| resolve_fragment_transform_sources(transform, source_policy))
         .collect::<Vec<_>>();
+    let managed = merge_managed_transforms(managed);
     if !managed.is_empty() {
         insert_before_header_allowlist(&mut transforms, managed);
     }
@@ -788,6 +789,58 @@ fn existing_unmanaged_transforms(cfg: &Mapping) -> Vec<Value> {
         .collect()
 }
 
+fn merge_managed_transforms(transforms: Vec<Value>) -> Vec<Value> {
+    let mut merged = Vec::<Value>::new();
+    let mut by_name = BTreeMap::<String, usize>::new();
+    for transform in transforms {
+        let Some(name) = transform_name(&transform).map(ToOwned::to_owned) else {
+            merged.push(transform);
+            continue;
+        };
+        if !MANAGED_TRANSFORMS.contains(&name.as_str()) {
+            merged.push(transform);
+            continue;
+        }
+        if let Some(index) = by_name.get(&name).copied() {
+            merge_transform_config(&mut merged[index], transform);
+        } else {
+            by_name.insert(name, merged.len());
+            merged.push(transform);
+        }
+    }
+    merged
+}
+
+fn merge_transform_config(target: &mut Value, source: Value) {
+    let Some(target_config) = target
+        .as_mapping_mut()
+        .and_then(|map| map.get_mut(&string_value("config")))
+        .and_then(Value::as_mapping_mut)
+    else {
+        return;
+    };
+    let Some(source_config) = source
+        .as_mapping()
+        .and_then(|map| map.get(&string_value("config")))
+        .and_then(Value::as_mapping)
+    else {
+        return;
+    };
+    for (key, source_value) in source_config {
+        match target_config.get_mut(key) {
+            Some(Value::Sequence(target_items)) => {
+                if let Value::Sequence(source_items) = source_value {
+                    target_items.extend(source_items.iter().cloned());
+                }
+            }
+            Some(_) => {}
+            None => {
+                target_config.insert(key.clone(), source_value.clone());
+            }
+        }
+    }
+}
+
 fn insert_before_header_allowlist(transforms: &mut Vec<Value>, managed: Vec<Value>) {
     if let Some(index) = transforms
         .iter()
@@ -973,6 +1026,34 @@ transforms:
             "OPENAI_API_KEY"
         );
         assert!(cfg["transforms"][1]["config"]["secrets"][0]["old"].is_null());
+    }
+
+    #[test]
+    fn merges_managed_secret_transforms_from_infra_and_harness_fragments() {
+        let infra = infra_fragment().unwrap();
+        let codex = harness_fragment("codex", "api_key").unwrap().unwrap();
+
+        let rendered = render_proxy_yaml(None, &[infra, codex], None).unwrap();
+        let cfg = parse_rendered(&rendered);
+
+        assert_eq!(
+            transform_names(&cfg),
+            vec!["allowlist", "secrets", "header_allowlist"]
+        );
+        let secrets = cfg["transforms"][1]["config"]["secrets"]
+            .as_sequence()
+            .unwrap();
+        assert_eq!(secrets.len(), 6);
+        assert!(
+            secrets
+                .iter()
+                .any(|secret| secret["source"]["var"].as_str() == Some("OPENAI_API_KEY"))
+        );
+        assert!(
+            secrets
+                .iter()
+                .any(|secret| secret["source"]["var"].as_str() == Some("GITHUB_TOKEN"))
+        );
     }
 
     #[test]

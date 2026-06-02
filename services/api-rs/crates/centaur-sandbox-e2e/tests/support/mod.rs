@@ -6,18 +6,25 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use centaur_iron_proxy::{SourcePolicy, load_fragment_str};
-use centaur_sandbox_agent_k8s::{AgentSandboxBackend, AgentSandboxConfig, IronProxyPodConfig};
+use centaur_sandbox_agent_k8s::{
+    AgentSandboxBackend, AgentSandboxConfig, IronProxyPodConfig, SandboxWarmPoolConfig,
+};
 use centaur_sandbox_core::{
     SandboxBackend, SandboxId, SandboxRead, SandboxSpec, SandboxStatus, SandboxWrite,
 };
 use centaur_sandbox_local::LocalSandboxBackend;
 use centaur_sandbox_manager::{DriftReason, ReconcileOutcome, SandboxManager};
 use clap::Parser;
-use k8s_openapi::api::core::v1::{Pod, Secret, Service, ServicePort, ServiceSpec};
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
+use k8s_openapi::api::core::v1::{Endpoints, Pod, Secret, Service, ServicePort, ServiceSpec};
+use k8s_openapi::api::networking::v1::{
+    NetworkPolicy, NetworkPolicyIngressRule, NetworkPolicyPeer, NetworkPolicyPort,
+    NetworkPolicySpec,
+};
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta};
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::api::{DeleteParams, ListParams, LogParams, PostParams};
 use kube::config::KubeConfigOptions;
@@ -29,6 +36,7 @@ const ALL_IMPLEMENTATIONS: &[&str] = &["local", "agent-k8s"];
 const PROXY_E2E_PLACEHOLDER: &str = "TEST_API_TOKEN";
 const PROXY_E2E_REAL_SECRET: &str = "real-env-secret-from-sandbox-e2e";
 const RECEIVER_PORT: i32 = 443;
+static NEXT_K8S_NAME: AtomicU64 = AtomicU64::new(0);
 
 type TestResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -397,6 +405,8 @@ async fn run_env_secret_proxy_e2e(
     cleanup.sandbox(implementation.receiver_backend.clone(), receiver.id.clone());
     create_receiver_service(implementation, &receiver.id).await?;
     cleanup.service(implementation.receiver_service_name.clone());
+    let receiver_policy = create_receiver_ingress_policy(implementation, &receiver.id).await?;
+    cleanup.network_policy(receiver_policy);
 
     let mut receiver_io = receiver_manager.open_io(&receiver.id).await?.into_parts();
     receiver_io.stdin.write_all(b"start\n").await?;
@@ -405,6 +415,13 @@ async fn run_env_secret_proxy_e2e(
         &mut receiver_io.stdout,
         "RECEIVER_READY\n",
         Duration::from_secs(15),
+    )
+    .await?;
+    wait_for_service_endpoint(
+        &implementation.client,
+        &implementation.namespace,
+        &implementation.receiver_service_name,
+        RECEIVER_PORT,
     )
     .await?;
 
@@ -573,6 +590,45 @@ async fn read_until(
     }
 }
 
+async fn wait_for_service_endpoint(
+    client: &Client,
+    namespace: &str,
+    service_name: &str,
+    port: i32,
+) -> TestResult<()> {
+    let endpoints: Api<Endpoints> = Api::namespaced(client.clone(), namespace);
+    let mut latest = String::new();
+    timeout(Duration::from_secs(15), async {
+        let mut ticks = interval(Duration::from_millis(100));
+        loop {
+            match endpoints.get(service_name).await {
+                Ok(endpoint) if endpoint_has_ready_port(&endpoint, port) => return Ok(()),
+                Ok(endpoint) => latest = format!("{endpoint:?}"),
+                Err(err) => latest = err.to_string(),
+            }
+            ticks.tick().await;
+        }
+    })
+    .await
+    .map_err(|_| {
+        format!("service {service_name} did not publish a ready endpoint on port {port}: {latest}")
+    })?
+}
+
+fn endpoint_has_ready_port(endpoints: &Endpoints, port: i32) -> bool {
+    endpoints.subsets.as_ref().is_some_and(|subsets| {
+        subsets.iter().any(|subset| {
+            subset
+                .addresses
+                .as_ref()
+                .is_some_and(|addresses| !addresses.is_empty())
+                && subset.ports.as_ref().is_some_and(|ports| {
+                    ports.iter().any(|endpoint_port| endpoint_port.port == port)
+                })
+        })
+    })
+}
+
 fn drop_stdin(stdin: SandboxWrite) {
     drop(stdin);
 }
@@ -731,6 +787,60 @@ async fn create_receiver_service(
     Ok(())
 }
 
+async fn create_receiver_ingress_policy(
+    implementation: &ProxyE2eImplementation,
+    receiver_id: &SandboxId,
+) -> TestResult<String> {
+    let policies: Api<NetworkPolicy> =
+        Api::namespaced(implementation.client.clone(), &implementation.namespace);
+    let name = format!("{}-ingress", implementation.receiver_service_name);
+    let _ = policies.delete(&name, &DeleteParams::default()).await;
+    policies
+        .create(
+            &PostParams::default(),
+            &NetworkPolicy {
+                metadata: ObjectMeta {
+                    name: Some(name.clone()),
+                    labels: Some(BTreeMap::from([(
+                        "centaur.ai/e2e".to_owned(),
+                        "iron-proxy-env-secret".to_owned(),
+                    )])),
+                    ..ObjectMeta::default()
+                },
+                spec: Some(NetworkPolicySpec {
+                    pod_selector: Some(LabelSelector {
+                        match_labels: Some(BTreeMap::from([(
+                            "centaur.ai/sandbox-id".to_owned(),
+                            receiver_id.as_str().to_owned(),
+                        )])),
+                        ..LabelSelector::default()
+                    }),
+                    policy_types: Some(vec!["Ingress".to_owned()]),
+                    ingress: Some(vec![NetworkPolicyIngressRule {
+                        from: Some(vec![NetworkPolicyPeer {
+                            pod_selector: Some(LabelSelector {
+                                match_labels: Some(BTreeMap::from([(
+                                    "centaur.ai/iron-proxy".to_owned(),
+                                    "true".to_owned(),
+                                )])),
+                                ..LabelSelector::default()
+                            }),
+                            ..NetworkPolicyPeer::default()
+                        }]),
+                        ports: Some(vec![NetworkPolicyPort {
+                            port: Some(IntOrString::Int(RECEIVER_PORT)),
+                            protocol: Some("TCP".to_owned()),
+                            ..NetworkPolicyPort::default()
+                        }]),
+                    }]),
+                    ..NetworkPolicySpec::default()
+                }),
+            },
+        )
+        .await?;
+    Ok(name)
+}
+
 async fn create_secret(
     client: &Client,
     namespace: &str,
@@ -765,6 +875,7 @@ struct ProxyE2eCleanup {
     namespace: String,
     sandboxes: Vec<(Arc<dyn SandboxBackend>, SandboxId)>,
     services: Vec<String>,
+    network_policies: Vec<String>,
     secrets: Vec<String>,
 }
 
@@ -775,6 +886,7 @@ impl ProxyE2eCleanup {
             namespace: implementation.namespace.clone(),
             sandboxes: Vec::new(),
             services: Vec::new(),
+            network_policies: Vec::new(),
             secrets: Vec::new(),
         }
     }
@@ -785,6 +897,10 @@ impl ProxyE2eCleanup {
 
     fn service(&mut self, name: String) {
         self.services.push(name);
+    }
+
+    fn network_policy(&mut self, name: String) {
+        self.network_policies.push(name);
     }
 
     fn secret(&mut self, name: String) {
@@ -799,6 +915,13 @@ impl ProxyE2eCleanup {
         let services: Api<Service> = Api::namespaced(self.client.clone(), &self.namespace);
         for name in self.services.drain(..).rev() {
             let _ = services.delete(&name, &DeleteParams::default()).await;
+        }
+        let network_policies: Api<NetworkPolicy> =
+            Api::namespaced(self.client.clone(), &self.namespace);
+        for name in self.network_policies.drain(..).rev() {
+            let _ = network_policies
+                .delete(&name, &DeleteParams::default())
+                .await;
         }
         let secrets: Api<Secret> = Api::namespaced(self.client.clone(), &self.namespace);
         for name in self.secrets.drain(..).rev() {
@@ -945,7 +1068,14 @@ fn unique_k8s_name(prefix: &str) -> String {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis();
-    format!("{prefix}-{}-{millis}", std::process::id())
+    let sequence = NEXT_K8S_NAME.fetch_add(1, Ordering::Relaxed);
+    format!("{prefix}-{}-{millis}-{sequence}", std::process::id())
+}
+
+fn use_unique_warm_pool(config: &mut AgentSandboxConfig, prefix: &str) {
+    let pool_name = unique_k8s_name(prefix);
+    let template_name = format!("{pool_name}-template");
+    config.warm_pool = SandboxWarmPoolConfig::new(pool_name, template_name);
 }
 
 struct TempDir {
@@ -990,6 +1120,7 @@ async fn agent_k8s_implementation() -> SandboxImplementation {
     let image = args.sandbox_e2e_k8s_image;
     let mut config = AgentSandboxConfig::new(namespace);
     config.ready_timeout = Duration::from_secs(90);
+    use_unique_warm_pool(&mut config, "sandbox-e2e");
     let backend = Arc::new(AgentSandboxBackend::new(client.clone(), config.clone()));
 
     SandboxImplementation {
@@ -1017,9 +1148,11 @@ async fn agent_k8s_proxy_implementation() -> ProxyE2eImplementation {
 
     let mut receiver_config = AgentSandboxConfig::new(namespace.clone());
     receiver_config.ready_timeout = Duration::from_secs(120);
+    use_unique_warm_pool(&mut receiver_config, "proxy-e2e-receiver");
 
     let mut sender_config = AgentSandboxConfig::new(namespace.clone());
     sender_config.ready_timeout = Duration::from_secs(120);
+    use_unique_warm_pool(&mut sender_config, "proxy-e2e-sender");
     let mut iron_proxy = IronProxyPodConfig::new(
         args.sandbox_e2e_iron_proxy_image,
         ca_cert_secret_name.clone(),

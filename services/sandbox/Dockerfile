@@ -201,7 +201,6 @@ COPY --link --from=centaur-tools-builder --chmod=755 /tmp/centaur-tools /usr/loc
 COPY --link --chmod=755 services/sandbox/slack-upload.sh /usr/local/bin/slack-upload
 COPY --link --chmod=755 services/sandbox/md2docx.py /usr/local/bin/md2docx
 COPY --link --chmod=755 services/sandbox/amp-wrapper.py /usr/local/bin/amp-wrapper
-COPY --link --chmod=755 services/sandbox/codex-app-wrapper.py /usr/local/bin/codex-app-wrapper
 COPY --link --chmod=755 services/sandbox/claude-app-wrapper.py /usr/local/bin/claude-app-wrapper
 COPY --link --chmod=755 services/sandbox/harness_adapter.py /usr/local/bin/harness-adapter
 COPY --link --chmod=755 services/sandbox/git-branch.sh /usr/local/bin/git-branch
@@ -216,5 +215,4 @@ COPY --link --chown=1001:1001 harness/ /home/agent/harness/
 COPY --link --chown=1001:1001 services/sandbox/SYSTEM_PROMPT.md /home/agent/AGENTS.md
 
 ENTRYPOINT ["/entrypoint.sh"]
-# Default CMD uses Codex app-server through Centaur's NDJSON bridge.
-CMD ["codex-app-wrapper"]
+CMD ["codex", "app-server", "--listen", "stdio://"]

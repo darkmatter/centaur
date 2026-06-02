@@ -102,8 +102,7 @@ fn container_workload_mode(args: &Args) -> SandboxWorkloadMode {
         SandboxWorkloadKind::Mock => SandboxWorkloadMode::mock_app_server(image),
         SandboxWorkloadKind::CodexAppServer => {
             let mut workload =
-                SandboxWorkloadMode::codex_app_server(image, codex_app_server_env_template(args))
-                    .without_thread_key_env();
+                SandboxWorkloadMode::codex_app_server(image, codex_app_server_env_template(args));
             if let Some(repos_path) = clean_optional_value(args.repos_path.as_deref()) {
                 workload = workload.mount(
                     Mount::new(
@@ -356,12 +355,6 @@ fn agent_sandbox_config_from_args(args: &Args) -> Result<AgentSandboxConfig, Ser
     config.state_volume = sandbox_state_volume_from_args(args);
     config.iron_proxy = iron_proxy_config_from_args(args)?;
     config.warm_pool = sandbox_warm_pool_config_from_args(args)?;
-    if config.iron_proxy.is_some() {
-        return Err(ServerError::UnsupportedConfig(
-            "SandboxWarmPool mode cannot be combined with per-sandbox iron-proxy resources"
-                .to_owned(),
-        ));
-    }
     Ok(config)
 }
 
@@ -601,6 +594,7 @@ fn clean_paths(paths: &[PathBuf]) -> Vec<PathBuf> {
 
 fn codex_app_server_env_template(args: &Args) -> Vec<(String, String)> {
     let mut envs = Vec::new();
+    push_env(&mut envs, "CENTAUR_HARNESS_KIND", "codex".to_owned());
     push_env(
         &mut envs,
         "CENTAUR_API_URL",
@@ -662,6 +656,23 @@ mod tests {
         assert_eq!(labels["component"], "worker");
         assert!(parse_label_selector_arg("app").is_err());
         assert!(parse_label_selector_arg("app=").is_err());
+    }
+
+    #[test]
+    fn codex_workload_env_sets_harness_kind_for_proxy_fragments() {
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgresql://postgres@localhost/centaur",
+        ])
+        .unwrap();
+
+        let env = codex_app_server_env_template(&args)
+            .into_iter()
+            .collect::<BTreeMap<_, _>>();
+
+        assert_eq!(env["CENTAUR_HARNESS_KIND"], "codex");
+        assert_eq!(env["CENTAUR_API_URL"], "http://api:8000");
     }
 
     #[test]
@@ -739,7 +750,7 @@ mod tests {
     }
 
     #[test]
-    fn warm_pool_rejects_per_sandbox_iron_proxy_config() {
+    fn warm_pool_allows_iron_proxy_config() {
         let args = Args::try_parse_from([
             "centaur-api-server",
             "--database-url",
@@ -753,10 +764,12 @@ mod tests {
         ])
         .unwrap();
 
-        let error = agent_sandbox_config_from_args(&args).unwrap_err();
+        let config = agent_sandbox_config_from_args(&args).unwrap();
+        let iron_proxy = config.iron_proxy.unwrap();
 
-        assert!(error.to_string().contains("SandboxWarmPool"));
-        assert!(error.to_string().contains("iron-proxy"));
+        assert_eq!(config.warm_pool.pool_name, "centaur-agent-warm-pool");
+        assert_eq!(iron_proxy.ca_cert_secret_name, "firewall-ca-cert");
+        assert_eq!(iron_proxy.ca_key_secret_name, "firewall-ca-key");
     }
 }
 

@@ -196,14 +196,7 @@ pub(crate) fn output_type_matches(data: &str, expected_type: Option<&str>) -> bo
         return false;
     };
     serde_json::from_str::<Value>(data)
-        .ok()
-        .and_then(|value| {
-            value
-                .get("type")
-                .and_then(Value::as_str)
-                .map(|event_type| event_type == expected_type)
-        })
-        .unwrap_or(false)
+        .is_ok_and(|value| value.get("type").and_then(Value::as_str) == Some(expected_type))
 }
 
 fn session_input_lines(args: &Args) -> Result<Vec<String>> {
@@ -240,17 +233,13 @@ pub(crate) fn is_terminal_event(event: &str) -> bool {
 
 fn api_base_url(value: &str) -> std::result::Result<String, String> {
     let value = value.trim_end_matches('/');
-    if value.is_empty() {
-        Err("api_url must not be empty".to_owned())
-    } else {
-        Ok(value.to_owned())
-    }
+    (!value.is_empty())
+        .then(|| value.to_owned())
+        .ok_or_else(|| "api_url must not be empty".to_owned())
 }
 
 fn non_empty_value(value: &str) -> std::result::Result<String, String> {
-    if value.trim().is_empty() {
-        Err("value must not be empty".to_owned())
-    } else {
-        Ok(value.to_owned())
-    }
+    (!value.trim().is_empty())
+        .then(|| value.to_owned())
+        .ok_or_else(|| "value must not be empty".to_owned())
 }

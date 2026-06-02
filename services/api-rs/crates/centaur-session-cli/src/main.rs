@@ -1,5 +1,3 @@
-use std::str::FromStr;
-
 use centaur_api_server::{
     client::{CentaurClient, SseEventStream},
     types::{AppendMessagesRequest, CreateSessionRequest, ExecuteSessionRequest},
@@ -17,8 +15,8 @@ const SOURCE: &str = "centaur-session-cli";
 #[derive(Debug, Parser)]
 #[command(about = "Create, execute, or attach to a Centaur session")]
 struct Args {
-    #[arg(long, env = "CENTAUR_API_URL", default_value = "http://127.0.0.1:8080")]
-    api_url: ApiBaseUrl,
+    #[arg(long, env = "CENTAUR_API_URL", default_value = "http://127.0.0.1:8080", value_parser = api_base_url)]
+    api_url: String,
 
     #[arg(long)]
     thread_key: Option<ThreadKey>,
@@ -63,14 +61,14 @@ async fn main() -> Result<()> {
     if generated_thread_key {
         eprintln!("thread_key={}", thread_key.as_str());
     }
-    let client = CentaurClient::new(args.api_url.as_str());
+    let client = CentaurClient::new(&args.api_url);
 
     if attach_mode {
         let events = client
             .stream_events(&thread_key, args.after_event_id)
             .await
             .wrap_err("open event stream")?;
-        return stream_output_lines(events, stream_run_options(&args)).await;
+        return stream_output_lines(events, &args).await;
     }
 
     client
@@ -124,15 +122,7 @@ async fn main() -> Result<()> {
         .await
         .wrap_err("execute initial turn")?;
 
-    stream_output_lines(events, stream_run_options(&args)).await
-}
-
-fn stream_run_options(args: &Args) -> StreamRunOptions {
-    StreamRunOptions {
-        all_events: args.all_events,
-        exit_on_terminal: args.exit_on_terminal,
-        exit_on_output_type: args.exit_on_output_type.clone(),
-    }
+    stream_output_lines(events, &args).await
 }
 
 fn attach_mode(args: &Args) -> bool {
@@ -164,23 +154,16 @@ fn thread_key_arg(args: &Args, attach_mode: bool) -> Result<(ThreadKey, bool)> {
     }
 }
 
-#[derive(Clone, Debug)]
-struct StreamRunOptions {
-    all_events: bool,
-    exit_on_terminal: bool,
-    exit_on_output_type: Option<String>,
-}
-
-async fn stream_output_lines(mut events: SseEventStream, options: StreamRunOptions) -> Result<()> {
+async fn stream_output_lines(mut events: SseEventStream, args: &Args) -> Result<()> {
     while let Some(event) = events.next().await {
         let event = event.wrap_err("read event stream")?;
 
         if event.event == "session.output.line" {
             println!("{}\t{}", event_id_or_unknown(&event.id), event.data);
-            if output_type_matches(&event.data, options.exit_on_output_type.as_deref()) {
+            if output_type_matches(&event.data, args.exit_on_output_type.as_deref()) {
                 return Ok(());
             }
-        } else if options.all_events {
+        } else if args.all_events {
             let data = parse_json_or_string(&event.data);
             println!(
                 "{}",
@@ -192,7 +175,7 @@ async fn stream_output_lines(mut events: SseEventStream, options: StreamRunOptio
             );
         }
 
-        if options.exit_on_terminal && is_terminal_event(&event.event) {
+        if args.exit_on_terminal && is_terminal_event(&event.event) {
             return Ok(());
         }
     }
@@ -255,24 +238,12 @@ pub(crate) fn is_terminal_event(event: &str) -> bool {
     )
 }
 
-#[derive(Clone, Debug)]
-struct ApiBaseUrl(String);
-
-impl ApiBaseUrl {
-    fn as_str(&self) -> &str {
-        self.0.as_str()
-    }
-}
-
-impl FromStr for ApiBaseUrl {
-    type Err = String;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        let value = value.trim_end_matches('/');
-        if value.is_empty() {
-            return Err("api_url must not be empty".to_owned());
-        }
-        Ok(Self(value.to_owned()))
+fn api_base_url(value: &str) -> std::result::Result<String, String> {
+    let value = value.trim_end_matches('/');
+    if value.is_empty() {
+        Err("api_url must not be empty".to_owned())
+    } else {
+        Ok(value.to_owned())
     }
 }
 

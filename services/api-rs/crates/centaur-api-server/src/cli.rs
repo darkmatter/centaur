@@ -24,6 +24,7 @@ pub(crate) async fn sandbox_runtime_from_args(
         SandboxBackendKind::Local => Ok(SandboxRuntime::backend_with_workload(
             Arc::new(LocalSandboxBackend::new()),
             args.workload.local_mode()?,
+            args.harness_auth.modes(),
         )),
         SandboxBackendKind::AgentK8s => {
             let config = args.agent_config()?;
@@ -34,6 +35,7 @@ pub(crate) async fn sandbox_runtime_from_args(
             Ok(SandboxRuntime::backend_with_workload(
                 backend,
                 args.container_workload_mode(),
+                args.harness_auth.modes(),
             ))
         }
     }
@@ -79,7 +81,7 @@ impl SandboxArgs {
     }
 
     fn container_workload_mode(&self) -> centaur_session_runtime::SandboxWorkloadMode {
-        self.workload.container_mode(self.harness_auth.modes())
+        self.workload.container_mode()
     }
 }
 

@@ -1,4 +1,4 @@
-use centaur_sandbox_core::{EnvVar, HarnessAuthModes};
+use centaur_sandbox_core::EnvVar;
 use centaur_session_runtime::{CodexAppServerWorkload, SandboxWorkloadMode};
 use clap::{Args as ClapArgs, ValueEnum};
 
@@ -51,7 +51,7 @@ impl SandboxWorkloadArgs {
         }
     }
 
-    pub(super) fn container_mode(&self, auth_modes: HarnessAuthModes) -> SandboxWorkloadMode {
+    pub(super) fn container_mode(&self) -> SandboxWorkloadMode {
         let image = self
             .agent_image
             .clone()
@@ -63,7 +63,6 @@ impl SandboxWorkloadArgs {
                     image,
                     centaur_api_url: self.centaur_api_url.clone(),
                     centaur_api_key: self.centaur_api_key.clone(),
-                    auth_modes,
                     extra_env: self.sandbox_env.clone(),
                 })
             }

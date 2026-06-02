@@ -1,7 +1,8 @@
 use std::sync::Arc;
 
 use centaur_sandbox_core::{
-    SandboxBackend, SandboxHandle, SandboxId, SandboxIo, SandboxResult, SandboxSpec, SandboxStatus,
+    CredentialProfile, HarnessAuthModes, SandboxBackend, SandboxHandle, SandboxId, SandboxIo,
+    SandboxResult, SandboxSpec, SandboxStatus,
 };
 use centaur_sandbox_manager::SandboxManager;
 use centaur_session_core::{HarnessType, ThreadKey};
@@ -27,9 +28,11 @@ impl SandboxRuntime {
     pub fn backend_with_workload(
         backend: Arc<dyn SandboxBackend>,
         workload: SandboxWorkloadMode,
+        auth_modes: HarnessAuthModes,
     ) -> Self {
         Self::backend_with_spec_factory(backend, move |thread_key, harness_type, _execution_id| {
-            workload.spec(thread_key, harness_type)
+            let profile = credential_profile_for(harness_type);
+            workload.spec(thread_key, profile, auth_modes.mode_for(profile))
         })
     }
 
@@ -62,5 +65,13 @@ impl SandboxRuntime {
         execution_id: &str,
     ) -> SandboxSpec {
         (self.spec_factory)(thread_key, harness_type, execution_id)
+    }
+}
+
+fn credential_profile_for(harness_type: &HarnessType) -> CredentialProfile {
+    match harness_type {
+        HarnessType::Codex => CredentialProfile::Codex,
+        HarnessType::Amp => CredentialProfile::Amp,
+        HarnessType::ClaudeCode => CredentialProfile::ClaudeCode,
     }
 }

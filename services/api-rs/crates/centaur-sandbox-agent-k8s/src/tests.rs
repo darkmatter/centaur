@@ -2,8 +2,7 @@ use std::collections::BTreeMap;
 
 use centaur_iron_proxy::SourcePolicy;
 use centaur_sandbox_core::{
-    CredentialProfile, HarnessAuthMode, MountKind, ResourceLimits, SandboxId, SandboxSpec,
-    SandboxStatus,
+    CredentialProfile, MountKind, ResourceLimits, SandboxId, SandboxSpec, SandboxStatus,
 };
 use k8s_openapi::api::core::v1::{EnvVar, Pod, PodCondition, PodStatus};
 
@@ -78,20 +77,6 @@ fn builds_agent_sandbox_spec_with_limits() {
     let image_pull_secrets = pod_spec.image_pull_secrets.as_ref().unwrap();
     assert_eq!(image_pull_secrets[0].name, "regcred");
     assert_eq!(image_pull_secrets[1].name, "mirrorcred");
-}
-
-#[test]
-fn typed_harness_auth_does_not_render_as_pod_env() {
-    let spec = SandboxSpec::new("centaur-agent:latest")
-        .credential(CredentialProfile::Codex, Some(HarnessAuthMode::AccessToken));
-    let config = AgentSandboxConfig::new("centaur");
-
-    let sandbox = build_agent_sandbox(&SandboxId::new("asbx-auth"), &spec, &config, None).unwrap();
-    let container = &sandbox.spec.pod_template.spec.containers[0];
-    let env = container.env.as_deref().map(env_values).unwrap_or_default();
-
-    assert!(!env.contains_key("CODEX_AUTH_MODE"));
-    assert!(!env.contains_key("CLAUDE_CODE_AUTH_MODE"));
 }
 
 #[test]

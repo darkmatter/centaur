@@ -1,7 +1,5 @@
-use centaur_sandbox_core::{
-    CredentialProfile, EnvVar, HarnessAuthMode, HarnessAuthModes, SandboxSpec,
-};
-use centaur_session_core::{HarnessType, ThreadKey};
+use centaur_sandbox_core::{CredentialProfile, EnvVar, HarnessAuthMode, SandboxSpec};
+use centaur_session_core::ThreadKey;
 
 #[derive(Clone, Debug)]
 pub enum SandboxWorkloadMode {
@@ -14,30 +12,37 @@ pub struct CodexAppServerWorkload {
     pub image: String,
     pub centaur_api_url: String,
     pub centaur_api_key: Option<String>,
-    pub auth_modes: HarnessAuthModes,
     pub extra_env: Vec<EnvVar>,
 }
 
 impl SandboxWorkloadMode {
-    pub(crate) fn spec(&self, thread_key: &ThreadKey, harness_type: &HarnessType) -> SandboxSpec {
+    pub(crate) fn spec(
+        &self,
+        thread_key: &ThreadKey,
+        profile: CredentialProfile,
+        auth_mode: Option<HarnessAuthMode>,
+    ) -> SandboxSpec {
         match self {
             Self::MockAppServer { image } => SandboxSpec::new(image)
                 .command(["/bin/sh", "-lc"])
                 .args([mock_app_server_script()]),
-            Self::CodexAppServer(workload) => workload.spec(thread_key, harness_type),
+            Self::CodexAppServer(workload) => workload.spec(thread_key, profile, auth_mode),
         }
     }
 }
 
 impl CodexAppServerWorkload {
-    fn spec(&self, thread_key: &ThreadKey, harness_type: &HarnessType) -> SandboxSpec {
-        let credential_profile = credential_profile_for(harness_type);
-        let auth_mode = self.auth_modes.mode_for(credential_profile);
+    fn spec(
+        &self,
+        thread_key: &ThreadKey,
+        profile: CredentialProfile,
+        auth_mode: Option<HarnessAuthMode>,
+    ) -> SandboxSpec {
         let mut spec = SandboxSpec::new(&self.image)
-            .args(entrypoint_args(credential_profile, auth_mode))
+            .args(entrypoint_args(profile, auth_mode))
             .env("CENTAUR_THREAD_KEY", thread_key.as_str())
             .env("CENTAUR_API_URL", &self.centaur_api_url)
-            .credential(credential_profile, auth_mode);
+            .credential(profile, auth_mode);
         if let Some(api_key) = &self.centaur_api_key {
             spec = spec.env("CENTAUR_API_KEY", api_key);
         }
@@ -46,30 +51,19 @@ impl CodexAppServerWorkload {
     }
 }
 
-fn entrypoint_args(
-    credential_profile: CredentialProfile,
-    auth_mode: Option<HarnessAuthMode>,
-) -> Vec<String> {
-    match (credential_profile, auth_mode) {
-        (CredentialProfile::Codex, Some(auth_mode)) => vec![
+fn entrypoint_args(profile: CredentialProfile, auth_mode: Option<HarnessAuthMode>) -> Vec<String> {
+    match (profile, auth_mode) {
+        (CredentialProfile::Codex, Some(mode)) => vec![
             "--codex-auth-mode".to_owned(),
-            auth_mode.as_ref().to_owned(),
+            mode.as_ref().to_owned(),
             "codex-app-wrapper".to_owned(),
         ],
-        (CredentialProfile::ClaudeCode, Some(auth_mode)) => vec![
+        (CredentialProfile::ClaudeCode, Some(mode)) => vec![
             "--claude-code-auth-mode".to_owned(),
-            auth_mode.as_ref().to_owned(),
+            mode.as_ref().to_owned(),
             "codex-app-wrapper".to_owned(),
         ],
         _ => vec!["codex-app-wrapper".to_owned()],
-    }
-}
-
-fn credential_profile_for(harness_type: &HarnessType) -> CredentialProfile {
-    match harness_type {
-        HarnessType::Codex => CredentialProfile::Codex,
-        HarnessType::Amp => CredentialProfile::Amp,
-        HarnessType::ClaudeCode => CredentialProfile::ClaudeCode,
     }
 }
 
@@ -109,13 +103,13 @@ mod tests {
             image: "centaur-agent:test".to_owned(),
             centaur_api_url: "http://api:8000".to_owned(),
             centaur_api_key: None,
-            auth_modes: HarnessAuthModes {
-                codex: Some(HarnessAuthMode::AccessToken),
-                claude_code: Some(HarnessAuthMode::ApiKey),
-            },
             extra_env: vec![EnvVar::new("NO_PROXY", "api")],
         })
-        .spec(&thread_key, &HarnessType::Codex);
+        .spec(
+            &thread_key,
+            CredentialProfile::Codex,
+            Some(HarnessAuthMode::AccessToken),
+        );
         let env = spec
             .env
             .iter()

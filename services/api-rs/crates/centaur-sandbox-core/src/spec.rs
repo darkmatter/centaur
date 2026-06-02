@@ -6,6 +6,8 @@ pub struct SandboxSpec {
     pub command: Option<Vec<String>>,
     pub args: Vec<String>,
     pub env: Vec<EnvVar>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub credential_profiles: Vec<CredentialProfile>,
     pub working_dir: Option<String>,
     pub mounts: Vec<Mount>,
     pub resources: Option<ResourceLimits>,
@@ -18,6 +20,7 @@ impl SandboxSpec {
             command: None,
             args: Vec::new(),
             env: Vec::new(),
+            credential_profiles: Vec::new(),
             working_dir: None,
             mounts: Vec::new(),
             resources: None,
@@ -36,6 +39,13 @@ impl SandboxSpec {
 
     pub fn env(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
         self.env.push(EnvVar::new(name, value));
+        self
+    }
+
+    pub fn credential_profile(mut self, profile: CredentialProfile) -> Self {
+        if !self.credential_profiles.contains(&profile) {
+            self.credential_profiles.push(profile);
+        }
         self
     }
 
@@ -66,6 +76,24 @@ impl EnvVar {
         Self {
             name: name.into(),
             value: value.into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CredentialProfile {
+    Codex,
+    Amp,
+    ClaudeCode,
+}
+
+impl CredentialProfile {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Codex => "codex",
+            Self::Amp => "amp",
+            Self::ClaudeCode => "claude-code",
         }
     }
 }

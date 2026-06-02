@@ -231,22 +231,7 @@ impl AgentSandboxBackend {
         let Some(iron_proxy) = &self.config.iron_proxy else {
             return Ok(None);
         };
-        let mut fragments = vec![centaur_iron_proxy::infra_fragment().map_err(|err| {
-            SandboxError::InvalidSpec(format!("iron-proxy infra fragment: {err}"))
-        })?];
-        fragments.extend(iron_proxy.fragments.clone());
-        if let Some(harness) = spec_env(spec, "CENTAUR_HARNESS_KIND") {
-            let auth_mode = iron_proxy
-                .harness_auth_modes
-                .get(harness)
-                .map(String::as_str)
-                .unwrap_or("api_key");
-            if let Some(fragment) = centaur_iron_proxy::harness_fragment(harness, auth_mode)
-                .map_err(|err| SandboxError::InvalidSpec(format!("iron-proxy fragment: {err}")))?
-            {
-                fragments.push(fragment);
-            }
-        }
+        let fragments = iron_proxy_fragments_for_spec(iron_proxy, spec)?;
         let config_yaml = centaur_iron_proxy::render_proxy_yaml_with_source_policy(
             None,
             &fragments,
@@ -1015,13 +1000,29 @@ fn host_from_url(value: &str) -> Option<String> {
     (!host.is_empty()).then(|| host.to_owned())
 }
 
-fn spec_env<'a>(spec: &'a SandboxSpec, name: &str) -> Option<&'a str> {
-    spec.env
-        .iter()
-        .rev()
-        .find(|item| item.name == name)
-        .map(|item| item.value.as_str())
-        .filter(|value| !value.trim().is_empty())
+fn iron_proxy_fragments_for_spec(
+    iron_proxy: &IronProxyPodConfig,
+    spec: &SandboxSpec,
+) -> SandboxResult<Vec<ProxyFragment>> {
+    let mut fragments =
+        vec![centaur_iron_proxy::infra_fragment().map_err(|err| {
+            SandboxError::InvalidSpec(format!("iron-proxy infra fragment: {err}"))
+        })?];
+    fragments.extend(iron_proxy.fragments.clone());
+    for profile in &spec.credential_profiles {
+        let harness = profile.as_str();
+        let auth_mode = iron_proxy
+            .harness_auth_modes
+            .get(harness)
+            .map(String::as_str)
+            .unwrap_or("api_key");
+        if let Some(fragment) = centaur_iron_proxy::harness_fragment(harness, auth_mode)
+            .map_err(|err| SandboxError::InvalidSpec(format!("iron-proxy fragment: {err}")))?
+        {
+            fragments.push(fragment);
+        }
+    }
+    Ok(fragments)
 }
 
 fn iron_proxy_container(
@@ -1562,7 +1563,7 @@ fn map_kube_error(operation: &str, err: Error) -> SandboxError {
 
 #[cfg(test)]
 mod tests {
-    use centaur_sandbox_core::{ResourceLimits, SandboxSpec};
+    use centaur_sandbox_core::{CredentialProfile, ResourceLimits, SandboxSpec};
     use k8s_openapi::api::core::v1::{PodCondition, PodStatus};
 
     use super::*;
@@ -1575,6 +1576,22 @@ mod tests {
                     .map(|value| (item.name.as_str(), value))
             })
             .collect()
+    }
+
+    #[test]
+    fn codex_credential_profile_adds_openai_placeholder() {
+        let iron_proxy = IronProxyPodConfig::new(
+            "centaur-iron-proxy:latest",
+            "firewall-ca-cert",
+            "firewall-ca-key",
+        );
+        let spec =
+            SandboxSpec::new("centaur-agent:latest").credential_profile(CredentialProfile::Codex);
+
+        let fragments = iron_proxy_fragments_for_spec(&iron_proxy, &spec).unwrap();
+        let placeholder_env = centaur_iron_proxy::placeholder_env(&fragments);
+
+        assert_eq!(placeholder_env["OPENAI_API_KEY"], "OPENAI_API_KEY");
     }
 
     #[test]
@@ -1656,8 +1673,7 @@ mod tests {
         };
         let spec = SandboxSpec::new("centaur-agent:latest")
             .env("CENTAUR_API_URL", "http://api:8000")
-            .env("CENTAUR_API_KEY", "sbx1.placeholder")
-            .env("CENTAUR_HARNESS_KIND", "codex");
+            .env("CENTAUR_API_KEY", "sbx1.placeholder");
 
         let sandbox =
             build_agent_sandbox(&SandboxId::new("asbx-sec"), &spec, &config, Some(&resolved))

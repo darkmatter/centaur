@@ -5,8 +5,8 @@ use std::{
 };
 
 use centaur_sandbox_core::{
-    SandboxBackend, SandboxError, SandboxId, SandboxIoGuard, SandboxRead, SandboxSpec,
-    SandboxStatus, SandboxWrite,
+    CredentialProfile, SandboxBackend, SandboxError, SandboxId, SandboxIoGuard, SandboxRead,
+    SandboxSpec, SandboxStatus, SandboxWrite,
 };
 use centaur_sandbox_manager::SandboxManager;
 use centaur_session_core::{
@@ -31,7 +31,7 @@ pub const SESSION_OUTPUT_LINE_EVENT: &str = "session.output.line";
 const MAX_SESSION_OUTPUT_LINE_BYTES: usize = 1024 * 1024;
 const EVENT_STREAM_SAFETY_POLL_INTERVAL: Duration = Duration::from_secs(30);
 
-type SandboxSpecFactory = Arc<dyn Fn(&ThreadKey, &str) -> SandboxSpec + Send + Sync>;
+type SandboxSpecFactory = Arc<dyn Fn(&ThreadKey, &HarnessType, &str) -> SandboxSpec + Send + Sync>;
 type SessionInputSink = FramedWrite<SandboxWrite, LinesCodec>;
 
 #[derive(Clone)]
@@ -135,6 +135,7 @@ impl SessionRuntime {
         let sandbox_id = self
             .ensure_session_sandbox(
                 thread_key,
+                &session.harness_type,
                 session.sandbox_id.as_deref(),
                 &execution.execution_id,
             )
@@ -228,6 +229,7 @@ impl SessionRuntime {
     async fn ensure_session_sandbox(
         &self,
         thread_key: &ThreadKey,
+        harness_type: &HarnessType,
         existing_sandbox_id: Option<&str>,
         execution_id: &str,
     ) -> Result<String, SessionRuntimeError> {
@@ -242,7 +244,7 @@ impl SessionRuntime {
             }
         }
 
-        let spec = (self.sandbox_runtime.spec_factory)(thread_key, execution_id);
+        let spec = (self.sandbox_runtime.spec_factory)(thread_key, harness_type, execution_id);
         let handle = self.sandbox_runtime.manager.create_running(spec).await?;
         self.store
             .update_sandbox_id(thread_key, Some(handle.id.as_str()))
@@ -317,7 +319,9 @@ impl SessionRuntime {
 
 impl SandboxRuntime {
     pub fn backend(backend: Arc<dyn SandboxBackend>, spec: SandboxSpec) -> Self {
-        let spec_factory = move |_thread_key: &ThreadKey, _execution_id: &str| spec.clone();
+        let spec_factory = move |_thread_key: &ThreadKey,
+                                 _harness_type: &HarnessType,
+                                 _execution_id: &str| { spec.clone() };
         Self::backend_with_spec_factory(backend, spec_factory)
     }
 
@@ -325,14 +329,14 @@ impl SandboxRuntime {
         backend: Arc<dyn SandboxBackend>,
         workload: SandboxWorkloadMode,
     ) -> Self {
-        Self::backend_with_spec_factory(backend, move |thread_key, _execution_id| {
-            workload.spec(thread_key)
+        Self::backend_with_spec_factory(backend, move |thread_key, harness_type, _execution_id| {
+            workload.spec(thread_key, harness_type)
         })
     }
 
     pub fn backend_with_spec_factory<F>(backend: Arc<dyn SandboxBackend>, spec_factory: F) -> Self
     where
-        F: Fn(&ThreadKey, &str) -> SandboxSpec + Send + Sync + 'static,
+        F: Fn(&ThreadKey, &HarnessType, &str) -> SandboxSpec + Send + Sync + 'static,
     {
         Self {
             manager: Arc::new(SandboxManager::new(backend)),
@@ -358,7 +362,7 @@ impl SandboxWorkloadMode {
         }
     }
 
-    fn spec(&self, thread_key: &ThreadKey) -> SandboxSpec {
+    fn spec(&self, thread_key: &ThreadKey, harness_type: &HarnessType) -> SandboxSpec {
         match self {
             Self::MockAppServer { image } => SandboxSpec::new(image)
                 .command(["/bin/sh", "-lc"])
@@ -366,7 +370,7 @@ impl SandboxWorkloadMode {
             Self::CodexAppServer { image, env } => {
                 let mut spec = SandboxSpec::new(image)
                     .env("CENTAUR_THREAD_KEY", thread_key.as_str())
-                    .env("CENTAUR_HARNESS_KIND", "codex");
+                    .credential_profile(credential_profile_for(harness_type));
                 for (name, value) in env {
                     spec = spec.env(name.clone(), value.clone());
                 }
@@ -376,15 +380,23 @@ impl SandboxWorkloadMode {
     }
 }
 
+fn credential_profile_for(harness_type: &HarnessType) -> CredentialProfile {
+    match harness_type {
+        HarnessType::Codex => CredentialProfile::Codex,
+        HarnessType::Amp => CredentialProfile::Amp,
+        HarnessType::ClaudeCode => CredentialProfile::ClaudeCode,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn codex_app_server_marks_harness_kind() {
+    fn codex_app_server_declares_credential_profile() {
         let thread_key = ThreadKey::parse("cli:test").unwrap();
-        let spec =
-            SandboxWorkloadMode::codex_app_server("centaur-agent:test", []).spec(&thread_key);
+        let spec = SandboxWorkloadMode::codex_app_server("centaur-agent:test", [])
+            .spec(&thread_key, &HarnessType::Codex);
         let env = spec
             .env
             .iter()
@@ -392,7 +404,7 @@ mod tests {
             .collect::<HashMap<_, _>>();
 
         assert_eq!(env["CENTAUR_THREAD_KEY"], "cli:test");
-        assert_eq!(env["CENTAUR_HARNESS_KIND"], "codex");
+        assert_eq!(spec.credential_profiles, vec![CredentialProfile::Codex]);
     }
 }
 

@@ -3,7 +3,9 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use serde_yaml::Value;
 
-use super::values::{resolve_placeholder_source_values, resolve_source_values};
+use super::values::{
+    listen_port, non_empty, resolve_placeholder_source_values, resolve_source_values,
+};
 use crate::{Result, SourcePolicy};
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -23,6 +25,24 @@ pub struct PostgresListener {
 }
 
 impl PostgresListener {
+    pub(crate) fn pg_dsn_env(&self) -> Option<PgDsnEnv> {
+        let sandbox_env = self.sandbox_env.as_ref()?;
+        let env_name = non_empty(sandbox_env.name.as_deref())?;
+        let database = non_empty(sandbox_env.database.as_deref())?;
+        let port = self.listen.as_deref().and_then(listen_port)?;
+        let password_env = non_empty(
+            self.client
+                .as_ref()
+                .and_then(|client| client.password_env.as_deref()),
+        )?;
+        Some(PgDsnEnv {
+            env_name: env_name.to_owned(),
+            database: database.to_owned(),
+            port,
+            password_env: password_env.to_owned(),
+        })
+    }
+
     pub(crate) fn resolve_sources(&mut self, source_policy: &SourcePolicy) -> Result<()> {
         if let Some(upstream) = &mut self.upstream {
             upstream.resolve_sources(source_policy)?;

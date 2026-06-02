@@ -26,7 +26,7 @@ pub use render::{render_proxy_yaml, render_proxy_yaml_with_source_policy};
 pub use source::{SourceKind, SourcePolicy};
 
 pub(crate) use model::{
-    ProxyConfig, listen_port, non_empty, resolve_placeholder_source_values, value_field_str,
+    ProxyConfig, listen_port, resolve_placeholder_source_values, value_field_str,
 };
 
 #[cfg(test)]

@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
+use crate::listen_port;
 use crate::{IronProxyConfigError, PgDsnEnv, ProxyConfig, ProxyFragment, Result};
-use crate::{listen_port, non_empty};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ListenPorts {
@@ -31,36 +31,12 @@ pub fn listen_ports_from_yaml(config_yaml: &str) -> Result<ListenPorts> {
 
 pub fn pg_dsn_envs(fragments: &[ProxyFragment]) -> Vec<PgDsnEnv> {
     let mut entries = BTreeMap::<String, PgDsnEnv>::new();
-    for listener in fragments
+    for entry in fragments
         .iter()
         .flat_map(|fragment| fragment.postgres.iter())
+        .filter_map(|listener| listener.pg_dsn_env())
     {
-        let Some(sandbox_env) = &listener.sandbox_env else {
-            continue;
-        };
-        let Some(env_name) = non_empty(sandbox_env.name.as_deref()) else {
-            continue;
-        };
-        let Some(database) = non_empty(sandbox_env.database.as_deref()) else {
-            continue;
-        };
-        let Some(port) = listener.listen.as_deref().and_then(listen_port) else {
-            continue;
-        };
-        let Some(password_env) = non_empty(
-            listener
-                .client
-                .as_ref()
-                .and_then(|client| client.password_env.as_deref()),
-        ) else {
-            continue;
-        };
-        entries.entry(env_name.to_owned()).or_insert(PgDsnEnv {
-            env_name: env_name.to_owned(),
-            database: database.to_owned(),
-            port,
-            password_env: password_env.to_owned(),
-        });
+        entries.entry(entry.env_name.clone()).or_insert(entry);
     }
     entries.into_values().collect()
 }

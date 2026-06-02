@@ -5,13 +5,14 @@ use centaur_api_server::{
     types::{AppendMessagesRequest, CreateSessionRequest, ExecuteSessionRequest},
 };
 use centaur_session_core::{HarnessType, MessageRole, SessionMessageInput, ThreadKey};
-use clap::{Parser, ValueEnum};
+use clap::Parser;
 use eyre::{Result, WrapErr, bail};
 use futures_util::StreamExt;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
 const DEFAULT_MESSAGE: &str = "Reply with exactly PONG and nothing else.";
+const SOURCE: &str = "centaur-session-cli";
 
 #[derive(Debug, Parser)]
 #[command(about = "Create, execute, or attach to a Centaur session")]
@@ -25,8 +26,8 @@ struct Args {
     #[arg(long)]
     attach: bool,
 
-    #[arg(long, value_enum, default_value = "codex")]
-    harness_type: HarnessTypeArg,
+    #[arg(long, default_value = "codex")]
+    harness_type: HarnessType,
 
     #[arg(long)]
     message: Option<String>,
@@ -76,9 +77,9 @@ async fn main() -> Result<()> {
         .create_session(
             &thread_key,
             CreateSessionRequest {
-                harness_type: args.harness_type.into(),
+                harness_type: args.harness_type,
                 metadata: Some(json!({
-                    "source": "centaur-session-cli",
+                    "source": SOURCE,
                 })),
             },
         )
@@ -87,7 +88,19 @@ async fn main() -> Result<()> {
 
     let input_lines = session_input_lines(&args)?;
     let message = message_text(&args);
-    append_user_message(&client, &thread_key, message)
+    client
+        .append_messages(
+            &thread_key,
+            AppendMessagesRequest {
+                messages: vec![SessionMessageInput {
+                    role: MessageRole::User,
+                    parts: vec![json!({"type": "text", "text": message})],
+                    metadata: json!({
+                        "source": SOURCE,
+                    }),
+                }],
+            },
+        )
         .await
         .wrap_err("append message")?;
 
@@ -96,15 +109,20 @@ async fn main() -> Result<()> {
         .await
         .wrap_err("open event stream")?;
 
-    execute_input_lines(
-        &client,
-        &thread_key,
-        input_lines,
-        args.idle_timeout_ms,
-        args.max_duration_ms,
-    )
-    .await
-    .wrap_err("execute initial turn")?;
+    client
+        .execute_session(
+            &thread_key,
+            ExecuteSessionRequest {
+                metadata: Some(json!({
+                    "source": SOURCE,
+                })),
+                input_lines,
+                idle_timeout_ms: Some(args.idle_timeout_ms),
+                max_duration_ms: Some(args.max_duration_ms),
+            },
+        )
+        .await
+        .wrap_err("execute initial turn")?;
 
     stream_output_lines(events, stream_run_options(&args)).await
 }
@@ -144,51 +162,6 @@ fn thread_key_arg(args: &Args, attach_mode: bool) -> Result<(ThreadKey, bool)> {
             true,
         )),
     }
-}
-
-pub(crate) async fn append_user_message(
-    client: &CentaurClient,
-    thread_key: &ThreadKey,
-    text: &str,
-) -> Result<()> {
-    client
-        .append_messages(
-            thread_key,
-            AppendMessagesRequest {
-                messages: vec![SessionMessageInput {
-                    role: MessageRole::User,
-                    parts: vec![json!({"type": "text", "text": text})],
-                    metadata: json!({
-                        "source": "centaur-session-cli",
-                    }),
-                }],
-            },
-        )
-        .await?;
-    Ok(())
-}
-
-pub(crate) async fn execute_input_lines(
-    client: &CentaurClient,
-    thread_key: &ThreadKey,
-    input_lines: Vec<String>,
-    idle_timeout_ms: u64,
-    max_duration_ms: u64,
-) -> Result<()> {
-    client
-        .execute_session(
-            thread_key,
-            ExecuteSessionRequest {
-                metadata: Some(json!({
-                    "source": "centaur-session-cli",
-                })),
-                input_lines,
-                idle_timeout_ms: Some(idle_timeout_ms),
-                max_duration_ms: Some(max_duration_ms),
-            },
-        )
-        .await?;
-    Ok(())
 }
 
 #[derive(Clone, Debug)]
@@ -300,24 +273,6 @@ impl FromStr for ApiBaseUrl {
             return Err("api_url must not be empty".to_owned());
         }
         Ok(Self(value.to_owned()))
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
-enum HarnessTypeArg {
-    Codex,
-    Amp,
-    #[value(name = "claudecode")]
-    ClaudeCode,
-}
-
-impl From<HarnessTypeArg> for HarnessType {
-    fn from(value: HarnessTypeArg) -> Self {
-        match value {
-            HarnessTypeArg::Codex => Self::Codex,
-            HarnessTypeArg::Amp => Self::Amp,
-            HarnessTypeArg::ClaudeCode => Self::ClaudeCode,
-        }
     }
 }
 

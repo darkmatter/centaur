@@ -6,7 +6,7 @@ use time::OffsetDateTime;
 use crate::{ThreadKey, empty_object};
 
 #[derive(
-    Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize, AsRefStr, Display, EnumString,
+    Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize, AsRefStr, Display, EnumString,
 )]
 #[serde(rename_all = "lowercase")]
 #[strum(serialize_all = "lowercase")]

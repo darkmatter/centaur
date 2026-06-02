@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
+const SESSION_STREAM_ERROR_EVENT: &str = "session.stream_error";
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct CreateSessionRequest {
     pub harness_type: HarnessType,
@@ -44,51 +46,6 @@ pub struct EventsQuery {
     pub after_event_id: Option<i64>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum SessionEventName {
-    OutputLine,
-    ExecutionStarted,
-    ExecutionCompleted,
-    ExecutionFailed,
-    ExecutionCancelled,
-    StreamError,
-    Other(String),
-}
-
-impl SessionEventName {
-    pub fn as_str(&self) -> &str {
-        match self {
-            Self::OutputLine => SESSION_OUTPUT_LINE_EVENT,
-            Self::ExecutionStarted => "session.execution_started",
-            Self::ExecutionCompleted => "session.execution_completed",
-            Self::ExecutionFailed => "session.execution_failed",
-            Self::ExecutionCancelled => "session.execution_cancelled",
-            Self::StreamError => "session.stream_error",
-            Self::Other(value) => value.as_str(),
-        }
-    }
-}
-
-impl From<String> for SessionEventName {
-    fn from(value: String) -> Self {
-        match value.as_str() {
-            SESSION_OUTPUT_LINE_EVENT => Self::OutputLine,
-            "session.execution_started" => Self::ExecutionStarted,
-            "session.execution_completed" => Self::ExecutionCompleted,
-            "session.execution_failed" => Self::ExecutionFailed,
-            "session.execution_cancelled" => Self::ExecutionCancelled,
-            "session.stream_error" => Self::StreamError,
-            _ => Self::Other(value),
-        }
-    }
-}
-
-impl From<&str> for SessionEventName {
-    fn from(value: &str) -> Self {
-        Self::from(value.to_owned())
-    }
-}
-
 pub struct SessionSseEvent(Event);
 
 impl TryFrom<SessionEvent> for SessionSseEvent {
@@ -96,21 +53,18 @@ impl TryFrom<SessionEvent> for SessionSseEvent {
 
     fn try_from(event: SessionEvent) -> Result<Self, Self::Error> {
         let event_id = event.event_id;
-        let event_name = SessionEventName::from(event.event_type);
-        let sse = Event::default()
-            .id(event_id.to_string())
-            .event(event_name.as_str());
+        let event_type = event.event_type;
+        let output_line = event_type == SESSION_OUTPUT_LINE_EVENT;
+        let sse = Event::default().id(event_id.to_string()).event(event_type);
 
-        let sse = match event_name {
-            SessionEventName::OutputLine => {
-                let Some(line) = event.payload.as_str() else {
-                    return Err(SessionEventConversionError::OutputLinePayload { event_id });
-                };
-                sse.data(line)
-            }
-            _ => sse
-                .json_data(event.payload)
-                .map_err(|source| SessionEventConversionError::JsonData { event_id, source })?,
+        let sse = if output_line {
+            let Some(line) = event.payload.as_str() else {
+                return Err(SessionEventConversionError::OutputLinePayload { event_id });
+            };
+            sse.data(line)
+        } else {
+            sse.json_data(event.payload)
+                .map_err(|source| SessionEventConversionError::JsonData { event_id, source })?
         };
 
         Ok(Self(sse))
@@ -125,11 +79,11 @@ impl From<SessionSseEvent> for Event {
 
 pub fn stream_error_sse(message: impl Into<String>) -> Event {
     Event::default()
-        .event(SessionEventName::StreamError.as_str())
+        .event(SESSION_STREAM_ERROR_EVENT)
         .json_data(serde_json::json!({ "error": message.into() }))
         .unwrap_or_else(|_| {
             Event::default()
-                .event(SessionEventName::StreamError.as_str())
+                .event(SESSION_STREAM_ERROR_EVENT)
                 .data("{}")
         })
 }

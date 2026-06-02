@@ -37,9 +37,7 @@ pub fn render_proxy_yaml_with_source_policy(
     for transform in &mut managed {
         transform.resolve_sources(source_policy)?;
     }
-    if !managed.is_empty() {
-        insert_before_header_allowlist(&mut transforms, managed);
-    }
+    insert_before_header_allowlist(&mut transforms, managed);
     cfg.transforms = transforms;
 
     let mut postgres = fragments

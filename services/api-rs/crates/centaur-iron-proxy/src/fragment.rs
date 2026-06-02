@@ -38,10 +38,7 @@ pub fn load_fragment_str(contents: &str) -> Result<ProxyFragment> {
 }
 
 pub fn load_fragment_files(paths: &[PathBuf]) -> Result<Vec<ProxyFragment>> {
-    paths
-        .iter()
-        .map(load_fragment_file)
-        .collect::<Result<Vec<_>>>()
+    paths.iter().map(load_fragment_file).collect()
 }
 
 pub fn discover_fragment_files(dirs: &[PathBuf]) -> Result<Vec<PathBuf>> {
@@ -111,23 +108,13 @@ pub fn harness_broker_fragments() -> Result<Vec<ProxyFragment>> {
 }
 
 pub fn placeholder_env(fragments: &[ProxyFragment]) -> BTreeMap<String, String> {
-    let mut env = BTreeMap::new();
-    for fragment in fragments {
-        for transform in &fragment.transforms {
-            if !transform.is_secrets() {
-                continue;
-            }
-            for secret in &transform.config.secrets {
-                let Some(proxy_value) = secret.proxy_value() else {
-                    continue;
-                };
-                if proxy_value.is_empty() || proxy_value.contains('=') {
-                    continue;
-                }
-                env.entry(proxy_value.to_owned())
-                    .or_insert_with(|| proxy_value.to_owned());
-            }
-        }
-    }
-    env
+    fragments
+        .iter()
+        .flat_map(|fragment| &fragment.transforms)
+        .filter(|transform| transform.is_secrets())
+        .flat_map(|transform| &transform.config.secrets)
+        .filter_map(|secret| secret.proxy_value())
+        .filter(|value| !value.is_empty() && !value.contains('='))
+        .map(|value| (value.to_owned(), value.to_owned()))
+        .collect()
 }

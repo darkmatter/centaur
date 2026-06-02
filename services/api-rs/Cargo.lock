@@ -327,13 +327,11 @@ dependencies = [
 name = "centaur-sandbox-e2e"
 version = "0.1.0"
 dependencies = [
- "centaur-iron-proxy",
  "centaur-sandbox-agent-k8s",
  "centaur-sandbox-core",
  "centaur-sandbox-local",
  "centaur-sandbox-manager",
  "clap",
- "k8s-openapi",
  "kube",
  "test-case",
  "tokio",
@@ -414,16 +412,6 @@ dependencies = [
  "thiserror",
  "time",
  "uuid",
-]
-
-[[package]]
-name = "centaur-tools"
-version = "0.1.0"
-dependencies = [
- "clap",
- "regex",
- "serde_json",
- "thiserror",
 ]
 
 [[package]]

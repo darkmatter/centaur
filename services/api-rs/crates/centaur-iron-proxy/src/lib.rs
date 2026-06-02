@@ -5,14 +5,12 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
-use serde_yaml::{Mapping, Value};
+use serde_yaml::Value;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 pub const DEFAULT_PROXY_BASE_CONFIG: &str =
     include_str!("../../../../api/api/iron-proxy.base.yaml");
-pub const CENTAUR_CORE_PG_LISTENER: &str = "centaur_core";
-pub const DEFAULT_CORE_PG_PORT: u16 = 5432;
 pub const INFRA_FRAGMENT: &str = include_str!("../../../../iron-proxy/infra.yaml");
 pub const CLAUDE_CODE_API_KEY_FRAGMENT: &str =
     include_str!("../../../../iron-proxy/harness/claude-code-api-key.yaml");
@@ -47,8 +45,6 @@ pub enum IronProxyConfigError {
     },
     #[error("failed to parse iron-proxy base yaml: {0}")]
     ParseBase(serde_yaml::Error),
-    #[error("iron-proxy base config must be a mapping")]
-    BaseNotMapping,
     #[error("failed to serialize iron-proxy yaml: {0}")]
     Serialize(serde_yaml::Error),
     #[error(
@@ -104,56 +100,25 @@ impl SourcePolicy {
         self
     }
 
-    #[cfg(test)]
-    fn from_lookup(mut lookup: impl FnMut(&str) -> Option<String>) -> Self {
-        let kind = match lookup("KUBERNETES_FIREWALL_MANAGER_SECRET_SOURCE")
-            .unwrap_or_else(|| "env".to_owned())
-            .trim()
-            .to_ascii_lowercase()
-            .as_str()
-        {
-            "onepassword" => SourceKind::OnePassword,
-            "onepassword-connect" => SourceKind::OnePasswordConnect,
-            _ => SourceKind::Env,
+    fn source_for(&self, placeholder: &str, json_key: Option<&str>) -> Result<Value> {
+        let json_key = json_key.map(ToOwned::to_owned);
+        let source = match self.kind {
+            SourceKind::Env => SecretSource::Env {
+                var: placeholder.to_owned(),
+                json_key,
+            },
+            SourceKind::OnePassword => SecretSource::OnePassword {
+                secret_ref: self.secret_ref(placeholder),
+                ttl: self.ttl.clone(),
+                json_key,
+            },
+            SourceKind::OnePasswordConnect => SecretSource::OnePasswordConnect {
+                secret_ref: self.secret_ref(placeholder),
+                ttl: self.ttl.clone(),
+                json_key,
+            },
         };
-        Self {
-            kind,
-            op_vault: lookup("OP_VAULT").unwrap_or_else(|| "ai-agents".to_owned()),
-            ttl: lookup("KUBERNETES_FIREWALL_MANAGER_SECRET_TTL")
-                .unwrap_or_else(|| "10m".to_owned()),
-            token_broker_ttl: lookup("KUBERNETES_FIREWALL_MANAGER_TOKEN_BROKER_TTL")
-                .unwrap_or_else(|| "1m".to_owned()),
-        }
-    }
-
-    fn source_for(&self, placeholder: &str, json_key: Option<&str>) -> Value {
-        let mut source = Mapping::new();
-        match self.kind {
-            SourceKind::Env => {
-                source.insert(string_value("type"), string_value("env"));
-                source.insert(string_value("var"), string_value(placeholder));
-            }
-            SourceKind::OnePassword => {
-                source.insert(string_value("type"), string_value("1password"));
-                source.insert(
-                    string_value("secret_ref"),
-                    string_value(format!("op://{}/{placeholder}/credential", self.op_vault)),
-                );
-                source.insert(string_value("ttl"), string_value(&self.ttl));
-            }
-            SourceKind::OnePasswordConnect => {
-                source.insert(string_value("type"), string_value("1password_connect"));
-                source.insert(
-                    string_value("secret_ref"),
-                    string_value(format!("op://{}/{placeholder}/credential", self.op_vault)),
-                );
-                source.insert(string_value("ttl"), string_value(&self.ttl));
-            }
-        }
-        if let Some(json_key) = json_key {
-            source.insert(string_value("json_key"), string_value(json_key));
-        }
-        Value::Mapping(source)
+        serde_yaml::to_value(source).map_err(IronProxyConfigError::Serialize)
     }
 
     fn store_source_for(&self, placeholder: &str) -> Result<Value> {
@@ -162,9 +127,13 @@ impl SourcePolicy {
                 placeholder: placeholder.to_owned(),
             }),
             SourceKind::OnePassword | SourceKind::OnePasswordConnect => {
-                Ok(self.source_for(placeholder, None))
+                self.source_for(placeholder, None)
             }
         }
+    }
+
+    fn secret_ref(&self, placeholder: &str) -> String {
+        format!("op://{}/{placeholder}/credential", self.op_vault)
     }
 }
 
@@ -181,14 +150,39 @@ pub enum SourceKind {
     OnePasswordConnect,
 }
 
+#[derive(Serialize)]
+#[serde(tag = "type")]
+enum SecretSource {
+    #[serde(rename = "env")]
+    Env {
+        var: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        json_key: Option<String>,
+    },
+    #[serde(rename = "1password")]
+    OnePassword {
+        secret_ref: String,
+        ttl: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        json_key: Option<String>,
+    },
+    #[serde(rename = "1password_connect")]
+    OnePasswordConnect {
+        secret_ref: String,
+        ttl: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        json_key: Option<String>,
+    },
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ProxyFragment {
     #[serde(default)]
-    pub transforms: Vec<Value>,
+    pub transforms: Vec<Transform>,
     #[serde(default)]
-    pub postgres: Vec<Value>,
+    pub postgres: Vec<PostgresListener>,
     #[serde(default)]
-    pub broker_credentials: Vec<Value>,
+    pub broker_credentials: Vec<BrokerCredential>,
     #[serde(default, flatten)]
     pub top_level: BTreeMap<String, Value>,
 }
@@ -202,21 +196,275 @@ impl ProxyFragment {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CorePgListener {
-    pub port: u16,
-    pub dsn_env_var: String,
-    pub password_env: String,
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct ProxyConfig {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    transforms: Vec<Transform>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    postgres: Vec<PostgresListener>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    proxy: Option<ProxySection>,
+    #[serde(default, flatten)]
+    top_level: BTreeMap<String, Value>,
 }
 
-impl CorePgListener {
-    pub fn new(port: u16, dsn_env_var: impl Into<String>, password_env: impl Into<String>) -> Self {
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct ProxySection {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tunnel_listen: Option<String>,
+    #[serde(default, flatten)]
+    extra: BTreeMap<String, Value>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct Transform {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "TransformConfig::is_empty")]
+    pub config: TransformConfig,
+    #[serde(default, flatten)]
+    pub extra: BTreeMap<String, Value>,
+}
+
+impl Transform {
+    fn is_managed(&self) -> bool {
+        MANAGED_TRANSFORMS.contains(&self.name.as_str())
+    }
+
+    fn is_secrets(&self) -> bool {
+        self.name == "secrets"
+    }
+
+    fn resolve_sources(&mut self, source_policy: &SourcePolicy) -> Result<()> {
+        if self.is_secrets() {
+            for secret in &mut self.config.secrets {
+                secret.fill_missing_source(source_policy)?;
+            }
+        }
+        self.config.resolve_sources(source_policy)?;
+        resolve_source_values(self.extra.values_mut(), source_policy)
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct TransformConfig {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub secrets: Vec<Secret>,
+    #[serde(default, flatten)]
+    pub extra: BTreeMap<String, Value>,
+}
+
+impl TransformConfig {
+    fn is_empty(&self) -> bool {
+        self.secrets.is_empty() && self.extra.is_empty()
+    }
+
+    fn resolve_sources(&mut self, source_policy: &SourcePolicy) -> Result<()> {
+        for secret in &mut self.secrets {
+            secret.resolve_sources(source_policy)?;
+        }
+        resolve_source_values(self.extra.values_mut(), source_policy)
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct Secret {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replace: Option<SecretReplace>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inject: Option<Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rules: Vec<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_value: Option<String>,
+    #[serde(default, flatten)]
+    pub extra: BTreeMap<String, Value>,
+}
+
+impl Secret {
+    fn explicit_id(&self) -> Option<&str> {
+        self.id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    }
+
+    fn proxy_value(&self) -> Option<&str> {
+        self.replace
+            .as_ref()
+            .and_then(|replace| replace.proxy_value.as_deref())
+            .or(self.proxy_value.as_deref())
+    }
+
+    fn fill_missing_source(&mut self, source_policy: &SourcePolicy) -> Result<()> {
+        if self.source.is_some() {
+            return Ok(());
+        }
+        if let Some(proxy_value) = self.proxy_value() {
+            self.source = Some(source_policy.source_for(proxy_value, None)?);
+        }
+        Ok(())
+    }
+
+    fn resolve_sources(&mut self, source_policy: &SourcePolicy) -> Result<()> {
+        if let Some(source) = &mut self.source {
+            resolve_placeholder_source_values(source, source_policy)?;
+        }
+        if let Some(replace) = &mut self.replace {
+            replace.resolve_sources(source_policy)?;
+        }
+        if let Some(inject) = &mut self.inject {
+            resolve_placeholder_source_values(inject, source_policy)?;
+        }
+        resolve_source_values(&mut self.rules, source_policy)?;
+        resolve_source_values(self.extra.values_mut(), source_policy)
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct SecretReplace {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_value: Option<String>,
+    #[serde(default, flatten)]
+    pub extra: BTreeMap<String, Value>,
+}
+
+impl SecretReplace {
+    fn resolve_sources(&mut self, source_policy: &SourcePolicy) -> Result<()> {
+        resolve_source_values(self.extra.values_mut(), source_policy)
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct PostgresListener {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listen: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream: Option<PostgresUpstream>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client: Option<PostgresClient>,
+    #[serde(default, skip_serializing)]
+    pub sandbox_env: Option<SandboxEnv>,
+    #[serde(default, flatten)]
+    pub extra: BTreeMap<String, Value>,
+}
+
+impl PostgresListener {
+    fn resolve_sources(&mut self, source_policy: &SourcePolicy) -> Result<()> {
+        if let Some(upstream) = &mut self.upstream {
+            upstream.resolve_sources(source_policy)?;
+        }
+        if let Some(client) = &mut self.client {
+            client.resolve_sources(source_policy)?;
+        }
+        resolve_source_values(self.extra.values_mut(), source_policy)
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct PostgresUpstream {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dsn: Option<Value>,
+    #[serde(default, flatten)]
+    pub extra: BTreeMap<String, Value>,
+}
+
+impl PostgresUpstream {
+    fn resolve_sources(&mut self, source_policy: &SourcePolicy) -> Result<()> {
+        if let Some(dsn) = &mut self.dsn {
+            resolve_placeholder_source_values(dsn, source_policy)?;
+        }
+        resolve_source_values(self.extra.values_mut(), source_policy)
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct PostgresClient {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password_env: Option<String>,
+    #[serde(default, flatten)]
+    pub extra: BTreeMap<String, Value>,
+}
+
+impl PostgresClient {
+    fn resolve_sources(&mut self, source_policy: &SourcePolicy) -> Result<()> {
+        resolve_source_values(self.extra.values_mut(), source_policy)
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct SandboxEnv {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub database: Option<String>,
+    #[serde(default, flatten)]
+    pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BrokerCredential {
+    pub id: String,
+    pub token_endpoint: String,
+    pub client_id: Value,
+    pub store: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_secret: Option<Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scopes: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub token_endpoint_headers: BTreeMap<String, Value>,
+    #[serde(default, flatten)]
+    pub extra: BTreeMap<String, Value>,
+}
+
+impl BrokerCredential {
+    fn resolve_sources(&mut self, source_policy: &SourcePolicy) -> Result<()> {
+        resolve_placeholder_source_values(&mut self.client_id, source_policy)?;
+        resolve_broker_store_source(&mut self.store, source_policy)?;
+        if let Some(client_secret) = &mut self.client_secret {
+            resolve_placeholder_source_values(client_secret, source_policy)?;
+        }
+        resolve_source_values(self.token_endpoint_headers.values_mut(), source_policy)?;
+        resolve_source_values(self.extra.values_mut(), source_policy)
+    }
+}
+
+#[derive(Serialize)]
+struct TokenBrokerConfig {
+    listen: String,
+    metrics_listen: String,
+    bearer_auth_env: &'static str,
+    log: TokenBrokerLogConfig,
+    credentials: Vec<BrokerCredential>,
+}
+
+impl TokenBrokerConfig {
+    fn new(credentials: Vec<BrokerCredential>) -> Self {
         Self {
-            port,
-            dsn_env_var: dsn_env_var.into(),
-            password_env: password_env.into(),
+            listen: format!(":{DEFAULT_BROKER_LISTEN_PORT}"),
+            metrics_listen: format!(":{DEFAULT_BROKER_METRICS_PORT}"),
+            bearer_auth_env: BROKER_BEARER_AUTH_ENV,
+            log: TokenBrokerLogConfig {
+                level: "info",
+                format: "json",
+            },
+            credentials,
         }
     }
+}
+
+#[derive(Serialize)]
+struct TokenBrokerLogConfig {
+    level: &'static str,
+    format: &'static str,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -314,8 +562,8 @@ pub fn harness_broker_fragments() -> Result<Vec<ProxyFragment>> {
         CLAUDE_CODE_ACCESS_TOKEN_FRAGMENT,
         CODEX_ACCESS_TOKEN_FRAGMENT,
     ]
-    .iter()
-    .map(|contents| load_fragment_str(contents))
+    .into_iter()
+    .map(load_fragment_str)
     .collect()
 }
 
@@ -323,15 +571,11 @@ pub fn placeholder_env(fragments: &[ProxyFragment]) -> BTreeMap<String, String> 
     let mut env = BTreeMap::new();
     for fragment in fragments {
         for transform in &fragment.transforms {
-            if transform_name(transform) != Some("secrets") {
+            if !transform.is_secrets() {
                 continue;
             }
-            for secret in transform["config"]["secrets"]
-                .as_sequence()
-                .into_iter()
-                .flatten()
-            {
-                let Some(proxy_value) = secret_proxy_value(secret) else {
+            for secret in &transform.config.secrets {
+                let Some(proxy_value) = secret.proxy_value() else {
                     continue;
                 };
                 if proxy_value.is_empty() || proxy_value.contains('=') {
@@ -346,11 +590,12 @@ pub fn placeholder_env(fragments: &[ProxyFragment]) -> BTreeMap<String, String> 
 }
 
 pub fn listen_ports_from_yaml(config_yaml: &str) -> Result<Vec<u16>> {
-    let cfg: Value = serde_yaml::from_str(config_yaml).map_err(IronProxyConfigError::ParseBase)?;
+    let cfg: ProxyConfig =
+        serde_yaml::from_str(config_yaml).map_err(IronProxyConfigError::ParseBase)?;
     let mut ports = Vec::new();
-    ports.push(proxy_listen_port_from_value(&cfg));
-    for listener in cfg["postgres"].as_sequence().into_iter().flatten() {
-        if let Some(port) = listener["listen"].as_str().and_then(listen_port) {
+    ports.push(proxy_listen_port_from_config(&cfg));
+    for listener in &cfg.postgres {
+        if let Some(port) = listener.listen.as_deref().and_then(listen_port) {
             ports.push(port);
         }
     }
@@ -360,13 +605,15 @@ pub fn listen_ports_from_yaml(config_yaml: &str) -> Result<Vec<u16>> {
 }
 
 pub fn proxy_listen_port_from_yaml(config_yaml: &str) -> Result<u16> {
-    let cfg: Value = serde_yaml::from_str(config_yaml).map_err(IronProxyConfigError::ParseBase)?;
-    Ok(proxy_listen_port_from_value(&cfg))
+    let cfg: ProxyConfig =
+        serde_yaml::from_str(config_yaml).map_err(IronProxyConfigError::ParseBase)?;
+    Ok(proxy_listen_port_from_config(&cfg))
 }
 
-fn proxy_listen_port_from_value(cfg: &Value) -> u16 {
-    cfg["proxy"]["tunnel_listen"]
-        .as_str()
+fn proxy_listen_port_from_config(cfg: &ProxyConfig) -> u16 {
+    cfg.proxy
+        .as_ref()
+        .and_then(|proxy| proxy.tunnel_listen.as_deref())
         .and_then(listen_port)
         .unwrap_or(8080)
 }
@@ -381,30 +628,32 @@ pub fn pg_dsn_envs(fragments: &[ProxyFragment]) -> Vec<PgDsnEnv> {
         .iter()
         .flat_map(|fragment| fragment.postgres.iter())
     {
-        let Some(sandbox_env) = listener["sandbox_env"].as_mapping() else {
+        let Some(sandbox_env) = &listener.sandbox_env else {
             continue;
         };
         let Some(env_name) = sandbox_env
-            .get(&string_value("name"))
-            .and_then(Value::as_str)
+            .name
+            .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty())
         else {
             continue;
         };
         let Some(database) = sandbox_env
-            .get(&string_value("database"))
-            .and_then(Value::as_str)
+            .database
+            .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty())
         else {
             continue;
         };
-        let Some(port) = listener["listen"].as_str().and_then(listen_port) else {
+        let Some(port) = listener.listen.as_deref().and_then(listen_port) else {
             continue;
         };
-        let Some(password_env) = listener["client"]["password_env"]
-            .as_str()
+        let Some(password_env) = listener
+            .client
+            .as_ref()
+            .and_then(|client| client.password_env.as_deref())
             .map(str::trim)
             .filter(|value| !value.is_empty())
         else {
@@ -420,66 +669,49 @@ pub fn pg_dsn_envs(fragments: &[ProxyFragment]) -> Vec<PgDsnEnv> {
     entries.into_values().collect()
 }
 
-pub fn render_proxy_yaml(
-    base_config: Option<&str>,
-    fragments: &[ProxyFragment],
-    core_pg: Option<&CorePgListener>,
-) -> Result<String> {
-    render_proxy_yaml_with_source_policy(base_config, fragments, core_pg, &SourcePolicy::default())
+pub fn render_proxy_yaml(base_config: Option<&str>, fragments: &[ProxyFragment]) -> Result<String> {
+    render_proxy_yaml_with_source_policy(base_config, fragments, &SourcePolicy::default())
 }
 
 pub fn render_proxy_yaml_with_source_policy(
     base_config: Option<&str>,
     fragments: &[ProxyFragment],
-    core_pg: Option<&CorePgListener>,
     source_policy: &SourcePolicy,
 ) -> Result<String> {
-    let mut cfg: Value = serde_yaml::from_str(base_config.unwrap_or(DEFAULT_PROXY_BASE_CONFIG))
-        .map_err(IronProxyConfigError::ParseBase)?;
-    let Value::Mapping(cfg_map) = &mut cfg else {
-        return Err(IronProxyConfigError::BaseNotMapping);
-    };
+    let mut cfg: ProxyConfig =
+        serde_yaml::from_str(base_config.unwrap_or(DEFAULT_PROXY_BASE_CONFIG))
+            .map_err(IronProxyConfigError::ParseBase)?;
 
     for fragment in fragments {
         for (key, value) in &fragment.top_level {
             let mut value = value.clone();
-            resolve_placeholder_source_values(&mut value, source_policy);
-            cfg_map.insert(string_value(key), value);
+            resolve_placeholder_source_values(&mut value, source_policy)?;
+            cfg.top_level.insert(key.clone(), value);
         }
     }
 
-    let mut transforms = existing_unmanaged_transforms(cfg_map);
+    let mut transforms = existing_unmanaged_transforms(cfg.transforms);
     let mut managed = fragments
         .iter()
         .flat_map(|fragment| fragment.transforms.iter().cloned())
         .collect::<Vec<_>>();
     assign_secret_ids(&mut managed)?;
-    let managed = managed
-        .into_iter()
-        .map(|transform| resolve_fragment_transform_sources(transform, source_policy))
-        .collect::<Vec<_>>();
+    for transform in &mut managed {
+        transform.resolve_sources(source_policy)?;
+    }
     if !managed.is_empty() {
         insert_before_header_allowlist(&mut transforms, managed);
     }
-    cfg_map.insert(string_value("transforms"), Value::Sequence(transforms));
+    cfg.transforms = transforms;
 
     let mut postgres = fragments
         .iter()
         .flat_map(|fragment| fragment.postgres.iter().cloned())
-        .map(|mut listener| {
-            strip_centaur_postgres_extensions(&mut listener);
-            resolve_placeholder_source_values(&mut listener, source_policy);
-            listener
-        })
         .collect::<Vec<_>>();
-    if let Some(core_pg) = core_pg {
-        postgres.push(core_pg_listener_value(core_pg));
+    for listener in &mut postgres {
+        listener.resolve_sources(source_policy)?;
     }
-    if postgres.is_empty() {
-        cfg_map.remove(&string_value("postgres"));
-    } else {
-        cfg_map.insert(string_value("postgres"), Value::Sequence(postgres));
-    }
+    cfg.postgres = postgres;
 
     serde_yaml::to_string(&cfg).map_err(IronProxyConfigError::Serialize)
 }
@@ -492,65 +724,133 @@ pub fn render_token_broker_yaml_with_source_policy(
     fragments: &[ProxyFragment],
     source_policy: &SourcePolicy,
 ) -> Result<String> {
-    let credentials = collect_broker_credentials(fragments, source_policy)?;
-    let cfg = mapping([
-        (
-            "listen",
-            string_value(format!(":{DEFAULT_BROKER_LISTEN_PORT}")),
-        ),
-        (
-            "metrics_listen",
-            string_value(format!(":{DEFAULT_BROKER_METRICS_PORT}")),
-        ),
-        ("bearer_auth_env", string_value(BROKER_BEARER_AUTH_ENV)),
-        (
-            "log",
-            mapping([
-                ("level", string_value("info")),
-                ("format", string_value("json")),
-            ]),
-        ),
-        ("credentials", Value::Sequence(credentials)),
-    ]);
-    serde_yaml::to_string(&cfg).map_err(IronProxyConfigError::Serialize)
-}
-
-fn collect_broker_credentials(
-    fragments: &[ProxyFragment],
-    source_policy: &SourcePolicy,
-) -> Result<Vec<Value>> {
-    let mut by_id = BTreeMap::<String, Value>::new();
+    let mut credentials = BTreeMap::<String, BrokerCredential>::new();
     for credential in fragments
         .iter()
-        .flat_map(|fragment| fragment.broker_credentials.iter().cloned())
+        .flat_map(|fragment| fragment.broker_credentials.iter())
     {
-        let id = credential["id"].as_str().map(ToOwned::to_owned);
-        let credential = resolve_broker_credential_sources(credential, source_policy)?;
-        if let Some(id) = id {
-            by_id.entry(id).or_insert(credential);
-        }
-    }
-    Ok(by_id.into_values().collect())
-}
-
-fn resolve_broker_credential_sources(
-    mut credential: Value,
-    source_policy: &SourcePolicy,
-) -> Result<Value> {
-    let Some(map) = credential.as_mapping_mut() else {
-        return Ok(credential);
-    };
-    let store_key = string_value("store");
-    if let Some(store) = map.get_mut(&store_key) {
-        resolve_broker_store_source(store, source_policy)?;
-    }
-    for (key, child) in map {
-        if key == &store_key {
+        if credentials.contains_key(&credential.id) {
             continue;
         }
-        resolve_placeholder_source_values(child, source_policy);
+        let mut credential = credential.clone();
+        credential.resolve_sources(source_policy)?;
+        credentials.insert(credential.id.clone(), credential);
     }
-    Ok(credential)
+    serde_yaml::to_string(&TokenBrokerConfig::new(credentials.into_values().collect()))
+        .map_err(IronProxyConfigError::Serialize)
+}
+
+fn assign_secret_ids(transforms: &mut [Transform]) -> Result<()> {
+    let mut used = BTreeMap::<String, usize>::new();
+    for secret in transforms
+        .iter()
+        .filter(|transform| transform.is_secrets())
+        .flat_map(|transform| transform.config.secrets.iter())
+    {
+        if let Some(id) = secret.explicit_id() {
+            used.entry(id.to_owned()).or_insert(1);
+        }
+    }
+
+    for transform in transforms
+        .iter_mut()
+        .filter(|transform| transform.is_secrets())
+    {
+        for secret in &mut transform.config.secrets {
+            if secret.explicit_id().is_some() {
+                continue;
+            }
+            let candidate = generated_secret_id(secret)?;
+            secret.id = Some(unique_id(candidate, &mut used));
+        }
+    }
+    Ok(())
+}
+
+fn generated_secret_id(secret: &Secret) -> Result<String> {
+    let base = secret_id_base(secret);
+    let digest = secret_identity_digest(secret)?;
+    Ok(format!("{base}-{digest}"))
+}
+
+fn secret_id_base(secret: &Secret) -> String {
+    let raw = secret
+        .proxy_value()
+        .or_else(|| value_field_str(secret.source.as_ref(), "credential_id"))
+        .or_else(|| value_field_str(secret.source.as_ref(), "placeholder"))
+        .or_else(|| value_field_str(secret.source.as_ref(), "var"))
+        .or_else(|| value_field_str(secret.source.as_ref(), "secret_ref"))
+        .or_else(|| value_field_str(secret.inject.as_ref(), "header"))
+        .or_else(|| value_field_str(secret.inject.as_ref(), "query_param"))
+        .or_else(|| {
+            secret
+                .rules
+                .first()
+                .and_then(|rule| value_field_str(Some(rule), "host"))
+        })
+        .unwrap_or("secret");
+    let slug = slugify_id_component(raw);
+    if slug.is_empty() {
+        "secret".to_owned()
+    } else {
+        slug
+    }
+}
+
+fn value_field_str<'a>(value: Option<&'a Value>, key: &str) -> Option<&'a str> {
+    value?
+        .as_mapping()?
+        .get(&Value::String(key.to_owned()))?
+        .as_str()
+}
+
+fn slugify_id_component(value: &str) -> String {
+    let mut slug = String::new();
+    let mut previous_dash = false;
+    for ch in value.chars().flat_map(char::to_lowercase) {
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch);
+            previous_dash = false;
+        } else if !previous_dash && !slug.is_empty() {
+            slug.push('-');
+            previous_dash = true;
+        }
+    }
+    while slug.ends_with('-') {
+        slug.pop();
+    }
+    slug
+}
+
+fn secret_identity_digest(secret: &Secret) -> Result<String> {
+    let mut identity = secret.clone();
+    identity.id = None;
+    let serialized = serde_yaml::to_string(&identity).map_err(IronProxyConfigError::Serialize)?;
+    let digest = Sha256::digest(serialized.as_bytes());
+    Ok(digest[..6]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
+fn unique_id(candidate: String, used: &mut BTreeMap<String, usize>) -> String {
+    let count = used.entry(candidate.clone()).or_insert(0);
+    *count += 1;
+    if *count == 1 {
+        candidate
+    } else {
+        format!("{candidate}-{count}")
+    }
+}
+
+fn resolve_source_values<'a>(
+    values: impl IntoIterator<Item = &'a mut Value>,
+    source_policy: &SourcePolicy,
+) -> Result<()> {
+    for value in values {
+        resolve_placeholder_source_values(value, source_policy)?;
+    }
+    Ok(())
 }
 
 fn resolve_broker_store_source(value: &mut Value, source_policy: &SourcePolicy) -> Result<()> {
@@ -579,182 +879,19 @@ fn resolve_broker_store_source(value: &mut Value, source_policy: &SourcePolicy) 
     Ok(())
 }
 
-fn strip_centaur_postgres_extensions(listener: &mut Value) {
-    if let Some(map) = listener.as_mapping_mut() {
-        map.remove(&string_value("sandbox_env"));
-    }
-}
-
-fn resolve_fragment_transform_sources(mut transform: Value, source_policy: &SourcePolicy) -> Value {
-    fill_missing_secret_sources(&mut transform, source_policy);
-    resolve_placeholder_source_values(&mut transform, source_policy);
-    transform
-}
-
-fn assign_secret_ids(transforms: &mut [Value]) -> Result<()> {
-    let mut used = BTreeMap::<String, usize>::new();
-    for secret in secret_entries_mut(transforms) {
-        if let Some(id) = secret["id"]
-            .as_str()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        {
-            used.entry(id.to_owned()).or_insert(1);
+fn resolve_placeholder_source_values(
+    value: &mut Value,
+    source_policy: &SourcePolicy,
+) -> Result<()> {
+    if let Some(source_ref) = SourceReference::from_value(value) {
+        if let Some(placeholder) = source_ref.placeholder {
+            *value = source_policy.source_for(&placeholder, source_ref.json_key.as_deref())?;
+            return Ok(());
         }
     }
 
-    for secret in secret_entries_mut(transforms) {
-        if secret
-            .as_mapping()
-            .and_then(|map| map.get(&string_value("id")))
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .is_some_and(|value| !value.is_empty())
-        {
-            continue;
-        }
-        let candidate = generated_secret_id(secret)?;
-        let id = unique_id(candidate, &mut used);
-        if let Some(secret_map) = secret.as_mapping_mut() {
-            secret_map.insert(string_value("id"), string_value(id));
-        }
-    }
-    Ok(())
-}
-
-fn secret_entries_mut(transforms: &mut [Value]) -> Vec<&mut Value> {
-    transforms
-        .iter_mut()
-        .filter(|transform| transform_name(transform) == Some("secrets"))
-        .filter_map(|transform| {
-            transform
-                .as_mapping_mut()
-                .and_then(|map| map.get_mut(&string_value("config")))
-                .and_then(Value::as_mapping_mut)
-                .and_then(|map| map.get_mut(&string_value("secrets")))
-                .and_then(Value::as_sequence_mut)
-        })
-        .flat_map(|secrets| secrets.iter_mut())
-        .collect()
-}
-
-fn generated_secret_id(secret: &Value) -> Result<String> {
-    let base = secret_id_base(secret);
-    let digest = secret_identity_digest(secret)?;
-    Ok(format!("{base}-{digest}"))
-}
-
-fn secret_id_base(secret: &Value) -> String {
-    let raw = secret_proxy_value(secret)
-        .or_else(|| secret["source"]["credential_id"].as_str())
-        .or_else(|| secret["source"]["placeholder"].as_str())
-        .or_else(|| secret["source"]["var"].as_str())
-        .or_else(|| secret["source"]["secret_ref"].as_str())
-        .or_else(|| secret["inject"]["header"].as_str())
-        .or_else(|| secret["inject"]["query_param"].as_str())
-        .or_else(|| secret["rules"][0]["host"].as_str())
-        .unwrap_or("secret");
-    let slug = slugify_id_component(raw);
-    if slug.is_empty() {
-        "secret".to_owned()
-    } else {
-        slug
-    }
-}
-
-fn slugify_id_component(value: &str) -> String {
-    let mut slug = String::new();
-    let mut previous_dash = false;
-    for ch in value.chars().flat_map(char::to_lowercase) {
-        if ch.is_ascii_alphanumeric() {
-            slug.push(ch);
-            previous_dash = false;
-        } else if !previous_dash && !slug.is_empty() {
-            slug.push('-');
-            previous_dash = true;
-        }
-    }
-    while slug.ends_with('-') {
-        slug.pop();
-    }
-    slug
-}
-
-fn secret_identity_digest(secret: &Value) -> Result<String> {
-    let mut identity = secret.clone();
-    if let Some(map) = identity.as_mapping_mut() {
-        map.remove(&string_value("id"));
-    }
-    let serialized = serde_yaml::to_string(&identity).map_err(IronProxyConfigError::Serialize)?;
-    let digest = Sha256::digest(serialized.as_bytes());
-    Ok(digest[..6]
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect())
-}
-
-fn unique_id(candidate: String, used: &mut BTreeMap<String, usize>) -> String {
-    let count = used.entry(candidate.clone()).or_insert(0);
-    *count += 1;
-    if *count == 1 {
-        candidate
-    } else {
-        format!("{candidate}-{count}")
-    }
-}
-
-fn fill_missing_secret_sources(transform: &mut Value, source_policy: &SourcePolicy) {
-    if transform_name(transform) != Some("secrets") {
-        return;
-    }
-    let Some(secrets) = transform
-        .as_mapping_mut()
-        .and_then(|map| map.get_mut(&string_value("config")))
-        .and_then(Value::as_mapping_mut)
-        .and_then(|map| map.get_mut(&string_value("secrets")))
-        .and_then(Value::as_sequence_mut)
-    else {
-        return;
-    };
-    for secret in secrets {
-        let proxy_value = secret_proxy_value(secret).map(ToOwned::to_owned);
-        let Some(secret_map) = secret.as_mapping_mut() else {
-            continue;
-        };
-        if secret_map.contains_key(&string_value("source")) {
-            continue;
-        }
-        let Some(proxy_value) = proxy_value else {
-            continue;
-        };
-        secret_map.insert(
-            string_value("source"),
-            source_policy.source_for(&proxy_value, None),
-        );
-    }
-}
-
-fn secret_proxy_value(secret: &Value) -> Option<&str> {
-    secret["replace"]["proxy_value"]
-        .as_str()
-        .or_else(|| secret["proxy_value"].as_str())
-}
-
-fn resolve_placeholder_source_values(value: &mut Value, source_policy: &SourcePolicy) {
     match value {
         Value::Mapping(map) => {
-            if let Some(placeholder) = map
-                .get(&string_value("placeholder"))
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned)
-            {
-                let json_key = map
-                    .get(&string_value("json_key"))
-                    .and_then(Value::as_str)
-                    .map(ToOwned::to_owned);
-                *value = source_policy.source_for(&placeholder, json_key.as_deref());
-                return;
-            }
             if map.get(&string_value("type")).and_then(Value::as_str) == Some("token_broker")
                 && !map.contains_key(&string_value("ttl"))
             {
@@ -764,78 +901,49 @@ fn resolve_placeholder_source_values(value: &mut Value, source_policy: &SourcePo
                 );
             }
             for child in map.values_mut() {
-                resolve_placeholder_source_values(child, source_policy);
+                resolve_placeholder_source_values(child, source_policy)?;
             }
         }
         Value::Sequence(values) => {
             for child in values {
-                resolve_placeholder_source_values(child, source_policy);
+                resolve_placeholder_source_values(child, source_policy)?;
             }
         }
         _ => {}
     }
+    Ok(())
 }
 
-fn existing_unmanaged_transforms(cfg: &Mapping) -> Vec<Value> {
-    cfg.get(&string_value("transforms"))
-        .and_then(Value::as_sequence)
+#[derive(Clone, Debug, Default, Deserialize)]
+struct SourceReference {
+    #[serde(default)]
+    placeholder: Option<String>,
+    #[serde(default)]
+    json_key: Option<String>,
+}
+
+impl SourceReference {
+    fn from_value(value: &Value) -> Option<Self> {
+        serde_yaml::from_value(value.clone()).ok()
+    }
+}
+
+fn existing_unmanaged_transforms(transforms: Vec<Transform>) -> Vec<Transform> {
+    transforms
         .into_iter()
-        .flatten()
-        .filter(|transform| {
-            transform_name(transform).is_none_or(|name| !MANAGED_TRANSFORMS.contains(&name))
-        })
-        .cloned()
+        .filter(|transform| !transform.is_managed())
         .collect()
 }
 
-fn insert_before_header_allowlist(transforms: &mut Vec<Value>, managed: Vec<Value>) {
+fn insert_before_header_allowlist(transforms: &mut Vec<Transform>, managed: Vec<Transform>) {
     if let Some(index) = transforms
         .iter()
-        .position(|transform| transform_name(transform) == Some("header_allowlist"))
+        .position(|transform| transform.name == "header_allowlist")
     {
         transforms.splice(index..index, managed);
     } else {
         transforms.extend(managed);
     }
-}
-
-fn transform_name(value: &Value) -> Option<&str> {
-    value
-        .as_mapping()
-        .and_then(|map| map.get(&string_value("name")))
-        .and_then(Value::as_str)
-}
-
-fn core_pg_listener_value(core_pg: &CorePgListener) -> Value {
-    mapping([
-        ("name", string_value(CENTAUR_CORE_PG_LISTENER)),
-        ("listen", string_value(format!("0.0.0.0:{}", core_pg.port))),
-        (
-            "upstream",
-            mapping([(
-                "dsn",
-                mapping([
-                    ("type", string_value("env")),
-                    ("var", string_value(&core_pg.dsn_env_var)),
-                ]),
-            )]),
-        ),
-        (
-            "client",
-            mapping([
-                ("user", string_value("app_user")),
-                ("password_env", string_value(&core_pg.password_env)),
-            ]),
-        ),
-    ])
-}
-
-fn mapping<const N: usize>(items: [(&str, Value); N]) -> Value {
-    let mut map = Mapping::new();
-    for (key, value) in items {
-        map.insert(string_value(key), value);
-    }
-    Value::Mapping(map)
 }
 
 fn string_value(value: impl AsRef<str>) -> Value {
@@ -862,31 +970,6 @@ mod tests {
 
     fn fragment_yaml(yaml: &str) -> ProxyFragment {
         serde_yaml::from_str(yaml).unwrap()
-    }
-
-    #[test]
-    fn source_policy_reads_kubernetes_prefixed_env() {
-        let vars = BTreeMap::from([
-            (
-                "KUBERNETES_FIREWALL_MANAGER_SECRET_SOURCE".to_owned(),
-                "onepassword-connect".to_owned(),
-            ),
-            ("OP_VAULT".to_owned(), "prod-agents".to_owned()),
-            (
-                "KUBERNETES_FIREWALL_MANAGER_SECRET_TTL".to_owned(),
-                "20m".to_owned(),
-            ),
-            (
-                "KUBERNETES_FIREWALL_MANAGER_TOKEN_BROKER_TTL".to_owned(),
-                "45s".to_owned(),
-            ),
-        ]);
-        let policy = SourcePolicy::from_lookup(|name| vars.get(name).cloned());
-
-        assert_eq!(policy.kind, SourceKind::OnePasswordConnect);
-        assert_eq!(policy.op_vault, "prod-agents");
-        assert_eq!(policy.ttl, "20m");
-        assert_eq!(policy.token_broker_ttl, "45s");
     }
 
     fn temp_dir(name: &str) -> PathBuf {
@@ -923,7 +1006,7 @@ transforms:
       rules: [{ host: api.example.com }]
 "#,
         );
-        let rendered = render_proxy_yaml(None, &[fragment], None).unwrap();
+        let rendered = render_proxy_yaml(None, &[fragment]).unwrap();
         let cfg = parse_rendered(&rendered);
         assert_eq!(
             transform_names(&cfg),
@@ -936,96 +1019,6 @@ transforms:
                 "header_allowlist",
             ]
         );
-    }
-
-    #[test]
-    fn replaces_managed_transforms_from_base_config() {
-        let base = r#"
-transforms:
-  - name: allowlist
-    config: { domains: ["*"] }
-  - name: secrets
-    config: { secrets: [{ old: true }] }
-  - name: header_allowlist
-    config: { headers: ["host"] }
-"#;
-        let fragment = fragment_yaml(
-            r#"
-transforms:
-  - name: secrets
-    config:
-      secrets:
-        - source: { type: env, var: OPENAI_API_KEY }
-          replace:
-            proxy_value: OPENAI_API_KEY
-            match_headers: ["Authorization"]
-          rules: [{ host: api.openai.com }]
-"#,
-        );
-        let rendered = render_proxy_yaml(Some(base), &[fragment], None).unwrap();
-        let cfg = parse_rendered(&rendered);
-        assert_eq!(
-            transform_names(&cfg),
-            vec!["allowlist", "secrets", "header_allowlist"]
-        );
-        assert_eq!(
-            cfg["transforms"][1]["config"]["secrets"][0]["source"]["var"],
-            "OPENAI_API_KEY"
-        );
-        assert!(cfg["transforms"][1]["config"]["secrets"][0]["old"].is_null());
-    }
-
-    #[test]
-    fn appends_core_pg_listener_after_fragment_postgres() {
-        let fragment = fragment_yaml(
-            r#"
-postgres:
-  - name: analytics
-    listen: 0.0.0.0:5432
-    upstream:
-      dsn: { type: env, var: ANALYTICS_DSN }
-    client:
-      user: app_user
-      password_env: PG_PROXY_PASSWORD_ANALYTICS
-"#,
-        );
-        let rendered = render_proxy_yaml(
-            None,
-            &[fragment],
-            Some(&CorePgListener::new(
-                5433,
-                "CENTAUR_DATABASE_URL",
-                "PG_PROXY_PASSWORD_CENTAUR_CORE",
-            )),
-        )
-        .unwrap();
-        let cfg = parse_rendered(&rendered);
-        let postgres = cfg["postgres"].as_sequence().unwrap();
-        assert_eq!(postgres[0]["name"], "analytics");
-        assert_eq!(postgres[1]["name"], CENTAUR_CORE_PG_LISTENER);
-        assert_eq!(postgres[1]["listen"], "0.0.0.0:5433");
-        assert_eq!(postgres[1]["upstream"]["dsn"]["type"], "env");
-        assert_eq!(
-            postgres[1]["upstream"]["dsn"]["var"],
-            "CENTAUR_DATABASE_URL"
-        );
-    }
-
-    #[test]
-    fn preserves_extra_top_level_config_from_fragments() {
-        let fragment = fragment_yaml(
-            r#"
-mcp:
-  servers:
-    - name: github
-      rules: [{ host: mcp.github.com }]
-      tools:
-        - name: search_repositories
-"#,
-        );
-        let rendered = render_proxy_yaml(None, &[fragment], None).unwrap();
-        let cfg = parse_rendered(&rendered);
-        assert_eq!(cfg["mcp"]["servers"][0]["name"], "github");
     }
 
     #[test]
@@ -1051,7 +1044,6 @@ mcp:
         let rendered = render_proxy_yaml_with_source_policy(
             None,
             &[fragment],
-            None,
             &SourcePolicy::onepassword("ai-agents", "10m"),
         )
         .unwrap();
@@ -1099,7 +1091,6 @@ postgres:
         let rendered = render_proxy_yaml_with_source_policy(
             None,
             &[fragment],
-            None,
             &SourcePolicy::onepassword("ai-agents", "10m"),
         )
         .unwrap();
@@ -1158,7 +1149,6 @@ transforms:
         let rendered = render_proxy_yaml_with_source_policy(
             None,
             &[fragment],
-            None,
             &SourcePolicy::onepassword_connect("ai-agents", "10m"),
         )
         .unwrap();
@@ -1208,17 +1198,12 @@ transforms:
           rules: [{ host: chatgpt.com }]
 "#,
         );
-        let env_rendered = render_proxy_yaml_with_source_policy(
-            None,
-            &[fragment.clone()],
-            None,
-            &SourcePolicy::env(),
-        )
-        .unwrap();
+        let env_rendered =
+            render_proxy_yaml_with_source_policy(None, &[fragment.clone()], &SourcePolicy::env())
+                .unwrap();
         let op_rendered = render_proxy_yaml_with_source_policy(
             None,
             &[fragment],
-            None,
             &SourcePolicy::onepassword_connect("ai-agents", "10m"),
         )
         .unwrap();
@@ -1262,17 +1247,9 @@ postgres:
       password_env: PG_PROXY_PASSWORD_WAREHOUSE
 "#,
             )],
-            Some(&CorePgListener::new(
-                5433,
-                "CENTAUR_DATABASE_URL",
-                "PG_PROXY_PASSWORD_CENTAUR_CORE",
-            )),
         )
         .unwrap();
-        assert_eq!(
-            listen_ports_from_yaml(&rendered).unwrap(),
-            vec![5432, 5433, 8080]
-        );
+        assert_eq!(listen_ports_from_yaml(&rendered).unwrap(), vec![5432, 8080]);
         assert_eq!(proxy_listen_port_from_yaml(&rendered).unwrap(), 8080);
         let rendered = render_proxy_yaml(
             Some(
@@ -1283,68 +1260,10 @@ transforms: []
 "#,
             ),
             &[],
-            None,
         )
         .unwrap();
         assert_eq!(listen_ports_from_yaml(&rendered).unwrap(), vec![18080]);
         assert_eq!(proxy_listen_port_from_yaml(&rendered).unwrap(), 18080);
-    }
-
-    #[test]
-    fn fills_missing_sources_from_operator_policy() {
-        let fragment = fragment_yaml(
-            r#"
-transforms:
-  - name: secrets
-    config:
-      secrets:
-        - replace:
-            proxy_value: SLACK_BOT_TOKEN
-            match_headers: ["Authorization"]
-          rules: [{ host: slack.com }]
-        - source:
-            placeholder: OPENAI_CODEX_ACCOUNT_ID
-          inject:
-            header: chatgpt-account-id
-          rules: [{ host: chatgpt.com }]
-  - name: oauth_token
-    config:
-      tokens:
-        - grant: refresh_token
-          refresh_token:
-            placeholder: GOOGLE_TOKEN_JSON
-            json_key: refresh_token
-          token_endpoint: https://oauth2.googleapis.com/token
-          rules: [{ host: gmail.googleapis.com }]
-"#,
-        );
-        let rendered = render_proxy_yaml_with_source_policy(
-            None,
-            &[fragment],
-            None,
-            &SourcePolicy::onepassword_connect("engineering", "5m"),
-        )
-        .unwrap();
-        let cfg = parse_rendered(&rendered);
-        let secrets = cfg["transforms"][1]["config"]["secrets"]
-            .as_sequence()
-            .unwrap();
-        assert_eq!(secrets[0]["source"]["type"], "1password_connect");
-        assert_eq!(
-            secrets[0]["source"]["secret_ref"],
-            "op://engineering/SLACK_BOT_TOKEN/credential"
-        );
-        assert_eq!(
-            secrets[1]["source"]["secret_ref"],
-            "op://engineering/OPENAI_CODEX_ACCOUNT_ID/credential"
-        );
-        let token = &cfg["transforms"][2]["config"]["tokens"][0];
-        assert_eq!(
-            token["refresh_token"]["secret_ref"],
-            "op://engineering/GOOGLE_TOKEN_JSON/credential"
-        );
-        assert_eq!(token["refresh_token"]["json_key"], "refresh_token");
-        assert!(!rendered.contains("placeholder:"));
     }
 
     #[test]
@@ -1394,7 +1313,6 @@ transforms:
         let rendered = render_proxy_yaml_with_source_policy(
             None,
             &[fragment],
-            None,
             &SourcePolicy::onepassword("ai-agents", "10m"),
         )
         .unwrap();
@@ -1432,7 +1350,6 @@ transforms:
         let rendered = render_proxy_yaml_with_source_policy(
             None,
             &[codex_access],
-            None,
             &SourcePolicy::onepassword("ai-agents", "10m"),
         )
         .unwrap();
@@ -1440,91 +1357,6 @@ transforms:
         assert!(rendered.contains("ttl: 1m"));
         assert!(rendered.contains("chatgpt-account-id"));
         assert!(!rendered.contains("placeholder:"));
-    }
-
-    #[test]
-    fn access_token_harness_fragments_do_not_expose_static_api_key_placeholders() {
-        let codex_access = harness_fragment("codex", "access_token").unwrap().unwrap();
-        let claude_access = harness_fragment("claude-code", "access_token")
-            .unwrap()
-            .unwrap();
-        let fragments = vec![codex_access, claude_access];
-
-        assert!(placeholder_env(&fragments).is_empty());
-
-        let rendered = render_proxy_yaml_with_source_policy(
-            None,
-            &fragments,
-            None,
-            &SourcePolicy::onepassword_connect("prod-agents", "10m"),
-        )
-        .unwrap();
-        let cfg = parse_rendered(&rendered);
-        let secrets = cfg["transforms"]
-            .as_sequence()
-            .unwrap()
-            .iter()
-            .filter(|transform| transform["name"].as_str() == Some("secrets"))
-            .flat_map(|transform| transform["config"]["secrets"].as_sequence().unwrap().iter())
-            .collect::<Vec<_>>();
-        let by_host = secrets
-            .iter()
-            .map(|secret| {
-                (
-                    secret["rules"][0]["host"].as_str().unwrap(),
-                    secret["source"]["type"].as_str().unwrap_or(""),
-                    secret,
-                )
-            })
-            .collect::<Vec<_>>();
-
-        assert!(by_host.iter().any(|(host, source_type, secret)| {
-            *host == "chatgpt.com"
-                && *source_type == "token_broker"
-                && secret["source"]["credential_id"] == "openai-codex"
-        }));
-        assert!(by_host.iter().any(|(host, source_type, secret)| {
-            *host == "api.anthropic.com"
-                && *source_type == "token_broker"
-                && secret["source"]["credential_id"] == "anthropic-claude"
-        }));
-        assert!(by_host.iter().any(|(host, source_type, secret)| {
-            *host == "chatgpt.com"
-                && *source_type == "1password_connect"
-                && secret["inject"]["header"] == "chatgpt-account-id"
-        }));
-        assert!(!rendered.contains("OPENAI_API_KEY"));
-        assert!(!rendered.contains("ANTHROPIC_API_KEY"));
-        assert!(!rendered.contains("placeholder:"));
-    }
-
-    #[test]
-    fn renders_token_broker_ttl_from_source_policy() {
-        let fragment = fragment_yaml(
-            r#"
-transforms:
-  - name: secrets
-    config:
-      secrets:
-        - source:
-            type: token_broker
-            credential_id: openai-codex
-          inject:
-            header: Authorization
-            formatter: "Bearer {{.Value}}"
-          rules: [{ host: chatgpt.com }]
-"#,
-        );
-        let rendered = render_proxy_yaml_with_source_policy(
-            None,
-            &[fragment],
-            None,
-            &SourcePolicy::env().with_token_broker_ttl("30s"),
-        )
-        .unwrap();
-        let cfg = parse_rendered(&rendered);
-        let secret = &cfg["transforms"][1]["config"]["secrets"][0];
-        assert_eq!(secret["source"]["ttl"], "30s");
     }
 
     #[test]
@@ -1541,13 +1373,10 @@ broker_credentials:
     client_secret:
       placeholder: OKTA_BUNDLE
       json_key: client_secret
-    token_endpoint_headers:
-      x-api-key:
-        placeholder: OKTA_API_KEY
     store:
       placeholder: OKTA_BLOB
   - id: openai-codex
-    token_endpoint: https://duplicate.example.com/oauth/token
+    token_endpoint: https://duplicate.example.com/token
     client_id:
       placeholder: DUPLICATE_CLIENT_ID
     store:
@@ -1564,33 +1393,28 @@ broker_credentials:
         assert_eq!(cfg["listen"], ":8181");
         assert_eq!(cfg["metrics_listen"], ":9091");
         assert_eq!(cfg["bearer_auth_env"], BROKER_BEARER_AUTH_ENV);
-        let credentials = cfg["credentials"].as_sequence().unwrap();
-        let by_id = credentials
+        let credentials = cfg["credentials"]
+            .as_sequence()
+            .unwrap()
             .iter()
             .map(|credential| (credential["id"].as_str().unwrap(), credential))
             .collect::<BTreeMap<_, _>>();
         assert_eq!(
-            by_id.keys().copied().collect::<Vec<_>>(),
+            credentials.keys().copied().collect::<Vec<_>>(),
             vec!["anthropic-claude", "okta", "openai-codex"]
         );
         assert_eq!(
-            by_id["anthropic-claude"]["token_endpoint"],
-            "https://console.anthropic.com/v1/oauth/token"
-        );
-        assert_eq!(
-            by_id["openai-codex"]["token_endpoint"],
-            "https://auth.openai.com/oauth/token"
-        );
-        assert_eq!(by_id["okta"]["client_id"]["type"], "1password_connect");
-        assert_eq!(
-            by_id["okta"]["client_id"]["secret_ref"],
+            credentials["okta"]["client_id"]["secret_ref"],
             "op://prod-agents/OKTA_BUNDLE/credential"
         );
-        assert_eq!(by_id["okta"]["client_id"]["json_key"], "client_id");
-        assert_eq!(by_id["okta"]["store"]["type"], "1password_connect");
+        assert_eq!(credentials["okta"]["client_id"]["json_key"], "client_id");
         assert_eq!(
-            by_id["okta"]["store"]["secret_ref"],
+            credentials["okta"]["store"]["secret_ref"],
             "op://prod-agents/OKTA_BLOB/credential"
+        );
+        assert_eq!(
+            credentials["openai-codex"]["token_endpoint"],
+            "https://auth.openai.com/oauth/token"
         );
         assert!(!rendered.contains("placeholder:"));
     }

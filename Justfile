@@ -41,7 +41,6 @@ build-one service:
     set -euo pipefail
     case "{{service}}" in
       api) just _build-api ;;
-      api-rs|rust-api) just _build-api-rs ;;
       iron-proxy) just _build-iron-proxy ;;
       slackbot) just _build-slackbot ;;
       agent|sandbox) just _build-agent ;;
@@ -50,9 +49,6 @@ build-one service:
 
 _build-api:
     docker build -t centaur-api:latest -f services/api/Dockerfile .
-
-_build-api-rs:
-    docker build -t centaur-api-rs:latest -f services/api-rs/Dockerfile .
 
 _build-iron-proxy:
     docker build -t centaur-iron-proxy:latest -f services/iron-proxy/Dockerfile .

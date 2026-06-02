@@ -2,10 +2,7 @@ use std::{collections::BTreeMap, env, net::SocketAddr, path::PathBuf, sync::Arc,
 
 use centaur_api_server::{SandboxRuntime, build_router_with_runtime};
 use centaur_iron_proxy::{SourceKind, SourcePolicy, discover_fragment_files, load_fragment_files};
-use centaur_sandbox_agent_k8s::{
-    AgentSandboxBackend, AgentSandboxConfig, IronProxyPodConfig, StateVolumeConfig,
-};
-use centaur_sandbox_core::{Mount, MountKind};
+use centaur_sandbox_agent_k8s::{AgentSandboxBackend, AgentSandboxConfig, IronProxyPodConfig};
 use centaur_sandbox_local::LocalSandboxBackend;
 use centaur_session_runtime::SandboxWorkloadMode;
 use centaur_session_sqlx::PgSessionStore;
@@ -14,8 +11,6 @@ use thiserror::Error;
 use tokio::net::TcpListener;
 use tracing::info;
 use tracing_subscriber::{EnvFilter, fmt as tracing_fmt};
-
-const SANDBOX_REPOS_MOUNT_PATH: &str = "/home/agent/github";
 
 #[tokio::main]
 async fn main() -> Result<(), ServerError> {
@@ -100,20 +95,7 @@ fn container_workload_mode(args: &Args) -> SandboxWorkloadMode {
     match args.kubernetes_sandbox_workload {
         SandboxWorkloadKind::Mock => SandboxWorkloadMode::mock_app_server(image),
         SandboxWorkloadKind::CodexAppServer => {
-            let mut workload =
-                SandboxWorkloadMode::codex_app_server(image, codex_app_server_env_template(args));
-            if let Some(repos_path) = clean_optional_value(args.repos_path.as_deref()) {
-                workload = workload.mount(
-                    Mount::new(
-                        MountKind::Bind {
-                            source_path: repos_path,
-                        },
-                        SANDBOX_REPOS_MOUNT_PATH,
-                    )
-                    .read_only(),
-                );
-            }
-            workload
+            SandboxWorkloadMode::codex_app_server(image, codex_app_server_env_template(args))
         }
     }
 }
@@ -165,20 +147,6 @@ struct Args {
     kubernetes_sandbox_runtime_class_name: Option<String>,
     #[arg(long, env = "KUBERNETES_SANDBOX_SERVICE_ACCOUNT_NAME")]
     kubernetes_sandbox_service_account_name: Option<String>,
-    #[arg(
-        long,
-        env = "KUBERNETES_SANDBOX_STATE_VOLUME_ENABLED",
-        default_value_t = false
-    )]
-    kubernetes_sandbox_state_volume_enabled: bool,
-    #[arg(long, env = "KUBERNETES_SANDBOX_STATE_MOUNT_PATH")]
-    kubernetes_sandbox_state_mount_path: Option<String>,
-    #[arg(long, env = "KUBERNETES_SANDBOX_STATE_VOLUME_SIZE")]
-    kubernetes_sandbox_state_volume_size: Option<String>,
-    #[arg(long, env = "KUBERNETES_SANDBOX_STATE_VOLUME_STORAGE_CLASS")]
-    kubernetes_sandbox_state_volume_storage_class: Option<String>,
-    #[arg(long, env = "REPOS_PATH")]
-    repos_path: Option<String>,
     #[arg(long, env = "CENTAUR_API_URL", default_value = "http://api:8000")]
     centaur_api_url: String,
     #[arg(long, env = "CENTAUR_API_KEY")]
@@ -261,14 +229,6 @@ struct Args {
         value_parser = parse_label_selector_arg
     )]
     kubernetes_api_pod_label_selector: Option<BTreeMap<String, String>>,
-    #[arg(
-        long,
-        env = "KUBERNETES_TOKEN_BROKER_POD_LABEL_SELECTOR",
-        value_parser = parse_label_selector_arg
-    )]
-    kubernetes_token_broker_pod_label_selector: Option<BTreeMap<String, String>>,
-    #[arg(long, env = "KUBERNETES_TOKEN_BROKER_URL")]
-    kubernetes_token_broker_url: Option<String>,
     #[arg(long, env = "KUBERNETES_TOKEN_BROKER_NAME")]
     kubernetes_token_broker_name: Option<String>,
     #[arg(long, env = "KUBERNETES_TOKEN_BROKER_CONFIGMAP_NAME")]
@@ -314,24 +274,18 @@ fn default_sandbox_image(workload: SandboxWorkloadKind) -> &'static str {
 
 fn agent_sandbox_config_from_args(args: &Args) -> Result<AgentSandboxConfig, ServerError> {
     let mut config = AgentSandboxConfig::new(args.kubernetes_namespace.clone());
-    config.image_pull_policy =
-        clean_optional_value(args.kubernetes_agent_image_pull_policy.as_deref());
-    config.image_pull_secrets = sandbox_image_pull_secrets_from_args(args);
-    config.runtime_class_name =
-        clean_optional_value(args.kubernetes_sandbox_runtime_class_name.as_deref());
-    config.service_account_name =
-        clean_optional_value(args.kubernetes_sandbox_service_account_name.as_deref());
-    config.state_volume = sandbox_state_volume_from_args(args);
+    config.image_pull_policy = args.kubernetes_agent_image_pull_policy.clone();
+    config.image_pull_secrets = args.kubernetes_sandbox_image_pull_secrets.clone();
+    config.runtime_class_name = args.kubernetes_sandbox_runtime_class_name.clone();
+    config.service_account_name = args.kubernetes_sandbox_service_account_name.clone();
     config.iron_proxy = iron_proxy_config_from_args(args)?;
     Ok(config)
 }
 
 fn iron_proxy_config_from_args(args: &Args) -> Result<Option<IronProxyPodConfig>, ServerError> {
     let fragment_paths = iron_proxy_fragment_paths(args)?;
-    let ca_cert_secret_name =
-        clean_optional_value(args.kubernetes_firewall_ca_secret_name.as_deref());
-    let ca_key_secret_name =
-        clean_optional_value(args.kubernetes_firewall_ca_key_secret_name.as_deref());
+    let ca_cert_secret_name = args.kubernetes_firewall_ca_secret_name.clone();
+    let ca_key_secret_name = args.kubernetes_firewall_ca_key_secret_name.clone();
     if !iron_proxy_enabled(
         args.kubernetes_sandbox_iron_proxy_mode,
         !fragment_paths.is_empty(),
@@ -339,7 +293,9 @@ fn iron_proxy_config_from_args(args: &Args) -> Result<Option<IronProxyPodConfig>
     ) {
         return Ok(None);
     }
-    let image = clean_optional_value(args.kubernetes_iron_proxy_image.as_deref())
+    let image = args
+        .kubernetes_iron_proxy_image
+        .clone()
         .unwrap_or_else(|| "centaur-iron-proxy:latest".to_owned());
     let mut config = IronProxyPodConfig::new(
         image,
@@ -347,32 +303,34 @@ fn iron_proxy_config_from_args(args: &Args) -> Result<Option<IronProxyPodConfig>
         ca_key_secret_name.ok_or(ServerError::MissingIronProxyCaSecret)?,
     )
     .with_fragments(load_fragment_files(&fragment_paths)?);
-    config.image_pull_policy =
-        clean_optional_value(args.kubernetes_iron_proxy_image_pull_policy.as_deref())
-            .or_else(|| clean_optional_value(args.kubernetes_agent_image_pull_policy.as_deref()));
-    config.image_pull_secrets = sandbox_image_pull_secrets_from_args(args);
+    config.image_pull_policy = args
+        .kubernetes_iron_proxy_image_pull_policy
+        .clone()
+        .or_else(|| args.kubernetes_agent_image_pull_policy.clone());
+    config.image_pull_secrets = args.kubernetes_sandbox_image_pull_secrets.clone();
     config.source_policy = source_policy_from_args(args);
-    if let Some(secret_name) = clean_optional_value(args.kubernetes_secret_env_name.as_deref()) {
+    if let Some(secret_name) = &args.kubernetes_secret_env_name {
         config.secret_env_name = Some(secret_name.clone());
-        config.secret_env_prefix =
-            clean_optional_value(args.kubernetes_secret_env_prefix.as_deref()).unwrap_or_default();
-        config.env_from_secret_names.push(secret_name);
+        config.secret_env_prefix = args
+            .kubernetes_secret_env_prefix
+            .clone()
+            .unwrap_or_default();
+        config.env_from_secret_names.push(secret_name.clone());
     }
     if matches!(config.source_policy.kind, SourceKind::OnePassword) {
-        if let Some(secret_name) =
-            clean_optional_value(args.kubernetes_bootstrap_secret_name.as_deref())
-        {
-            config.env_from_secret_names.push(secret_name);
+        if let Some(secret_name) = &args.kubernetes_bootstrap_secret_name {
+            config.env_from_secret_names.push(secret_name.clone());
         }
     }
-    if let Some(app_name) = clean_optional_value(args.kubernetes_op_connect_app_name.as_deref()) {
-        config.op_connect_app_name = app_name;
+    if let Some(app_name) = &args.kubernetes_op_connect_app_name {
+        config.op_connect_app_name = app_name.clone();
     }
     config.op_connect_port = args
         .kubernetes_op_connect_port
         .or_else(|| {
-            clean_optional_value(args.kubernetes_op_connect_host.as_deref())
-                .and_then(|value| parse_host_port(&value))
+            args.kubernetes_op_connect_host
+                .as_deref()
+                .and_then(parse_host_port)
         })
         .unwrap_or(config.op_connect_port);
     if let Some(labels) = args
@@ -382,35 +340,22 @@ fn iron_proxy_config_from_args(args: &Args) -> Result<Option<IronProxyPodConfig>
     {
         config.api_pod_labels = labels.clone();
     }
-    if let Some(labels) = args
-        .kubernetes_token_broker_pod_label_selector
-        .as_ref()
-        .filter(|labels| !labels.is_empty())
-    {
-        config.token_broker_pod_labels = labels.clone();
-    }
+    config.token_broker_name = args.kubernetes_token_broker_name.clone();
+    config.token_broker_configmap_name = args.kubernetes_token_broker_configmap_name.clone();
     config.harness_auth_modes = harness_auth_modes_from_args(args);
-    insert_optional_env(
-        &mut config.extra_env,
-        "OP_CONNECT_HOST",
-        clean_optional_value(args.kubernetes_op_connect_host.as_deref()),
+    config.extra_env.extend(
+        [("OP_CONNECT_HOST", args.kubernetes_op_connect_host.clone())]
+            .into_iter()
+            .filter_map(|(name, value)| value.map(|value| (name.to_owned(), value))),
     );
-    insert_optional_env(
-        &mut config.extra_env,
-        "IRON_BROKER_URL",
-        clean_optional_value(args.kubernetes_token_broker_url.as_deref()),
-    );
-    config.token_broker_name = clean_optional_value(args.kubernetes_token_broker_name.as_deref());
-    config.token_broker_configmap_name =
-        clean_optional_value(args.kubernetes_token_broker_configmap_name.as_deref());
     Ok(Some(config))
 }
 
 fn iron_proxy_fragment_paths(args: &Args) -> Result<Vec<PathBuf>, ServerError> {
-    let mut paths = clean_paths(&args.kubernetes_iron_proxy_fragment_paths);
-    let mut dirs = clean_paths(&args.kubernetes_iron_proxy_fragment_dirs);
+    let mut paths = args.kubernetes_iron_proxy_fragment_paths.clone();
+    let mut dirs = args.kubernetes_iron_proxy_fragment_dirs.clone();
     if dirs.is_empty() {
-        dirs.extend(clean_paths(&args.tool_dirs));
+        dirs.extend(args.tool_dirs.clone());
     }
     paths.extend(discover_fragment_files(&dirs)?);
     paths.sort();
@@ -431,14 +376,12 @@ fn iron_proxy_enabled(
 }
 
 fn source_policy_from_args(args: &Args) -> SourcePolicy {
-    let op_vault =
-        clean_optional_value(args.op_vault.as_deref()).unwrap_or_else(|| "ai-agents".to_owned());
-    let ttl = clean_optional_value(Some(args.kubernetes_firewall_manager_secret_ttl.as_str()))
-        .unwrap_or_else(|| "10m".to_owned());
-    let token_broker_ttl = clean_optional_value(Some(
-        args.kubernetes_firewall_manager_token_broker_ttl.as_str(),
-    ))
-    .unwrap_or_else(|| "1m".to_owned());
+    let op_vault = args
+        .op_vault
+        .clone()
+        .unwrap_or_else(|| "ai-agents".to_owned());
+    let ttl = args.kubernetes_firewall_manager_secret_ttl.clone();
+    let token_broker_ttl = args.kubernetes_firewall_manager_token_broker_ttl.clone();
 
     match args.kubernetes_firewall_manager_secret_source {
         IronProxySecretSourceArg::Env => SourcePolicy::env(),
@@ -451,20 +394,17 @@ fn source_policy_from_args(args: &Args) -> SourcePolicy {
 }
 
 fn harness_auth_modes_from_args(args: &Args) -> BTreeMap<String, String> {
-    let mut modes = BTreeMap::new();
-    if let Some(mode) = clean_optional_value(args.codex_auth_mode.as_deref()) {
-        modes.insert("codex".to_owned(), mode);
-    }
-    if let Some(mode) = clean_optional_value(args.claude_code_auth_mode.as_deref()) {
-        modes.insert("claude-code".to_owned(), mode);
-    }
-    modes
-}
-
-fn insert_optional_env(envs: &mut BTreeMap<String, String>, name: &str, value: Option<String>) {
-    if let Some(value) = value {
-        envs.insert(name.to_owned(), value);
-    }
+    [
+        args.codex_auth_mode
+            .clone()
+            .map(|mode| ("codex".to_owned(), mode)),
+        args.claude_code_auth_mode
+            .clone()
+            .map(|mode| ("claude-code".to_owned(), mode)),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
 }
 
 fn parse_host_port(value: &str) -> Option<u16> {
@@ -491,71 +431,20 @@ fn parse_label_selector_arg(value: &str) -> Result<BTreeMap<String, String>, Str
     Ok(labels)
 }
 
-fn sandbox_image_pull_secrets_from_args(args: &Args) -> Vec<String> {
-    clean_values(&args.kubernetes_sandbox_image_pull_secrets)
-}
-
-fn sandbox_state_volume_from_args(args: &Args) -> Option<StateVolumeConfig> {
-    if !args.kubernetes_sandbox_state_volume_enabled {
-        return None;
-    }
-    let mount_path = clean_optional_value(args.kubernetes_sandbox_state_mount_path.as_deref())
-        .unwrap_or_else(|| "/home/agent/state".to_owned());
-    let size = clean_optional_value(args.kubernetes_sandbox_state_volume_size.as_deref())
-        .unwrap_or_else(|| "10Gi".to_owned());
-    let mut config = StateVolumeConfig::new(mount_path, size);
-    if let Some(storage_class_name) = clean_optional_value(
-        args.kubernetes_sandbox_state_volume_storage_class
-            .as_deref(),
-    ) {
-        config = config.storage_class_name(storage_class_name);
-    }
-    Some(config)
-}
-
-fn clean_optional_value(value: Option<&str>) -> Option<String> {
-    value
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
-}
-
-fn clean_values(values: &[String]) -> Vec<String> {
-    values
-        .iter()
-        .map(|value| value.trim())
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
-        .collect()
-}
-
-fn clean_paths(paths: &[PathBuf]) -> Vec<PathBuf> {
-    paths
-        .iter()
-        .filter(|path| !path.as_os_str().is_empty())
-        .cloned()
-        .collect()
-}
-
 fn codex_app_server_env_template(args: &Args) -> Vec<(String, String)> {
     let mut envs = Vec::new();
-    push_env(
-        &mut envs,
-        "CENTAUR_API_URL",
-        clean_optional_value(Some(args.centaur_api_url.as_str()))
-            .unwrap_or_else(|| "http://api:8000".to_owned()),
-    );
-    if let Some(api_key) = clean_optional_value(args.centaur_api_key.as_deref()) {
-        push_env(&mut envs, "CENTAUR_API_KEY", api_key.to_owned());
+    push_env(&mut envs, "CENTAUR_API_URL", args.centaur_api_url.clone());
+    if let Some(api_key) = &args.centaur_api_key {
+        push_env(&mut envs, "CENTAUR_API_KEY", api_key.clone());
     }
-    if let Some(value) = clean_optional_value(args.claude_code_auth_mode.as_deref()) {
-        push_env(&mut envs, "CLAUDE_CODE_AUTH_MODE", value);
+    if let Some(value) = &args.claude_code_auth_mode {
+        push_env(&mut envs, "CLAUDE_CODE_AUTH_MODE", value.clone());
     }
-    if let Some(value) = clean_optional_value(args.codex_auth_mode.as_deref()) {
-        push_env(&mut envs, "CODEX_AUTH_MODE", value);
+    if let Some(value) = &args.codex_auth_mode {
+        push_env(&mut envs, "CODEX_AUTH_MODE", value.clone());
     }
 
-    for name in clean_values(&args.kubernetes_sandbox_passthrough_env) {
+    for name in &args.kubernetes_sandbox_passthrough_env {
         if let Ok(value) = env::var(&name) {
             push_env(&mut envs, &name, value);
         }
@@ -624,6 +513,10 @@ mod tests {
             "5m",
             "--kubernetes-firewall-manager-token-broker-ttl",
             "30s",
+            "--kubernetes-token-broker-name",
+            "centaur-token-broker",
+            "--kubernetes-token-broker-configmap-name",
+            "centaur-token-broker-config",
             "--codex-auth-mode",
             "access_token",
         ])
@@ -642,6 +535,15 @@ mod tests {
         assert_eq!(config.source_policy.ttl, "5m");
         assert_eq!(config.source_policy.token_broker_ttl, "30s");
         assert_eq!(config.harness_auth_modes["codex"], "access_token");
+        assert_eq!(
+            config.token_broker_name.as_deref(),
+            Some("centaur-token-broker")
+        );
+        assert_eq!(
+            config.token_broker_configmap_name.as_deref(),
+            Some("centaur-token-broker-config")
+        );
+        assert!(!config.extra_env.contains_key("IRON_BROKER_URL"));
     }
 }
 

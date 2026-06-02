@@ -6,13 +6,11 @@ license.workspace = true
 repository.workspace = true
 
 [dev-dependencies]
-centaur-iron-proxy.workspace = true
 centaur-sandbox-agent-k8s.workspace = true
 centaur-sandbox-core.workspace = true
 centaur-sandbox-local.workspace = true
 centaur-sandbox-manager.workspace = true
 clap.workspace = true
-k8s-openapi.workspace = true
 kube.workspace = true
 test-case.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "rt-multi-thread", "time"] }

@@ -168,18 +168,6 @@ RUN mkdir -p ~/.amp/bin ~/.config/amp ~/.codex ~/.pi/agent ~/github ~/workspace 
     && git config --global user.name "Centaur AI" \
     && git config --global user.email "ai@centaur.local"
 
-FROM toolchain AS centaur-tools-builder
-
-USER agent
-WORKDIR /tmp/api-rs
-COPY --link --chown=1001:1001 services/api-rs/Cargo.toml services/api-rs/Cargo.lock ./
-COPY --link --chown=1001:1001 services/api-rs/crates/ crates/
-RUN --mount=type=cache,target=/home/agent/.cargo/registry,uid=1001,gid=1001,sharing=locked \
-    --mount=type=cache,target=/home/agent/.cargo/git,uid=1001,gid=1001,sharing=locked \
-    --mount=type=cache,target=/tmp/api-rs/target,uid=1001,gid=1001,sharing=locked \
-    cargo build --release -p centaur-tools \
-    && cp target/release/centaur-tools /tmp/centaur-tools
-
 # ==============================================================================
 # Final thin stage: only frequently-changing local files below.
 # Changing harness_session.py / SYSTEM_PROMPT.md / entrypoint.sh rebuilds only
@@ -193,11 +181,11 @@ RUN rm -f /etc/sudoers.d/agent
 # BuildKit's COPY --link creates parent directories without an explicit mode,
 # which can leave /etc/centaur without the execute bit for non-root users.
 # Pre-create it as 0755 so the agent user can traverse into it at runtime.
-RUN install -d -m 0755 /etc/centaur
+RUN install -d -m 0755 /etc/centaur /opt/centaur
+COPY --link centaur_sdk/ /opt/centaur/centaur_sdk/
 COPY --link --chmod=644 services/sandbox/codex-auth.json /etc/centaur/codex-auth.default.json
 COPY --link --chmod=644 services/sandbox/claude-credentials.json /etc/centaur/claude-credentials.default.json
 COPY --link --chmod=755 services/sandbox/call.sh /usr/local/bin/call
-COPY --link --from=centaur-tools-builder --chmod=755 /tmp/centaur-tools /usr/local/bin/centaur-tools
 COPY --link --chmod=755 services/sandbox/slack-upload.sh /usr/local/bin/slack-upload
 COPY --link --chmod=755 services/sandbox/md2docx.py /usr/local/bin/md2docx
 COPY --link --chmod=755 services/sandbox/amp-wrapper.py /usr/local/bin/amp-wrapper

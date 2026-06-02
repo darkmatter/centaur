@@ -49,13 +49,18 @@ pub struct SandboxRuntime {
 
 #[derive(Clone, Debug)]
 pub enum SandboxWorkloadMode {
-    MockAppServer {
-        image: String,
-    },
-    CodexAppServer {
-        image: String,
-        env: Vec<(String, String)>,
-    },
+    MockAppServer { image: String },
+    CodexAppServer(CodexAppServerWorkload),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CodexAppServerWorkload {
+    pub image: String,
+    pub centaur_api_url: String,
+    pub centaur_api_key: Option<String>,
+    pub codex_auth_mode: Option<String>,
+    pub claude_code_auth_mode: Option<String>,
+    pub passthrough_env: Vec<(String, String)>,
 }
 
 #[derive(Debug)]
@@ -352,14 +357,8 @@ impl SandboxWorkloadMode {
         }
     }
 
-    pub fn codex_app_server(
-        image: impl Into<String>,
-        env: impl IntoIterator<Item = (String, String)>,
-    ) -> Self {
-        Self::CodexAppServer {
-            image: image.into(),
-            env: env.into_iter().collect(),
-        }
+    pub fn codex_app_server(workload: CodexAppServerWorkload) -> Self {
+        Self::CodexAppServer(workload)
     }
 
     fn spec(&self, thread_key: &ThreadKey, harness_type: &HarnessType) -> SandboxSpec {
@@ -367,16 +366,30 @@ impl SandboxWorkloadMode {
             Self::MockAppServer { image } => SandboxSpec::new(image)
                 .command(["/bin/sh", "-lc"])
                 .args([mock_app_server_script()]),
-            Self::CodexAppServer { image, env } => {
-                let mut spec = SandboxSpec::new(image)
-                    .env("CENTAUR_THREAD_KEY", thread_key.as_str())
-                    .credential_profile(credential_profile_for(harness_type));
-                for (name, value) in env {
-                    spec = spec.env(name.clone(), value.clone());
-                }
-                spec
-            }
+            Self::CodexAppServer(workload) => workload.spec(thread_key, harness_type),
         }
+    }
+}
+
+impl CodexAppServerWorkload {
+    fn spec(&self, thread_key: &ThreadKey, harness_type: &HarnessType) -> SandboxSpec {
+        let mut spec = SandboxSpec::new(&self.image)
+            .env("CENTAUR_THREAD_KEY", thread_key.as_str())
+            .env("CENTAUR_API_URL", &self.centaur_api_url)
+            .credential_profile(credential_profile_for(harness_type));
+        if let Some(api_key) = &self.centaur_api_key {
+            spec = spec.env("CENTAUR_API_KEY", api_key);
+        }
+        if let Some(auth_mode) = &self.codex_auth_mode {
+            spec = spec.env("CODEX_AUTH_MODE", auth_mode);
+        }
+        if let Some(auth_mode) = &self.claude_code_auth_mode {
+            spec = spec.env("CLAUDE_CODE_AUTH_MODE", auth_mode);
+        }
+        for (name, value) in &self.passthrough_env {
+            spec = spec.env(name, value);
+        }
+        spec
     }
 }
 
@@ -395,8 +408,15 @@ mod tests {
     #[test]
     fn codex_app_server_declares_credential_profile() {
         let thread_key = ThreadKey::parse("cli:test").unwrap();
-        let spec = SandboxWorkloadMode::codex_app_server("centaur-agent:test", [])
-            .spec(&thread_key, &HarnessType::Codex);
+        let spec = SandboxWorkloadMode::codex_app_server(CodexAppServerWorkload {
+            image: "centaur-agent:test".to_owned(),
+            centaur_api_url: "http://api:8000".to_owned(),
+            centaur_api_key: None,
+            codex_auth_mode: Some("access_token".to_owned()),
+            claude_code_auth_mode: None,
+            passthrough_env: vec![("NO_PROXY".to_owned(), "api".to_owned())],
+        })
+        .spec(&thread_key, &HarnessType::Codex);
         let env = spec
             .env
             .iter()
@@ -404,6 +424,9 @@ mod tests {
             .collect::<HashMap<_, _>>();
 
         assert_eq!(env["CENTAUR_THREAD_KEY"], "cli:test");
+        assert_eq!(env["CENTAUR_API_URL"], "http://api:8000");
+        assert_eq!(env["CODEX_AUTH_MODE"], "access_token");
+        assert_eq!(env["NO_PROXY"], "api");
         assert_eq!(spec.credential_profiles, vec![CredentialProfile::Codex]);
     }
 }

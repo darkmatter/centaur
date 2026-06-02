@@ -81,7 +81,8 @@ impl SandboxArgs {
 
     fn container_workload_mode(&self) -> centaur_session_runtime::SandboxWorkloadMode {
         self.workload.container_mode(
-            &self.harness_auth,
+            self.harness_auth.codex_auth_mode(),
+            self.harness_auth.claude_code_auth_mode(),
             process_env_values(self.workload.passthrough_env_names()),
         )
     }

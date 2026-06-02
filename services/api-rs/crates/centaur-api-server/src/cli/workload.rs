@@ -1,10 +1,9 @@
 use std::collections::BTreeMap;
 
-use centaur_session_runtime::SandboxWorkloadMode;
+use centaur_session_runtime::{CodexAppServerWorkload, SandboxWorkloadMode};
 use clap::{Args as ClapArgs, ValueEnum};
 
 use super::ServerError;
-use super::auth::HarnessAuthArgs;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum SandboxWorkloadKind {
@@ -53,7 +52,8 @@ impl SandboxWorkloadArgs {
 
     pub(super) fn container_mode(
         &self,
-        harness_auth: &HarnessAuthArgs,
+        codex_auth_mode: Option<String>,
+        claude_code_auth_mode: Option<String>,
         passthrough_env: BTreeMap<String, String>,
     ) -> SandboxWorkloadMode {
         let image = self
@@ -62,26 +62,17 @@ impl SandboxWorkloadArgs {
             .unwrap_or_else(|| default_sandbox_image(self.workload).to_owned());
         match self.workload {
             SandboxWorkloadKind::Mock => SandboxWorkloadMode::mock_app_server(image),
-            SandboxWorkloadKind::CodexAppServer => SandboxWorkloadMode::codex_app_server(
-                image,
-                self.app_server_env(harness_auth, passthrough_env),
-            ),
+            SandboxWorkloadKind::CodexAppServer => {
+                SandboxWorkloadMode::codex_app_server(CodexAppServerWorkload {
+                    image,
+                    centaur_api_url: self.centaur_api_url.clone(),
+                    centaur_api_key: self.centaur_api_key.clone(),
+                    codex_auth_mode,
+                    claude_code_auth_mode,
+                    passthrough_env: passthrough_env.into_iter().collect(),
+                })
+            }
         }
-    }
-
-    fn app_server_env(
-        &self,
-        harness_auth: &HarnessAuthArgs,
-        passthrough_env: BTreeMap<String, String>,
-    ) -> Vec<(String, String)> {
-        let mut values =
-            BTreeMap::from([("CENTAUR_API_URL".to_owned(), self.centaur_api_url.clone())]);
-        if let Some(api_key) = &self.centaur_api_key {
-            values.insert("CENTAUR_API_KEY".to_owned(), api_key.clone());
-        }
-        harness_auth.insert_app_server_env(&mut values);
-        values.extend(passthrough_env);
-        values.into_iter().collect()
     }
 
     pub(super) fn passthrough_env_names(&self) -> &[String] {

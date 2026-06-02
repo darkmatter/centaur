@@ -102,6 +102,21 @@ impl PgSessionStore {
         row.try_into()
     }
 
+    pub async fn list_sessions_with_sandbox(&self) -> Result<Vec<Session>, SessionStoreError> {
+        let rows = sqlx::query_as::<_, SessionRow>(
+            r#"
+            select thread_key, sandbox_id, harness_type, harness_thread_id, status, created_at, updated_at
+            from sessions
+            where sandbox_id is not null
+            order by updated_at desc, thread_key
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(TryInto::try_into).collect()
+    }
+
     pub async fn append_messages(
         &self,
         thread_key: &ThreadKey,
@@ -349,6 +364,79 @@ impl PgSessionStore {
         .bind(status.as_ref())
         .execute(&self.pool)
         .await?;
+        Ok(())
+    }
+
+    pub async fn try_claim_pipe_lease(
+        &self,
+        sandbox_id: &str,
+        thread_key: &ThreadKey,
+        holder_id: &str,
+        ttl_ms: i64,
+    ) -> Result<bool, SessionStoreError> {
+        let row = sqlx::query_scalar::<_, String>(
+            r#"
+            insert into session_pipe_leases (sandbox_id, thread_key, holder_id, lease_expires_at)
+            values ($1, $2, $3, now() + ($4::bigint * interval '1 millisecond'))
+            on conflict (sandbox_id) do update
+            set thread_key = excluded.thread_key,
+                holder_id = excluded.holder_id,
+                lease_expires_at = excluded.lease_expires_at,
+                updated_at = now()
+            where session_pipe_leases.holder_id = excluded.holder_id
+               or session_pipe_leases.lease_expires_at <= now()
+            returning sandbox_id
+            "#,
+        )
+        .bind(sandbox_id)
+        .bind(thread_key.as_str())
+        .bind(holder_id)
+        .bind(ttl_ms)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.is_some())
+    }
+
+    pub async fn renew_pipe_lease(
+        &self,
+        sandbox_id: &str,
+        holder_id: &str,
+        ttl_ms: i64,
+    ) -> Result<bool, SessionStoreError> {
+        let result = sqlx::query(
+            r#"
+            update session_pipe_leases
+            set lease_expires_at = now() + ($3::bigint * interval '1 millisecond'),
+                updated_at = now()
+            where sandbox_id = $1 and holder_id = $2
+            "#,
+        )
+        .bind(sandbox_id)
+        .bind(holder_id)
+        .bind(ttl_ms)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn release_pipe_lease(
+        &self,
+        sandbox_id: &str,
+        holder_id: &str,
+    ) -> Result<(), SessionStoreError> {
+        sqlx::query(
+            r#"
+            delete from session_pipe_leases
+            where sandbox_id = $1 and holder_id = $2
+            "#,
+        )
+        .bind(sandbox_id)
+        .bind(holder_id)
+        .execute(&self.pool)
+        .await?;
+
         Ok(())
     }
 }

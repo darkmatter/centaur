@@ -104,7 +104,12 @@ onepasswordConnect:
 secrets:
   bootstrapSecretName: ""
 
+# Legacy Python control plane. Superseded by apiRs (the Rust control plane);
+# disabled by default. It still owns subsystems not yet ported (workflows, warm
+# pool, Slack ETL, plugin watcher, egress discovery), so re-enable it if you need
+# those alongside api-rs.
 api:
+  enabled: false
   replicaCount: 1
   image:
     repository: centaur-api
@@ -199,8 +204,10 @@ repoCache:
   affinity: {}
   resources: {}
 
+# Installs the upstream agent-sandbox controller + CRDs (subchart). Required by
+# apiRs when apiRs.sandboxBackend is agent-k8s, which is the default.
 agentSandbox:
-  enabled: false
+  enabled: true
   namespace:
     create: true
     name: agent-sandbox-system
@@ -211,14 +218,73 @@ agentSandbox:
   controller:
     extensions: false
 
-slackbot:
+# Rust session control plane (services/api-rs). Owns sessions, agent-k8s
+# sandboxes (via the agents.x-k8s.io Sandbox CRD), and the per-sandbox
+# iron-proxy/firewall. Coexists with the Python `api`; reuses the same Postgres
+# and infra secret. Disable to fall back to the Python-only stack.
+apiRs:
   enabled: true
+  replicaCount: 1
+  image:
+    repository: centaur-api-rs
+    tag: latest
+    pullPolicy: Always
+  port: 8080
+  runMigrations: true
+  sandboxBackend: agent-k8s
+  sandboxWorkload: codex-app-server
+  sandboxReadyTimeoutSecs: 90
+  ironProxy:
+    mode: enabled
+  codexAuthMode: api_key
+  # 1Password vault the iron-proxy secret source reads from when
+  # ironProxy.secretSource is "onepassword". Empty falls back to the binary
+  # default ("ai-agents").
+  opVault: ""
+  startupProbe:
+    failureThreshold: 30
+    periodSeconds: 10
+    timeoutSeconds: 5
+  livenessProbe:
+    failureThreshold: 6
+    periodSeconds: 10
+    timeoutSeconds: 5
+  readinessProbe:
+    failureThreshold: 6
+    periodSeconds: 10
+    timeoutSeconds: 5
+  terminationGracePeriodSeconds: 35
+  extraEnv: {}
+  resources: {}
+
+# Legacy Slackbot that talks to the Python `api` on :8000. Superseded by
+# slackbotv2 (which talks to api-rs); disabled by default so the two bots don't
+# both answer the same Slack events. Re-enable only for a separate Slack app.
+slackbot:
+  enabled: false
   replicaCount: 1
   image:
     repository: centaur-slackbot
     tag: latest
     pullPolicy: Always
   runtimeErrorAlertChannel: ""
+  extraEnv: {}
+  resources: {}
+
+# Chat SDK Slackbot v2 — successor to `slackbot`. Forwards Slack events to the
+# api-rs control plane (:8080) and streams responses back. Listens on :3001 so
+# chart ingress/networkpolicy swap cleanly from slackbot.
+slackbotv2:
+  enabled: true
+  replicaCount: 1
+  image:
+    repository: centaur-slackbotv2
+    tag: latest
+    pullPolicy: Always
+  userName: centaur
+  assistantStatus: ""
+  externalOrgAllowlist: ""
+  triggerBotAllowlist: ""
   extraEnv: {}
   resources: {}
 

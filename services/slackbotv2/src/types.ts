@@ -63,6 +63,13 @@ export type SlackbotV2ExecuteSessionRequest = {
   metadata: JsonObject
 }
 
+export type SlackbotV2ExecuteSessionResponse = {
+  execution_id: string
+  ok: boolean
+  status: string
+  thread_key: string
+}
+
 export type SlackbotV2Fetch = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>
 
 export type SlackbotV2Options = {
@@ -92,8 +99,17 @@ export type SlackbotV2 = {
   chat: Chat
 }
 
+export type SlackbotV2ActiveSessionStream = {
+  executionId: string
+  lastEventId: number
+  message: SlackbotV2ApiMessage
+  startedAtMs: number
+  threadId: string
+}
+
 export type SlackbotV2ThreadState = {
   activeExecution?: boolean
+  activeSessionStream?: SlackbotV2ActiveSessionStream
   forwardedMessageIds?: string[]
   historyForwarded?: boolean
   lastEventId?: number
@@ -114,10 +130,17 @@ export type SlackbotV2Trace = {
 
 export type ForwardSessionInput = {
   afterEventId: number
+  executionId?: string
   executeMessage?: SlackbotV2ApiMessage
   messages: SlackbotV2ApiMessage[]
-  onEventId(eventId: number): void
+  onEventId(eventId: number): void | Promise<void>
+  onTerminal?(): void
   openStream: boolean
   threadId: string
   trace?: SlackbotV2Trace
+}
+
+export type ForwardSessionResult = {
+  executionId?: string
+  stream: AsyncIterable<SlackbotV2RendererSource> | null
 }

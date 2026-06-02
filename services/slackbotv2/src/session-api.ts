@@ -2,6 +2,7 @@ import type { RustSessionStreamEvent } from '@centaur/harness-events'
 import type { Attachment, Message } from 'chat'
 import type {
   ForwardSessionInput,
+  ForwardSessionResult,
   JsonObject,
   JsonValue,
   SlackbotV2ApiAttachment,
@@ -9,6 +10,7 @@ import type {
   SlackbotV2AppendMessagesRequest,
   SlackbotV2CreateSessionRequest,
   SlackbotV2ExecuteSessionRequest,
+  SlackbotV2ExecuteSessionResponse,
   SlackbotV2Options,
   SlackbotV2RendererSource,
   SlackbotV2SessionMessage
@@ -65,7 +67,7 @@ export async function serializeMessage(message: Message): Promise<SlackbotV2ApiM
 export async function forwardToSessionApi(
   options: SlackbotV2Options,
   input: ForwardSessionInput
-): Promise<AsyncIterable<SlackbotV2RendererSource> | null> {
+): Promise<ForwardSessionResult | null> {
   const createStartedAtMs = nowMs()
   await createSession(options, input.threadId)
   traceLog(options, 'slackbotv2_session_create_complete', input.trace, {
@@ -77,24 +79,56 @@ export async function forwardToSessionApi(
     message_count: input.messages.length,
     phase_ms: elapsedMs(appendStartedAtMs)
   })
-  if (!input.executeMessage) return null
+  if (!input.executeMessage && !input.executionId) return null
 
-  const executeStartedAtMs = nowMs()
-  await executeSession(options, input.threadId, input.executeMessage)
-  traceLog(options, 'slackbotv2_session_execute_complete', input.trace, {
-    phase_ms: elapsedMs(executeStartedAtMs)
-  })
-  if (!input.openStream) return null
+  let executionId = input.executionId
+  if (input.executeMessage) {
+    const executeStartedAtMs = nowMs()
+    const execution = await executeSession(options, input.threadId, input.executeMessage)
+    executionId = execution.execution_id
+    traceLog(options, 'slackbotv2_session_execute_complete', input.trace, {
+      execution_id: executionId,
+      phase_ms: elapsedMs(executeStartedAtMs)
+    })
+  }
+  if (!input.openStream) return { executionId, stream: null }
 
   const streamStartedAtMs = nowMs()
   const stream = await streamSessionNotifications(
     options,
     input.threadId,
     input.afterEventId,
-    input.onEventId
+    input.onEventId,
+    input.onTerminal,
+    executionId
   )
   traceLog(options, 'slackbotv2_session_events_opened', input.trace, {
     after_event_id: input.afterEventId,
+    execution_id: executionId,
+    phase_ms: elapsedMs(streamStartedAtMs)
+  })
+  return { executionId, stream }
+}
+
+export async function streamSessionApiEvents(
+  options: SlackbotV2Options,
+  input: Pick<
+    ForwardSessionInput,
+    'afterEventId' | 'executionId' | 'onEventId' | 'onTerminal' | 'threadId' | 'trace'
+  >
+): Promise<AsyncIterable<SlackbotV2RendererSource>> {
+  const streamStartedAtMs = nowMs()
+  const stream = await streamSessionNotifications(
+    options,
+    input.threadId,
+    input.afterEventId,
+    input.onEventId,
+    input.onTerminal,
+    input.executionId
+  )
+  traceLog(options, 'slackbotv2_session_events_reopened', input.trace, {
+    after_event_id: input.afterEventId,
+    execution_id: input.executionId,
     phase_ms: elapsedMs(streamStartedAtMs)
   })
   return stream
@@ -195,7 +229,7 @@ async function executeSession(
   options: SlackbotV2Options,
   threadId: string,
   message: SlackbotV2ApiMessage
-): Promise<void> {
+): Promise<SlackbotV2ExecuteSessionResponse> {
   const fetchFn = options.fetch ?? fetch
   const body: SlackbotV2ExecuteSessionRequest = {
     metadata: sessionMetadata(message, { action: 'execute' }),
@@ -209,6 +243,7 @@ async function executeSession(
     body: JSON.stringify(body)
   })
   await ensureApiOk(response, 'execute session')
+  return response.json() as Promise<SlackbotV2ExecuteSessionResponse>
 }
 
 async function ensureApiOk(response: Response, action: string): Promise<void> {
@@ -227,11 +262,15 @@ async function streamSessionNotifications(
   options: SlackbotV2Options,
   threadId: string,
   afterEventId: number,
-  onEventId: (eventId: number) => void
+  onEventId: (eventId: number) => void | Promise<void>,
+  onTerminal?: () => void,
+  executionId?: string
 ): Promise<AsyncIterable<SlackbotV2RendererSource>> {
   const fetchFn = options.fetch ?? fetch
+  const query = new URLSearchParams({ after_event_id: String(afterEventId) })
+  if (executionId) query.set('execution_id', executionId)
   const response = await fetchFn(
-    `${apiSessionUrl(options.apiUrl, threadId, 'events')}?after_event_id=${afterEventId}`,
+    `${apiSessionUrl(options.apiUrl, threadId, 'events')}?${query.toString()}`,
     {
       method: 'GET',
       headers: apiHeaders(options, false)
@@ -239,7 +278,7 @@ async function streamSessionNotifications(
   )
   await ensureApiOk(response, 'stream events')
   if (!response.body) return toAsyncIterable([])
-  return parseSessionEventStream(response.body, onEventId)
+  return parseSessionEventStream(response.body, onEventId, onTerminal)
 }
 
 function apiSessionUrl(
@@ -362,21 +401,25 @@ type ParsedSessionEvent = {
 
 async function* parseSessionEventStream(
   stream: ReadableStream<Uint8Array>,
-  onEventId: (eventId: number) => void
+  onEventId: (eventId: number) => void | Promise<void>,
+  onTerminal?: () => void
 ): AsyncIterable<SlackbotV2RendererSource> {
   for await (const event of parseSseEvents(stream)) {
-    if (typeof event.id === 'number') onEventId(event.id)
+    if (typeof event.id === 'number') await onEventId(event.id)
     if (event.event === 'session.output.line') {
+      const isTerminal = isTerminalCodexOutputLine(event.data)
+      if (isTerminal) onTerminal?.()
       yield {
         data: event.data,
         event: event.event,
         eventId: event.id,
         eventKind: event.event
       } satisfies RustSessionStreamEvent
-      if (isTerminalCodexOutputLine(event.data)) return
+      if (isTerminal) return
       continue
     }
     if (event.event === 'session.execution_failed' || event.event === 'session.stream_error') {
+      onTerminal?.()
       yield {
         data: { error: sessionErrorMessage(event) },
         event: event.event,

@@ -17,7 +17,8 @@ import {
   type SlackbotV2AppendMessagesRequest,
   type SlackbotV2CreateSessionRequest,
   type SlackbotV2ExecuteSessionRequest,
-  type SlackbotV2SessionMessage
+  type SlackbotV2SessionMessage,
+  type SlackbotV2ThreadState
 } from '../src/index'
 
 const BOT_TOKEN = 'xoxb-slackbotv2-emulate'
@@ -416,6 +417,88 @@ describe('slackbotv2', () => {
     await Promise.all(waits)
   })
 
+  it('reattaches an active session stream after Slackbot restarts', async () => {
+    const sharedState = createMemoryState()
+    codexApi.autoRespond = false
+    bot = createTestBot({ state: sharedState })
+
+    const parent = await postUserMessage('Context before restart.')
+    const mention = await postUserMessage(`<@${BOT_USER_ID}> start and survive restart`, parent.ts)
+    const waits: Promise<unknown>[] = []
+    const response = await bot.app.request(
+      '/api/webhooks/slack',
+      signedSlackEvent({
+        event_id: 'Ev-slackbotv2-restart-start',
+        event: {
+          type: 'app_mention',
+          user: USER_ID,
+          channel: CHANNEL_ID,
+          team: TEAM_ID,
+          ts: mention.ts,
+          thread_ts: parent.ts,
+          text: `<@${BOT_USER_ID}> start and survive restart`
+        }
+      }),
+      {},
+      waitUntilContext(waits)
+    )
+
+    expect(response.status).toBe(200)
+    await waitFor(() => codexApi.executes.length === 1)
+    await waitFor(() => codexApi.eventRequests.length === 1)
+    expect(codexApi.eventRequests[0]).toEqual({
+      afterEventId: 0,
+      executionId: 'exe-1',
+      threadKey: threadKey(parent.ts)
+    })
+
+    codexApi.emitOutputLine(
+      threadKey(parent.ts),
+      JSON.stringify({ method: 'turn/started', params: { turn: { id: 'turn-1' } } }),
+      'exe-1'
+    )
+    await waitForThreadState(sharedState, threadKey(parent.ts), state => state.lastEventId === 1)
+    codexApi.closeStreams()
+    await Promise.all(waits)
+    const storedState = await sharedState.get<SlackbotV2ThreadState>(
+      `thread-state:${threadKey(parent.ts)}`
+    )
+    expect(storedState?.activeExecution).toBe(true)
+    expect(storedState?.activeSessionStream?.executionId).toBe('exe-1')
+
+    bot = createTestBot({ state: sharedState })
+    const followUp = await postUserMessage('continue after restart', parent.ts)
+    const resumeWaits: Promise<unknown>[] = []
+    const resumeResponse = await bot.app.request(
+      '/api/webhooks/slack',
+      signedSlackEvent({
+        event_id: 'Ev-slackbotv2-restart-resume',
+        event: {
+          type: 'message',
+          user: USER_ID,
+          channel: CHANNEL_ID,
+          team: TEAM_ID,
+          ts: followUp.ts,
+          thread_ts: parent.ts,
+          text: 'continue after restart'
+        }
+      }),
+      {},
+      waitUntilContext(resumeWaits)
+    )
+    expect(resumeResponse.status).toBe(200)
+    await waitFor(() => codexApi.eventRequests.length === 2)
+    expect(codexApi.eventRequests[1]).toEqual({
+      afterEventId: 1,
+      executionId: 'exe-1',
+      threadKey: threadKey(parent.ts)
+    })
+
+    codexApi.emitOutputLines(threadKey(parent.ts), sampleCodexOutputLines('Recovered answer.'), 'exe-1')
+    await Promise.all(resumeWaits)
+    await waitForThreadText(parent.ts, 'Recovered answer.')
+  })
+
   it('refetches full context on a later mention if the initial execute failed', async () => {
     codexApi.failNextExecute = true
 
@@ -788,6 +871,30 @@ async function threadText(threadTs: string): Promise<string> {
   return (await threadTexts(threadTs)).join('\n')
 }
 
+async function waitForThreadText(threadTs: string, expected: string, timeoutMs = 1000): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if ((await threadText(threadTs)).includes(expected)) return
+    await new Promise(resolve => setTimeout(resolve, 10))
+  }
+  throw new Error(`Timed out waiting for thread text ${expected}`)
+}
+
+async function waitForThreadState(
+  state: { get<T = unknown>(key: string): Promise<T | null> },
+  key: string,
+  predicate: (state: SlackbotV2ThreadState) => boolean,
+  timeoutMs = 1000
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    const value = await state.get<SlackbotV2ThreadState>(`thread-state:${key}`)
+    if (value && predicate(value)) return
+    await new Promise(resolve => setTimeout(resolve, 10))
+  }
+  throw new Error(`Timed out waiting for thread state ${key}`)
+}
+
 async function threadTexts(threadTs: string): Promise<string[]> {
   const response = await slack.conversations.replies({
     channel: CHANNEL_ID,
@@ -842,12 +949,14 @@ type MockSessionRequest<T> = {
 
 type MockSessionEventRequest = {
   afterEventId: number
+  executionId?: string
   threadKey: string
 }
 
 type MockSessionEvent = {
   data: string
   event: string
+  executionId?: string
   id: number
   threadKey: string
 }
@@ -858,8 +967,8 @@ type MockSessionApi = {
   close(): Promise<void>
   closeStreams(): void
   creates: MockSessionRequest<SlackbotV2CreateSessionRequest>[]
-  emitOutputLine(threadKey: string, line: string): void
-  emitOutputLines(threadKey: string, lines: string[]): void
+  emitOutputLine(threadKey: string, line: string, executionId?: string): void
+  emitOutputLines(threadKey: string, lines: string[], executionId?: string): void
   eventRequests: MockSessionEventRequest[]
   executes: MockSessionRequest<SlackbotV2ExecuteSessionRequest>[]
   failNextExecute: boolean
@@ -966,18 +1075,19 @@ async function startMockCodexApi(): Promise<MockSessionApi> {
     get streamCount() {
       return streams.size
     },
-    emitOutputLine(threadKey: string, line: string) {
+    emitOutputLine(threadKey: string, line: string, executionId?: string) {
       emitMockSessionEvent({
         data: line,
         event: 'session.output.line',
         events,
+        executionId,
         id: ++eventId,
         streams,
         threadKey
       })
     },
-    emitOutputLines(threadKey: string, lines: string[]) {
-      for (const line of lines) api.emitOutputLine(threadKey, line)
+    emitOutputLines(threadKey: string, lines: string[], executionId?: string) {
+      for (const line of lines) api.emitOutputLine(threadKey, line, executionId)
     },
     async close() {
       closeStreams()
@@ -1033,7 +1143,8 @@ async function handleMockCodexRequest(
 
   if (endpoint === 'events') {
     const afterEventId = Number.parseInt(url.searchParams.get('after_event_id') ?? '0', 10) || 0
-    input.eventRequests.push({ threadKey, afterEventId })
+    const executionId = url.searchParams.get('execution_id') ?? undefined
+    input.eventRequests.push({ threadKey, afterEventId, executionId })
     res.writeHead(200, {
       'cache-control': 'no-cache',
       connection: 'keep-alive',
@@ -1041,7 +1152,13 @@ async function handleMockCodexRequest(
     })
     input.streams.add(res)
     for (const event of input.events) {
-      if (event.threadKey === threadKey && event.id > afterEventId) writeMockSseEvent(res, event)
+      if (
+        event.threadKey === threadKey &&
+        event.id > afterEventId &&
+        (!executionId || event.executionId === executionId)
+      ) {
+        writeMockSseEvent(res, event)
+      }
     }
     req.once('close', () => {
       input.streams.delete(res)
@@ -1066,11 +1183,13 @@ async function handleMockCodexRequest(
   }
   if (input.executeHold) await input.executeHold
   if (input.autoRespond) {
+    const executionId = `exe-${input.executes.length}`
     for (const line of sampleCodexOutputLines(`Executed request ${input.executes.length}.`)) {
       emitMockSessionEvent({
         data: line,
         event: 'session.output.line',
         events: input.events,
+        executionId,
         id: input.nextEventId(),
         streams: input.streams,
         threadKey
@@ -1092,6 +1211,7 @@ function emitMockSessionEvent(input: {
   data: string
   event: string
   events: MockSessionEvent[]
+  executionId?: string
   id: number
   streams: Set<ServerResponse>
   threadKey: string
@@ -1099,6 +1219,7 @@ function emitMockSessionEvent(input: {
   const event: MockSessionEvent = {
     data: input.data,
     event: input.event,
+    executionId: input.executionId,
     id: input.id,
     threadKey: input.threadKey
   }

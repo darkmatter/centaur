@@ -19,12 +19,15 @@ import {
   forwardToSessionApi,
   serializeMessage,
   sessionStreamError,
+  streamSessionApiEvents,
   startingStreamNotification
 } from './session-api'
 import { isAllowedSlackMessage, isAllowedSlackWebhookBody } from './slack-events'
 import type {
   ForwardSessionInput,
+  ForwardSessionResult,
   SlackbotV2,
+  SlackbotV2ActiveSessionStream,
   SlackbotV2ApiMessage,
   SlackbotV2MessageMode,
   SlackbotV2Options,
@@ -45,7 +48,8 @@ export type {
   SlackbotV2Fetch,
   SlackbotV2Options,
   SlackbotV2SessionMessage,
-  SlackbotV2SessionMessageRole
+  SlackbotV2SessionMessageRole,
+  SlackbotV2ThreadState
 } from './types'
 
 type WaitUntilContext = {
@@ -65,36 +69,41 @@ type SlackAssistantAdapter = {
 export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
   const userName = options.userName ?? 'centaur'
   const logger = options.logger ?? noopLogger
+  const state = options.state ?? createDefaultState(options, logger)
+  const runtimeOptions: SlackbotV2Options = { ...options, state }
+  const activeRenderThreads = new Set<string>()
   const slack = createSlackAdapter({
-    apiUrl: options.slackApiUrl,
-    botToken: options.botToken,
-    botUserId: options.botUserId,
-    signingSecret: options.signingSecret,
+    apiUrl: runtimeOptions.slackApiUrl,
+    botToken: runtimeOptions.botToken,
+    botUserId: runtimeOptions.botUserId,
+    signingSecret: runtimeOptions.signingSecret,
     userName,
     logger
   })
   const chat = new Chat({
     userName,
     adapters: { slack },
-    state: options.state ?? createDefaultState(options, logger),
+    state,
     onLockConflict: 'force',
     logger
   })
 
   chat.onNewMention(async (thread, message) => {
-    if (!isAllowedSlackMessage(message, options, logger)) return
+    if (!isAllowedSlackMessage(message, runtimeOptions, logger)) return
     await thread.subscribe()
     await syncThreadMessageToSession(thread, message, {
+      activeRenderThreads,
       mode: 'execute',
-      options
+      options: runtimeOptions
     })
   })
 
   chat.onSubscribedMessage(async (thread, message) => {
-    if (!isAllowedSlackMessage(message, options, logger)) return
+    if (!isAllowedSlackMessage(message, runtimeOptions, logger)) return
     await syncThreadMessageToSession(thread, message, {
+      activeRenderThreads,
       mode: message.isMention === true ? 'execute' : 'append',
-      options
+      options: runtimeOptions
     })
   })
 
@@ -102,7 +111,7 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
   app.get('/health', c => c.json({ ok: true, service: 'slackbotv2' }))
   app.post('/api/webhooks/slack', async c => {
     const rawBody = await c.req.raw.clone().text()
-    if (!isAllowedSlackWebhookBody(rawBody, options, logger)) {
+    if (!isAllowedSlackWebhookBody(rawBody, runtimeOptions, logger)) {
       return new globalThis.Response('ok', { status: 200 })
     }
     const response = await chat.webhooks.slack(c.req.raw, {
@@ -125,6 +134,121 @@ function createDefaultState(options: SlackbotV2Options, logger: Logger): StateAd
   })
 }
 
+async function resumeActiveSessionStream(
+  thread: Thread<SlackbotV2ThreadState>,
+  options: SlackbotV2Options,
+  activeRenderThreads: Set<string>,
+  parentTrace?: SlackbotV2Trace
+): Promise<boolean> {
+  if (activeRenderThreads.has(thread.id)) return false
+  const state = (await thread.state) ?? {}
+  const active = state.activeSessionStream
+  if (state.activeExecution !== true || !active) return false
+
+  let lastEventId = Math.max(state.lastEventId ?? 0, active.lastEventId)
+  let streamReachedTerminal = false
+  const trace: SlackbotV2Trace = {
+    includeContext: false,
+    messageId: active.message.id,
+    mode: 'execute',
+    openStream: true,
+    startedAtMs: nowMs(),
+    threadId: thread.id
+  }
+  traceLog(options, 'slackbotv2_active_stream_resume_started', parentTrace ?? trace, {
+    after_event_id: lastEventId,
+    execution_id: active.executionId
+  })
+
+  const streamInput: ForwardSessionInput = {
+    afterEventId: lastEventId,
+    executionId: active.executionId,
+    messages: [],
+    onEventId: async eventId => {
+      lastEventId = Math.max(lastEventId, eventId)
+      await persistActiveSessionCursor(thread, lastEventId)
+    },
+    onTerminal: () => {
+      streamReachedTerminal = true
+    },
+    openStream: true,
+    threadId: thread.id,
+    trace
+  }
+
+  activeRenderThreads.add(thread.id)
+  try {
+    await renderExecutionStream(
+      thread,
+      resumeSessionStream(options, streamInput),
+      active.message,
+      options,
+      trace
+    )
+  } finally {
+    activeRenderThreads.delete(thread.id)
+    const latest = (await thread.state) ?? {}
+    const nextLastEventId = Math.max(latest.lastEventId ?? 0, lastEventId)
+    await thread.setState({
+      ...latest,
+      activeExecution: streamReachedTerminal ? false : true,
+      activeSessionStream: streamReachedTerminal
+        ? undefined
+        : updateActiveSessionLastEventId(latest.activeSessionStream, nextLastEventId),
+      lastEventId: nextLastEventId
+    })
+  }
+  traceLog(options, 'slackbotv2_active_stream_resume_complete', trace, {
+    last_event_id: lastEventId,
+    terminal: streamReachedTerminal
+  })
+  return true
+}
+
+async function* resumeSessionStream(
+  options: SlackbotV2Options,
+  input: ForwardSessionInput
+): AsyncIterable<SlackbotV2RendererSource> {
+  yield startingStreamNotification(input.threadId)
+  try {
+    const stream = await streamSessionApiEvents(options, input)
+    for await (const event of stream) yield event
+  } catch (error) {
+    traceLog(options, 'slackbotv2_resume_stream_failed', input.trace, {
+      error: errorMessage(error)
+    })
+    yield sessionStreamError(error)
+  }
+}
+
+async function persistActiveSessionCursor(
+  thread: Thread<SlackbotV2ThreadState>,
+  lastEventId: number
+): Promise<void> {
+  const latest = (await thread.state) ?? {}
+  const activeSessionStream = updateActiveSessionLastEventId(
+    latest.activeSessionStream,
+    lastEventId
+  )
+  if (!activeSessionStream) return
+  await thread.setState({
+    activeExecution: true,
+    activeSessionStream,
+    lastEventId: Math.max(latest.lastEventId ?? 0, lastEventId)
+  })
+}
+
+function updateActiveSessionLastEventId(
+  activeSessionStream: SlackbotV2ActiveSessionStream | undefined,
+  lastEventId: number
+): SlackbotV2ActiveSessionStream | undefined {
+  if (!activeSessionStream) return undefined
+  return {
+    ...activeSessionStream,
+    lastEventId: Math.max(activeSessionStream.lastEventId, lastEventId)
+  }
+}
+
 /**
  * Persists a Slack thread update into the session API. In execute mode it also starts and
  * renders a session stream unless another execution is already active for the same thread.
@@ -133,6 +257,7 @@ async function syncThreadMessageToSession(
   thread: Thread<SlackbotV2ThreadState>,
   message: Message,
   input: {
+    activeRenderThreads: Set<string>
     mode: SlackbotV2MessageMode
     options: SlackbotV2Options
   }
@@ -187,22 +312,39 @@ async function syncThreadMessageToSession(
   }
 
   let lastEventId = state.lastEventId ?? 0
+  let streamReachedTerminal = false
 
   const forwardInput: ForwardSessionInput = {
     afterEventId: lastEventId,
     executeMessage: shouldStartExecution ? serializedMessage : undefined,
     messages: context ?? [serializedMessage],
-    onEventId: eventId => {
+    onEventId: async eventId => {
       lastEventId = Math.max(lastEventId, eventId)
+      await persistActiveSessionCursor(thread, lastEventId)
+    },
+    onTerminal: () => {
+      streamReachedTerminal = true
     },
     openStream: shouldStartExecution,
     threadId: thread.id,
     trace
   }
 
-  const commitForwardedState = async (): Promise<void> => {
+  const commitForwardedState = async (result?: ForwardSessionResult | null): Promise<void> => {
+    const activeSessionStream =
+      state.activeSessionStream ??
+      (result?.executionId
+        ? {
+            executionId: result.executionId,
+            lastEventId,
+            message: serializedMessage,
+            startedAtMs: traceStartedAtMs,
+            threadId: thread.id
+          }
+        : undefined)
     await thread.setState({
       activeExecution: state.activeExecution || shouldStartExecution,
+      activeSessionStream,
       forwardedMessageIds: Array.from(messageIds).slice(-1000),
       historyForwarded: state.historyForwarded || shouldIncludeContext,
       lastEventId
@@ -215,6 +357,9 @@ async function syncThreadMessageToSession(
   if (!shouldStartExecution) {
     await forwardToSessionApi(input.options, forwardInput)
     await commitForwardedState()
+    if (state.activeSessionStream && !input.activeRenderThreads.has(thread.id)) {
+      await resumeActiveSessionStream(thread, input.options, input.activeRenderThreads, trace)
+    }
     traceLog(input.options, 'slackbotv2_forward_complete', trace)
     return
   }
@@ -222,6 +367,7 @@ async function syncThreadMessageToSession(
   try {
     await thread.setState({ ...state, activeExecution: true })
     traceLog(input.options, 'slackbotv2_forward_active_execution_marked', trace)
+    input.activeRenderThreads.add(thread.id)
     await renderExecutionStream(
       thread,
       executeAndStreamSession(input.options, forwardInput, commitForwardedState),
@@ -231,11 +377,16 @@ async function syncThreadMessageToSession(
     )
     traceLog(input.options, 'slackbotv2_render_complete', trace)
   } finally {
+    input.activeRenderThreads.delete(thread.id)
     const latest = (await thread.state) ?? {}
+    const nextLastEventId = Math.max(latest.lastEventId ?? 0, lastEventId)
     await thread.setState({
       ...latest,
-      activeExecution: false,
-      lastEventId: Math.max(latest.lastEventId ?? 0, lastEventId)
+      activeExecution: streamReachedTerminal ? false : true,
+      activeSessionStream: streamReachedTerminal
+        ? undefined
+        : updateActiveSessionLastEventId(latest.activeSessionStream, nextLastEventId),
+      lastEventId: nextLastEventId
     })
     traceLog(input.options, 'slackbotv2_forward_complete', trace, {
       last_event_id: lastEventId
@@ -271,17 +422,18 @@ async function renderExecutionStream(
 async function* executeAndStreamSession(
   options: SlackbotV2Options,
   input: ForwardSessionInput,
-  onSessionReady: () => Promise<void>
+  onSessionReady: (result: ForwardSessionResult | null) => Promise<void>
 ): AsyncIterable<SlackbotV2RendererSource> {
   yield startingStreamNotification(input.threadId)
   traceLog(options, 'slackbotv2_stream_heartbeat_emitted', input.trace)
 
   try {
-    const stream = await forwardToSessionApi(options, input)
-    await onSessionReady()
-    if (!stream) return
-    for await (const event of stream) yield event
+    const result = await forwardToSessionApi(options, input)
+    await onSessionReady(result)
+    if (!result?.stream) return
+    for await (const event of result.stream) yield event
   } catch (error) {
+    if (input.executeMessage) input.onTerminal?.()
     traceLog(options, 'slackbotv2_forward_failed', input.trace, {
       error: errorMessage(error)
     })

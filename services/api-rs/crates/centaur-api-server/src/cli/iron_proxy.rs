@@ -2,7 +2,6 @@ use std::collections::BTreeMap;
 
 use centaur_iron_proxy::load_fragment_files;
 use centaur_sandbox_agent_k8s::IronProxyPodConfig;
-use centaur_sandbox_core::HarnessAuthModes;
 use clap::Args as ClapArgs;
 
 use super::ServerError;
@@ -59,7 +58,6 @@ impl IronProxyArgs {
     pub(super) fn to_config(
         &self,
         kubernetes: &KubernetesSandboxArgs,
-        harness_auth_modes: HarnessAuthModes,
     ) -> Result<Option<IronProxyPodConfig>, ServerError> {
         let fragment_paths = self.fragments.paths()?;
         if !self
@@ -80,7 +78,6 @@ impl IronProxyArgs {
             .or_else(|| kubernetes.agent_image_pull_policy());
         config.image_pull_secrets = kubernetes.image_pull_secrets();
         config.source_policy = self.source.policy();
-        config.harness_auth_modes = harness_auth_modes;
         self.secret_env.apply_to(&mut config);
         self.op_connect.apply_to(&mut config);
         self.token_broker.apply_to(&mut config);

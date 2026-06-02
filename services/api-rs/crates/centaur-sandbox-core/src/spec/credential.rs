@@ -1,0 +1,62 @@
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CredentialProfile {
+    Codex,
+    Amp,
+    ClaudeCode,
+}
+
+impl CredentialProfile {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Codex => "codex",
+            Self::Amp => "amp",
+            Self::ClaudeCode => "claude-code",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CredentialRequest {
+    pub profile: CredentialProfile,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_mode: Option<HarnessAuthMode>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct HarnessAuthModes {
+    pub codex: Option<HarnessAuthMode>,
+    pub claude_code: Option<HarnessAuthMode>,
+}
+
+impl HarnessAuthModes {
+    pub fn new(codex: Option<HarnessAuthMode>, claude_code: Option<HarnessAuthMode>) -> Self {
+        Self { codex, claude_code }
+    }
+
+    pub fn mode_for(&self, profile: CredentialProfile) -> Option<HarnessAuthMode> {
+        match profile {
+            CredentialProfile::Codex => self.codex,
+            CredentialProfile::ClaudeCode => self.claude_code,
+            CredentialProfile::Amp => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HarnessAuthMode {
+    ApiKey,
+    AccessToken,
+}
+
+impl HarnessAuthMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ApiKey => "api_key",
+            Self::AccessToken => "access_token",
+        }
+    }
+}

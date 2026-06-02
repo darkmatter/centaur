@@ -17,6 +17,6 @@ pub use lifecycle::{
     DesiredSandboxState, ObservedSandbox, SandboxHandle, SandboxId, SandboxStatus,
 };
 pub use spec::{
-    CredentialProfile, EnvVar, HarnessAuthMode, HarnessAuthModes, Mount, MountKind, ResourceLimits,
-    SandboxSpec,
+    CredentialProfile, CredentialRequest, EnvVar, HarnessAuthMode, HarnessAuthModes, Mount,
+    MountKind, ResourceLimits, SandboxSpec,
 };

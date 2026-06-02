@@ -1,4 +1,4 @@
-use centaur_sandbox_core::{CredentialProfile, HarnessAuthMode, HarnessAuthModes, SandboxSpec};
+use centaur_sandbox_core::{CredentialProfile, HarnessAuthModes, SandboxSpec};
 use centaur_session_core::{HarnessType, ThreadKey};
 
 #[derive(Clone, Debug)]
@@ -43,15 +43,12 @@ impl CodexAppServerWorkload {
         let mut spec = SandboxSpec::new(&self.image)
             .env("CENTAUR_THREAD_KEY", thread_key.as_str())
             .env("CENTAUR_API_URL", &self.centaur_api_url)
-            .credential_profile(credential_profile);
+            .credential(
+                credential_profile,
+                self.auth_modes.mode_for(credential_profile),
+            );
         if let Some(api_key) = &self.centaur_api_key {
             spec = spec.env("CENTAUR_API_KEY", api_key);
-        }
-        if let Some((name, auth_mode)) = auth_mode_env(
-            credential_profile,
-            self.auth_modes.mode_for(credential_profile),
-        ) {
-            spec = spec.env(name, auth_mode.as_str());
         }
         for (name, value) in &self.passthrough_env {
             spec = spec.env(name, value);
@@ -66,18 +63,6 @@ fn credential_profile_for(harness_type: &HarnessType) -> CredentialProfile {
         HarnessType::Amp => CredentialProfile::Amp,
         HarnessType::ClaudeCode => CredentialProfile::ClaudeCode,
     }
-}
-
-fn auth_mode_env(
-    profile: CredentialProfile,
-    auth_mode: Option<HarnessAuthMode>,
-) -> Option<(&'static str, HarnessAuthMode)> {
-    let name = match profile {
-        CredentialProfile::Codex => "CODEX_AUTH_MODE",
-        CredentialProfile::ClaudeCode => "CLAUDE_CODE_AUTH_MODE",
-        CredentialProfile::Amp => return None,
-    };
-    auth_mode.map(|mode| (name, mode))
 }
 
 fn mock_app_server_script() -> &'static str {
@@ -107,6 +92,7 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
+    use centaur_sandbox_core::{CredentialRequest, HarnessAuthMode};
 
     #[test]
     fn codex_app_server_declares_credential_profile() {
@@ -130,9 +116,15 @@ mod tests {
 
         assert_eq!(env["CENTAUR_THREAD_KEY"], "cli:test");
         assert_eq!(env["CENTAUR_API_URL"], "http://api:8000");
-        assert_eq!(env["CODEX_AUTH_MODE"], "access_token");
+        assert!(!env.contains_key("CODEX_AUTH_MODE"));
         assert!(!env.contains_key("CLAUDE_CODE_AUTH_MODE"));
         assert_eq!(env["NO_PROXY"], "api");
-        assert_eq!(spec.credential_profiles, vec![CredentialProfile::Codex]);
+        assert_eq!(
+            spec.credentials,
+            vec![CredentialRequest {
+                profile: CredentialProfile::Codex,
+                auth_mode: Some(HarnessAuthMode::AccessToken),
+            }]
+        );
     }
 }

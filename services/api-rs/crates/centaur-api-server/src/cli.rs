@@ -73,9 +73,7 @@ pub(crate) struct SandboxArgs {
 
 impl SandboxArgs {
     fn agent_config(&self) -> Result<AgentSandboxConfig, ServerError> {
-        let iron_proxy = self
-            .iron_proxy
-            .to_config(&self.kubernetes, self.harness_auth.modes())?;
+        let iron_proxy = self.iron_proxy.to_config(&self.kubernetes)?;
         Ok(self.kubernetes.agent_config(iron_proxy))
     }
 
@@ -150,8 +148,9 @@ mod tests {
         assert_eq!(config.source_policy.ttl, "5m");
         assert_eq!(config.source_policy.token_broker_ttl, "30s");
         assert_eq!(
-            config
-                .harness_auth_modes
+            cli.sandbox
+                .harness_auth
+                .modes()
                 .mode_for(centaur_sandbox_core::CredentialProfile::Codex),
             Some(centaur_sandbox_core::HarnessAuthMode::AccessToken)
         );

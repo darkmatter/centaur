@@ -3,9 +3,11 @@ use k8s_openapi::api::core::v1::EnvVar;
 
 use super::super::iron_proxy::ResolvedIronProxy;
 
+mod harness;
 mod proxy;
 mod vars;
 
+use harness::harness_auth_env;
 use proxy::proxy_env;
 use vars::EnvVars;
 
@@ -14,6 +16,7 @@ pub(super) fn env_vars(
     resolved_iron_proxy: Option<&ResolvedIronProxy>,
 ) -> Option<Vec<EnvVar>> {
     let mut env = EnvVars::from_spec(spec);
+    env.set_all(harness_auth_env(&spec.credentials));
     if let Some(resolved_iron_proxy) = resolved_iron_proxy {
         env.set_missing_all(&resolved_iron_proxy.placeholder_env);
         env.set_missing_all(&resolved_iron_proxy.pg_dsn_env);

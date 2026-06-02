@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use centaur_iron_proxy::ProxyFragment;
-use centaur_sandbox_core::{SandboxError, SandboxResult, SandboxSpec};
+use centaur_sandbox_core::{HarnessAuthMode, SandboxError, SandboxResult, SandboxSpec};
 use uuid::Uuid;
 
 use crate::config::IronProxyPodConfig;
@@ -35,13 +35,10 @@ pub(crate) fn iron_proxy_fragments_for_spec(
             SandboxError::InvalidSpec(format!("iron-proxy infra fragment: {err}"))
         })?];
     fragments.extend(iron_proxy.fragments.clone());
-    for profile in &spec.credential_profiles {
-        let auth_mode = iron_proxy
-            .harness_auth_modes
-            .mode_for(*profile)
-            .unwrap_or(centaur_sandbox_core::HarnessAuthMode::ApiKey);
+    for credential in &spec.credentials {
+        let auth_mode = credential.auth_mode.unwrap_or(HarnessAuthMode::ApiKey);
         if let Some(fragment) =
-            centaur_iron_proxy::harness_fragment(profile.as_str(), auth_mode.as_str())
+            centaur_iron_proxy::harness_fragment(credential.profile.as_str(), auth_mode.as_str())
                 .map_err(|err| SandboxError::InvalidSpec(format!("iron-proxy fragment: {err}")))?
         {
             fragments.push(fragment);

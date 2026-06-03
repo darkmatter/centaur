@@ -467,6 +467,24 @@ async function* parseSessionEventStream(
       } satisfies RustSessionStreamEvent
       return
     }
+    if (event.event === 'session.execution_cancelled') {
+      yield {
+        data: { error: sessionErrorMessage(event, 'Execution cancelled') },
+        event: event.event,
+        eventId: event.id,
+        eventKind: event.event
+      } satisfies RustSessionStreamEvent
+      return
+    }
+    if (event.event === 'session.execution_completed') {
+      yield {
+        data: sessionEventData(event),
+        event: event.event,
+        eventId: event.id,
+        eventKind: event.event
+      } satisfies RustSessionStreamEvent
+      return
+    }
   }
 }
 
@@ -560,8 +578,16 @@ function isTerminalCodexOutputLine(line: string): boolean {
   )
 }
 
-function sessionErrorMessage(event: ParsedSessionEvent): string {
-  let message = `${event.event ?? 'session error'}`
+function sessionEventData(event: ParsedSessionEvent): unknown {
+  try {
+    return JSON.parse(event.data)
+  } catch {
+    return event.data
+  }
+}
+
+function sessionErrorMessage(event: ParsedSessionEvent, fallback?: string): string {
+  let message = fallback ?? `${event.event ?? 'session error'}`
   try {
     const payload = JSON.parse(event.data)
     if (isJsonObject(payload)) {

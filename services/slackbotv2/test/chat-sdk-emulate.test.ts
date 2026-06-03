@@ -387,6 +387,222 @@ describe('slackbotv2', () => {
     await Promise.all(firstWaits)
   })
 
+  it('renders raw turn.failed session output as visible final text', async () => {
+    codexApi.autoRespond = false
+
+    const parent = await postUserMessage('Context before a raw failure.')
+    const mention = await postUserMessage(`<@${BOT_USER_ID}> run a failing turn`, parent.ts)
+    const waits: Promise<unknown>[] = []
+    const response = await bot.app.request(
+      '/api/webhooks/slack',
+      signedSlackEvent({
+        event_id: 'Ev-slackbotv2-raw-turn-failed',
+        event: {
+          type: 'app_mention',
+          user: USER_ID,
+          channel: CHANNEL_ID,
+          team: TEAM_ID,
+          ts: mention.ts,
+          thread_ts: parent.ts,
+          text: `<@${BOT_USER_ID}> run a failing turn`
+        }
+      }),
+      {},
+      waitUntilContext(waits)
+    )
+
+    expect(response.status).toBe(200)
+    await waitFor(() => codexApi.executes.length === 1)
+    await waitFor(() => codexApi.eventRequests.length === 1)
+    await waitFor(() => codexApi.streamCount === 1)
+
+    codexApi.emitOutputLine(
+      threadKey(parent.ts),
+      JSON.stringify({
+        type: 'item.started',
+        item: {
+          id: 'cmd-1',
+          type: 'commandExecution',
+          command: 'gh auth status',
+          status: 'inProgress'
+        }
+      })
+    )
+    codexApi.emitOutputLine(
+      threadKey(parent.ts),
+      JSON.stringify({
+        type: 'turn.failed',
+        error: {
+          message: 'Reconnecting... 2/5',
+          additionalDetails: 'unexpected status 502 Bad Gateway'
+        }
+      })
+    )
+
+    await Promise.all(waits)
+    const transcripts = slackStreamTranscripts(slackApi.calls)
+    expect(transcripts).toHaveLength(1)
+    const markdownChunks = transcripts[0]!.chunks.filter(chunk => chunk.type === 'markdown_text')
+    expect(markdownChunks).toEqual([
+      {
+        type: 'markdown_text',
+        text: 'Execution failed: Reconnecting... 2/5: unexpected status 502 Bad Gateway'
+      }
+    ])
+    const renderedText = transcripts[0]!.chunks.map(chunkText).filter(Boolean).join('\n')
+    expect(renderedText).toContain('Command execution')
+    expect(renderedText).toContain(
+      'Execution failed: Reconnecting... 2/5: unexpected status 502 Bad Gateway'
+    )
+  })
+
+  it('renders successful completions with no final answer as visible Slack text', async () => {
+    codexApi.autoRespond = false
+
+    const parent = await postUserMessage('Context before an empty completion.')
+    const mention = await postUserMessage(`<@${BOT_USER_ID}> complete with no final text`, parent.ts)
+    const waits: Promise<unknown>[] = []
+    const response = await bot.app.request(
+      '/api/webhooks/slack',
+      signedSlackEvent({
+        event_id: 'Ev-slackbotv2-empty-completion',
+        event: {
+          type: 'app_mention',
+          user: USER_ID,
+          channel: CHANNEL_ID,
+          team: TEAM_ID,
+          ts: mention.ts,
+          thread_ts: parent.ts,
+          text: `<@${BOT_USER_ID}> complete with no final text`
+        }
+      }),
+      {},
+      waitUntilContext(waits)
+    )
+
+    expect(response.status).toBe(200)
+    await waitFor(() => codexApi.executes.length === 1)
+    await waitFor(() => codexApi.eventRequests.length === 1)
+    await waitFor(() => codexApi.streamCount === 1)
+
+    codexApi.emitOutputLine(
+      threadKey(parent.ts),
+      JSON.stringify({
+        type: 'item.started',
+        item: {
+          id: 'cmd-1',
+          type: 'commandExecution',
+          command: 'true',
+          status: 'inProgress'
+        }
+      })
+    )
+    codexApi.emitOutputLine(
+      threadKey(parent.ts),
+      JSON.stringify({
+        type: 'item.completed',
+        item: {
+          id: 'cmd-1',
+          type: 'commandExecution',
+          command: 'true',
+          status: 'completed',
+          aggregatedOutput: ''
+        }
+      })
+    )
+    codexApi.emitSessionEvent(threadKey(parent.ts), 'session.execution_completed', {
+      execution_id: 'exe-empty',
+      status: 'completed'
+    })
+
+    await Promise.all(waits)
+    const transcripts = slackStreamTranscripts(slackApi.calls)
+    expect(transcripts).toHaveLength(1)
+    const markdownChunks = transcripts[0]!.chunks.filter(chunk => chunk.type === 'markdown_text')
+    expect(markdownChunks).toEqual([
+      {
+        type: 'markdown_text',
+        text: 'Execution completed, but no final text was captured.'
+      }
+    ])
+    const renderedText = transcripts[0]!.chunks.map(chunkText).filter(Boolean).join('\n')
+    expect(renderedText).toContain('Command execution')
+    expect(renderedText.trim().endsWith('Execution completed, but no final text was captured.')).toBe(
+      true
+    )
+  })
+
+  it('does not duplicate final text when execution completion follows final answer deltas', async () => {
+    codexApi.autoRespond = false
+
+    const parent = await postUserMessage('Context before a completion snapshot.')
+    const mention = await postUserMessage(`<@${BOT_USER_ID}> guard against duplicate final text`, parent.ts)
+    const waits: Promise<unknown>[] = []
+    const response = await bot.app.request(
+      '/api/webhooks/slack',
+      signedSlackEvent({
+        event_id: 'Ev-slackbotv2-no-duplicate-completion',
+        event: {
+          type: 'app_mention',
+          user: USER_ID,
+          channel: CHANNEL_ID,
+          team: TEAM_ID,
+          ts: mention.ts,
+          thread_ts: parent.ts,
+          text: `<@${BOT_USER_ID}> guard against duplicate final text`
+        }
+      }),
+      {},
+      waitUntilContext(waits)
+    )
+
+    expect(response.status).toBe(200)
+    await waitFor(() => codexApi.executes.length === 1)
+    await waitFor(() => codexApi.eventRequests.length === 1)
+    await waitFor(() => codexApi.streamCount === 1)
+
+    codexApi.emitOutputLine(
+      threadKey(parent.ts),
+      JSON.stringify({
+        type: 'item.started',
+        item: {
+          id: 'answer-1',
+          type: 'agentMessage',
+          text: '',
+          phase: 'final_answer'
+        }
+      })
+    )
+    codexApi.emitOutputLine(
+      threadKey(parent.ts),
+      JSON.stringify({
+        type: 'item.agentMessage.delta',
+        itemId: 'answer-1',
+        delta: 'DUPLICATE_DELIVERY_GUARD_OK'
+      })
+    )
+    codexApi.emitSessionEvent(threadKey(parent.ts), 'session.execution_completed', {
+      execution_id: 'exe-duplicate-guard',
+      status: 'completed'
+    })
+
+    await Promise.all(waits)
+    const transcripts = slackStreamTranscripts(slackApi.calls)
+    expect(transcripts).toHaveLength(1)
+    const markdownChunks = transcripts[0]!.chunks.filter(chunk => chunk.type === 'markdown_text')
+    expect(markdownChunks).toEqual([
+      {
+        type: 'markdown_text',
+        text: 'DUPLICATE_DELIVERY_GUARD_OK'
+      }
+    ])
+    expect(
+      transcripts[0]!.chunks.filter(chunk =>
+        chunkText(chunk).includes('DUPLICATE_DELIVERY_GUARD_OK')
+      )
+    ).toHaveLength(1)
+  })
+
   it('waits for a slow session execute before acknowledging Slack and starting the stream', async () => {
     codexApi.autoRespond = false
     const releaseExecute = codexApi.holdNextExecute()
@@ -1084,6 +1300,7 @@ type MockSessionApi = {
   creates: MockSessionRequest<SlackbotV2CreateSessionRequest>[]
   emitOutputLine(threadKey: string, line: string): void
   emitOutputLines(threadKey: string, lines: string[]): void
+  emitSessionEvent(threadKey: string, event: string, data: unknown): void
   eventRequests: MockSessionEventRequest[]
   executes: MockSessionRequest<SlackbotV2ExecuteSessionRequest>[]
   failNextEvents: boolean
@@ -1235,6 +1452,16 @@ async function startMockCodexApi(): Promise<MockSessionApi> {
     },
     emitOutputLines(threadKey: string, lines: string[]) {
       for (const line of lines) api.emitOutputLine(threadKey, line)
+    },
+    emitSessionEvent(threadKey: string, event: string, data: unknown) {
+      emitMockSessionEvent({
+        data: typeof data === 'string' ? data : JSON.stringify(data),
+        event,
+        events,
+        id: ++eventId,
+        streams,
+        threadKey
+      })
     },
     async close() {
       closeStreams()

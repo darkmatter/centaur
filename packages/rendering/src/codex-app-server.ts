@@ -1,5 +1,10 @@
 import type { RustSessionStreamEvent } from '@centaur/harness-events'
-import { ChatSDKRenderer, type ChatSDKOutput, type ChatSDKStreamChunk } from './chat-sdk'
+import {
+  ChatSDKRenderer,
+  EMPTY_FINAL_ANSWER_TEXT,
+  type ChatSDKOutput,
+  type ChatSDKStreamChunk
+} from './chat-sdk'
 import { elementsToPlainText, preformatted as pre, section, text } from './rich-text'
 import type {
   RendererEvent,
@@ -106,6 +111,7 @@ export class CodexAppServerRendererEventMapper
     completeThinkingTasks(this.state)
     completeOpenTasks(this.state)
     this.emitActivitySummary(out, { final: true })
+    this.ensureFinalAnswerText()
     this.emitPendingAssistantText(out, { force: true })
     out.push({
       type: 'renderer.done',
@@ -324,6 +330,10 @@ export class CodexAppServerRendererEventMapper
         output: []
       })
     }
+    if (!this.state.answerText.trim()) {
+      this.state.harnessAnswerText += `Execution failed: ${error || 'Execution failed'}`
+      recomposeBuffers(this.state)
+    }
     this.emitActivitySummary(out, { final: true })
     this.emitPendingAssistantText(out, { force: true })
     out.push({
@@ -334,6 +344,12 @@ export class CodexAppServerRendererEventMapper
       threadId: this.state.threadId || undefined
     })
     return out
+  }
+
+  private ensureFinalAnswerText(): void {
+    if (this.state.answerText.trim()) return
+    this.state.harnessAnswerText += EMPTY_FINAL_ANSWER_TEXT
+    recomposeBuffers(this.state)
   }
 
   private emitActivitySummary(out: RendererEvent[], opts: { final?: boolean } = {}): void {
@@ -685,11 +701,34 @@ function parseServerNotificationLine(line: string): ServerNotification | null {
 }
 
 function errorMessage(event: any): string {
-  if (String(event?.type ?? '') !== 'error') return ''
-  const error = event?.error
+  const eventType = String(event?.type ?? '')
+  if (eventType === 'turn.completed' && isFailedTurn(event)) {
+    return messageFromError(event?.turn?.error ?? event?.error, event?.message, 'turn failed')
+  }
+  if (eventType !== 'error' && eventType !== 'turn.failed') return ''
+  return messageFromError(
+    event?.error,
+    event?.message,
+    eventType === 'turn.failed' ? 'turn failed' : 'Execution failed'
+  )
+}
+
+function isFailedTurn(event: any): boolean {
+  const status = String(event?.turn?.status ?? event?.status ?? '').toLowerCase()
+  return status === 'failed' || status === 'error' || status === 'cancelled' || status === 'canceled'
+}
+
+function messageFromError(error: any, message: unknown, fallback: string): string {
   if (typeof error === 'string') return error
-  if (isRecord(error) && typeof error.message === 'string') return error.message
-  return String(event?.message ?? 'Execution failed')
+  if (isRecord(error)) {
+    const message = typeof error.message === 'string' ? error.message : ''
+    const details =
+      typeof error.additionalDetails === 'string' ? error.additionalDetails : ''
+    if (message && details && !message.includes(details)) return `${message}: ${details}`
+    if (message) return message
+    if (details) return details
+  }
+  return String(message ?? fallback)
 }
 
 function content(event: any): any[] {

@@ -143,6 +143,7 @@ pub struct Session {
     pub sandbox_id: Option<String>,
     pub harness_type: HarnessType,
     pub harness_thread_id: Option<String>,
+    pub persona_id: Option<String>,
     pub status: SessionStatus,
     pub created_at: OffsetDateTime,
     pub updated_at: OffsetDateTime,

@@ -281,6 +281,7 @@ dependencies = [
  "sqlx",
  "thiserror",
  "tokio",
+ "toml",
  "tracing",
  "tracing-subscriber",
  "urlencoding",

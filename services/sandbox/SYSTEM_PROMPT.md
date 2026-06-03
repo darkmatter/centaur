@@ -67,6 +67,9 @@
 |*NEVER run git commit/push inside* ~/github/ — it is read-only. Always use git-branch first.
 |Prefer `rg` (ripgrep) over `grep` for all codebase operations.
 
+[Rust policy]
+|Use `cargo +nightly fmt` to format Rust code.
+
 [Python policy — ALWAYS use uv]
 |ALWAYS use `uv run python` for inline Python and scripts. NEVER invoke `python` or `python3` directly.
 |ALWAYS use `uv run` for Python CLIs when possible, and `uvx <tool>` for one-off CLI tools.

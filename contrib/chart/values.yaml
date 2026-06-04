@@ -119,7 +119,7 @@ api:
   pluginWatcherEnabled: false
   slackEtlEnabled: false
   slackSyncIntervalSeconds: 3600
-  slackBackfillIntervalSeconds: 3600
+  slackBackfillIntervalSeconds: 300
   slackBackfillChannelBatchLimit: 20
   slackSyncBackfillLookbackDays: 30
   slackSyncThreadLookbackDays: 3

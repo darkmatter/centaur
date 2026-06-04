@@ -301,7 +301,7 @@ def test_backfill_schedule_defaults_disabled(monkeypatch):
     assert reloaded.DEFAULT_CHANNEL_PAGES_PER_JOB == 5
     assert reloaded.SCHEDULE == {
         "schedule_id": "slack_backfill",
-        "interval_seconds": 600,
+        "interval_seconds": 300,
         "enabled": False,
         "no_delivery": True,
     }

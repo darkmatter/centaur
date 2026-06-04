@@ -12,6 +12,7 @@ centaur-iron-proxy.workspace = true
 centaur-sandbox-agent-k8s.workspace = true
 centaur-sandbox-core.workspace = true
 centaur-sandbox-local.workspace = true
+centaur-sandbox-manager.workspace = true
 centaur-session-core.workspace = true
 centaur-session-runtime.workspace = true
 centaur-session-sqlx.workspace = true
@@ -23,9 +24,11 @@ reqwest.workspace = true
 rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+serde_yaml.workspace = true
 sqlx.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "signal"] }
+toml.workspace = true
 tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["env-filter", "fmt", "json"] }
 urlencoding.workspace = true

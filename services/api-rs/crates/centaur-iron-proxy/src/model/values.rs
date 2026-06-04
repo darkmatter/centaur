@@ -2,19 +2,8 @@ use serde_yaml::Value;
 
 use crate::{IronProxyConfigError, Result, SourcePolicy};
 
-pub(crate) fn listen_port(value: &str) -> Option<u16> {
-    value.rsplit_once(':')?.1.parse().ok()
-}
-
-pub(crate) fn non_empty(value: Option<&str>) -> Option<&str> {
-    value.map(str::trim).filter(|value| !value.is_empty())
-}
-
 pub(crate) fn value_field_str<'a>(value: Option<&'a Value>, key: &str) -> Option<&'a str> {
-    value?
-        .as_mapping()?
-        .get(Value::String(key.to_owned()))?
-        .as_str()
+    value?.as_mapping()?.get(string_value(key))?.as_str()
 }
 
 pub(crate) fn resolve_source_values<'a>(
@@ -84,7 +73,7 @@ pub(crate) fn resolve_broker_store_source(
 fn value_has_field(value: &Value, key: &str) -> bool {
     value
         .as_mapping()
-        .is_some_and(|map| map.contains_key(Value::String(key.to_owned())))
+        .is_some_and(|map| map.contains_key(string_value(key)))
 }
 
 fn string_value(value: impl AsRef<str>) -> Value {

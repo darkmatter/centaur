@@ -3,12 +3,15 @@
 //! The Agent Sandbox CRD types are generated from the upstream CRD with
 //! `just codegen-agent-sandbox-crd`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::pin::Pin;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
+use centaur_iron_control::IronControlClient;
+use tokio::sync::Mutex;
 use centaur_sandbox_core::{
     MountKind, ObservedSandbox, SandboxBackend, SandboxError, SandboxHandle, SandboxId, SandboxIo,
     SandboxResult, SandboxSpec, SandboxStatus,
@@ -31,6 +34,10 @@ const DEFAULT_CONTAINER_NAME: &str = "agent";
 const MANAGED_BY_LABEL: &str = "centaur.ai/managed-by";
 const SANDBOX_ID_LABEL: &str = "centaur.ai/sandbox-id";
 const MANAGED_BY_VALUE: &str = "api-rs";
+// iron-control principal OID the sandbox's proxy binds to, stamped at create
+// so resume (which has only the sandbox id) can rebind without the spec or any
+// in-memory state. Survives pause and api-rs restarts.
+const IRON_CONTROL_PRINCIPAL_ANNOTATION: &str = "centaur.ai/iron-control-principal";
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -44,7 +51,22 @@ pub struct AgentSandboxConfig {
     pub image_pull_policy: Option<String>,
     pub state_volume: Option<StateVolumeConfig>,
     pub iron_proxy: Option<IronProxyConfig>,
+    pub iron_control: Option<IronControlSettings>,
     pub ready_timeout: Duration,
+}
+
+/// iron-control coordinates for sync-mode egress proxies. When set, a sandbox
+/// whose spec carries an `iron_control_principal` gets a per-sandbox proxy
+/// registered in iron-control (synced over `IRON_CONTROL_URL` with its
+/// `iprx_` token) instead of a rendered static proxy config.
+#[derive(Clone, Debug)]
+pub struct IronControlSettings {
+    /// Admin client used to register/deregister the per-sandbox proxy.
+    pub client: IronControlClient,
+    /// Base URL injected into the proxy pod as `IRON_CONTROL_URL`.
+    pub control_url: String,
+    /// iron-control namespace, used to resolve principals by `foreign_id`.
+    pub namespace: String,
 }
 
 impl AgentSandboxConfig {
@@ -58,6 +80,7 @@ impl AgentSandboxConfig {
             image_pull_policy: None,
             state_volume: None,
             iron_proxy: None,
+            iron_control: None,
             ready_timeout: Duration::from_secs(60),
         }
     }
@@ -69,6 +92,11 @@ impl AgentSandboxConfig {
 
     pub fn iron_proxy(mut self, iron_proxy: IronProxyConfig) -> Self {
         self.iron_proxy = Some(iron_proxy);
+        self
+    }
+
+    pub fn iron_control(mut self, iron_control: IronControlSettings) -> Self {
+        self.iron_control = Some(iron_control);
         self
     }
 }
@@ -99,11 +127,18 @@ impl StateVolumeConfig {
 pub struct AgentSandboxBackend {
     client: Client,
     config: AgentSandboxConfig,
+    // sandbox id -> iron-control proxy OID, so the proxy can be deregistered on
+    // stop. Only populated for sync-mode sandboxes.
+    proxy_ids: Arc<Mutex<HashMap<String, String>>>,
 }
 
 impl AgentSandboxBackend {
     pub fn new(client: Client, config: AgentSandboxConfig) -> Self {
-        Self { client, config }
+        Self {
+            client,
+            config,
+            proxy_ids: Arc::new(Mutex::new(HashMap::new())),
+        }
     }
 
     pub async fn try_default(namespace: impl Into<String>) -> SandboxResult<Self> {
@@ -236,7 +271,7 @@ impl SandboxBackend for AgentSandboxBackend {
     async fn create(&self, spec: SandboxSpec) -> SandboxResult<SandboxHandle> {
         let id = SandboxId::new(next_sandbox_name());
         let mut spec = spec;
-        let resolved_iron_proxy = self.resolve_iron_proxy(&id, &spec)?;
+        let resolved_iron_proxy = self.resolve_iron_proxy(&id, &spec).await?;
         if let Some(resolved) = &resolved_iron_proxy {
             iron_proxy::apply_proxy_env(&mut spec, resolved);
         }
@@ -325,6 +360,11 @@ impl SandboxBackend for AgentSandboxBackend {
     }
 
     async fn resume(&self, id: &SandboxId) -> SandboxResult<()> {
+        // Resume only has the sandbox id, not the spec, so rebind the proxy to
+        // the principal recorded at create rather than re-resolving from spec.
+        let resolved_iron_proxy = self.resolve_iron_proxy_for_resume(id).await?;
+        self.create_iron_proxy_resources(id, resolved_iron_proxy.as_ref())
+            .await?;
         self.patch_replicas(id, 1).await?;
         self.wait_until_running(id).await
     }
@@ -461,11 +501,19 @@ fn build_agent_sandbox(
         config.state_volume.as_ref().map(state_volume_claim_json),
     );
 
-    let spec = serde_json::from_value(agent_spec)
+    let mut annotations = config.annotations.clone();
+    if let Some(principal) = &spec.iron_control_principal {
+        annotations.insert(
+            IRON_CONTROL_PRINCIPAL_ANNOTATION.to_owned(),
+            principal.clone(),
+        );
+    }
+
+    let crd_spec = serde_json::from_value(agent_spec)
         .map_err(|err| SandboxError::InvalidSpec(format!("invalid Agent Sandbox spec: {err}")))?;
-    let mut sandbox = crd::Sandbox::new(id.as_str(), spec);
+    let mut sandbox = crd::Sandbox::new(id.as_str(), crd_spec);
     sandbox.metadata.labels = Some(labels);
-    sandbox.metadata.annotations = Some(config.annotations.clone());
+    sandbox.metadata.annotations = Some(annotations);
     Ok(sandbox)
 }
 

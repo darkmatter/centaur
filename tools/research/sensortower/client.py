@@ -30,10 +30,15 @@ class SensorTowerClient:
         """Get auth token from instance or env var."""
         if self._auth_token:
             return self._auth_token
-        token = secret("SENSOR_TOWER_AUTH_TOKEN", "") or secret("SENSORTOWER_AUTH_TOKEN", "")
+        token = (
+            secret("SENSOR_TOWER_API_TOKEN", "")
+            or secret("SENSORTOWER_API_KEY", "")
+            or secret("SENSOR_TOWER_AUTH_TOKEN", "")
+            or secret("SENSORTOWER_AUTH_TOKEN", "")
+        )
         if not token:
             raise RuntimeError(
-                "SENSOR_TOWER_AUTH_TOKEN not set. "
+                "SENSOR_TOWER_API_TOKEN not set. "
                 "Get your token from https://sensortower.com/users/edit"
             )
         return token
@@ -117,8 +122,7 @@ class SensorTowerClient:
             params["app_ids"] = ",".join(app_ids)
             endpoint = "/v1/android/sales_report_estimates"
 
-        if countries:
-            params["countries"] = ",".join(countries)
+        params["countries"] = ",".join(countries or ["WW"])
 
         return self._request(endpoint, params=params)
 

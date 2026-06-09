@@ -23,9 +23,9 @@ use serde_yaml::Value as YamlValue;
 use crate::client::IronControlClient;
 use crate::error::IronControlError;
 use crate::models::{
-    GcpAuthSecretInput, GrantSecret, Grantee, HmacSecretInput, IdentityInput, InjectConfig,
-    OAuthTokenSecretInput, PgDsnSecretInput, ReplaceConfig, RequestRule, SecretSource,
-    StaticSecretInput,
+    AwsAuthSecretInput, GcpAuthSecretInput, GrantSecret, Grantee, HmacSecretInput, IdentityInput,
+    InjectConfig, OAuthTokenSecretInput, PgDsnSecretInput, ReplaceConfig, RequestRule,
+    SecretSource, StaticSecretInput,
 };
 use crate::util::{managed_labels, slugify};
 
@@ -64,6 +64,7 @@ pub enum SecretInput {
     GcpAuth(GcpAuthSecretInput),
     PgDsn(PgDsnSecretInput),
     Hmac(HmacSecretInput),
+    AwsAuth(AwsAuthSecretInput),
 }
 
 /// A fragment transform iron-control cannot represent, or a malformed entry.
@@ -152,6 +153,9 @@ pub async fn grant_inputs_to_role(
             SecretInput::Hmac(input) => {
                 GrantSecret::Hmac(client.upsert_hmac_secret(&input).await?.id)
             }
+            SecretInput::AwsAuth(input) => {
+                GrantSecret::AwsAuth(client.upsert_aws_auth_secret(&input).await?.id)
+            }
         };
         let grant = client
             .create_grant(&Grantee::Role(role_oid.to_owned()), &secret)
@@ -165,11 +169,11 @@ pub async fn grant_inputs_to_role(
 ///
 /// Only the transform shapes Centaur uses are translated: the ``secrets``
 /// transform (replace and inject, including ``token_broker`` sources),
-/// ``oauth_token``, and ``gcp_auth``. Postgres listeners translate to
-/// ``pg_dsn`` secrets (one per listener). ``hmac_sign`` errors out here: it is
-/// represented in iron-control (see [`HmacSecretInput`]), but only the infra
-/// and harness fragments flow through this fragment translator and neither
-/// signs requests — tool ``hmac_sign`` secrets are operator-managed via the
+/// ``oauth_token``, ``gcp_auth``, and ``aws_auth``. Postgres listeners translate
+/// to ``pg_dsn`` secrets (one per listener). ``hmac_sign`` errors out here: it
+/// is represented in iron-control (see [`HmacSecretInput`]), but only the infra
+/// and harness fragments flow through this fragment translator and none sign
+/// requests — tool ``hmac_sign`` secrets are operator-managed via the
 /// ``centaur-perms`` CLI, which parses ``pyproject.toml`` directly.
 pub fn secret_inputs_from_fragment(
     namespace: &str,
@@ -218,6 +222,12 @@ pub fn secret_inputs_from_fragment(
                 return Err(TranslateError::Unsupported {
                     what: "hmac_sign request signing in an infra/harness fragment".to_owned(),
                 });
+            }
+            "aws_auth" => {
+                let mut input =
+                    aws_auth_from_transform(namespace, role_foreign_id, transform, policy)?;
+                input.foreign_id = unique_foreign_id(input.foreign_id, &mut used_foreign_ids);
+                inputs.push(SecretInput::AwsAuth(input));
             }
             // Base-config transforms (allowlist, header_allowlist) and any
             // future unmanaged entries carry no secrets to register.
@@ -695,6 +705,71 @@ fn gcp_auth_from_transform(
 }
 
 // ---------------------------------------------------------------------------
+// AWS auth secrets
+// ---------------------------------------------------------------------------
+
+/// Translate an ``aws_auth`` transform into an [`AwsAuthSecretInput`]. The
+/// credential refs (``access_key_id``/``secret_access_key`` and the optional
+/// ``session_token``) are placeholders resolved through the deployment
+/// [`SourcePolicy`], like the ``gcp_auth`` keyfile; ``allowed_regions`` /
+/// ``allowed_services`` scope which the proxy signs for, and ``rules`` mirror the
+/// shared request-rule shape. The ``foreign_id`` keys on the access-key
+/// placeholder so the same credential set is one stable secret.
+fn aws_auth_from_transform(
+    namespace: &str,
+    role: &str,
+    transform: &centaur_iron_proxy::Transform,
+    policy: &SourcePolicy,
+) -> Result<AwsAuthSecretInput, TranslateError> {
+    let config = &transform.config.extra;
+    let access_key_id_value = config
+        .get("access_key_id")
+        .ok_or_else(|| malformed(role, "aws_auth missing access_key_id"))?;
+    let (access_key_id, placeholder) =
+        aws_source(role, "access_key_id", access_key_id_value, policy)?;
+    let secret_access_key_value = config
+        .get("secret_access_key")
+        .ok_or_else(|| malformed(role, "aws_auth missing secret_access_key"))?;
+    let (secret_access_key, _) =
+        aws_source(role, "secret_access_key", secret_access_key_value, policy)?;
+    let session_token = config
+        .get("session_token")
+        .map(|value| aws_source(role, "session_token", value, policy).map(|(source, _)| source))
+        .transpose()?;
+    Ok(AwsAuthSecretInput {
+        namespace: namespace.to_owned(),
+        foreign_id: format!("{role}-aws-{}", slugify(&placeholder)),
+        name: Some(format!("AWS Auth ({role})")),
+        description: None,
+        labels: managed_labels(),
+        access_key_id,
+        secret_access_key,
+        session_token,
+        allowed_regions: yaml_string_array(config.get("allowed_regions")),
+        allowed_services: yaml_string_array(config.get("allowed_services")),
+        rules: rules_from_values(role, &sequence(config.get("rules")))?,
+    })
+}
+
+/// Resolve one ``aws_auth`` credential ref — a ``{placeholder: NAME}`` mapping or
+/// a bare ``NAME`` string — into its [`SecretSource`], returning the placeholder
+/// too so the caller can derive the secret's ``foreign_id``.
+fn aws_source(
+    role: &str,
+    field: &str,
+    value: &YamlValue,
+    policy: &SourcePolicy,
+) -> Result<(SecretSource, String), TranslateError> {
+    let placeholder = yaml_str(value, "placeholder")
+        .or_else(|| value.as_str())
+        .ok_or_else(|| malformed(role, &format!("aws_auth {field} must be a placeholder")))?;
+    Ok((
+        source_from_placeholder(policy, placeholder, None),
+        placeholder.to_owned(),
+    ))
+}
+
+// ---------------------------------------------------------------------------
 // serde_yaml helpers and slugging
 // ---------------------------------------------------------------------------
 
@@ -938,6 +1013,94 @@ transforms:
         let err =
             secret_inputs_from_fragment("default", "tool-x", &fragment, &env_policy()).unwrap_err();
         assert!(matches!(err, TranslateError::Unsupported { .. }));
+    }
+
+    #[test]
+    fn translates_aws_auth_transform() {
+        let fragment = load_fragment_str(
+            r#"
+transforms:
+  - name: aws_auth
+    config:
+      access_key_id: { placeholder: AWS_ACCESS_KEY_ID }
+      secret_access_key: { placeholder: AWS_SECRET_ACCESS_KEY }
+      allowed_services: [logs, monitoring]
+      rules:
+        - { host: logs.us-east-1.amazonaws.com }
+        - { host: monitoring.us-east-1.amazonaws.com }
+"#,
+        )
+        .unwrap();
+        let inputs =
+            secret_inputs_from_fragment("default", "infra", &fragment, &env_policy()).unwrap();
+        let SecretInput::AwsAuth(input) = &inputs[0] else {
+            panic!("expected an aws_auth secret");
+        };
+        assert_eq!(input.foreign_id, "infra-aws-aws-access-key-id");
+        assert_eq!(input.name.as_deref(), Some("AWS Auth (infra)"));
+        assert_eq!(input.access_key_id.source_type, "env");
+        assert_eq!(
+            input.access_key_id.config,
+            json!({ "var": "AWS_ACCESS_KEY_ID" })
+        );
+        assert_eq!(
+            input.secret_access_key.config,
+            json!({ "var": "AWS_SECRET_ACCESS_KEY" })
+        );
+        assert!(input.session_token.is_none());
+        assert_eq!(
+            input.allowed_services,
+            vec!["logs".to_owned(), "monitoring".to_owned()]
+        );
+        assert!(input.allowed_regions.is_empty());
+        assert_eq!(input.rules.len(), 2);
+        assert_eq!(
+            input.rules[0].host.as_deref(),
+            Some("logs.us-east-1.amazonaws.com")
+        );
+    }
+
+    #[test]
+    fn translates_aws_auth_with_session_token() {
+        let fragment = load_fragment_str(
+            r#"
+transforms:
+  - name: aws_auth
+    config:
+      access_key_id: { placeholder: AWS_ACCESS_KEY_ID }
+      secret_access_key: { placeholder: AWS_SECRET_ACCESS_KEY }
+      session_token: { placeholder: AWS_SESSION_TOKEN }
+      allowed_regions: [us-west-2]
+      rules:
+        - { host: logs.us-west-2.amazonaws.com }
+"#,
+        )
+        .unwrap();
+        let inputs =
+            secret_inputs_from_fragment("default", "infra", &fragment, &env_policy()).unwrap();
+        let SecretInput::AwsAuth(input) = &inputs[0] else {
+            panic!("expected an aws_auth secret");
+        };
+        let session = input.session_token.as_ref().unwrap();
+        assert_eq!(session.config, json!({ "var": "AWS_SESSION_TOKEN" }));
+        assert_eq!(input.allowed_regions, vec!["us-west-2".to_owned()]);
+    }
+
+    #[test]
+    fn aws_auth_missing_access_key_is_malformed() {
+        let fragment = load_fragment_str(
+            r#"
+transforms:
+  - name: aws_auth
+    config:
+      secret_access_key: { placeholder: AWS_SECRET_ACCESS_KEY }
+      rules: [{ host: logs.us-east-1.amazonaws.com }]
+"#,
+        )
+        .unwrap();
+        let err =
+            secret_inputs_from_fragment("default", "infra", &fragment, &env_policy()).unwrap_err();
+        assert!(matches!(err, TranslateError::Malformed { .. }), "{err:?}");
     }
 
     #[test]

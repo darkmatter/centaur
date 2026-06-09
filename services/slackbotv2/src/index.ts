@@ -3,7 +3,6 @@ import { randomUUID } from 'node:crypto'
 import { Hono } from 'hono'
 import {
   Chat,
-  StreamingPlan,
   type Adapter,
   type Logger,
   type Message as ChatMessage,
@@ -35,6 +34,8 @@ import type {
   SlackbotV2ExecuteSessionResponse,
   SlackbotV2MessageMode,
   SlackbotV2Options,
+  SlackbotV2RenderPage,
+  SlackbotV2RenderPaginationState,
   SlackbotV2RenderObligation,
   SlackbotV2RendererSource,
   SlackbotV2ThreadState,
@@ -85,6 +86,7 @@ const RENDER_RETRY_INITIAL_DELAY_MS = 250
 const RENDER_RETRY_MAX_DELAY_MS = 5_000
 const SLACK_TASK_DETAILS_MAX_CHARS = 500
 const SLACK_FALLBACK_TEXT_MAX_CHARS = 35_000
+const SLACK_PROGRESS_TASKS_PER_PAGE = 24
 const POSTGRES_CONNECT_INITIAL_DELAY_MS = 250
 const POSTGRES_CONNECT_MAX_DELAY_MS = 10_000
 
@@ -415,7 +417,15 @@ async function syncThreadMessageToSession(
         throw error
       }
     }
-    await renderExecutionStream(thread, streamError(error), serializedMessage, input.options, trace)
+    await renderExecutionStream(
+      thread,
+      streamError(error),
+      serializedMessage,
+      input.options,
+      forwardInput.executionId,
+      () => lastEventId,
+      trace
+    )
     traceLog(input.options, 'slackbotv2_forward_complete', trace, {
       latest_active_execution: latest.activeExecution === true,
       last_event_id: lastEventId
@@ -471,6 +481,8 @@ async function renderExecutionAttempt(
       streamSessionAfterHandoff(options, input),
       message,
       options,
+      input.executionId,
+      getLastEventId,
       trace
     )
     rendered = true
@@ -631,7 +643,15 @@ async function recoverRenderObligation(
       retryable
     })
     if (retryable) return true
-    await renderRecoveredExecutionStream(thread, streamError(error), obligation.message, options, trace)
+    await renderRecoveredExecutionStream(
+      thread,
+      streamError(error),
+      obligation.message,
+      options,
+      obligation.executionId,
+      () => lastEventId,
+      trace
+    )
     await thread.setState({
       activeExecution: false,
       lastEventId,
@@ -651,6 +671,8 @@ async function recoverRenderObligation(
       streamOpenedSession(input, openedStream),
       obligation.message,
       options,
+      obligation.executionId,
+      () => lastEventId,
       trace
     )
     rendered = true
@@ -706,6 +728,8 @@ async function renderExecutionStream(
   stream: AsyncIterable<SlackbotV2RendererSource>,
   message: SlackbotV2ApiMessage,
   options: SlackbotV2Options,
+  executionId: string | undefined,
+  getLastEventId: () => number,
   trace?: SlackbotV2Trace
 ): Promise<void> {
   if (isPlainTextOnlyRequest(message.text)) {
@@ -720,23 +744,20 @@ async function renderExecutionStream(
     phase_ms: elapsedMs(titleStartedAtMs)
   })
   try {
-    const visibleStream = await streamAfterFirstChunk(
-      fallback.collectChatSdk(
+    await new SlackRenderPager({
+      executionId: executionId ?? message.id,
+      fallback,
+      getLastEventId,
+      message,
+      options,
+      stream: fallback.collectChatSdk(
         slackSafeChatSdkStream(
-          codexAppServerToChatSdkStream(
-            fallback.collectSource(stream),
-            rendererOptions(thread, options)
-          )
+          codexAppServerToChatSdkStream(fallback.collectSource(stream), rendererOptions(thread, options))
         )
-      )
-    )
-    if (!visibleStream) return
-    await thread.post(
-      new StreamingPlan(
-        visibleStream,
-        { groupTasks: options.streamTaskDisplayMode ?? 'plan' }
-      )
-    )
+      ),
+      thread,
+      trace
+    }).render()
   } catch (error) {
     if (!isSlackMessageTooLongError(error)) throw error
     await postSlackTooLongFallback(thread, fallback, options, trace)
@@ -750,6 +771,8 @@ async function renderRecoveredExecutionStream(
   stream: AsyncIterable<SlackbotV2RendererSource>,
   message: SlackbotV2ApiMessage,
   options: SlackbotV2Options,
+  executionId: string,
+  getLastEventId: () => number,
   trace?: SlackbotV2Trace
 ): Promise<void> {
   if (isPlainTextOnlyRequest(message.text)) {
@@ -764,26 +787,20 @@ async function renderRecoveredExecutionStream(
     phase_ms: elapsedMs(titleStartedAtMs)
   })
   try {
-    const visibleStream = await streamAfterFirstChunk(
-      fallback.collectChatSdk(
+    await new SlackRenderPager({
+      executionId,
+      fallback,
+      getLastEventId,
+      message,
+      options,
+      stream: fallback.collectChatSdk(
         slackSafeChatSdkStream(
-          codexAppServerToChatSdkStream(
-            fallback.collectSource(stream),
-            rendererOptions(thread, options)
-          )
+          codexAppServerToChatSdkStream(fallback.collectSource(stream), rendererOptions(thread, options))
         )
-      )
-    )
-    if (!visibleStream) return
-    await thread.adapter.stream!(
-      thread.id,
-      visibleStream,
-      {
-        recipientTeamId: message.teamId,
-        recipientUserId: message.author.userId,
-        taskDisplayMode: options.streamTaskDisplayMode ?? 'plan'
-      }
-    )
+      ),
+      thread,
+      trace
+    }).render()
   } catch (error) {
     if (!isSlackMessageTooLongError(error)) throw error
     await postSlackTooLongFallback(thread, fallback, options, trace)
@@ -830,6 +847,276 @@ async function renderPlainTextExecutionStream(
   } finally {
     await setAssistantStatus(thread, '')
   }
+}
+
+type SlackRenderPagerInput = {
+  executionId: string
+  fallback: SlackRenderFallback
+  getLastEventId: () => number
+  message: SlackbotV2ApiMessage
+  options: SlackbotV2Options
+  stream: AsyncIterable<ChatSDKStreamChunk>
+  thread: Thread
+  trace?: SlackbotV2Trace
+}
+
+type LocalSlackRenderPage = {
+  page: SlackbotV2RenderPage
+  promise: Promise<void>
+  queue: AsyncChunkQueue
+}
+
+class SlackRenderPager {
+  private finalText = ''
+  private localPages = new Map<string, LocalSlackRenderPage>()
+  private renderState: SlackbotV2RenderPaginationState
+
+  constructor(private readonly input: SlackRenderPagerInput) {
+    this.renderState = {
+      executionId: input.executionId,
+      pages: [],
+      taskRoutes: {}
+    }
+  }
+
+  async render(): Promise<void> {
+    await this.loadState()
+    for await (const chunk of this.input.stream) {
+      if (chunk.type === 'markdown_text') {
+        this.finalText += chunk.text
+        continue
+      }
+      if (chunk.type === 'task_update') {
+        await this.routeTaskChunk(chunk)
+        continue
+      }
+      await this.pushToCurrentPage(chunk)
+    }
+    await this.closeLocalPages()
+    await this.postFinalAnswer()
+  }
+
+  private async loadState(): Promise<void> {
+    const threadState = ((await this.input.thread.state) ?? {}) as SlackbotV2ThreadState
+    const existing = threadState.renderPagination
+    if (existing?.executionId === this.input.executionId) {
+      this.renderState = cloneRenderPagination(existing)
+      return
+    }
+    this.renderState = {
+      executionId: this.input.executionId,
+      lastRenderedEventId: this.input.getLastEventId(),
+      pages: [],
+      taskRoutes: {}
+    }
+    await this.persistState()
+  }
+
+  private async routeTaskChunk(chunk: Extract<ChatSDKStreamChunk, { type: 'task_update' }>): Promise<void> {
+    const routedPageId = this.renderState.taskRoutes[chunk.id]
+    if (routedPageId) {
+      const localPage = this.localPages.get(routedPageId)
+      if (localPage) {
+        localPage.queue.push(chunk)
+      }
+      return
+    }
+
+    const page = await this.currentPageForNewTask()
+    page.page.taskIds.push(chunk.id)
+    this.renderState.taskRoutes[chunk.id] = page.page.pageId
+    this.renderState.lastRenderedEventId = this.input.getLastEventId()
+    await this.persistState()
+    page.queue.push(chunk)
+  }
+
+  private async pushToCurrentPage(chunk: ChatSDKStreamChunk): Promise<void> {
+    const page = await this.currentPageForNewTask()
+    page.queue.push(chunk)
+  }
+
+  private async currentPageForNewTask(): Promise<LocalSlackRenderPage> {
+    const current = this.latestLocalPage()
+    if (current && current.page.taskIds.length < SLACK_PROGRESS_TASKS_PER_PAGE) {
+      return current
+    }
+    return this.openPage()
+  }
+
+  private latestLocalPage(): LocalSlackRenderPage | undefined {
+    return Array.from(this.localPages.values()).at(-1)
+  }
+
+  private async openPage(): Promise<LocalSlackRenderPage> {
+    const pageNumber = this.renderState.pages.length + 1
+    const page: SlackbotV2RenderPage = {
+      firstEventId: this.input.getLastEventId(),
+      lastEventId: this.input.getLastEventId(),
+      pageId: `${this.input.executionId}:page:${pageNumber}`,
+      pageNumber,
+      status: 'open',
+      taskIds: []
+    }
+    this.renderState.pages.push(page)
+    this.renderState.lastRenderedEventId = this.input.getLastEventId()
+    await this.persistState()
+
+    const queue = new AsyncChunkQueue()
+    if (pageNumber > 1) {
+      queue.push({ type: 'plan_update', title: `Progress continued ${pageNumber}` })
+    }
+    const localPage: LocalSlackRenderPage = {
+      page,
+      queue,
+      promise: this.streamPage(page, queue)
+    }
+    this.localPages.set(page.pageId, localPage)
+    traceLog(this.input.options, 'slackbotv2_render_page_opened', this.input.trace, {
+      page_id: page.pageId,
+      page_number: page.pageNumber
+    })
+    return localPage
+  }
+
+  private async streamPage(page: SlackbotV2RenderPage, queue: AsyncChunkQueue): Promise<void> {
+    try {
+      const raw = await this.input.thread.adapter.stream!(
+        this.input.thread.id,
+        queue,
+        {
+          recipientTeamId: this.input.message.teamId,
+          recipientUserId: this.input.message.author.userId,
+          taskDisplayMode: this.input.options.streamTaskDisplayMode ?? 'plan'
+        }
+      )
+      page.slackTs = String(raw?.id ?? '')
+      page.status = 'sealed'
+      page.lastEventId = this.input.getLastEventId()
+      this.renderState.lastRenderedEventId = this.input.getLastEventId()
+      await this.persistState()
+      traceLog(this.input.options, 'slackbotv2_render_page_sealed', this.input.trace, {
+        page_id: page.pageId,
+        page_number: page.pageNumber,
+        slack_ts: page.slackTs,
+        task_count: page.taskIds.length
+      })
+    } catch (error) {
+      page.status = 'failed'
+      page.lastEventId = this.input.getLastEventId()
+      this.renderState.lastRenderedEventId = this.input.getLastEventId()
+      await this.persistState()
+      traceLog(this.input.options, 'slackbotv2_render_page_failed', this.input.trace, {
+        error: errorMessage(error),
+        page_id: page.pageId,
+        page_number: page.pageNumber,
+        task_count: page.taskIds.length
+      })
+      if (!isSlackMessageTooLongError(error)) throw error
+      await this.input.thread.post(this.compactPageFallback(page))
+    }
+  }
+
+  private compactPageFallback(page: SlackbotV2RenderPage): string {
+    const taskList = page.taskIds
+      .map((taskId, index) => `${index + 1}. ${taskId}`)
+      .join('\n')
+    return truncateSlackText(
+      [
+        `Progress page ${page.pageNumber} was too large for Slack's task-card renderer.`,
+        taskList
+      ].filter(Boolean).join('\n\n'),
+      SLACK_FALLBACK_TEXT_MAX_CHARS,
+      'Slack progress fallback'
+    )
+  }
+
+  private async closeLocalPages(): Promise<void> {
+    const pages = Array.from(this.localPages.values())
+    for (const page of pages) page.queue.close()
+    await Promise.all(pages.map(page => page.promise))
+  }
+
+  private async postFinalAnswer(): Promise<void> {
+    const text = (this.finalText || this.input.fallback.text()).trim()
+    if (!text) return
+    for (const chunk of splitSlackText(text, SLACK_FALLBACK_TEXT_MAX_CHARS)) {
+      await this.input.thread.post(chunk)
+    }
+  }
+
+  private async persistState(): Promise<void> {
+    await this.input.thread.setState({
+      renderPagination: cloneRenderPagination(this.renderState)
+    })
+  }
+}
+
+class AsyncChunkQueue implements AsyncIterable<ChatSDKStreamChunk> {
+  private chunks: ChatSDKStreamChunk[] = []
+  private closed = false
+  private waiting: ((value: IteratorResult<ChatSDKStreamChunk>) => void) | null = null
+
+  push(chunk: ChatSDKStreamChunk): void {
+    if (this.closed) return
+    if (this.waiting) {
+      const resolve = this.waiting
+      this.waiting = null
+      resolve({ done: false, value: chunk })
+      return
+    }
+    this.chunks.push(chunk)
+  }
+
+  close(): void {
+    this.closed = true
+    if (this.waiting) {
+      const resolve = this.waiting
+      this.waiting = null
+      resolve({ done: true, value: undefined })
+    }
+  }
+
+  [Symbol.asyncIterator](): AsyncIterator<ChatSDKStreamChunk> {
+    return {
+      next: () => {
+        const chunk = this.chunks.shift()
+        if (chunk) return Promise.resolve({ done: false, value: chunk })
+        if (this.closed) return Promise.resolve({ done: true, value: undefined })
+        return new Promise(resolve => {
+          this.waiting = resolve
+        })
+      }
+    }
+  }
+}
+
+function cloneRenderPagination(
+  state: SlackbotV2RenderPaginationState
+): SlackbotV2RenderPaginationState {
+  return {
+    executionId: state.executionId,
+    lastRenderedEventId: state.lastRenderedEventId,
+    pages: state.pages.map(page => ({
+      ...page,
+      taskIds: [...page.taskIds]
+    })),
+    taskRoutes: { ...state.taskRoutes }
+  }
+}
+
+function splitSlackText(text: string, maxChars: number): string[] {
+  if (text.length <= maxChars) return [text]
+  const chunks: string[] = []
+  let remaining = text
+  while (remaining.length > maxChars) {
+    let splitAt = remaining.lastIndexOf('\n\n', maxChars)
+    if (splitAt < maxChars / 2) splitAt = remaining.lastIndexOf('\n', maxChars)
+    if (splitAt < maxChars / 2) splitAt = maxChars
+    chunks.push(remaining.slice(0, splitAt).trim())
+    remaining = remaining.slice(splitAt).trim()
+  }
+  if (remaining) chunks.push(remaining)
+  return chunks
 }
 
 class SlackRenderFallback {
@@ -938,25 +1225,6 @@ function truncateSlackText(value: string, maxChars: number, label: string): stri
   }
 }
 
-async function streamAfterFirstChunk(
-  stream: AsyncIterable<ChatSDKStreamChunk>
-): Promise<AsyncIterable<ChatSDKStreamChunk> | null> {
-  const iterator = stream[Symbol.asyncIterator]()
-  const first = await iterator.next()
-  if (first.done) return null
-
-  return {
-    async *[Symbol.asyncIterator](): AsyncIterator<ChatSDKStreamChunk> {
-      yield first.value
-      for (;;) {
-        const next = await iterator.next()
-        if (next.done) return
-        yield next.value
-      }
-    }
-  }
-}
-
 function isTerminalCodexAppServerEvent(event: unknown): boolean {
   if (!event || typeof event !== 'object') return false
   const type = (event as { type?: unknown }).type
@@ -975,15 +1243,25 @@ function terminalResultText(event: unknown): string {
 }
 
 function isSlackMessageTooLongError(error: unknown): boolean {
-  if (error instanceof Error && error.message.includes('msg_too_long')) return true
+  if (error instanceof Error && isSlackSizeError(error.message)) return true
   if (!error || typeof error !== 'object') return false
   const fields = error as Record<string, unknown>
-  if (fields.error === 'msg_too_long') return true
+  if (typeof fields.error === 'string' && isSlackSizeError(fields.error)) return true
   const data = fields.data
+  const dataError = Boolean(data) && typeof data === 'object'
+    ? (data as Record<string, unknown>).error
+    : undefined
   return (
-    Boolean(data) &&
-    typeof data === 'object' &&
-    (data as Record<string, unknown>).error === 'msg_too_long'
+    typeof dataError === 'string' &&
+    isSlackSizeError(dataError)
+  )
+}
+
+function isSlackSizeError(value: string): boolean {
+  return (
+    value.includes('msg_too_long') ||
+    value.includes('msg_blocks_too_long') ||
+    value.includes('msg_blocks_too_many')
   )
 }
 

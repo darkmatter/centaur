@@ -261,8 +261,10 @@ describe('slackbotv2', () => {
       reply.includes('Executed request')
     )
     expect(renderedReplies).toHaveLength(2)
-    expectSlackRenderedReply(renderedReplies[0]!, 'Executed request 1.')
-    expectSlackRenderedReply(renderedReplies[1]!, 'Executed request 2.')
+    expect(renderedReplies[0]).toContain('Executed request 1.')
+    expect(renderedReplies[0]).not.toContain('Implementation plan')
+    expect(renderedReplies[1]).toContain('Executed request 2.')
+    expect(renderedReplies[1]).not.toContain('Implementation plan')
   })
 
   it('executes a root app mention when Slack has no thread history yet', async () => {
@@ -481,16 +483,9 @@ describe('slackbotv2', () => {
     await Promise.all(waits)
     const transcripts = slackStreamTranscripts(slackApi.calls)
     expect(transcripts).toHaveLength(1)
-    const markdownChunks = transcripts[0]!.chunks.filter(chunk => chunk.type === 'markdown_text')
-    expect(markdownChunks).toEqual([
-      {
-        type: 'markdown_text',
-        text: 'Execution failed: Reconnecting... 2/5: unexpected status 502 Bad Gateway'
-      }
-    ])
     const renderedText = transcripts[0]!.chunks.map(chunkText).filter(Boolean).join('\n')
     expect(renderedText).toContain('Command execution')
-    expect(renderedText).toContain(
+    expect(await threadText(parent.ts)).toContain(
       'Execution failed: Reconnecting... 2/5: unexpected status 502 Bad Gateway'
     )
   })
@@ -557,17 +552,10 @@ describe('slackbotv2', () => {
     await Promise.all(waits)
     const transcripts = slackStreamTranscripts(slackApi.calls)
     expect(transcripts).toHaveLength(1)
-    const markdownChunks = transcripts[0]!.chunks.filter(chunk => chunk.type === 'markdown_text')
-    expect(markdownChunks).toEqual([
-      {
-        type: 'markdown_text',
-        text: 'Execution completed, but no final text was captured.'
-      }
-    ])
     const renderedText = transcripts[0]!.chunks.map(chunkText).filter(Boolean).join('\n')
     expect(renderedText).toContain('Command execution')
-    expect(renderedText.trim().endsWith('Execution completed, but no final text was captured.')).toBe(
-      true
+    expect(await threadText(parent.ts)).toContain(
+      'Execution completed, but no final text was captured.'
     )
   })
 
@@ -636,8 +624,10 @@ describe('slackbotv2', () => {
     expect(transcripts).toHaveLength(1)
     const renderedText = transcripts[0]!.chunks.map(chunkText).filter(Boolean).join('\n')
     expect(renderedText).toContain('Command execution')
-    expect(renderedText).toContain('TERMINAL_RESULT_VISIBLE')
-    expect(renderedText).not.toContain('Execution completed, but no final text was captured.')
+    expect(await threadText(parent.ts)).toContain('TERMINAL_RESULT_VISIBLE')
+    expect(await threadText(parent.ts)).not.toContain(
+      'Execution completed, but no final text was captured.'
+    )
   })
 
   it('posts a visible final-answer fallback when Slack rejects the stream as too long', async () => {
@@ -744,9 +734,8 @@ describe('slackbotv2', () => {
 
     await Promise.all(waits)
     const transcripts = slackStreamTranscripts(slackApi.calls)
-    expect(transcripts).toHaveLength(1)
-    const renderedText = transcripts[0]!.chunks.map(chunkText).filter(Boolean).join('\n')
-    expect(renderedText).toContain('DELAYED_VISIBLE_OUTPUT')
+    expect(transcripts).toHaveLength(0)
+    expect(await threadText(parent.ts)).toContain('DELAYED_VISIBLE_OUTPUT')
   })
 
   it('does not duplicate final text when execution completion follows final answer deltas', async () => {
@@ -805,19 +794,9 @@ describe('slackbotv2', () => {
 
     await Promise.all(waits)
     const transcripts = slackStreamTranscripts(slackApi.calls)
-    expect(transcripts).toHaveLength(1)
-    const markdownChunks = transcripts[0]!.chunks.filter(chunk => chunk.type === 'markdown_text')
-    expect(markdownChunks).toEqual([
-      {
-        type: 'markdown_text',
-        text: 'DUPLICATE_DELIVERY_GUARD_OK'
-      }
-    ])
-    expect(
-      transcripts[0]!.chunks.filter(chunk =>
-        chunkText(chunk).includes('DUPLICATE_DELIVERY_GUARD_OK')
-      )
-    ).toHaveLength(1)
+    expect(transcripts).toHaveLength(0)
+    const replies = await threadTexts(parent.ts)
+    expect(replies.filter(reply => reply.includes('DUPLICATE_DELIVERY_GUARD_OK'))).toHaveLength(1)
   })
 
   it('omits large structured task output so final markdown still delivers', async () => {
@@ -918,13 +897,114 @@ describe('slackbotv2', () => {
         .filter(Boolean)
         .every(details => details.length <= 500)
     ).toBe(true)
-    const markdownChunks = transcripts[0]!.chunks.filter(chunk => chunk.type === 'markdown_text')
-    expect(markdownChunks).toEqual([
-      {
-        type: 'markdown_text',
-        text: 'LARGE_TASK_FINAL_VISIBLE'
-      }
-    ])
+    expect(await threadText(parent.ts)).toContain('LARGE_TASK_FINAL_VISIBLE')
+  })
+
+  it('paginates long task-card streams and posts final text separately', async () => {
+    const sharedState = createMemoryState()
+    await sharedState.connect()
+    bot = createTestBot({ state: sharedState })
+    codexApi.autoRespond = false
+
+    const parent = await postUserMessage('Context before many task cards.')
+    const mention = await postUserMessage(`<@${BOT_USER_ID}> render many commands`, parent.ts)
+    const key = threadKey(parent.ts)
+    const waits: Promise<unknown>[] = []
+    const response = await bot.app.request(
+      '/api/webhooks/slack',
+      signedSlackEvent({
+        event_id: 'Ev-slackbotv2-task-pagination',
+        event: {
+          type: 'app_mention',
+          user: USER_ID,
+          channel: CHANNEL_ID,
+          team: TEAM_ID,
+          ts: mention.ts,
+          thread_ts: parent.ts,
+          text: `<@${BOT_USER_ID}> render many commands`
+        }
+      }),
+      {},
+      waitUntilContext(waits)
+    )
+
+    expect(response.status).toBe(200)
+    await waitFor(() => codexApi.executes.length === 1)
+    await waitFor(() => codexApi.eventRequests.length === 1)
+    await waitFor(() => codexApi.streamCount === 1)
+
+    for (let index = 0; index < 30; index += 1) {
+      codexApi.emitOutputLine(
+        key,
+        JSON.stringify({
+          type: 'item.started',
+          item: {
+            id: `cmd-page-${index}`,
+            type: 'commandExecution',
+            command: `echo page-${index}`,
+            status: 'inProgress'
+          }
+        })
+      )
+      codexApi.emitOutputLine(
+        key,
+        JSON.stringify({
+          type: 'item.completed',
+          item: {
+            id: `cmd-page-${index}`,
+            type: 'commandExecution',
+            command: `echo page-${index}`,
+            status: 'completed',
+            aggregatedOutput: ''
+          }
+        })
+      )
+    }
+    codexApi.emitOutputLine(
+      key,
+      JSON.stringify({
+        type: 'item.started',
+        item: {
+          id: 'answer-pagination',
+          type: 'agentMessage',
+          text: '',
+          phase: 'final_answer'
+        }
+      })
+    )
+    codexApi.emitOutputLine(
+      key,
+      JSON.stringify({
+        type: 'item.agentMessage.delta',
+        itemId: 'answer-pagination',
+        delta: 'PAGINATED_FINAL_VISIBLE'
+      })
+    )
+    codexApi.emitSessionEvent(key, 'session.execution_completed', {
+      execution_id: 'exe-task-pagination',
+      status: 'completed'
+    })
+
+    await Promise.all(waits)
+    const transcripts = slackStreamTranscripts(slackApi.calls)
+    expect(transcripts).toHaveLength(2)
+    expect(transcripts[0]!.chunks.filter(chunk => chunk.type === 'task_update')).toHaveLength(48)
+    expect(transcripts[1]!.chunks.filter(chunk => chunk.type === 'task_update')).toHaveLength(12)
+    expect(transcripts.flatMap(transcript => transcript.chunks)).not.toContainEqual(
+      expect.objectContaining({ type: 'markdown_text', text: 'PAGINATED_FINAL_VISIBLE' })
+    )
+    expect(await threadText(parent.ts)).toContain('PAGINATED_FINAL_VISIBLE')
+
+    const threadState = await sharedState.get<Record<string, unknown>>(`thread-state:${key}`)
+    expect(threadState?.renderPagination).toEqual(
+      expect.objectContaining({
+        executionId: 'exe-1',
+        pages: expect.arrayContaining([
+          expect.objectContaining({ pageNumber: 1, status: 'sealed' }),
+          expect.objectContaining({ pageNumber: 2, status: 'sealed' })
+        ])
+      })
+    )
   })
 
   it('honors plain-text-only requests without Slack plan blocks', async () => {
@@ -2370,12 +2450,9 @@ function expectSlackPlanStreamShape(
 
   for (const [index, transcript] of transcripts.entries()) {
     const answer = input.answers[index]!
-    const markdownChunks = transcript.chunks.filter(chunk => chunk.type === 'markdown_text')
     const progressChunks = transcript.chunks.filter(chunk => chunk.type !== 'markdown_text')
-    const markdownText = markdownChunks.map(chunk => stringField(chunk.text)).join('')
     const progressText = progressChunks.map(chunkText).filter(Boolean).join('\n')
     const renderedText = transcript.chunks.map(chunkText).filter(Boolean).join('\n')
-    const markdownIndex = transcript.chunks.findIndex(chunk => chunk.type === 'markdown_text')
 
     expect(transcript.start.body).toEqual(
       expect.objectContaining({
@@ -2420,19 +2497,9 @@ function expectSlackPlanStreamShape(
     ]
       .filter(Boolean)
       .join('\n')
-    if (stopFinalText) expect(stopFinalText).toContain(answer)
-
-    expect(markdownChunks).toEqual([{ type: 'markdown_text', text: answer }])
-    expect(markdownText).toBe(answer)
-    expect(markdownText).not.toContain('Implementation plan')
-    expect(markdownText).not.toContain('Checking the command output')
-    expect(markdownText).not.toContain('Inspecting the event stream')
-    expect(markdownText).not.toContain('Command execution')
-    expect(markdownText).not.toContain('pnpm test')
-    expect(markdownText).not.toContain('tests passed')
+    expect(stopFinalText).not.toContain(answer)
     expect(progressText).not.toContain(answer)
 
-    expect(markdownIndex).toBe(transcript.chunks.length - 1)
     expect(progressChunks.length).toBeGreaterThan(0)
     expect(progressChunks.every(chunk =>
       chunk.type === 'plan_update' || chunk.type === 'task_update'
@@ -2501,21 +2568,7 @@ function expectSlackPlanStreamShape(
     expect(renderedText).toContain('Command execution')
     expect(renderedText).toContain('pnpm test')
     expect(renderedText).not.toContain('tests passed')
-    expect(renderedText.trim().endsWith(answer)).toBe(true)
   }
-}
-
-function expectSlackRenderedReply(text: string, answer: string): void {
-  expect(text).toContain('Implementation plan')
-  expect(text).toContain('Inspect App Server events')
-  expect(text).toContain('Stream Chat SDK chunks')
-  expect(text).toContain('Thinking')
-  expect(text).toContain('Checking the command output')
-  expect(text).toContain('Inspecting the event stream')
-  expect(text).toContain('Command execution')
-  expect(text).toContain('pnpm test')
-  expect(text).not.toContain('tests passed')
-  expect(text.trim().endsWith(answer)).toBe(true)
 }
 
 function slackStreamTranscripts(calls: StreamCall[]): SlackStreamTranscript[] {

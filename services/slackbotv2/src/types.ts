@@ -109,6 +109,7 @@ export type SlackbotV2ThreadState = {
   forwardedMessageIds?: string[]
   historyForwarded?: boolean
   lastEventId?: number
+  renderPagination?: SlackbotV2RenderPaginationState | null
   renderObligation?: SlackbotV2RenderObligation | null
 }
 
@@ -116,6 +117,23 @@ export type SlackbotV2RenderObligation = {
   afterEventId: number
   executionId: string
   message: SlackbotV2ApiMessage
+}
+
+export type SlackbotV2RenderPage = {
+  firstEventId?: number
+  lastEventId?: number
+  pageId: string
+  pageNumber: number
+  slackTs?: string
+  status: 'open' | 'sealed' | 'failed'
+  taskIds: string[]
+}
+
+export type SlackbotV2RenderPaginationState = {
+  executionId: string
+  lastRenderedEventId?: number
+  pages: SlackbotV2RenderPage[]
+  taskRoutes: Record<string, string>
 }
 
 export type SlackbotV2MessageMode = 'append' | 'execute'

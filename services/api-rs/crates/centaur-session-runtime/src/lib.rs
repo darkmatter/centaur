@@ -41,17 +41,27 @@ const MAX_SESSION_OUTPUT_LINE_BYTES: usize = 8 * 1024 * 1024;
 const EVENT_STREAM_SAFETY_POLL_INTERVAL: Duration = Duration::from_secs(30);
 const STEERING_STARTUP_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 const STEERING_STARTUP_RETRY_TIMEOUT: Duration = Duration::from_secs(15);
+const SESSION_PIPE_MAX_REATTACH_ATTEMPTS: u32 = 3;
+const SESSION_PIPE_REATTACH_DELAY: Duration = Duration::from_millis(500);
 const COMPONENT_SESSION_RUNTIME: &str = "session_runtime";
 
 type SandboxSpecFactory = Arc<dyn Fn(&ThreadKey, &str) -> SandboxSpec + Send + Sync>;
 type SessionInputSink = FramedWrite<SandboxWrite, LinesCodec>;
 type ExecutionSpanRegistry = Arc<Mutex<HashMap<String, Span>>>;
+type SessionPipeMap = Arc<Mutex<HashMap<String, SessionPipe>>>;
+/// Per-sandbox locks serializing `open_io` so concurrent attach attempts
+/// (execute, SSE attach, steering, pump reattach) cannot open competing
+/// attach streams that interfere with each other. Entries are never removed:
+/// they are tiny, bounded by the sandboxes this process touches, and removal
+/// would reintroduce the open race it exists to prevent.
+type SessionPipeOpenLocks = Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>;
 
 #[derive(Clone)]
 pub struct SessionRuntime {
     store: PgSessionStore,
     sandbox_runtime: SandboxRuntime,
-    sandbox_pipes: Arc<Mutex<HashMap<String, SessionPipe>>>,
+    sandbox_pipes: SessionPipeMap,
+    pipe_open_locks: SessionPipeOpenLocks,
     execution_spans: ExecutionSpanRegistry,
     iron_control: Option<SessionRegistrar>,
     warm_pool: Option<Arc<WarmPoolManager>>,
@@ -124,6 +134,7 @@ impl SessionRuntime {
             store,
             sandbox_runtime,
             sandbox_pipes: Arc::new(Mutex::new(HashMap::new())),
+            pipe_open_locks: Arc::new(Mutex::new(HashMap::new())),
             execution_spans: Arc::new(Mutex::new(HashMap::new())),
             iron_control: None,
             warm_pool: None,
@@ -1018,81 +1029,46 @@ impl SessionRuntime {
                 return Ok(pipe);
             }
 
+            // Serialize opens per sandbox: concurrent callers (execute, SSE
+            // attach, steering) must not race `open_io` for the same sandbox,
+            // since competing k8s attach streams disrupt each other.
+            let open_lock = self.pipe_open_lock(sandbox_id).await;
+            let _open_guard = open_lock.lock().await;
+            if let Some(pipe) = self.sandbox_pipes.lock().await.get(sandbox_id).cloned() {
+                info!(
+                    component = COMPONENT_SESSION_RUNTIME,
+                    event = "session_pipe_reused",
+                    thread_key = %thread_key,
+                    sandbox_id,
+                    "reusing session pipe"
+                );
+                return Ok(pipe);
+            }
+
             let io = self
                 .sandbox_runtime
                 .manager
                 .open_io(&SandboxId::new(sandbox_id))
                 .await?
                 .into_parts();
-            let pipe = SessionPipe {
-                stdin: Arc::new(Mutex::new(FramedWrite::new(
-                    io.stdin,
-                    LinesCodec::new_with_max_length(MAX_SESSION_OUTPUT_LINE_BYTES),
-                ))),
-            };
+            let pipe = session_pipe_from_stdin(io.stdin);
 
             self.sandbox_pipes
                 .lock()
                 .await
                 .insert(sandbox_id.to_owned(), pipe.clone());
-            let store = self.store.clone();
-            let manager = self.sandbox_runtime.manager.clone();
-            let execution_spans = self.execution_spans.clone();
-            let thread_key = thread_key.clone();
-            let pump_thread_key = thread_key.clone();
-            let pump_key = sandbox_id.to_owned();
-            let sandbox_pipes = self.sandbox_pipes.clone();
-            let stdout = io.stdout;
-            let stderr = io.stderr;
-            let guard = io.guard;
-            let stderr_key = pump_key.clone();
-
-            tokio::spawn(async move {
-                let result = run_stdout_pump(
-                    store.clone(),
-                    manager,
-                    sandbox_pipes.clone(),
-                    execution_spans.clone(),
-                    pump_thread_key.clone(),
-                    &pump_key,
-                    stdout,
-                    guard,
-                )
-                .await;
-                if let Err(error) = result {
-                    warn!(
-                        component = COMPONENT_SESSION_RUNTIME,
-                        event = "session_stdout_pump_failed",
-                        thread_key = %pump_thread_key,
-                        sandbox_id = %pump_key,
-                        %error,
-                        "session stdout pump failed"
-                    );
-                    let _ = store
-                        .append_event(
-                            &pump_thread_key,
-                            None,
-                            "session.stdout_pump_failed",
-                            json!({
-                                "sandbox_id": pump_key.as_str(),
-                                "error": error.to_string(),
-                            }),
-                        )
-                        .await;
-                }
-                sandbox_pipes.lock().await.remove(&pump_key);
-            });
-
-            tokio::spawn(async move {
-                if let Err(error) = drain_stderr(stderr).await {
-                    warn!(
-                        component = COMPONENT_SESSION_RUNTIME,
-                        event = "session_stderr_drain_failed",
-                        sandbox_id = %stderr_key,
-                        %error,
-                        "session stderr drain failed"
-                    );
-                }
+            spawn_stderr_drain(sandbox_id.to_owned(), io.stderr);
+            spawn_stdout_pump_loop(StdoutPumpLoop {
+                store: self.store.clone(),
+                manager: self.sandbox_runtime.manager.clone(),
+                sandbox_pipes: self.sandbox_pipes.clone(),
+                open_lock: open_lock.clone(),
+                execution_spans: self.execution_spans.clone(),
+                thread_key: thread_key.clone(),
+                sandbox_id: sandbox_id.to_owned(),
+                pipe: pipe.clone(),
+                stdout: io.stdout,
+                guard: io.guard,
             });
 
             info!(
@@ -1118,6 +1094,15 @@ impl SessionRuntime {
             );
         }
         result
+    }
+
+    async fn pipe_open_lock(&self, sandbox_id: &str) -> Arc<Mutex<()>> {
+        self.pipe_open_locks
+            .lock()
+            .await
+            .entry(sandbox_id.to_owned())
+            .or_default()
+            .clone()
     }
 }
 
@@ -1361,16 +1346,29 @@ fn session_event_stream(
     )
 }
 
+/// How a stdout pump pass ended once the attach stream closed.
+enum StdoutPumpEnd {
+    /// The stream closed with no execution in flight (or the failure was
+    /// already recorded); nothing is owed to any execution.
+    Idle,
+    /// The stream closed while an execution was still active. The caller
+    /// decides whether to reattach or fail the execution.
+    EofActiveExecution {
+        execution_id: String,
+        lines_pumped: u64,
+    },
+}
+
 async fn run_stdout_pump(
     store: PgSessionStore,
     manager: Arc<SandboxManager>,
-    sandbox_pipes: Arc<Mutex<HashMap<String, SessionPipe>>>,
+    sandbox_pipes: SessionPipeMap,
     execution_spans: ExecutionSpanRegistry,
     thread_key: ThreadKey,
     sandbox_id: &str,
     stdout: SandboxRead,
     _guard: SandboxIoGuard,
-) -> Result<(), SessionRuntimeError> {
+) -> Result<StdoutPumpEnd, SessionRuntimeError> {
     let span = info_span!(
         "centaur.api_rs.session.stdout_pump",
         component = COMPONENT_SESSION_RUNTIME,
@@ -1408,7 +1406,7 @@ async fn run_stdout_pump(
                         stdout_pump_error_message(&error),
                     )
                     .await?;
-                    return Ok(());
+                    return Ok(StdoutPumpEnd::Idle);
                 }
             };
             line_count += 1;
@@ -1471,35 +1469,7 @@ async fn run_stdout_pump(
                 output_state.forget(&output_execution_id);
             }
         }
-        if let Some(execution) = store.active_execution_for_thread(&thread_key).await? {
-            let execution_span = execution_spans
-                .lock()
-                .await
-                .get(&execution.execution_id)
-                .cloned();
-            let output_span = output_state.stdout_span_for_execution(
-                execution_span.as_ref(),
-                &thread_key,
-                sandbox_id,
-                &execution.execution_id,
-            );
-            record_terminal_output(
-                &store,
-                manager,
-                sandbox_pipes,
-                execution_spans.clone(),
-                &thread_key,
-                sandbox_id,
-                &execution.execution_id,
-                TerminalOutput::Failed {
-                    error: "sandbox stdout closed before terminal output".to_owned(),
-                },
-            )
-            .instrument(output_span)
-            .await?;
-            execution_spans.lock().await.remove(&execution.execution_id);
-            output_state.forget(&execution.execution_id);
-        }
+        let active_execution = store.active_execution_for_thread(&thread_key).await?;
         store
             .append_event(
                 &thread_key,
@@ -1518,10 +1488,297 @@ async fn run_stdout_pump(
             output_line_count = line_count,
             "session stdout pump completed"
         );
-        Ok(())
+        // An EOF with an execution still active is a transport-level close,
+        // not proof the harness failed. Let the pump loop decide whether to
+        // reattach (sandbox still live) or fail the execution.
+        match active_execution {
+            Some(execution) => Ok(StdoutPumpEnd::EofActiveExecution {
+                execution_id: execution.execution_id,
+                lines_pumped: line_count,
+            }),
+            None => Ok(StdoutPumpEnd::Idle),
+        }
     }
     .instrument(span)
     .await
+}
+
+struct StdoutPumpLoop {
+    store: PgSessionStore,
+    manager: Arc<SandboxManager>,
+    sandbox_pipes: SessionPipeMap,
+    open_lock: Arc<Mutex<()>>,
+    execution_spans: ExecutionSpanRegistry,
+    thread_key: ThreadKey,
+    sandbox_id: String,
+    pipe: SessionPipe,
+    stdout: SandboxRead,
+    guard: SandboxIoGuard,
+}
+
+enum ReattachOutcome {
+    Reattached {
+        pipe: SessionPipe,
+        stdout: SandboxRead,
+        guard: SandboxIoGuard,
+    },
+    /// Another pipe replaced ours; its pump now owns the sandbox stream.
+    Superseded,
+    /// The sandbox cannot serve io anymore (or reattaching failed).
+    Dead(String),
+}
+
+/// Runs the stdout pump for a session pipe, reattaching to the sandbox when
+/// the attach stream closes mid-execution but the sandbox is still running.
+/// Only when the sandbox is gone (or reattaching keeps failing) is the active
+/// execution failed.
+fn spawn_stdout_pump_loop(state: StdoutPumpLoop) {
+    tokio::spawn(async move {
+        let StdoutPumpLoop {
+            store,
+            manager,
+            sandbox_pipes,
+            open_lock,
+            execution_spans,
+            thread_key,
+            sandbox_id,
+            mut pipe,
+            mut stdout,
+            mut guard,
+        } = state;
+        let mut reattach_attempts = 0_u32;
+        loop {
+            let result = run_stdout_pump(
+                store.clone(),
+                manager.clone(),
+                sandbox_pipes.clone(),
+                execution_spans.clone(),
+                thread_key.clone(),
+                &sandbox_id,
+                stdout,
+                guard,
+            )
+            .await;
+            let (execution_id, lines_pumped) = match result {
+                Ok(StdoutPumpEnd::Idle) => break,
+                Ok(StdoutPumpEnd::EofActiveExecution {
+                    execution_id,
+                    lines_pumped,
+                }) => (execution_id, lines_pumped),
+                Err(error) => {
+                    warn!(
+                        component = COMPONENT_SESSION_RUNTIME,
+                        event = "session_stdout_pump_failed",
+                        thread_key = %thread_key,
+                        sandbox_id = %sandbox_id,
+                        %error,
+                        "session stdout pump failed"
+                    );
+                    let _ = store
+                        .append_event(
+                            &thread_key,
+                            None,
+                            "session.stdout_pump_failed",
+                            json!({
+                                "sandbox_id": sandbox_id.as_str(),
+                                "error": error.to_string(),
+                            }),
+                        )
+                        .await;
+                    break;
+                }
+            };
+            if lines_pumped > 0 {
+                reattach_attempts = 0;
+            }
+            if reattach_attempts >= SESSION_PIPE_MAX_REATTACH_ATTEMPTS {
+                fail_detached_execution(
+                    &store,
+                    manager.clone(),
+                    sandbox_pipes.clone(),
+                    execution_spans.clone(),
+                    &thread_key,
+                    &sandbox_id,
+                    &execution_id,
+                    "stdout reattach attempts exhausted",
+                )
+                .await;
+                break;
+            }
+            reattach_attempts += 1;
+            if reattach_attempts > 1 {
+                sleep(SESSION_PIPE_REATTACH_DELAY).await;
+            }
+            let outcome =
+                reattach_session_pipe(&manager, &sandbox_pipes, &open_lock, &sandbox_id, &pipe)
+                    .await;
+            match outcome {
+                ReattachOutcome::Reattached {
+                    pipe: new_pipe,
+                    stdout: new_stdout,
+                    guard: new_guard,
+                } => {
+                    info!(
+                        component = COMPONENT_SESSION_RUNTIME,
+                        event = "session_stdout_pump_reattached",
+                        thread_key = %thread_key,
+                        sandbox_id = %sandbox_id,
+                        execution_id = %execution_id,
+                        attempt = reattach_attempts,
+                        "reattached session stdout pump after eof"
+                    );
+                    let _ = store
+                        .append_event(
+                            &thread_key,
+                            Some(&execution_id),
+                            "session.stdout_pump_reattached",
+                            json!({
+                                "sandbox_id": sandbox_id.as_str(),
+                                "attempt": reattach_attempts,
+                            }),
+                        )
+                        .await;
+                    pipe = new_pipe;
+                    stdout = new_stdout;
+                    guard = new_guard;
+                }
+                ReattachOutcome::Superseded => return,
+                ReattachOutcome::Dead(detail) => {
+                    fail_detached_execution(
+                        &store,
+                        manager.clone(),
+                        sandbox_pipes.clone(),
+                        execution_spans.clone(),
+                        &thread_key,
+                        &sandbox_id,
+                        &execution_id,
+                        &detail,
+                    )
+                    .await;
+                    break;
+                }
+            }
+        }
+        remove_pipe_if_current(&sandbox_pipes, &sandbox_id, &pipe).await;
+    });
+}
+
+async fn reattach_session_pipe(
+    manager: &Arc<SandboxManager>,
+    sandbox_pipes: &SessionPipeMap,
+    open_lock: &Arc<Mutex<()>>,
+    sandbox_id: &str,
+    pipe: &SessionPipe,
+) -> ReattachOutcome {
+    // Reattach under the per-sandbox open lock so this cannot race a
+    // concurrent `ensure_session_pipe` into duplicate attach streams.
+    let _open_guard = open_lock.lock().await;
+    {
+        let pipes = sandbox_pipes.lock().await;
+        let superseded = pipes
+            .get(sandbox_id)
+            .is_none_or(|existing| !Arc::ptr_eq(&existing.stdin, &pipe.stdin));
+        if superseded {
+            return ReattachOutcome::Superseded;
+        }
+    }
+    let id = SandboxId::new(sandbox_id);
+    match manager.status(&id).await {
+        Ok(status) if status.can_open_io() => match manager.open_io(&id).await {
+            Ok(io) => {
+                let parts = io.into_parts();
+                let new_pipe = session_pipe_from_stdin(parts.stdin);
+                sandbox_pipes
+                    .lock()
+                    .await
+                    .insert(sandbox_id.to_owned(), new_pipe.clone());
+                spawn_stderr_drain(sandbox_id.to_owned(), parts.stderr);
+                ReattachOutcome::Reattached {
+                    pipe: new_pipe,
+                    stdout: parts.stdout,
+                    guard: parts.guard,
+                }
+            }
+            Err(error) => ReattachOutcome::Dead(format!("sandbox stdout reattach failed: {error}")),
+        },
+        Ok(status) => {
+            ReattachOutcome::Dead(format!("sandbox no longer accepts io (status {status:?})"))
+        }
+        Err(error) => ReattachOutcome::Dead(format!("sandbox status check failed: {error}")),
+    }
+}
+
+async fn fail_detached_execution(
+    store: &PgSessionStore,
+    manager: Arc<SandboxManager>,
+    sandbox_pipes: SessionPipeMap,
+    execution_spans: ExecutionSpanRegistry,
+    thread_key: &ThreadKey,
+    sandbox_id: &str,
+    execution_id: &str,
+    detail: &str,
+) {
+    let error = format!("sandbox stdout closed before terminal output; {detail}");
+    if let Err(record_error) = record_terminal_output(
+        store,
+        manager,
+        sandbox_pipes,
+        execution_spans,
+        thread_key,
+        sandbox_id,
+        execution_id,
+        TerminalOutput::Failed { error },
+    )
+    .await
+    {
+        warn!(
+            component = COMPONENT_SESSION_RUNTIME,
+            event = "session_stdout_pump_fail_record_failed",
+            thread_key = %thread_key,
+            sandbox_id = %sandbox_id,
+            execution_id = %execution_id,
+            error = %record_error,
+            "failed to record detached execution failure"
+        );
+    }
+}
+
+fn session_pipe_from_stdin(stdin: SandboxWrite) -> SessionPipe {
+    SessionPipe {
+        stdin: Arc::new(Mutex::new(FramedWrite::new(
+            stdin,
+            LinesCodec::new_with_max_length(MAX_SESSION_OUTPUT_LINE_BYTES),
+        ))),
+    }
+}
+
+fn spawn_stderr_drain(sandbox_id: String, stderr: SandboxRead) {
+    tokio::spawn(async move {
+        if let Err(error) = drain_stderr(stderr).await {
+            warn!(
+                component = COMPONENT_SESSION_RUNTIME,
+                event = "session_stderr_drain_failed",
+                sandbox_id = %sandbox_id,
+                %error,
+                "session stderr drain failed"
+            );
+        }
+    });
+}
+
+/// Removes the pipe map entry only if it still points at `pipe`, so a dying
+/// pump cannot clobber a newer pipe opened for the same sandbox.
+async fn remove_pipe_if_current(
+    sandbox_pipes: &SessionPipeMap,
+    sandbox_id: &str,
+    pipe: &SessionPipe,
+) {
+    let mut pipes = sandbox_pipes.lock().await;
+    if let Some(existing) = pipes.get(sandbox_id)
+        && Arc::ptr_eq(&existing.stdin, &pipe.stdin)
+    {
+        pipes.remove(sandbox_id);
+    }
 }
 
 async fn record_stdout_pump_failure(
@@ -3883,5 +4140,312 @@ mod tests {
             .iter()
             .find(|env| env.name == name)
             .map(|env| env.value.as_str())
+    }
+}
+
+/// Integration tests for the stdout pump reattach loop. They need a real
+/// Postgres; set `SESSION_RUNTIME_TEST_DATABASE_URL` to run them (they skip
+/// silently otherwise, mirroring `ABSURD_TEST_DATABASE_URL` in absurd-sdk).
+#[cfg(test)]
+mod pipe_reattach_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use centaur_sandbox_core::{ObservedSandbox, SandboxHandle, SandboxIo, SandboxResult};
+    use tokio::io::{AsyncWriteExt, DuplexStream};
+
+    use super::*;
+
+    struct MockBackend {
+        ios: Mutex<VecDeque<SandboxIo>>,
+        open_count: AtomicUsize,
+        status: std::sync::Mutex<SandboxStatus>,
+    }
+
+    impl MockBackend {
+        fn new(status: SandboxStatus) -> Self {
+            Self {
+                ios: Mutex::new(VecDeque::new()),
+                open_count: AtomicUsize::new(0),
+                status: std::sync::Mutex::new(status),
+            }
+        }
+
+        async fn push_io(&self, io: SandboxIo) {
+            self.ios.lock().await.push_back(io);
+        }
+
+        fn set_status(&self, status: SandboxStatus) {
+            *self.status.lock().unwrap() = status;
+        }
+
+        fn opens(&self) -> usize {
+            self.open_count.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SandboxBackend for MockBackend {
+        fn name(&self) -> &'static str {
+            "mock"
+        }
+
+        async fn create(&self, _spec: SandboxSpec) -> SandboxResult<SandboxHandle> {
+            Ok(SandboxHandle::new(SandboxId::new("mock-sbx"), "mock"))
+        }
+
+        async fn open_io(&self, _id: &SandboxId) -> SandboxResult<SandboxIo> {
+            self.open_count.fetch_add(1, Ordering::SeqCst);
+            self.ios
+                .lock()
+                .await
+                .pop_front()
+                .ok_or_else(|| SandboxError::Io("mock backend has no more ios".to_owned()))
+        }
+
+        async fn status(&self, _id: &SandboxId) -> SandboxResult<SandboxStatus> {
+            Ok(self.status.lock().unwrap().clone())
+        }
+
+        async fn observe(&self, id: &SandboxId) -> SandboxResult<ObservedSandbox> {
+            let status = self.status(id).await?;
+            Ok(ObservedSandbox::new(id.clone(), "mock", status))
+        }
+
+        async fn list_observed(&self) -> SandboxResult<Vec<ObservedSandbox>> {
+            Ok(Vec::new())
+        }
+
+        async fn stop(&self, _id: &SandboxId) -> SandboxResult<()> {
+            Ok(())
+        }
+
+        async fn pause(&self, _id: &SandboxId) -> SandboxResult<()> {
+            Ok(())
+        }
+
+        async fn resume(&self, _id: &SandboxId) -> SandboxResult<()> {
+            Ok(())
+        }
+    }
+
+    /// Returns a mock io plus the test-side stdout writer (dropping it EOFs
+    /// the pump) and the test-side stdin peer (kept alive so pump-side stdin
+    /// writes would not error).
+    fn mock_io() -> (SandboxIo, DuplexStream, DuplexStream) {
+        let (stdin_near, stdin_far) = tokio::io::duplex(64 * 1024);
+        let (stdout_near, stdout_far) = tokio::io::duplex(64 * 1024);
+        let (stderr_near, _stderr_far) = tokio::io::duplex(1024);
+        let io = SandboxIo::new(
+            Box::pin(stdin_near),
+            Box::pin(stdout_near),
+            Box::pin(stderr_near),
+        );
+        (io, stdout_far, stdin_far)
+    }
+
+    async fn test_store() -> Option<PgSessionStore> {
+        let Ok(url) = std::env::var("SESSION_RUNTIME_TEST_DATABASE_URL") else {
+            eprintln!("skipping: SESSION_RUNTIME_TEST_DATABASE_URL not set");
+            return None;
+        };
+        let store = PgSessionStore::connect(&url)
+            .await
+            .expect("connect test db");
+        store.run_migrations().await.expect("run migrations");
+        Some(store)
+    }
+
+    async fn running_execution(store: &PgSessionStore, thread_key: &ThreadKey) -> String {
+        store
+            .create_or_get_session(thread_key, &HarnessType::Codex, None, json!({}))
+            .await
+            .expect("create session");
+        let created = store
+            .create_execution(thread_key, None, json!({}))
+            .await
+            .expect("create execution");
+        let execution_id = created.execution.execution_id;
+        store
+            .mark_execution_running(&execution_id)
+            .await
+            .expect("mark running");
+        execution_id
+    }
+
+    async fn wait_for<F, Fut>(what: &str, mut check: F)
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = bool>,
+    {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if check().await {
+                return;
+            }
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    async fn events(store: &PgSessionStore, thread_key: &ThreadKey) -> Vec<SessionEvent> {
+        store
+            .list_events_after(thread_key, 0, None, 1000)
+            .await
+            .expect("list events")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stdout_eof_reattaches_and_delivers_late_terminal_output() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let thread_key =
+            ThreadKey::parse(format!("test:reattach-{}", uuid::Uuid::new_v4())).unwrap();
+        running_execution(&store, &thread_key).await;
+
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running));
+        let (first_io, mut first_stdout, _first_stdin) = mock_io();
+        let (second_io, mut second_stdout, _second_stdin) = mock_io();
+        backend.push_io(first_io).await;
+        backend.push_io(second_io).await;
+
+        let runtime = SessionRuntime::new(
+            store.clone(),
+            SandboxRuntime::backend(backend.clone(), SandboxSpec::new("mock")),
+        );
+        runtime
+            .ensure_session_pipe(&thread_key, "sbx-mock")
+            .await
+            .expect("ensure pipe");
+        assert_eq!(backend.opens(), 1);
+
+        first_stdout
+            .write_all(b"{\"type\":\"turn.started\",\"turn\":{\"id\":\"turn-1\"}}\n")
+            .await
+            .unwrap();
+        {
+            let store = store.clone();
+            let thread_key = thread_key.clone();
+            wait_for("first output line persisted", move || {
+                let store = store.clone();
+                let thread_key = thread_key.clone();
+                async move {
+                    events(&store, &thread_key)
+                        .await
+                        .iter()
+                        .any(|event| event.event_type == SESSION_OUTPUT_LINE_EVENT)
+                }
+            })
+            .await;
+        }
+
+        // Transport-level close while the execution is still running: the pump
+        // must reattach instead of failing the execution.
+        drop(first_stdout);
+        {
+            let backend = backend.clone();
+            wait_for("pump reattach", move || {
+                let backend = backend.clone();
+                async move { backend.opens() >= 2 }
+            })
+            .await;
+        }
+
+        second_stdout
+            .write_all(
+                b"{\"type\":\"turn.completed\",\"turn\":{\"id\":\"turn-1\",\"status\":\"completed\"}}\n",
+            )
+            .await
+            .unwrap();
+        {
+            let store = store.clone();
+            let thread_key = thread_key.clone();
+            wait_for("execution completed", move || {
+                let store = store.clone();
+                let thread_key = thread_key.clone();
+                async move {
+                    events(&store, &thread_key)
+                        .await
+                        .iter()
+                        .any(|event| event.event_type == "session.execution_completed")
+                }
+            })
+            .await;
+        }
+
+        let all = events(&store, &thread_key).await;
+        assert!(
+            all.iter()
+                .any(|event| event.event_type == "session.stdout_pump_reattached"),
+            "expected a reattach event, got: {:?}",
+            all.iter()
+                .map(|event| &event.event_type)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            !all.iter()
+                .any(|event| event.event_type == "session.execution_failed"),
+            "execution must not fail on a reattachable eof"
+        );
+        let session = store.get_session(&thread_key).await.unwrap();
+        assert_ne!(session.status.as_ref(), "failed");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stdout_eof_fails_execution_when_sandbox_is_gone() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let thread_key = ThreadKey::parse(format!("test:gone-{}", uuid::Uuid::new_v4())).unwrap();
+        running_execution(&store, &thread_key).await;
+
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running));
+        let (first_io, first_stdout, _first_stdin) = mock_io();
+        backend.push_io(first_io).await;
+
+        let runtime = SessionRuntime::new(
+            store.clone(),
+            SandboxRuntime::backend(backend.clone(), SandboxSpec::new("mock")),
+        );
+        runtime
+            .ensure_session_pipe(&thread_key, "sbx-mock")
+            .await
+            .expect("ensure pipe");
+
+        backend.set_status(SandboxStatus::Gone);
+        drop(first_stdout);
+
+        {
+            let store = store.clone();
+            let thread_key = thread_key.clone();
+            wait_for("execution failed", move || {
+                let store = store.clone();
+                let thread_key = thread_key.clone();
+                async move {
+                    events(&store, &thread_key)
+                        .await
+                        .iter()
+                        .any(|event| event.event_type == "session.execution_failed")
+                }
+            })
+            .await;
+        }
+
+        let all = events(&store, &thread_key).await;
+        let failed = all
+            .iter()
+            .find(|event| event.event_type == "session.execution_failed")
+            .expect("failed event");
+        let error = failed.payload["error"].as_str().unwrap_or_default();
+        assert!(
+            error.contains("sandbox stdout closed before terminal output"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            error.contains("sandbox no longer accepts io"),
+            "expected status detail in error: {error}"
+        );
+        // Only the initial attach: a Gone sandbox must not be reattached.
+        assert_eq!(backend.opens(), 1);
     }
 }

@@ -772,6 +772,76 @@ describe('slackbotv2', () => {
     )
   })
 
+  it('rotates card-heavy streams into multiple Slack messages under the segment budget', async () => {
+    codexApi.autoRespond = false
+
+    const parent = await postUserMessage('Context before a card-heavy render.')
+    const mention = await postUserMessage(`<@${BOT_USER_ID}> run many commands`, parent.ts)
+    const key = threadKey(parent.ts)
+    const waits: Promise<unknown>[] = []
+    const response = await bot.app.request(
+      '/api/webhooks/slack',
+      signedSlackEvent({
+        event_id: 'Ev-slackbotv2-card-heavy-rotation',
+        event: {
+          type: 'app_mention',
+          user: USER_ID,
+          channel: CHANNEL_ID,
+          team: TEAM_ID,
+          ts: mention.ts,
+          thread_ts: parent.ts,
+          text: `<@${BOT_USER_ID}> run many commands`
+        }
+      }),
+      {},
+      waitUntilContext(waits)
+    )
+
+    expect(response.status).toBe(200)
+    await waitFor(() => codexApi.executes.length === 1)
+    await waitFor(() => codexApi.eventRequests.length === 1)
+    await waitFor(() => codexApi.streamCount === 1)
+
+    for (let index = 1; index <= 60; index += 1) {
+      codexApi.emitOutputLine(
+        key,
+        JSON.stringify({
+          type: 'item.completed',
+          item: {
+            id: `cmd-${index}`,
+            type: 'commandExecution',
+            command: `printf step-${index} ${'x'.repeat(220)}`,
+            status: 'completed',
+            aggregatedOutput: ''
+          }
+        })
+      )
+    }
+    codexApi.emitSessionEvent(key, 'session.execution_completed', {
+      execution_id: 'exe-card-heavy-rotation',
+      status: 'completed',
+      result_text: 'SEGMENT_ROTATION_FINAL_ANSWER_VISIBLE'
+    })
+
+    await Promise.all(waits)
+    const transcripts = slackStreamTranscripts(slackApi.calls)
+    // Card bytes count toward the segment budget, so the cards spread across
+    // multiple stream messages instead of overflowing a single one.
+    expect(transcripts.length).toBeGreaterThanOrEqual(2)
+    for (const transcript of transcripts) {
+      const accumulated = transcript.calls.reduce((total, call) => {
+        const markdown = stringField(call.body.markdown_text)
+        return total + markdown.length + chunksText(call.body.chunks).length
+      }, 0)
+      expect(accumulated).toBeLessThanOrEqual(11800)
+    }
+    const renderedText = transcripts
+      .flatMap(transcript => transcript.chunks.map(chunkText))
+      .filter(Boolean)
+      .join('\n')
+    expect(renderedText).toContain('SEGMENT_ROTATION_FINAL_ANSWER_VISIBLE')
+  })
+
   it('continues oversized final answers across Slack stream replies', async () => {
     codexApi.autoRespond = false
 

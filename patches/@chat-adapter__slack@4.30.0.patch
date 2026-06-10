@@ -1,8 +1,8 @@
 diff --git a/dist/index.js b/dist/index.js
-index 53a35e40d7dc03dea57f965325728761467ad7c7..3e63db3d328688a104cf408ff97f8e984b25ba93 100644
+index 53a35e40d7dc03dea57f965325728761467ad7c7..f9f5a201e661a5234fd5cd479d8475ca9bfacccd 100644
 --- a/dist/index.js
 +++ b/dist/index.js
-@@ -31,6 +31,123 @@ import {
+@@ -31,6 +31,148 @@ import {
    toModalElement,
    toPlainText
  } from "chat";
@@ -11,6 +11,8 @@ index 53a35e40d7dc03dea57f965325728761467ad7c7..3e63db3d328688a104cf408ff97f8e98
 +var STREAM_CHUNK_LIMIT = 256;
 +var STREAM_TASK_LIMIT = 50;
 +var STREAM_FENCE_RESERVE = 64;
++var STREAM_CARD_OVERHEAD = 64;
++var STREAM_PLAN_SIZE_KEY = "\0plan";
 +var FENCE_PATTERN = /^(`{3,}|~{3,})/;
 +var Fence = class {
 +  constructor() {
@@ -123,10 +125,33 @@ index 53a35e40d7dc03dea57f965325728761467ad7c7..3e63db3d328688a104cf408ff97f8e98
 +    type: "task_update"
 +  }));
 +}
++function estimateStructuredChunkSize(chunk) {
++  let size = STREAM_CARD_OVERHEAD;
++  if (typeof chunk.id === "string") {
++    size += chunk.id.length;
++  }
++  if (typeof chunk.title === "string") {
++    size += chunk.title.length;
++  }
++  if (typeof chunk.details === "string") {
++    size += chunk.details.length;
++  }
++  if (typeof chunk.output === "string") {
++    size += chunk.output.length;
++  }
++  if (chunk.sources !== void 0) {
++    try {
++      size += JSON.stringify(chunk.sources).length;
++    } catch {
++      size += STREAM_CHUNK_LIMIT;
++    }
++  }
++  return size;
++}
  
  // src/cards.ts
  import {
-@@ -3434,26 +3551,122 @@ var SlackAdapter = class _SlackAdapter {
+@@ -3434,26 +3576,130 @@ var SlackAdapter = class _SlackAdapter {
      }
      this.logger.debug("Slack: starting stream", { channel, threadTs });
      const token = await this.getToken();
@@ -140,6 +165,7 @@ index 53a35e40d7dc03dea57f965325728761467ad7c7..3e63db3d328688a104cf408ff97f8e98
 -      }
 +    const createSegment = () => ({
 +      cards: 0,
++      chunkSizes: /* @__PURE__ */ new Map(),
 +      hasContent: false,
 +      length: 0,
 +      stopped: false,
@@ -199,7 +225,7 @@ index 53a35e40d7dc03dea57f965325728761467ad7c7..3e63db3d328688a104cf408ff97f8e98
 -      await streamer.append({ markdown_text: delta, token });
 +      let remaining = delta;
 +      while (remaining.length > 0) {
-+        if (current.length === STREAM_SEGMENT_LIMIT) {
++        if (current.length >= STREAM_SEGMENT_LIMIT) {
 +          await rotateSegment(fence.closing, fence.opening);
 +        }
 +        const available = STREAM_SEGMENT_LIMIT - current.length;
@@ -229,24 +255,31 @@ index 53a35e40d7dc03dea57f965325728761467ad7c7..3e63db3d328688a104cf408ff97f8e98
 +      }
      };
      let structuredChunksSupported = true;
-+    const appendStructuredChunk = async (segment, chunk) => {
++    const appendStructuredChunk = async (segment, chunk, sizeKey) => {
 +      await segment.streamer.append({ chunks: [chunk], token });
 +      segment.hasContent = true;
++      const size = estimateStructuredChunkSize(chunk);
++      const prior = segment.chunkSizes.get(sizeKey) ?? 0;
++      if (size > prior) {
++        segment.length += size - prior;
++        segment.chunkSizes.set(sizeKey, size);
++      }
 +    };
 +    const createStructuredSegment = async () => {
 +      current = createSegment();
 +      structured.add(current);
 +      if (plan) {
-+        await appendStructuredChunk(current, plan);
++        await appendStructuredChunk(current, plan, STREAM_PLAN_SIZE_KEY);
 +      }
 +      return current;
 +    };
-+    const getTaskSegment = async (id) => {
++    const getTaskSegment = async (id, size) => {
 +      const existing = taskSegments.get(id);
 +      if (existing) {
 +        return existing;
 +      }
-+      if (current.cards >= STREAM_TASK_LIMIT) {
++      const overflowing = current.hasContent && current.length + size > STREAM_SEGMENT_LIMIT;
++      if (current.cards >= STREAM_TASK_LIMIT || overflowing) {
 +        await createStructuredSegment();
 +      } else {
 +        structured.add(current);
@@ -258,7 +291,7 @@ index 53a35e40d7dc03dea57f965325728761467ad7c7..3e63db3d328688a104cf408ff97f8e98
      const sendStructuredChunk = async (chunk) => {
        if (!structuredChunksSupported) {
          return;
-@@ -3463,7 +3676,25 @@ var SlackAdapter = class _SlackAdapter {
+@@ -3463,7 +3709,25 @@ var SlackAdapter = class _SlackAdapter {
        await flushMarkdownDelta(delta);
        lastAppended = committable;
        try {
@@ -272,20 +305,20 @@ index 53a35e40d7dc03dea57f965325728761467ad7c7..3e63db3d328688a104cf408ff97f8e98
 +            structured.add(current);
 +          }
 +          for (const segment of structured) {
-+            await appendStructuredChunk(segment, plan);
++            await appendStructuredChunk(segment, plan, STREAM_PLAN_SIZE_KEY);
 +          }
 +          return;
 +        }
 +        const chunks = splitTask(chunk, taskParts.get(chunk.id) ?? 0);
 +        taskParts.set(chunk.id, chunks.length);
 +        for (const normalized of chunks) {
-+          const segment = await getTaskSegment(normalized.id);
-+          await appendStructuredChunk(segment, normalized);
++          const segment = await getTaskSegment(normalized.id, estimateStructuredChunkSize(normalized));
++          await appendStructuredChunk(segment, normalized, normalized.id);
 +        }
        } catch (error) {
          structuredChunksSupported = false;
          this.logger.warn(
-@@ -3479,31 +3710,72 @@ var SlackAdapter = class _SlackAdapter {
+@@ -3479,31 +3743,75 @@ var SlackAdapter = class _SlackAdapter {
        await flushMarkdownDelta(delta);
        lastAppended = committable;
      };
@@ -305,7 +338,7 @@ index 53a35e40d7dc03dea57f965325728761467ad7c7..3e63db3d328688a104cf408ff97f8e98
 +        } else {
 +          await sendStructuredChunk(chunk);
 +        }
-       }
++      }
 +      renderer.finish();
 +      const finalCommittable = renderer.getCommittableText();
 +      const finalDelta = finalCommittable.slice(lastAppended.length);
@@ -318,6 +351,9 @@ index 53a35e40d7dc03dea57f965325728761467ad7c7..3e63db3d328688a104cf408ff97f8e98
 +        });
 +        current.hasContent = true;
 +        current.length += fence.closing.length;
++      }
++      if (options?.stopBlocks && current.hasContent && current.length + JSON.stringify(options.stopBlocks).length > STREAM_SEGMENT_LIMIT) {
++        await rotateSegment(void 0, void 0);
 +      }
 +      for (const segment of structured) {
 +        if (segment !== current) {
@@ -350,7 +386,7 @@ index 53a35e40d7dc03dea57f965325728761467ad7c7..3e63db3d328688a104cf408ff97f8e98
 +            error: stopError
 +          });
 +        }
-+      }
+       }
 +      throw error;
      }
 -    renderer.finish();

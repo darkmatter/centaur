@@ -39,6 +39,11 @@ pub struct ExecuteSessionResponse {
     pub execution_id: String,
     pub thread_key: ThreadKey,
     pub status: String,
+    pub base_image_ref: Option<String>,
+    pub base_image_hash: Option<String>,
+    pub overlay_hash: Option<String>,
+    pub model: Option<String>,
+    pub harness_run_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]

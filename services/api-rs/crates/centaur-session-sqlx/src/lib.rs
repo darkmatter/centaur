@@ -3,8 +3,8 @@
 use std::str::FromStr;
 
 use centaur_session_core::{
-    ExecutionStatus, HarnessType, Session, SessionEvent, SessionExecution, SessionMessage,
-    SessionMessageInput, SessionStatus, ThreadKey, empty_object,
+    ExecutionRuntimeIdentity, ExecutionStatus, HarnessType, Session, SessionEvent,
+    SessionExecution, SessionMessage, SessionMessageInput, SessionStatus, ThreadKey, empty_object,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -204,6 +204,11 @@ impl PgSessionStore {
                 idempotency_key,
                 thread_key,
                 status,
+                base_image_ref,
+                base_image_hash,
+                overlay_hash,
+                model,
+                harness_run_id,
                 metadata,
                 error,
                 created_at,
@@ -229,7 +234,7 @@ impl PgSessionStore {
     ) -> Result<Option<SessionExecution>, SessionStoreError> {
         let row = sqlx::query_as::<_, SessionExecutionRow>(
             r#"
-            select execution_id, idempotency_key, thread_key, status, metadata, error, created_at, updated_at, started_at, completed_at
+            select execution_id, idempotency_key, thread_key, status, base_image_ref, base_image_hash, overlay_hash, model, harness_run_id, metadata, error, created_at, updated_at, started_at, completed_at
             from session_executions
             where thread_key = $1 and status in ($2, $3)
             order by created_at desc, execution_id desc
@@ -251,7 +256,7 @@ impl PgSessionStore {
     ) -> Result<Option<SessionExecution>, SessionStoreError> {
         let row = sqlx::query_as::<_, SessionExecutionRow>(
             r#"
-            select execution_id, idempotency_key, thread_key, status, metadata, error, created_at, updated_at, started_at, completed_at
+            select execution_id, idempotency_key, thread_key, status, base_image_ref, base_image_hash, overlay_hash, model, harness_run_id, metadata, error, created_at, updated_at, started_at, completed_at
             from session_executions
             where thread_key = $1
             order by created_at desc, execution_id desc
@@ -274,7 +279,7 @@ impl PgSessionStore {
             update session_executions
             set status = $2, started_at = coalesce(started_at, now()), updated_at = now()
             where execution_id = $1 and status = $3
-            returning execution_id, idempotency_key, thread_key, status, metadata, error, created_at, updated_at, started_at, completed_at
+            returning execution_id, idempotency_key, thread_key, status, base_image_ref, base_image_hash, overlay_hash, model, harness_run_id, metadata, error, created_at, updated_at, started_at, completed_at
             "#,
         )
         .bind(execution_id)
@@ -289,7 +294,7 @@ impl PgSessionStore {
             // row without taking ownership.
             let row = sqlx::query_as::<_, SessionExecutionRow>(
                 r#"
-                select execution_id, idempotency_key, thread_key, status, metadata, error, created_at, updated_at, started_at, completed_at
+                select execution_id, idempotency_key, thread_key, status, base_image_ref, base_image_hash, overlay_hash, model, harness_run_id, metadata, error, created_at, updated_at, started_at, completed_at
                 from session_executions
                 where execution_id = $1
                 "#,
@@ -311,6 +316,56 @@ impl PgSessionStore {
         })
     }
 
+    pub async fn update_execution_runtime_identity(
+        &self,
+        execution_id: &str,
+        identity: &ExecutionRuntimeIdentity,
+    ) -> Result<SessionExecution, SessionStoreError> {
+        let row = sqlx::query_as::<_, SessionExecutionRow>(
+            r#"
+            update session_executions
+            set
+                base_image_ref = $2,
+                base_image_hash = $3,
+                overlay_hash = $4,
+                model = $5,
+                updated_at = now()
+            where execution_id = $1
+            returning execution_id, idempotency_key, thread_key, status, base_image_ref, base_image_hash, overlay_hash, model, harness_run_id, metadata, error, created_at, updated_at, started_at, completed_at
+            "#,
+        )
+        .bind(execution_id)
+        .bind(identity.base_image_ref.as_deref())
+        .bind(identity.base_image_hash.as_deref())
+        .bind(identity.overlay_hash.as_deref())
+        .bind(identity.model.as_deref())
+        .fetch_one(&self.pool)
+        .await?;
+
+        row.try_into()
+    }
+
+    pub async fn update_execution_harness_run_id(
+        &self,
+        execution_id: &str,
+        harness_run_id: Option<&str>,
+    ) -> Result<SessionExecution, SessionStoreError> {
+        let row = sqlx::query_as::<_, SessionExecutionRow>(
+            r#"
+            update session_executions
+            set harness_run_id = $2, updated_at = now()
+            where execution_id = $1
+            returning execution_id, idempotency_key, thread_key, status, base_image_ref, base_image_hash, overlay_hash, model, harness_run_id, metadata, error, created_at, updated_at, started_at, completed_at
+            "#,
+        )
+        .bind(execution_id)
+        .bind(harness_run_id)
+        .fetch_one(&self.pool)
+        .await?;
+
+        row.try_into()
+    }
+
     pub async fn complete_execution(
         &self,
         execution_id: &str,
@@ -320,7 +375,7 @@ impl PgSessionStore {
             update session_executions
             set status = $2, completed_at = coalesce(completed_at, now()), updated_at = now()
             where execution_id = $1
-            returning execution_id, idempotency_key, thread_key, status, metadata, error, created_at, updated_at, started_at, completed_at
+            returning execution_id, idempotency_key, thread_key, status, base_image_ref, base_image_hash, overlay_hash, model, harness_run_id, metadata, error, created_at, updated_at, started_at, completed_at
             "#,
         )
         .bind(execution_id)
@@ -342,7 +397,7 @@ impl PgSessionStore {
             update session_executions
             set status = $2, completed_at = coalesce(completed_at, now()), updated_at = now()
             where execution_id = $1 and status in ($3, $4)
-            returning execution_id, idempotency_key, thread_key, status, metadata, error, created_at, updated_at, started_at, completed_at
+            returning execution_id, idempotency_key, thread_key, status, base_image_ref, base_image_hash, overlay_hash, model, harness_run_id, metadata, error, created_at, updated_at, started_at, completed_at
             "#,
         )
         .bind(execution_id)
@@ -370,7 +425,7 @@ impl PgSessionStore {
             update session_executions
             set status = $2, error = $3, completed_at = coalesce(completed_at, now()), updated_at = now()
             where execution_id = $1
-            returning execution_id, idempotency_key, thread_key, status, metadata, error, created_at, updated_at, started_at, completed_at
+            returning execution_id, idempotency_key, thread_key, status, base_image_ref, base_image_hash, overlay_hash, model, harness_run_id, metadata, error, created_at, updated_at, started_at, completed_at
             "#,
         )
         .bind(execution_id)
@@ -394,7 +449,7 @@ impl PgSessionStore {
             update session_executions
             set status = $2, error = $3, completed_at = coalesce(completed_at, now()), updated_at = now()
             where execution_id = $1 and status in ($4, $5)
-            returning execution_id, idempotency_key, thread_key, status, metadata, error, created_at, updated_at, started_at, completed_at
+            returning execution_id, idempotency_key, thread_key, status, base_image_ref, base_image_hash, overlay_hash, model, harness_run_id, metadata, error, created_at, updated_at, started_at, completed_at
             "#,
         )
         .bind(execution_id)
@@ -767,6 +822,11 @@ struct SessionExecutionRow {
     idempotency_key: Option<String>,
     thread_key: String,
     status: String,
+    base_image_ref: Option<String>,
+    base_image_hash: Option<String>,
+    overlay_hash: Option<String>,
+    model: Option<String>,
+    harness_run_id: Option<String>,
     metadata: Value,
     error: Option<String>,
     created_at: OffsetDateTime,
@@ -784,6 +844,11 @@ impl TryFrom<SessionExecutionRow> for SessionExecution {
             idempotency_key: row.idempotency_key,
             thread_key: parse_persisted(row.thread_key)?,
             status: parse_persisted(row.status)?,
+            base_image_ref: row.base_image_ref,
+            base_image_hash: row.base_image_hash,
+            overlay_hash: row.overlay_hash,
+            model: row.model,
+            harness_run_id: row.harness_run_id,
             metadata: row.metadata,
             error: row.error,
             created_at: row.created_at,
@@ -801,6 +866,11 @@ struct CreateExecutionRow {
     idempotency_key: Option<String>,
     thread_key: String,
     status: String,
+    base_image_ref: Option<String>,
+    base_image_hash: Option<String>,
+    overlay_hash: Option<String>,
+    model: Option<String>,
+    harness_run_id: Option<String>,
     metadata: Value,
     error: Option<String>,
     created_at: OffsetDateTime,
@@ -820,6 +890,11 @@ impl TryFrom<CreateExecutionRow> for CreateExecutionResult {
                 idempotency_key: row.idempotency_key,
                 thread_key: row.thread_key,
                 status: row.status,
+                base_image_ref: row.base_image_ref,
+                base_image_hash: row.base_image_hash,
+                overlay_hash: row.overlay_hash,
+                model: row.model,
+                harness_run_id: row.harness_run_id,
                 metadata: row.metadata,
                 error: row.error,
                 created_at: row.created_at,

@@ -1,6 +1,8 @@
 use std::{sync::Arc, time::Duration};
 
-use centaur_sandbox_core::{SandboxError, SandboxId, SandboxSpec, SandboxStatus};
+use centaur_sandbox_core::{
+    SandboxError, SandboxId, SandboxRuntimeIdentity, SandboxSpec, SandboxStatus,
+};
 use centaur_session_sqlx::{PgSessionStore, SessionStoreError};
 use thiserror::Error;
 use tokio::time::{MissedTickBehavior, interval};
@@ -43,6 +45,10 @@ impl WarmPoolManager {
 
     pub fn workload_key(&self) -> &str {
         &self.workload_key
+    }
+
+    pub fn runtime_identity(&self) -> SandboxRuntimeIdentity {
+        (self.spec_factory)().runtime_identity
     }
 
     pub fn spawn_replenisher(self: Arc<Self>) {

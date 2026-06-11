@@ -29,6 +29,8 @@ use centaur_session_core::HarnessType;
 use centaur_session_runtime::SandboxWorkloadMode;
 use centaur_workflows::WorkflowHostSandboxRuntime;
 use clap::{Args as ClapArgs, Parser, ValueEnum};
+use serde_json::json;
+use sha2::{Digest, Sha256};
 use tracing::{error, info};
 
 use crate::{
@@ -783,7 +785,8 @@ impl SandboxArgs {
                 let mut workload = SandboxWorkloadMode::codex_app_server(
                     image,
                     self.codex_app_server_env_template()?,
-                );
+                )
+                .overlay_hash(self.tools_source.overlay_hash());
                 if let Some(repos_path) = clean_optional_value(self.repos_path.as_deref()) {
                     workload = workload.mount(
                         Mount::new(
@@ -1131,6 +1134,31 @@ impl ToolsArgs {
             }
         }
         Some(config)
+    }
+
+    fn overlay_hash(&self) -> Option<String> {
+        let repo = clean_optional_value(self.repo.as_deref())?;
+        let git_ref = clean_optional_value(self.git_ref.as_deref());
+        let source_subdir = clean_optional_value(Some(self.source_subdir.as_str()))
+            .unwrap_or_else(|| "tools".to_owned());
+        let extra_sources = clean_optional_value(self.extra_sources.as_deref());
+        if let (Some(git_ref), None) = (&git_ref, &extra_sources)
+            && clean_optional_value(self.repo_cache_path.as_deref()).is_none()
+            && is_sha_like_ref(git_ref)
+        {
+            return Some(git_ref.clone());
+        }
+        let descriptor = json!({
+            "repo": repo,
+            "git_ref": git_ref,
+            "source_subdir": source_subdir,
+            "repo_cache_path": clean_optional_value(self.repo_cache_path.as_deref()),
+            "extra_sources": extra_sources,
+        });
+        let encoded =
+            serde_json::to_vec(&descriptor).expect("tool source descriptor should serialize");
+        let digest = Sha256::digest(encoded);
+        Some(format!("sha256:{digest:x}"))
     }
 }
 
@@ -1498,6 +1526,14 @@ fn clean_optional_value(value: Option<&str>) -> Option<String> {
     non_empty(value).map(ToOwned::to_owned)
 }
 
+fn is_sha_like_ref(value: &str) -> bool {
+    let value = value
+        .strip_prefix("sha-")
+        .or_else(|| value.strip_prefix("sha_"))
+        .unwrap_or(value);
+    (7..=64).contains(&value.len()) && value.chars().all(|ch| ch.is_ascii_hexdigit())
+}
+
 fn upsert_spec_env(spec: &mut SandboxSpec, name: String, value: String) {
     if let Some(existing) = spec.env.iter_mut().find(|env| env.name == name) {
         existing.value = value;
@@ -1647,6 +1683,35 @@ mod tests {
         let token = tools.github_token.expect("token should be Some");
         assert_eq!(token.secret_name, "centaur-repo-cache-github-token");
         assert_eq!(token.secret_key, "token");
+        assert!(
+            args.sandbox
+                .tools_source
+                .overlay_hash()
+                .is_some_and(|hash| hash.starts_with("sha256:"))
+        );
+    }
+
+    #[test]
+    fn tools_overlay_hash_hashes_layered_source_descriptors() {
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+            "--kubernetes-tools-repo",
+            "paradigmxyz/centaur",
+            "--kubernetes-tools-ref",
+            "main",
+            "--kubernetes-tools-runner-image",
+            "centaur-agent:test",
+            "--kubernetes-tools-extra-sources",
+            r#"[{"repo":"tempoxyz/centaur-tempo","ref":"abc1234","subdir":"tools"}]"#,
+        ])
+        .unwrap();
+
+        let hash = args.sandbox.tools_source.overlay_hash().unwrap();
+
+        assert!(hash.starts_with("sha256:"));
+        assert_ne!(hash, "main");
     }
 
     #[test]

@@ -586,12 +586,33 @@ fn build_agent_sandbox(
     );
 
     let mut annotations = config.annotations.clone();
+    insert_annotation(
+        &mut annotations,
+        "centaur.ai/base-image-ref",
+        spec.runtime_identity.base_image_ref.as_deref(),
+    );
+    insert_annotation(
+        &mut annotations,
+        "centaur.ai/base-image-hash",
+        spec.runtime_identity.base_image_hash.as_deref(),
+    );
+    insert_annotation(
+        &mut annotations,
+        "centaur.ai/overlay-hash",
+        spec.runtime_identity.overlay_hash.as_deref(),
+    );
+    insert_annotation(
+        &mut annotations,
+        "centaur.ai/model",
+        spec.runtime_identity.model.as_deref(),
+    );
     if let Some(principal) = &spec.iron_control_principal {
         annotations.insert(
             IRON_CONTROL_PRINCIPAL_ANNOTATION.to_owned(),
             principal.clone(),
         );
     }
+    agent_spec["podTemplate"]["metadata"]["annotations"] = json!(annotations.clone());
 
     let crd_spec = serde_json::from_value(agent_spec)
         .map_err(|err| SandboxError::InvalidSpec(format!("invalid Agent Sandbox spec: {err}")))?;
@@ -632,6 +653,12 @@ fn mount_json(spec: &SandboxSpec) -> (Vec<Value>, Vec<Value>) {
         });
     }
     (volumes, mounts)
+}
+
+fn insert_annotation(annotations: &mut BTreeMap<String, String>, name: &str, value: Option<&str>) {
+    if let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) {
+        annotations.insert(name.to_owned(), value.to_owned());
+    }
 }
 
 fn resources_json(spec: &SandboxSpec) -> Option<Value> {
@@ -721,7 +748,14 @@ mod tests {
 
     #[test]
     fn builds_agent_sandbox_spec_with_state_volume_and_limits() {
-        let spec = SandboxSpec::new("centaur-agent:latest")
+        let spec = SandboxSpec::new("centaur-agent:sha-deadbeef")
+            .runtime_identity(
+                centaur_sandbox_core::SandboxRuntimeIdentity::from_base_image(
+                    "centaur-agent:sha-deadbeef",
+                )
+                .overlay_hash(Some("overlay-sha".to_owned()))
+                .model(Some("gpt-5".to_owned())),
+            )
             .command(["/bin/sh", "-lc"])
             .args(["cat"])
             .env("CENTAUR_API_URL", "http://api:8000")
@@ -754,10 +788,30 @@ mod tests {
             sandbox.spec.pod_template.spec.enable_service_links,
             Some(false)
         );
-        assert_eq!(container.image.as_deref(), Some("centaur-agent:latest"));
+        assert_eq!(
+            container.image.as_deref(),
+            Some("centaur-agent:sha-deadbeef")
+        );
         assert_eq!(container.stdin, Some(true));
         assert_eq!(container.volume_mounts.as_ref().unwrap().len(), 2);
         assert!(container.resources.as_ref().unwrap().limits.is_some());
+        let annotations = sandbox.metadata.annotations.as_ref().unwrap();
+        assert_eq!(
+            annotations
+                .get("centaur.ai/base-image-hash")
+                .map(String::as_str),
+            Some("sha-deadbeef")
+        );
+        assert_eq!(
+            annotations
+                .get("centaur.ai/overlay-hash")
+                .map(String::as_str),
+            Some("overlay-sha")
+        );
+        assert_eq!(
+            annotations.get("centaur.ai/model").map(String::as_str),
+            Some("gpt-5")
+        );
     }
 
     #[test]

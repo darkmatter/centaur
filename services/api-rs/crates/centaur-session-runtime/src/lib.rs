@@ -6,15 +6,15 @@ use std::{
 
 use centaur_iron_control::SessionRegistrar;
 use centaur_sandbox_core::{
-    Mount, SandboxBackend, SandboxError, SandboxId, SandboxIoGuard, SandboxRead, SandboxSpec,
-    SandboxStatus, SandboxWrite,
+    Mount, SandboxBackend, SandboxError, SandboxId, SandboxIoGuard, SandboxRead,
+    SandboxRuntimeIdentity, SandboxSpec, SandboxStatus, SandboxWrite,
 };
 use centaur_sandbox_manager::{
     SandboxManager, WarmPoolConfig, WarmPoolError, WarmPoolManager, WarmSandboxSpecFactory,
 };
 use centaur_session_core::{
-    ExecutionStatus, HarnessType, MessageRole, Session, SessionEvent, SessionExecution,
-    SessionMessageInput, ThreadKey,
+    ExecutionRuntimeIdentity, ExecutionStatus, HarnessType, MessageRole, Session, SessionEvent,
+    SessionExecution, SessionMessageInput, ThreadKey,
 };
 use centaur_session_sqlx::{
     PgSessionStore, SessionEventListener, SessionStoreError, default_metadata,
@@ -69,11 +69,13 @@ pub struct SandboxRuntime {
 pub enum SandboxWorkloadMode {
     MockAppServer {
         image: String,
+        runtime_identity: SandboxRuntimeIdentity,
     },
     CodexAppServer {
         image: String,
         env: Vec<(String, String)>,
         mounts: Vec<Mount>,
+        runtime_identity: SandboxRuntimeIdentity,
     },
 }
 
@@ -400,9 +402,15 @@ impl SessionRuntime {
             "centaur.thread_key" = thread_key.as_str(),
             "centaur.execution_id" = tracing::field::Empty,
             "centaur.sandbox_id" = tracing::field::Empty,
+            "centaur.base_image_hash" = tracing::field::Empty,
+            "centaur.overlay_hash" = tracing::field::Empty,
+            "centaur.model" = tracing::field::Empty,
             thread_key = %thread_key,
             execution_id = tracing::field::Empty,
             sandbox_id = tracing::field::Empty,
+            base_image_hash = tracing::field::Empty,
+            overlay_hash = tracing::field::Empty,
+            model = tracing::field::Empty,
             input_line_count,
             idempotency_key_present,
         );
@@ -420,7 +428,7 @@ impl SessionRuntime {
             validate_input_lines(&input_lines)?;
             let (idle_timeout, max_duration) = duration_options(idle_timeout_ms, max_duration_ms)?;
 
-            let execution = self
+            let create_result = self
                 .store
                 .create_execution(
                     thread_key,
@@ -428,25 +436,63 @@ impl SessionRuntime {
                     execution_metadata(metadata, idle_timeout_ms, max_duration_ms),
                 )
                 .await?;
-            span.record(
-                "centaur.execution_id",
-                execution.execution.execution_id.as_str(),
+            let runtime_identity = identity_with_model_fallback(
+                self.sandbox_runtime
+                    .runtime_identity(thread_key, &create_result.execution.execution_id),
+                &session.harness_type,
             );
-            span.record("execution_id", execution.execution.execution_id.as_str());
-            if !execution.created && execution.execution.status != ExecutionStatus::Queued {
+            let execution_created = create_result.created;
+            let execution_needs_identity = create_result.execution.status
+                == ExecutionStatus::Queued
+                && execution_runtime_identity_missing(&create_result.execution, &runtime_identity);
+            let execution = if execution_created || execution_needs_identity {
+                self.store
+                    .update_execution_runtime_identity(
+                        &create_result.execution.execution_id,
+                        &runtime_identity,
+                    )
+                    .await?
+            } else {
+                create_result.execution
+            };
+            span.record("centaur.execution_id", execution.execution_id.as_str());
+            span.record("execution_id", execution.execution_id.as_str());
+            span.record(
+                "centaur.base_image_hash",
+                execution.base_image_hash.as_deref().unwrap_or(""),
+            );
+            span.record(
+                "centaur.overlay_hash",
+                execution.overlay_hash.as_deref().unwrap_or(""),
+            );
+            span.record("centaur.model", execution.model.as_deref().unwrap_or(""));
+            span.record(
+                "base_image_hash",
+                execution.base_image_hash.as_deref().unwrap_or(""),
+            );
+            span.record(
+                "overlay_hash",
+                execution.overlay_hash.as_deref().unwrap_or(""),
+            );
+            span.record("model", execution.model.as_deref().unwrap_or(""));
+            if !execution_created && execution.status != ExecutionStatus::Queued {
                 info!(
                     component = COMPONENT_SESSION_RUNTIME,
                     event = "session_execute_idempotent_replay",
                     thread_key = %thread_key,
-                    execution_id = %execution.execution.execution_id,
-                    status = %execution.execution.status,
+                    execution_id = %execution.execution_id,
+                    status = %execution.status,
+                    base_image_hash = execution.base_image_hash.as_deref().unwrap_or(""),
+                    overlay_hash = execution.overlay_hash.as_deref().unwrap_or(""),
+                    model = execution.model.as_deref().unwrap_or(""),
+                    harness_run_id = execution.harness_run_id.as_deref().unwrap_or(""),
                     "returning existing execution"
                 );
-                return Ok(execution.execution);
+                return Ok(execution);
             }
             let claim = self
                 .store
-                .mark_execution_running(&execution.execution.execution_id)
+                .mark_execution_running(&execution.execution_id)
                 .await?;
             let execution = claim.execution;
             span.record("centaur.execution_id", execution.execution_id.as_str());
@@ -473,9 +519,15 @@ impl SessionRuntime {
                 "centaur.thread_key" = thread_key.as_str(),
                 "centaur.execution_id" = execution.execution_id.as_str(),
                 "centaur.sandbox_id" = tracing::field::Empty,
+                "centaur.base_image_hash" = execution.base_image_hash.as_deref().unwrap_or(""),
+                "centaur.overlay_hash" = execution.overlay_hash.as_deref().unwrap_or(""),
+                "centaur.model" = execution.model.as_deref().unwrap_or(""),
                 thread_key = %thread_key,
                 execution_id = %execution.execution_id,
                 sandbox_id = tracing::field::Empty,
+                base_image_hash = execution.base_image_hash.as_deref().unwrap_or(""),
+                overlay_hash = execution.overlay_hash.as_deref().unwrap_or(""),
+                model = execution.model.as_deref().unwrap_or(""),
             );
             self.execution_spans
                 .lock()
@@ -493,6 +545,10 @@ impl SessionRuntime {
                         "input_line_count": input_line_count,
                         "idle_timeout_ms": idle_timeout_ms,
                         "max_duration_ms": max_duration_ms,
+                        "base_image_ref": execution.base_image_ref.clone(),
+                        "base_image_hash": execution.base_image_hash.clone(),
+                        "overlay_hash": execution.overlay_hash.clone(),
+                        "model": execution.model.clone(),
                     }),
                 )
                 .await?;
@@ -559,6 +615,9 @@ impl SessionRuntime {
                 execution_id = %execution.execution_id,
                 sandbox_id = %sandbox_id,
                 status = %execution.status,
+                base_image_hash = execution.base_image_hash.as_deref().unwrap_or(""),
+                overlay_hash = execution.overlay_hash.as_deref().unwrap_or(""),
+                model = execution.model.as_deref().unwrap_or(""),
                 completion_reason = "input_accepted",
                 "session execution accepted input"
             );
@@ -588,6 +647,32 @@ impl SessionRuntime {
     ) {
         self.execution_spans.lock().await.remove(execution_id);
         let error_message = error.to_string();
+        if let Ok(execution) = self
+            .store
+            .fail_execution(execution_id, &error_message)
+            .await
+        {
+            let _ = self
+                .store
+                .append_event(
+                    thread_key,
+                    Some(execution_id),
+                    "session.execution_failed",
+                    json!({
+                        "execution_id": execution_id,
+                        "thread_key": thread_key.as_str(),
+                        "error": error_message,
+                        "base_image_ref": execution.base_image_ref.clone(),
+                        "base_image_hash": execution.base_image_hash.clone(),
+                        "overlay_hash": execution.overlay_hash.clone(),
+                        "model": execution.model.clone(),
+                        "harness_run_id": execution.harness_run_id.clone(),
+                    }),
+                )
+                .await;
+            record_finished_execution_metric(&self.store, thread_key, &execution, "failed").await;
+            return;
+        }
         let _ = self
             .store
             .append_event(
@@ -601,13 +686,6 @@ impl SessionRuntime {
                 }),
             )
             .await;
-        if let Ok(execution) = self
-            .store
-            .fail_execution(execution_id, &error_message)
-            .await
-        {
-            record_finished_execution_metric(&self.store, thread_key, &execution, "failed").await;
-        }
     }
 
     async fn forward_messages_to_active_execution(
@@ -914,6 +992,8 @@ impl SessionRuntime {
                     .await
                 {
                     Ok(Some(sandbox_id)) => {
+                        let identity =
+                            execution_identity_from_sandbox_identity(&warm_pool.runtime_identity());
                         record_sandbox_warm_pool_claim("hit");
                         span.record("centaur.sandbox_id", sandbox_id.as_str());
                         span.record("sandbox_id", sandbox_id.as_str());
@@ -929,6 +1009,10 @@ impl SessionRuntime {
                                     "sandbox_id": sandbox_id.as_str(),
                                     "workload_key": warm_pool.workload_key(),
                                     "iron_control_principal": iron_control_principal,
+                                    "base_image_ref": identity.base_image_ref.clone(),
+                                    "base_image_hash": identity.base_image_hash.clone(),
+                                    "overlay_hash": identity.overlay_hash.clone(),
+                                    "model": identity.model.clone(),
                                 }),
                             )
                             .await?;
@@ -939,6 +1023,9 @@ impl SessionRuntime {
                             execution_id,
                             sandbox_id = %sandbox_id,
                             workload_key = warm_pool.workload_key(),
+                            base_image_hash = identity.base_image_hash.as_deref().unwrap_or(""),
+                            overlay_hash = identity.overlay_hash.as_deref().unwrap_or(""),
+                            model = identity.model.as_deref().unwrap_or(""),
                             "claimed warm session sandbox"
                         );
                         return Ok(sandbox_id);
@@ -955,6 +1042,7 @@ impl SessionRuntime {
             if let Some(principal) = iron_control_principal {
                 spec.iron_control_principal = Some(principal.to_owned());
             }
+            let identity = execution_identity_from_sandbox_identity(&spec.runtime_identity);
             let handle = self.sandbox_runtime.manager.create_running(spec).await?;
             span.record("centaur.sandbox_id", handle.id.as_str());
             span.record("sandbox_id", handle.id.as_str());
@@ -967,6 +1055,9 @@ impl SessionRuntime {
                 thread_key = %thread_key,
                 execution_id,
                 sandbox_id = %handle.id.as_str(),
+                base_image_hash = identity.base_image_hash.as_deref().unwrap_or(""),
+                overlay_hash = identity.overlay_hash.as_deref().unwrap_or(""),
+                model = identity.model.as_deref().unwrap_or(""),
                 "created new session sandbox"
             );
             Ok(handle.id.into_string())
@@ -1196,12 +1287,24 @@ impl SandboxRuntime {
             workload_key: Some(workload_key),
         }
     }
+
+    fn runtime_identity(
+        &self,
+        thread_key: &ThreadKey,
+        execution_id: &str,
+    ) -> ExecutionRuntimeIdentity {
+        execution_identity_from_sandbox_identity(
+            &(self.spec_factory)(thread_key, execution_id).runtime_identity,
+        )
+    }
 }
 
 impl SandboxWorkloadMode {
     pub fn mock_app_server(image: impl Into<String>) -> Self {
+        let image = image.into();
         Self::MockAppServer {
-            image: image.into(),
+            runtime_identity: SandboxRuntimeIdentity::from_base_image(&image),
+            image,
         }
     }
 
@@ -1209,9 +1312,13 @@ impl SandboxWorkloadMode {
         image: impl Into<String>,
         env: impl IntoIterator<Item = (String, String)>,
     ) -> Self {
+        let image = image.into();
+        let env = env.into_iter().collect::<Vec<_>>();
         Self::CodexAppServer {
-            image: image.into(),
-            env: env.into_iter().collect(),
+            runtime_identity: SandboxRuntimeIdentity::from_base_image(&image)
+                .model(model_from_env_pairs(&env)),
+            image,
+            env,
             mounts: Vec::new(),
         }
     }
@@ -1220,6 +1327,20 @@ impl SandboxWorkloadMode {
         match &mut self {
             Self::MockAppServer { .. } => {}
             Self::CodexAppServer { mounts, .. } => mounts.push(mount),
+        }
+        self
+    }
+
+    pub fn overlay_hash(mut self, overlay_hash: Option<String>) -> Self {
+        match &mut self {
+            Self::MockAppServer {
+                runtime_identity, ..
+            }
+            | Self::CodexAppServer {
+                runtime_identity, ..
+            } => {
+                runtime_identity.overlay_hash = overlay_hash.and_then(|value| non_empty(&value));
+            }
         }
         self
     }
@@ -1234,11 +1355,20 @@ impl SandboxWorkloadMode {
 
     fn spec_with_thread_key(&self, thread_key: Option<&ThreadKey>) -> SandboxSpec {
         match self {
-            Self::MockAppServer { image } => SandboxSpec::new(image)
+            Self::MockAppServer {
+                image,
+                runtime_identity,
+            } => SandboxSpec::new(image)
+                .runtime_identity(runtime_identity.clone())
                 .command(["/bin/sh", "-lc"])
                 .args([mock_app_server_script()]),
-            Self::CodexAppServer { image, env, mounts } => {
-                let mut spec = SandboxSpec::new(image);
+            Self::CodexAppServer {
+                image,
+                env,
+                mounts,
+                runtime_identity,
+            } => {
+                let mut spec = SandboxSpec::new(image).runtime_identity(runtime_identity.clone());
                 if let Some(thread_key) = thread_key {
                     spec = spec.env("CENTAUR_THREAD_KEY", thread_key.as_str());
                 }
@@ -1258,6 +1388,62 @@ fn sandbox_spec_key(spec: &SandboxSpec) -> String {
     let encoded = serde_json::to_vec(spec).expect("sandbox specs should serialize");
     let digest = Sha256::digest(encoded);
     format!("sandbox-spec-sha256:{digest:x}")
+}
+
+fn execution_identity_from_sandbox_identity(
+    identity: &SandboxRuntimeIdentity,
+) -> ExecutionRuntimeIdentity {
+    ExecutionRuntimeIdentity {
+        base_image_ref: identity.base_image_ref.clone(),
+        base_image_hash: identity.base_image_hash.clone(),
+        overlay_hash: identity.overlay_hash.clone(),
+        model: identity.model.clone(),
+    }
+}
+
+fn identity_with_model_fallback(
+    mut identity: ExecutionRuntimeIdentity,
+    harness_type: &HarnessType,
+) -> ExecutionRuntimeIdentity {
+    if identity.model.is_none() {
+        identity.model = model_from_harness_env(harness_type);
+    }
+    identity
+}
+
+fn execution_runtime_identity_missing(
+    execution: &SessionExecution,
+    identity: &ExecutionRuntimeIdentity,
+) -> bool {
+    execution.base_image_ref.is_none()
+        || execution.base_image_hash.is_none()
+        || (identity.overlay_hash.is_some() && execution.overlay_hash.is_none())
+        || (identity.model.is_some() && execution.model.is_none())
+}
+
+fn model_from_env_pairs(env: &[(String, String)]) -> Option<String> {
+    for name in ["CODEX_MODEL", "CLAUDE_MODEL", "AMP_MODEL"] {
+        if let Some((_, value)) = env.iter().find(|(env_name, _)| env_name == name)
+            && let Some(value) = non_empty(value)
+        {
+            return Some(value);
+        }
+    }
+    None
+}
+
+fn model_from_harness_env(harness_type: &HarnessType) -> Option<String> {
+    let name = match harness_type {
+        HarnessType::Codex => "CODEX_MODEL",
+        HarnessType::ClaudeCode => "CLAUDE_MODEL",
+        HarnessType::Amp => "AMP_MODEL",
+    };
+    std::env::var(name).ok().and_then(|value| non_empty(&value))
+}
+
+fn non_empty(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_owned())
 }
 
 fn mock_app_server_script() -> &'static str {
@@ -1418,18 +1604,45 @@ async fn run_stdout_pump(
             };
             line_count += 1;
             let output_value = serde_json::from_str::<Value>(&line).ok();
-            if let Some(harness_thread_id) = harness_thread_id_from_output_line(&line)
-                && let Err(error) = ctx
-                    .store
-                    .update_harness_thread_id(&thread_key, Some(&harness_thread_id))
-                    .await
-            {
-                warn!(%thread_key, %harness_thread_id, %error, "failed to persist harness thread id");
-            }
+            let observed_harness_run_id = harness_thread_id_from_output_line(&line);
             let active_execution = ctx.store.active_execution_for_thread(&thread_key).await?;
             let execution_id = active_execution
                 .as_ref()
                 .map(|execution| execution.execution_id.as_str());
+            if let Some(harness_run_id) = observed_harness_run_id.as_deref()
+                && let Some(execution_id) = execution_id
+            {
+                if let Err(error) = ctx
+                    .store
+                    .update_harness_thread_id(&thread_key, Some(harness_run_id))
+                    .await
+                {
+                    warn!(%thread_key, harness_run_id, %error, "failed to persist session harness run id");
+                }
+                match ctx
+                    .store
+                    .update_execution_harness_run_id(execution_id, Some(harness_run_id))
+                    .await
+                {
+                    Ok(execution) => {
+                        info!(
+                            component = COMPONENT_SESSION_RUNTIME,
+                            event = "session_harness_run_observed",
+                            thread_key = %thread_key,
+                            execution_id,
+                            sandbox_id,
+                            harness_run_id,
+                            base_image_hash = execution.base_image_hash.as_deref().unwrap_or(""),
+                            overlay_hash = execution.overlay_hash.as_deref().unwrap_or(""),
+                            model = execution.model.as_deref().unwrap_or(""),
+                            "observed harness run id"
+                        );
+                    }
+                    Err(error) => {
+                        warn!(%thread_key, execution_id, harness_run_id, %error, "failed to persist execution harness run id");
+                    }
+                }
+            }
             let Some(output_execution_id) = output_state.execution_for_line(execution_id, &line)
             else {
                 continue;
@@ -2167,6 +2380,11 @@ async fn record_terminal_output(
                 "execution_id": execution_id,
                 "thread_key": thread_key.as_str(),
                 "completion_reason": reason,
+                "base_image_ref": execution.base_image_ref.clone(),
+                "base_image_hash": execution.base_image_hash.clone(),
+                "overlay_hash": execution.overlay_hash.clone(),
+                "model": execution.model.clone(),
+                "harness_run_id": execution.harness_run_id.clone(),
             });
             if let (Some(result_text), Some(object)) =
                 (result_text.as_deref(), payload.as_object_mut())
@@ -2200,6 +2418,11 @@ async fn record_terminal_output(
                         "execution_id": execution_id,
                         "thread_key": thread_key.as_str(),
                         "error": error.as_str(),
+                        "base_image_ref": execution.base_image_ref.clone(),
+                        "base_image_hash": execution.base_image_hash.clone(),
+                        "overlay_hash": execution.overlay_hash.clone(),
+                        "model": execution.model.clone(),
+                        "harness_run_id": execution.harness_run_id.clone(),
                     }),
                 )
                 .await?;
@@ -2272,6 +2495,11 @@ async fn record_max_duration_failure(
                 "error": error,
                 "reason": "max_duration_exceeded",
                 "max_duration_ms": max_duration_ms,
+                "base_image_ref": execution.base_image_ref.clone(),
+                "base_image_hash": execution.base_image_hash.clone(),
+                "overlay_hash": execution.overlay_hash.clone(),
+                "model": execution.model.clone(),
+                "harness_run_id": execution.harness_run_id.clone(),
             }),
         )
         .await?;
@@ -3777,6 +4005,32 @@ mod tests {
     }
 
     #[test]
+    fn codex_workload_carries_runtime_identity() {
+        let workload = SandboxWorkloadMode::codex_app_server(
+            "ghcr.io/org/centaur-agent:sha-deadbeef",
+            [("CODEX_MODEL".to_owned(), "gpt-5".to_owned())],
+        )
+        .overlay_hash(Some("overlay-sha".to_owned()));
+        let thread_key = ThreadKey::parse("chat:C123:1780000000.000000").unwrap();
+
+        let spec = workload.spec(&thread_key);
+
+        assert_eq!(
+            spec.runtime_identity.base_image_ref.as_deref(),
+            Some("ghcr.io/org/centaur-agent:sha-deadbeef")
+        );
+        assert_eq!(
+            spec.runtime_identity.base_image_hash.as_deref(),
+            Some("sha-deadbeef")
+        );
+        assert_eq!(
+            spec.runtime_identity.overlay_hash.as_deref(),
+            Some("overlay-sha")
+        );
+        assert_eq!(spec.runtime_identity.model.as_deref(), Some("gpt-5"));
+    }
+
+    #[test]
     fn warm_workload_key_ignores_claimed_thread_key() {
         let workload = SandboxWorkloadMode::codex_app_server(
             "centaur-agent:latest",
@@ -3848,6 +4102,11 @@ mod tests {
             idempotency_key: None,
             thread_key,
             status,
+            base_image_ref: None,
+            base_image_hash: None,
+            overlay_hash: None,
+            model: None,
+            harness_run_id: None,
             metadata,
             error: None,
             created_at: now,

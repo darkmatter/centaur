@@ -234,11 +234,28 @@ async fn execute_session(
             },
         )
         .await?;
+    tracing::info!(
+        component = "api_server",
+        event = "session_execute_response",
+        thread_key = %execution.thread_key,
+        execution_id = %execution.execution_id,
+        status = %execution.status,
+        base_image_hash = execution.base_image_hash.as_deref().unwrap_or(""),
+        overlay_hash = execution.overlay_hash.as_deref().unwrap_or(""),
+        model = execution.model.as_deref().unwrap_or(""),
+        harness_run_id = execution.harness_run_id.as_deref().unwrap_or(""),
+        "session execution response ready"
+    );
     Ok(Json(ExecuteSessionResponse {
         ok: true,
         execution_id: execution.execution_id,
         thread_key: execution.thread_key,
         status: execution.status.to_string(),
+        base_image_ref: execution.base_image_ref,
+        base_image_hash: execution.base_image_hash,
+        overlay_hash: execution.overlay_hash,
+        model: execution.model,
+        harness_run_id: execution.harness_run_id,
     }))
 }
 

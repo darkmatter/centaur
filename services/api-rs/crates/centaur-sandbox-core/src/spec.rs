@@ -16,12 +16,19 @@ pub struct SandboxSpec {
     /// proxy for the sandbox instead of rendering a static proxy config.
     #[serde(default)]
     pub iron_control_principal: Option<String>,
+    /// Operator-facing runtime identity stamped by the control plane. This is
+    /// not used by backends for scheduling; it lets API responses, logs, and
+    /// pod annotations identify what ran.
+    #[serde(default)]
+    pub runtime_identity: SandboxRuntimeIdentity,
 }
 
 impl SandboxSpec {
     pub fn new(image: impl Into<String>) -> Self {
+        let image = image.into();
         Self {
-            image: image.into(),
+            runtime_identity: SandboxRuntimeIdentity::from_base_image(&image),
+            image,
             labels: std::collections::BTreeMap::new(),
             command: None,
             args: Vec::new(),
@@ -70,6 +77,44 @@ impl SandboxSpec {
 
     pub fn resources(mut self, resources: ResourceLimits) -> Self {
         self.resources = Some(resources);
+        self
+    }
+
+    pub fn runtime_identity(mut self, identity: SandboxRuntimeIdentity) -> Self {
+        self.runtime_identity = identity;
+        self
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SandboxRuntimeIdentity {
+    #[serde(default)]
+    pub base_image_ref: Option<String>,
+    #[serde(default)]
+    pub base_image_hash: Option<String>,
+    #[serde(default)]
+    pub overlay_hash: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+}
+
+impl SandboxRuntimeIdentity {
+    pub fn from_base_image(image_ref: &str) -> Self {
+        Self {
+            base_image_ref: non_empty(image_ref),
+            base_image_hash: image_ref_hash(image_ref),
+            overlay_hash: None,
+            model: None,
+        }
+    }
+
+    pub fn overlay_hash(mut self, value: Option<String>) -> Self {
+        self.overlay_hash = value.and_then(|value| non_empty(&value));
+        self
+    }
+
+    pub fn model(mut self, value: Option<String>) -> Self {
+        self.model = value.and_then(|value| non_empty(&value));
         self
     }
 }
@@ -146,5 +191,67 @@ impl ResourceLimits {
 impl Default for ResourceLimits {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+pub fn image_ref_hash(image_ref: &str) -> Option<String> {
+    let image_ref = image_ref.trim();
+    if image_ref.is_empty() {
+        return None;
+    }
+    if let Some((_, digest)) = image_ref.rsplit_once('@') {
+        return non_empty(digest);
+    }
+    let tail = image_ref.rsplit('/').next().unwrap_or(image_ref);
+    let (_, tag) = tail.rsplit_once(':')?;
+    let tag = tag.trim();
+    if is_sha_like_tag(tag) || tag.to_ascii_lowercase().contains("sha-") {
+        return Some(tag.to_owned());
+    }
+    None
+}
+
+fn is_sha_like_tag(value: &str) -> bool {
+    let value = value
+        .strip_prefix("sha-")
+        .or_else(|| value.strip_prefix("sha_"))
+        .unwrap_or(value);
+    (7..=64).contains(&value.len()) && value.chars().all(|ch| ch.is_ascii_hexdigit())
+}
+
+fn non_empty(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SandboxSpec, image_ref_hash};
+
+    #[test]
+    fn extracts_image_hash_from_digest_or_sha_tag() {
+        assert_eq!(
+            image_ref_hash("ghcr.io/org/agent@sha256:abc123"),
+            Some("sha256:abc123".to_owned())
+        );
+        assert_eq!(
+            image_ref_hash("ghcr.io/org/agent:sha-deadbeef"),
+            Some("sha-deadbeef".to_owned())
+        );
+        assert_eq!(image_ref_hash("ghcr.io/org/agent:latest"), None);
+    }
+
+    #[test]
+    fn sandbox_spec_defaults_base_runtime_identity_from_image() {
+        let spec = SandboxSpec::new("ghcr.io/org/agent:sha-deadbeef");
+
+        assert_eq!(
+            spec.runtime_identity.base_image_ref.as_deref(),
+            Some("ghcr.io/org/agent:sha-deadbeef")
+        );
+        assert_eq!(
+            spec.runtime_identity.base_image_hash.as_deref(),
+            Some("sha-deadbeef")
+        );
     }
 }

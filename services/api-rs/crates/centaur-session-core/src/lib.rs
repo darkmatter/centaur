@@ -200,12 +200,25 @@ pub struct SessionExecution {
     pub idempotency_key: Option<String>,
     pub thread_key: ThreadKey,
     pub status: ExecutionStatus,
+    pub base_image_ref: Option<String>,
+    pub base_image_hash: Option<String>,
+    pub overlay_hash: Option<String>,
+    pub model: Option<String>,
+    pub harness_run_id: Option<String>,
     pub metadata: Value,
     pub error: Option<String>,
     pub created_at: OffsetDateTime,
     pub updated_at: OffsetDateTime,
     pub started_at: Option<OffsetDateTime>,
     pub completed_at: Option<OffsetDateTime>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ExecutionRuntimeIdentity {
+    pub base_image_ref: Option<String>,
+    pub base_image_hash: Option<String>,
+    pub overlay_hash: Option<String>,
+    pub model: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

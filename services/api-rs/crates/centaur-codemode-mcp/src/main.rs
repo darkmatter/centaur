@@ -68,8 +68,10 @@ struct Args {
     )]
     env_dir: PathBuf,
 
-    /// Cap on returned script stdout (bytes).
-    #[arg(long, env = "CODEMODE_MAX_OUTPUT_BYTES", default_value_t = 50_000)]
+    /// Cap on returned script stdout (bytes). The default keeps a careless
+    /// script (raw API dump) to ~2.5k tokens of client context; distilled
+    /// output should be far below it.
+    #[arg(long, env = "CODEMODE_MAX_OUTPUT_BYTES", default_value_t = 10_000)]
     max_output_bytes: usize,
 
     /// Default `run_python` timeout (seconds).

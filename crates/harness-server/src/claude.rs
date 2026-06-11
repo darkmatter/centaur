@@ -11,7 +11,7 @@ use crate::{
     command_from_override, user_input_to_anthropic_content,
 };
 
-const DEFAULT_CLAUDE_MODEL: &str = "claude-opus-4-8";
+const DEFAULT_CLAUDE_MODEL: &str = "claude-fable-5";
 
 /// Defers agent text until the owning message's fate is known, so agentMessage
 /// items can be emitted with an authoritative stop reason. Claude's per-block

@@ -169,7 +169,46 @@ impl ToolIndex {
     }
 }
 
+/// Max matching method lines rendered per tool in a `list_tools` search.
+const SEARCH_METHODS_PER_TOOL: usize = 6;
+
 impl ToolProject {
+    /// Render this tool for a search result if it matches `needle`
+    /// (lowercase): a `name<TAB>description` header plus matching method
+    /// signatures, or `None` when nothing matches.
+    fn search_entry(&self, needle: &str) -> Option<String> {
+        let header_match = self.name.to_lowercase().contains(needle)
+            || self.description.to_lowercase().contains(needle);
+        let matched: Vec<&ApiEntry> = self
+            .api
+            .iter()
+            .filter(|entry| {
+                entry.signature.to_lowercase().contains(needle)
+                    || entry
+                        .doc
+                        .as_deref()
+                        .is_some_and(|doc| doc.to_lowercase().contains(needle))
+            })
+            .collect();
+        if !header_match && matched.is_empty() {
+            return None;
+        }
+        let mut lines = vec![format!("{}\t{}", self.name, self.description)];
+        for entry in matched.iter().take(SEARCH_METHODS_PER_TOOL) {
+            match &entry.doc {
+                Some(doc) => lines.push(format!("  {}  # {}", entry.signature, doc)),
+                None => lines.push(format!("  {}", entry.signature)),
+            }
+        }
+        if matched.len() > SEARCH_METHODS_PER_TOOL {
+            lines.push(format!(
+                "  ... {} more matching methods (see tool_api)",
+                matched.len() - SEARCH_METHODS_PER_TOOL
+            ));
+        }
+        Some(lines.join("\n"))
+    }
+
     fn stub(&self) -> String {
         let mut lines = Vec::new();
         let header = format!("# {}: {}", self.name, self.description);
@@ -196,6 +235,14 @@ impl ToolProject {
 // ── MCP tool parameters ──────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct ListToolsParams {
+    /// Optional case-insensitive search. Matches tool names, descriptions, and
+    /// method signatures/docstrings; matching methods are shown inline under
+    /// each tool. Omit to list the full catalog.
+    query: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct ToolApiParams {
     /// Tool name as shown by list_tools.
     tool: String,
@@ -220,18 +267,40 @@ struct CodeModeServer {
 #[tool_router]
 impl CodeModeServer {
     #[tool(
-        description = "List available Centaur tools, one `name<TAB>description` per line. Call tool_api next for method signatures."
+        description = "List or search Centaur tools. Without `query`: full catalog, one `name<TAB>description` per line. With `query`: server-side case-insensitive search over names, descriptions, and method signatures/docstrings, with matching methods shown inline. Prefer searching over listing everything. Call tool_api next for a tool's full method signatures."
     )]
-    async fn list_tools(&self) -> Result<CallToolResult, ErrorData> {
+    async fn list_tools(
+        &self,
+        Parameters(ListToolsParams { query }): Parameters<ListToolsParams>,
+    ) -> Result<CallToolResult, ErrorData> {
         let index = ToolIndex::load(&self.config.index_path).await?;
-        let mut lines: Vec<String> = index
-            .projects
-            .iter()
-            .map(|project| format!("{}\t{}", project.name, project.description))
-            .collect();
-        lines.sort();
+        let needle = query
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or_default()
+            .to_lowercase();
+        let mut entries: Vec<String> = if needle.is_empty() {
+            index
+                .projects
+                .iter()
+                .map(|project| format!("{}\t{}", project.name, project.description))
+                .collect()
+        } else {
+            index
+                .projects
+                .iter()
+                .filter_map(|project| project.search_entry(&needle))
+                .collect()
+        };
+        entries.sort();
+        if entries.is_empty() {
+            return Ok(CallToolResult::success(vec![Content::text(format!(
+                "no tools matched {:?}; retry with a broader query or omit it for the full catalog",
+                needle
+            ))]));
+        }
         Ok(CallToolResult::success(vec![Content::text(
-            lines.join("\n"),
+            entries.join("\n"),
         )]))
     }
 
@@ -355,9 +424,10 @@ impl ServerHandler for CodeModeServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
             "Centaur Code Mode: compose Centaur deployment tools in Python. \
-                 Workflow: list_tools → tool_api(<tool>) → run_python(<script>). \
-                 Write ONE script per task that makes all the tool calls it needs \
-                 and prints only the distilled result.",
+             Workflow: list_tools(query=<keywords>) to find relevant tools → \
+             tool_api(<tool>) for full signatures → run_python(<script>). \
+             Write ONE script per task that makes all the tool calls it needs \
+             and prints only the distilled result.",
         )
     }
 }
@@ -460,6 +530,54 @@ mod tests {
         assert!(index.project("standard_metrics").is_some());
         assert!(index.project("standard-metrics").is_some());
         assert!(index.project("missing").is_none());
+    }
+
+    #[test]
+    fn search_matches_name_description_and_methods() {
+        let tool = project(
+            "slack",
+            vec![
+                ApiEntry {
+                    signature: "search_messages(query: str) -> list[dict]".to_string(),
+                    doc: Some("Search messages.".to_string()),
+                },
+                ApiEntry {
+                    signature: "list_channels() -> list[dict]".to_string(),
+                    doc: None,
+                },
+            ],
+        );
+        // name match → header only (no methods matched)
+        let by_name = tool.search_entry("slack").unwrap();
+        assert!(by_name.starts_with("slack\t"), "{by_name}");
+        assert!(!by_name.contains("search_messages"), "{by_name}");
+        // method match → header + matching signature inline
+        let by_method = tool.search_entry("search_mess").unwrap();
+        assert!(
+            by_method.contains("  search_messages(query: str)"),
+            "{by_method}"
+        );
+        assert!(!by_method.contains("list_channels"), "{by_method}");
+        // doc match works, case-insensitively
+        assert!(tool.search_entry("search messages.").is_some());
+        // no match
+        assert!(tool.search_entry("kubernetes").is_none());
+    }
+
+    #[test]
+    fn search_caps_matching_methods() {
+        let api = (0..10)
+            .map(|i| ApiEntry {
+                signature: format!("query_thing_{i}() -> dict"),
+                doc: None,
+            })
+            .collect();
+        let entry = project("dune", api).search_entry("query_thing").unwrap();
+        assert_eq!(
+            entry.matches("query_thing_").count(),
+            SEARCH_METHODS_PER_TOOL
+        );
+        assert!(entry.contains("... 4 more matching methods"), "{entry}");
     }
 
     #[test]

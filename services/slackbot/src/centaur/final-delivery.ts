@@ -148,6 +148,7 @@ async function deliver(
     threadTs,
     executionId(delivery),
     config.SLACK_TEAM_ID,
+    recipientTeamId(meta),
     chunks,
   );
 }
@@ -156,12 +157,20 @@ function executionId(delivery: any): string {
   return String(delivery?.execution_id ?? "");
 }
 
+function recipientTeamId(delivery: any): string | undefined {
+  const value = String(
+    delivery?.recipient_team_id ?? delivery?.team_id ?? "",
+  ).trim();
+  return value || undefined;
+}
+
 async function postFollowups(
   client: WebClient,
   channel: string,
   threadTs: string,
   executionId: string,
   teamId: string | undefined,
+  recipientTeamId: string | undefined,
   chunks: string[],
 ): Promise<void> {
   const posted = await withSpan(
@@ -190,6 +199,7 @@ async function postFollowups(
         client.chat.postMessage({
           channel,
           thread_ts: threadTs,
+          ...(recipientTeamId ? { recipient_team_id: recipientTeamId } : {}),
           text: renderedChunk,
           blocks: renderMarkdownBlocks(renderedChunk),
           unfurl_links: false,

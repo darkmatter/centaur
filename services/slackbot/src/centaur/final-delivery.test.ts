@@ -162,6 +162,7 @@ describe("final delivery polling", () => {
       expect((postMessage?.params as any)?.text).toBe(
         "done [once](https://example.com) with **bold** text",
       );
+      expect((postMessage?.params as any)?.recipient_team_id).toBe("T123");
       expect((postMessage?.params as any)?.blocks).toEqual([
         {
           type: "markdown",

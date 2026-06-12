@@ -1576,7 +1576,7 @@ impl SandboxWorkloadMode {
                 let mut spec = SandboxSpec::new(image);
                 if let Some(harness_type) = harness_type {
                     spec = spec
-                        .args([harness_wrapper(harness_type)])
+                        .args(["harness-server", harness_server_subcommand(harness_type)])
                         .env("CENTAUR_HARNESS_TYPE", harness_type.as_ref());
                 }
                 if let Some(thread_key) = thread_key {
@@ -1602,11 +1602,13 @@ impl SandboxWorkloadMode {
     }
 }
 
-fn harness_wrapper(harness_type: &HarnessType) -> &'static str {
+/// Subcommand of the sandbox image's `harness-server` binary that serves this
+/// harness over the App Server V2 protocol (see `crates/harness-server`).
+fn harness_server_subcommand(harness_type: &HarnessType) -> &'static str {
     match harness_type {
-        HarnessType::Codex => "codex-app-wrapper",
-        HarnessType::Amp => "amp-wrapper",
-        HarnessType::ClaudeCode => "claude-app-wrapper",
+        HarnessType::Codex => "codex",
+        HarnessType::Amp => "amp",
+        HarnessType::ClaudeCode => "claude-code",
     }
 }
 
@@ -4218,14 +4220,14 @@ mod tests {
         );
         let thread_key = ThreadKey::parse("web:test-thread").unwrap();
 
-        for (harness_type, expected_wrapper, expected_wire_value) in [
-            (HarnessType::Codex, "codex-app-wrapper", "codex"),
-            (HarnessType::ClaudeCode, "claude-app-wrapper", "claudecode"),
-            (HarnessType::Amp, "amp-wrapper", "amp"),
+        for (harness_type, expected_subcommand, expected_wire_value) in [
+            (HarnessType::Codex, "codex", "codex"),
+            (HarnessType::ClaudeCode, "claude-code", "claudecode"),
+            (HarnessType::Amp, "amp", "amp"),
         ] {
             let spec = workload.spec(&thread_key, &harness_type, Some("eng"));
 
-            assert_eq!(spec.args, vec![expected_wrapper]);
+            assert_eq!(spec.args, vec!["harness-server", expected_subcommand]);
             assert!(
                 spec.env
                     .iter()

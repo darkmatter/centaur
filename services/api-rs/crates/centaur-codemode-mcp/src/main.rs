@@ -515,26 +515,20 @@ async fn provision(args: ProvisionArgs) -> anyhow::Result<()> {
         .await
         .context("upserting codemode principal")?;
 
-    // api-rs registers one role per discovered tool at startup; grant them all.
-    // The infra role (harness LLM auth) is deliberately not assigned: scripts
-    // call tools, not model APIs.
+    // Mirror SessionRegistrar: assign every Centaur-managed role. api-rs
+    // registers all discovered tool secrets onto its managed role set (today a
+    // single `infra` role carrying the combined fragment), and sandbox session
+    // principals receive exactly those roles.
+    let managed: Vec<(String, String)> = managed_labels().into_iter().collect();
     let roles = client
-        .list_roles(namespace, &[])
+        .list_roles(namespace, &managed)
         .await
         .context("listing iron-control roles")?;
-    let tool_roles: Vec<_> = roles
-        .iter()
-        .filter(|role| {
-            role.foreign_id
-                .as_deref()
-                .is_some_and(|foreign_id| foreign_id.starts_with("tool-"))
-        })
-        .collect();
     anyhow::ensure!(
-        !tool_roles.is_empty(),
-        "no tool-* roles in iron-control namespace {namespace}; is api-rs up and pointed at the same namespace?"
+        !roles.is_empty(),
+        "no Centaur-managed roles in iron-control namespace {namespace}; is api-rs up and pointed at the same namespace?"
     );
-    for role in &tool_roles {
+    for role in &roles {
         client
             .assign_role(&principal.id, &role.id)
             .await
@@ -557,7 +551,7 @@ async fn provision(args: ProvisionArgs) -> anyhow::Result<()> {
     tracing::info!(
         principal = %principal.id,
         proxy = %proxy.id,
-        roles = tool_roles.len(),
+        roles = roles.len(),
         token_file = %args.token_file.display(),
         "codemode iron-control identity provisioned"
     );

@@ -15,10 +15,11 @@ Put organization skills in an overlay repo under `.agents/skills/`. See
 configuration.
 
 Skills are loaded from `CENTAUR_SKILL_DIRS` in the sandbox. In a repo-cache
-overlay deployment, they must exist under the configured `skillsSubdir` in the
-sandbox repo checkout, for example
+overlay deployment, they must exist under the source's `skillsSubdir` — by
+default `.agents/skills/` — in the sandbox repo checkout, for example
 `/home/agent/github/your-org/centaur-overlay/.agents/skills`. The sandbox
-entrypoint copies those skills into the agent workspace during startup.
+entrypoint copies those skills into the agent workspace during startup; a
+source without the directory is skipped.
 
 ## Write SKILL.md
 

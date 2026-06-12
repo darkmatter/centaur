@@ -12,10 +12,12 @@ an overlay repo under `tools/` so the base Centaur repo stays generic. See
 configuration.
 
 Tools are loaded from `TOOL_DIRS`. In an overlay deployment, the tool must exist
-under the configured `toolsSubdir` in its repo-cache checkout, for example
+under the source's `toolsSubdir` — by default `tools/` — in its repo-cache
+checkout, for example
 `/var/lib/centaur/repos/your-org/centaur-overlay/tools` in the API container.
 Later tool directories can shadow earlier tools with the same name, so an
-overlay can replace a base tool intentionally.
+overlay can replace a base tool intentionally. Sources without a tools
+directory are skipped.
 
 See the [Tool Directory](/reference/tool-directory) for the integrations that
 ship with Centaur.

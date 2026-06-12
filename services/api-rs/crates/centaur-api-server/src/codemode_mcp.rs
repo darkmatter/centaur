@@ -2,8 +2,11 @@ use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
 
 use axum::Router;
 use centaur_iron_control::SessionRegistrar;
-use centaur_sandbox_core::{SandboxId, SandboxIoGuard, SandboxRead, SandboxSpec, SandboxWrite};
-use centaur_session_runtime::SandboxRuntime;
+use centaur_sandbox_core::{SandboxId, SandboxIoGuard, SandboxRead, SandboxWrite};
+use centaur_session_core::{
+    AgentBoxAccessRole, AgentBoxOwnerKey, AgentBoxOwnerScope, AgentBoxPrincipalId, AgentProfileId,
+};
+use centaur_session_runtime::{AgentBoxRuntime, EnsureAgentBoxRequest, SandboxRuntime};
 use rmcp::{
     ErrorData, RoleServer, ServerHandler,
     handler::server::wrapper::Parameters,
@@ -16,6 +19,7 @@ use rmcp::{
     },
 };
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     sync::{Mutex, oneshot},
@@ -25,12 +29,15 @@ use tokio_util::sync::CancellationToken;
 #[derive(Clone)]
 pub struct CodeModeMcpConfig {
     pub runtime: SandboxRuntime,
-    pub sandbox_spec: SandboxSpec,
+    pub agent_box_runtime: AgentBoxRuntime,
     pub index_path: PathBuf,
     pub iron_control: Option<SessionRegistrar>,
     pub max_output_bytes: usize,
     pub default_timeout_seconds: u64,
     pub default_principal: String,
+    pub box_profile_id: AgentProfileId,
+    pub box_profile_display_name: String,
+    pub box_profile_distribution_ref: Option<String>,
 }
 
 pub fn nest_codemode_mcp<S>(router: Router<S>, config: CodeModeMcpConfig) -> Router<S>
@@ -363,19 +370,30 @@ impl CodeModeExecutor {
             return Ok(session);
         }
 
-        let mut spec = self.config.sandbox_spec.clone();
-        spec = spec.env("CENTAUR_CODEMODE_PRINCIPAL", &principal.env_principal);
-        if let Some(iron_control_principal) = &principal.iron_control_principal {
-            spec.iron_control_principal = Some(iron_control_principal.clone());
-        }
-        let (sandbox_id, io) =
-            self.config
-                .runtime
-                .create_running_io(spec)
-                .await
-                .map_err(|error| {
-                    ErrorData::internal_error(format!("creating Code Mode sandbox: {error}"), None)
-                })?;
+        let request = self.agent_box_request(principal)?;
+        let (agent_box, io) = self
+            .config
+            .agent_box_runtime
+            .ensure_running_box_io(request)
+            .await
+            .map_err(|error| {
+                ErrorData::internal_error(format!("creating Code Mode agent box: {error}"), None)
+            })?;
+        let sandbox_id = SandboxId::new(
+            agent_box
+                .active_sandbox_id
+                .as_deref()
+                .ok_or_else(|| {
+                    ErrorData::internal_error(
+                        format!(
+                            "Code Mode agent box {} has no active sandbox",
+                            agent_box.box_id
+                        ),
+                        None,
+                    )
+                })?
+                .to_owned(),
+        );
 
         let pending = Arc::new(Mutex::new(HashMap::new()));
         let session = Arc::new(SandboxSession {
@@ -399,9 +417,35 @@ impl CodeModeExecutor {
             principal = %principal.env_principal,
             session_key = %principal.session_key,
             sandbox_id = %sandbox_id.as_str(),
+            agent_box_id = %agent_box.box_id,
+            profile_id = %agent_box.profile_id,
             "claimed Code Mode sandbox"
         );
         Ok(session)
+    }
+
+    fn agent_box_request(
+        &self,
+        principal: &ResolvedPrincipal,
+    ) -> Result<EnsureAgentBoxRequest, ErrorData> {
+        Ok(EnsureAgentBoxRequest {
+            profile_id: self.config.box_profile_id.clone(),
+            profile_display_name: self.config.box_profile_display_name.clone(),
+            profile_distribution_ref: self.config.box_profile_distribution_ref.clone(),
+            owner_scope: owner_scope_for_principal(&principal.env_principal),
+            owner_key: AgentBoxOwnerKey::parse(principal.env_principal.clone())
+                .map_err(internal_error)?,
+            egress_principal_id: principal.iron_control_principal.clone(),
+            grant_principal_id: Some(
+                AgentBoxPrincipalId::parse(principal.session_key.clone())
+                    .map_err(internal_error)?,
+            ),
+            grant_role: AgentBoxAccessRole::Owner,
+            metadata: json!({
+                "source": "codemode_mcp",
+                "env_principal": principal.env_principal,
+            }),
+        })
     }
 
     async fn drop_session(&self, principal: &ResolvedPrincipal) {
@@ -419,6 +463,18 @@ fn header_value(parts: Option<&http::request::Parts>, name: &'static str) -> Opt
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
+}
+
+fn owner_scope_for_principal(principal: &str) -> AgentBoxOwnerScope {
+    if principal.starts_with("slack-user-") {
+        AgentBoxOwnerScope::User
+    } else if principal.starts_with("slack-channel-") {
+        AgentBoxOwnerScope::Channel
+    } else if principal.starts_with("slack-team-") {
+        AgentBoxOwnerScope::Team
+    } else {
+        AgentBoxOwnerScope::Custom
+    }
 }
 
 async fn read_responses(
@@ -668,5 +724,30 @@ impl ToolProject {
             }
         }
         lines.join("\n")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn principal_prefixes_map_to_box_owner_scopes() {
+        assert_eq!(
+            owner_scope_for_principal("slack-user-T123-U123"),
+            AgentBoxOwnerScope::User
+        );
+        assert_eq!(
+            owner_scope_for_principal("slack-channel-T123-C123"),
+            AgentBoxOwnerScope::Channel
+        );
+        assert_eq!(
+            owner_scope_for_principal("slack-team-T123"),
+            AgentBoxOwnerScope::Team
+        );
+        assert_eq!(
+            owner_scope_for_principal("prn_123"),
+            AgentBoxOwnerScope::Custom
+        );
     }
 }

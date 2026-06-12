@@ -20,13 +20,14 @@ use centaur_iron_proxy::{
 };
 use centaur_sandbox_agent_k8s::{
     AgentSandboxBackend, AgentSandboxConfig, GitHubTokenRef, IronControlSettings, IronProxyConfig,
-    OtlpEgressTarget, ToolSource, ToolsConfig,
+    OtlpEgressTarget, StateVolumeConfig, ToolSource, ToolsConfig,
 };
 use centaur_sandbox_core::{Mount, MountKind, SandboxSpec};
 use centaur_sandbox_local::LocalSandboxBackend;
 use centaur_sandbox_manager::WarmPoolConfig;
-use centaur_session_core::HarnessType;
-use centaur_session_runtime::SandboxWorkloadMode;
+use centaur_session_core::{AgentProfileId, HarnessType};
+use centaur_session_runtime::{AgentBoxRuntime, SandboxWorkloadMode};
+use centaur_session_sqlx::PgSessionStore;
 use centaur_workflows::WorkflowHostSandboxRuntime;
 use clap::{Args as ClapArgs, Parser, ValueEnum};
 use tracing::{error, info, warn};
@@ -94,11 +95,12 @@ impl Args {
 
     pub(crate) async fn codemode_mcp_config(
         &self,
+        store: PgSessionStore,
         sandbox_runtime: SandboxRuntime,
         iron_control: Option<SessionRegistrar>,
     ) -> Result<Option<CodeModeMcpConfig>, ServerError> {
         self.codemode
-            .config(&self.sandbox, sandbox_runtime, iron_control)
+            .config(&self.sandbox, store, sandbox_runtime, iron_control)
             .await
     }
 }
@@ -504,17 +506,42 @@ struct CodeModeArgs {
         env = "CODEMODE_HARNESS_SERVER_PATH"
     )]
     harness_server_path: Option<PathBuf>,
+    #[arg(
+        long = "codemode-box-profile-id",
+        env = "CODEMODE_BOX_PROFILE_ID",
+        default_value = "codemode-default"
+    )]
+    box_profile_id: String,
+    #[arg(
+        long = "codemode-box-profile-display-name",
+        env = "CODEMODE_BOX_PROFILE_DISPLAY_NAME",
+        default_value = "Code Mode"
+    )]
+    box_profile_display_name: String,
+    #[arg(
+        long = "codemode-box-profile-distribution-ref",
+        env = "CODEMODE_BOX_PROFILE_DISTRIBUTION_REF"
+    )]
+    box_profile_distribution_ref: Option<String>,
 }
 
 impl CodeModeArgs {
     async fn config(
         &self,
         sandbox: &SandboxArgs,
+        store: PgSessionStore,
         runtime: SandboxRuntime,
         iron_control: Option<SessionRegistrar>,
     ) -> Result<Option<CodeModeMcpConfig>, ServerError> {
         if !self.enabled {
             return Ok(None);
+        }
+        if matches!(sandbox.backend, SandboxBackendKind::AgentK8s) && !sandbox.state_volume_enabled
+        {
+            return Err(ServerError::UnsupportedConfig(
+                "Code Mode MCP durable boxes require --session-sandbox-state-volume-enabled=true"
+                    .to_owned(),
+            ));
         }
 
         let bin_dir = self.bin_dir();
@@ -524,6 +551,26 @@ impl CodeModeArgs {
             self.bootstrap_tools(&bin_dir, &proxy_dir, &env_dir).await?;
         }
         let sandbox_spec = self.sandbox_spec(sandbox, &proxy_dir, &env_dir);
+        let box_profile_id =
+            AgentProfileId::parse(self.box_profile_id.clone()).map_err(|error| {
+                ServerError::CodeMode(format!(
+                    "invalid Code Mode box profile id {}: {error}",
+                    self.box_profile_id
+                ))
+            })?;
+        let agent_box_runtime = AgentBoxRuntime::with_spec_factory(
+            store,
+            runtime.clone(),
+            {
+                let sandbox_spec = sandbox_spec.clone();
+                move |agent_box| {
+                    sandbox_spec
+                        .clone()
+                        .env("CENTAUR_CODEMODE_PRINCIPAL", agent_box.owner_key.as_str())
+                }
+            },
+            sandbox.state_volume_mount_path.clone(),
+        );
         info!(
             index_path = %bin_dir.join(".centaur-tools.json").display(),
             proxy_dir = %proxy_dir.display(),
@@ -533,12 +580,17 @@ impl CodeModeArgs {
         );
         Ok(Some(CodeModeMcpConfig {
             runtime,
-            sandbox_spec,
+            agent_box_runtime,
             index_path: bin_dir.join(".centaur-tools.json"),
             iron_control,
             max_output_bytes: self.max_output_bytes,
             default_timeout_seconds: self.default_timeout_seconds,
             default_principal: self.default_principal.clone(),
+            box_profile_id,
+            box_profile_display_name: self.box_profile_display_name.clone(),
+            box_profile_distribution_ref: clean_optional_value(
+                self.box_profile_distribution_ref.as_deref(),
+            ),
         }))
     }
 
@@ -729,6 +781,29 @@ struct SandboxArgs {
         value_parser = clap::value_parser!(u64).range(1..)
     )]
     warm_pool_replenish_interval_secs: u64,
+    #[arg(
+        long = "session-sandbox-state-volume-enabled",
+        env = "SESSION_SANDBOX_STATE_VOLUME_ENABLED",
+        default_value_t = false
+    )]
+    state_volume_enabled: bool,
+    #[arg(
+        long = "session-sandbox-state-volume-mount-path",
+        env = "SESSION_SANDBOX_STATE_VOLUME_MOUNT_PATH",
+        default_value = "/home/agent/state"
+    )]
+    state_volume_mount_path: String,
+    #[arg(
+        long = "session-sandbox-state-volume-size",
+        env = "SESSION_SANDBOX_STATE_VOLUME_SIZE",
+        default_value = "10Gi"
+    )]
+    state_volume_size: String,
+    #[arg(
+        long = "session-sandbox-state-volume-storage-class-name",
+        env = "SESSION_SANDBOX_STATE_VOLUME_STORAGE_CLASS_NAME"
+    )]
+    state_volume_storage_class_name: Option<String>,
     #[arg(
         long = "session-sandbox-k8s-context",
         alias = "kubernetes-context",
@@ -1367,6 +1442,18 @@ impl TryFrom<&SandboxArgs> for AgentSandboxConfig {
             .collect();
         config.ready_timeout = Duration::from_secs(args.ready_timeout_secs);
         config.iron_proxy = args.iron_proxy.to_config()?;
+        if args.state_volume_enabled {
+            let mut state_volume = StateVolumeConfig::new(
+                args.state_volume_mount_path.clone(),
+                args.state_volume_size.clone(),
+            );
+            if let Some(storage_class_name) =
+                clean_optional_value(args.state_volume_storage_class_name.as_deref())
+            {
+                state_volume = state_volume.storage_class_name(storage_class_name);
+            }
+            config.state_volume = Some(state_volume);
+        }
         if let Some(proxy) = config.iron_proxy.as_mut() {
             // The k8s backend derives the static sandbox PG DSN catalog from
             // these fragments (see `pg_sandbox_dsns`); `to_config` only ships
@@ -2033,6 +2120,30 @@ mod tests {
     }
 
     #[test]
+    fn codemode_profile_distribution_flags_are_parsed() {
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+            "--codemode-mcp-enabled",
+            "--codemode-box-profile-id",
+            "hermes-researcher",
+            "--codemode-box-profile-display-name",
+            "Hermes Researcher",
+            "--codemode-box-profile-distribution-ref",
+            "nous/hermes-researcher:2026-06",
+        ])
+        .unwrap();
+
+        assert_eq!(args.codemode.box_profile_id, "hermes-researcher");
+        assert_eq!(args.codemode.box_profile_display_name, "Hermes Researcher");
+        assert_eq!(
+            args.codemode.box_profile_distribution_ref.as_deref(),
+            Some("nous/hermes-researcher:2026-06")
+        );
+    }
+
+    #[test]
     fn agent_k8s_config_converts_from_sandbox_args() {
         let args = Args::try_parse_from([
             "centaur-api-server",
@@ -2048,6 +2159,13 @@ mod tests {
             "github-access-token-read-packages, extra-secret ",
             "--session-sandbox-ready-timeout-secs",
             "42",
+            "--session-sandbox-state-volume-enabled",
+            "--session-sandbox-state-volume-mount-path",
+            "/home/agent/box",
+            "--session-sandbox-state-volume-size",
+            "20Gi",
+            "--session-sandbox-state-volume-storage-class-name",
+            "fast",
             "--kubernetes-sandbox-iron-proxy-mode",
             "disabled",
         ])
@@ -2062,6 +2180,10 @@ mod tests {
         );
         assert_eq!(config.ready_timeout, Duration::from_secs(42));
         assert!(config.iron_proxy.is_none());
+        let state_volume = config.state_volume.expect("state volume should be enabled");
+        assert_eq!(state_volume.mount_path, "/home/agent/box");
+        assert_eq!(state_volume.size, "20Gi");
+        assert_eq!(state_volume.storage_class_name.as_deref(), Some("fast"));
     }
 
     #[test]

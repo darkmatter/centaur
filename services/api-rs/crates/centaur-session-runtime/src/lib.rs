@@ -6,15 +6,16 @@ use std::{
 
 use centaur_iron_control::SessionRegistrar;
 use centaur_sandbox_core::{
-    Mount, SandboxBackend, SandboxError, SandboxId, SandboxIoGuard, SandboxRead, SandboxSpec,
-    SandboxStatus, SandboxWrite,
+    Mount, MountKind, SandboxBackend, SandboxError, SandboxId, SandboxIoGuard, SandboxRead,
+    SandboxSpec, SandboxStatus, SandboxWrite,
 };
 use centaur_sandbox_manager::{
     SandboxManager, WarmPoolConfig, WarmPoolError, WarmPoolManager, WarmSandboxSpecFactory,
 };
 use centaur_session_core::{
-    ExecutionStatus, HarnessType, MessageRole, Session, SessionEvent, SessionExecution,
-    SessionMessageInput, ThreadKey,
+    AgentBox, AgentBoxAccessRole, AgentBoxOwnerKey, AgentBoxOwnerScope, AgentBoxPrincipalId,
+    AgentBoxStatus, AgentProfileId, ExecutionStatus, HarnessType, MessageRole, Session,
+    SessionEvent, SessionExecution, SessionMessageInput, ThreadKey,
 };
 use centaur_session_sqlx::{
     PgSessionStore, SessionEventListener, SessionStoreError, default_metadata,
@@ -44,6 +45,7 @@ const STEERING_STARTUP_RETRY_TIMEOUT: Duration = Duration::from_secs(15);
 const COMPONENT_SESSION_RUNTIME: &str = "session_runtime";
 
 type SandboxSpecFactory = Arc<dyn Fn(&ThreadKey, &str) -> SandboxSpec + Send + Sync>;
+type AgentBoxSpecFactory = Arc<dyn Fn(&AgentBox) -> SandboxSpec + Send + Sync>;
 type SessionInputSink = FramedWrite<SandboxWrite, LinesCodec>;
 type ExecutionSpanRegistry = Arc<Mutex<HashMap<String, Span>>>;
 
@@ -63,6 +65,27 @@ pub struct SandboxRuntime {
     spec_factory: SandboxSpecFactory,
     warm_spec_factory: Option<WarmSandboxSpecFactory>,
     workload_key: Option<String>,
+}
+
+#[derive(Clone)]
+pub struct AgentBoxRuntime {
+    store: PgSessionStore,
+    sandbox_runtime: SandboxRuntime,
+    spec_factory: AgentBoxSpecFactory,
+    state_mount_path: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct EnsureAgentBoxRequest {
+    pub profile_id: AgentProfileId,
+    pub profile_display_name: String,
+    pub profile_distribution_ref: Option<String>,
+    pub owner_scope: AgentBoxOwnerScope,
+    pub owner_key: AgentBoxOwnerKey,
+    pub egress_principal_id: Option<String>,
+    pub grant_principal_id: Option<AgentBoxPrincipalId>,
+    pub grant_role: AgentBoxAccessRole,
+    pub metadata: Value,
 }
 
 #[derive(Clone, Debug)]
@@ -1371,6 +1394,13 @@ impl SandboxRuntime {
         Ok((handle.id, io))
     }
 
+    pub async fn open_sandbox_io(
+        &self,
+        sandbox_id: &SandboxId,
+    ) -> Result<centaur_sandbox_core::SandboxIoParts, SessionRuntimeError> {
+        Ok(self.manager.open_io(sandbox_id).await?.into_parts())
+    }
+
     pub async fn stop_sandbox(&self, sandbox_id: &SandboxId) -> Result<(), SessionRuntimeError> {
         self.manager.stop(sandbox_id).await?;
         Ok(())
@@ -1424,6 +1454,178 @@ impl SandboxRuntime {
             warm_spec_factory: Some(warm_spec_factory),
             workload_key: Some(workload_key),
         }
+    }
+}
+
+impl AgentBoxRuntime {
+    pub fn new(
+        store: PgSessionStore,
+        sandbox_runtime: SandboxRuntime,
+        spec: SandboxSpec,
+        state_mount_path: impl Into<String>,
+    ) -> Self {
+        Self::with_spec_factory(
+            store,
+            sandbox_runtime,
+            move |_box| spec.clone(),
+            state_mount_path,
+        )
+    }
+
+    pub fn with_spec_factory<F>(
+        store: PgSessionStore,
+        sandbox_runtime: SandboxRuntime,
+        spec_factory: F,
+        state_mount_path: impl Into<String>,
+    ) -> Self
+    where
+        F: Fn(&AgentBox) -> SandboxSpec + Send + Sync + 'static,
+    {
+        Self {
+            store,
+            sandbox_runtime,
+            spec_factory: Arc::new(spec_factory),
+            state_mount_path: state_mount_path.into(),
+        }
+    }
+
+    pub async fn ensure_running_box(
+        &self,
+        request: EnsureAgentBoxRequest,
+    ) -> Result<AgentBox, SessionRuntimeError> {
+        self.store
+            .ensure_agent_profile(
+                &request.profile_id,
+                &request.profile_display_name,
+                request.profile_distribution_ref.as_deref(),
+                empty_metadata_if_null(&request.metadata),
+            )
+            .await?;
+        let mut agent_box = self
+            .store
+            .ensure_agent_box(
+                &request.profile_id,
+                request.owner_scope,
+                &request.owner_key,
+                request.egress_principal_id.as_deref(),
+                request.metadata,
+            )
+            .await?;
+
+        if let Some(principal_id) = request.grant_principal_id {
+            self.store
+                .grant_agent_box_access(&agent_box.box_id, &principal_id, request.grant_role)
+                .await?;
+        }
+
+        agent_box = self.ensure_box_sandbox(agent_box).await?;
+        Ok(agent_box)
+    }
+
+    pub async fn ensure_running_box_io(
+        &self,
+        request: EnsureAgentBoxRequest,
+    ) -> Result<(AgentBox, centaur_sandbox_core::SandboxIoParts), SessionRuntimeError> {
+        let agent_box = self.ensure_running_box(request).await?;
+        let sandbox_id = agent_box.active_sandbox_id.as_deref().ok_or_else(|| {
+            SessionRuntimeError::BadRequest(format!(
+                "agent box {} has no active sandbox after ensure",
+                agent_box.box_id
+            ))
+        })?;
+        let io = self
+            .sandbox_runtime
+            .open_sandbox_io(&SandboxId::new(sandbox_id))
+            .await?;
+        Ok((agent_box, io))
+    }
+
+    async fn ensure_box_sandbox(
+        &self,
+        agent_box: AgentBox,
+    ) -> Result<AgentBox, SessionRuntimeError> {
+        if let Some(sandbox_id) = agent_box.active_sandbox_id.as_deref() {
+            let id = SandboxId::new(sandbox_id);
+            match self.sandbox_runtime.manager.status(&id).await {
+                Ok(status) => match existing_sandbox_action(&status) {
+                    ExistingSandboxAction::Reuse => return Ok(agent_box),
+                    ExistingSandboxAction::ResumeOrReplace => {
+                        if self.sandbox_runtime.manager.resume(&id).await.is_ok() {
+                            return self
+                                .store
+                                .set_agent_box_sandbox(
+                                    &agent_box.box_id,
+                                    Some(sandbox_id),
+                                    AgentBoxStatus::Active,
+                                )
+                                .await
+                                .map_err(Into::into);
+                        }
+                    }
+                    ExistingSandboxAction::Replace => {
+                        let _ = self.sandbox_runtime.manager.stop(&id).await;
+                    }
+                },
+                Err(SandboxError::NotFound(_)) => {}
+                Err(error) => return Err(SessionRuntimeError::Sandbox(error)),
+            }
+        }
+
+        let spec = decorate_agent_box_spec(
+            (self.spec_factory)(&agent_box),
+            &agent_box,
+            &self.state_mount_path,
+        );
+        let handle = match self.sandbox_runtime.manager.create_running(spec).await {
+            Ok(handle) => handle,
+            Err(error) => {
+                let _ = self
+                    .store
+                    .mark_agent_box_failed(&agent_box.box_id, &error.to_string())
+                    .await;
+                return Err(SessionRuntimeError::Sandbox(error));
+            }
+        };
+        self.store
+            .set_agent_box_sandbox(
+                &agent_box.box_id,
+                Some(handle.id.as_str()),
+                AgentBoxStatus::Active,
+            )
+            .await
+            .map_err(Into::into)
+    }
+}
+
+fn decorate_agent_box_spec(
+    mut spec: SandboxSpec,
+    agent_box: &AgentBox,
+    state_mount_path: &str,
+) -> SandboxSpec {
+    spec = spec
+        .label("centaur.ai/agent-box-id", agent_box.box_id.as_str())
+        .label("centaur.ai/agent-profile-id", agent_box.profile_id.as_str())
+        .env("CENTAUR_AGENT_BOX_ID", agent_box.box_id.as_str())
+        .env("CENTAUR_AGENT_PROFILE_ID", agent_box.profile_id.as_str())
+        .env(
+            "CENTAUR_AGENT_BOX_STATE_VOLUME",
+            &agent_box.state_volume_key,
+        )
+        .mount(Mount::new(
+            MountKind::NamedVolume(agent_box.state_volume_key.clone()),
+            state_mount_path,
+        ));
+    if let Some(egress_principal_id) = &agent_box.egress_principal_id {
+        spec.iron_control_principal = Some(egress_principal_id.clone());
+    }
+    spec
+}
+
+fn empty_metadata_if_null(metadata: &Value) -> Value {
+    if metadata.is_null() {
+        json!({})
+    } else {
+        metadata.clone()
     }
 }
 
@@ -3405,7 +3607,7 @@ pub enum SessionRuntimeError {
 mod tests {
     use super::*;
     use centaur_sandbox_core::MountKind;
-    use centaur_session_core::SessionStatus;
+    use centaur_session_core::{AgentBoxId, SessionStatus};
     use serde_json::json;
     use time::OffsetDateTime;
 
@@ -3896,6 +4098,46 @@ mod tests {
             existing_sandbox_action(&SandboxStatus::Unknown("rollout missing".to_owned())),
             ExistingSandboxAction::Replace
         );
+    }
+
+    #[test]
+    fn agent_box_spec_mounts_stable_state_volume() {
+        let now = OffsetDateTime::UNIX_EPOCH;
+        let agent_box = AgentBox {
+            box_id: AgentBoxId::parse("abox_123").unwrap(),
+            profile_id: AgentProfileId::parse("profile-default").unwrap(),
+            owner_scope: AgentBoxOwnerScope::Team,
+            owner_key: AgentBoxOwnerKey::parse("team-protocol").unwrap(),
+            state_volume_key: "agent-box-abox-123".to_owned(),
+            active_sandbox_id: None,
+            egress_principal_id: Some("prn_team".to_owned()),
+            status: AgentBoxStatus::Active,
+            metadata: json!({}),
+            created_at: now,
+            updated_at: now,
+            last_used_at: now,
+        };
+
+        let spec = decorate_agent_box_spec(
+            SandboxSpec::new("centaur-agent:test"),
+            &agent_box,
+            "/home/agent/box",
+        );
+
+        assert_eq!(
+            spec.labels
+                .get("centaur.ai/agent-box-id")
+                .map(String::as_str),
+            Some("abox_123")
+        );
+        assert_eq!(spec.iron_control_principal.as_deref(), Some("prn_team"));
+        assert!(spec.mounts.iter().any(|mount| {
+            mount.target_path == "/home/agent/box"
+                && mount.kind == MountKind::NamedVolume("agent-box-abox-123".to_owned())
+        }));
+        assert!(spec.env.iter().any(|env| {
+            env.name == "CENTAUR_AGENT_BOX_STATE_VOLUME" && env.value == "agent-box-abox-123"
+        }));
     }
 
     #[test]

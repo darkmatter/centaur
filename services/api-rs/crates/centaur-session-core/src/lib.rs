@@ -12,6 +12,10 @@ use thiserror::Error;
 use time::OffsetDateTime;
 
 pub const MAX_THREAD_KEY_BYTES: usize = 512;
+pub const MAX_AGENT_PROFILE_ID_BYTES: usize = 128;
+pub const MAX_AGENT_BOX_ID_BYTES: usize = 128;
+pub const MAX_AGENT_BOX_OWNER_KEY_BYTES: usize = 256;
+pub const MAX_AGENT_BOX_PRINCIPAL_BYTES: usize = 256;
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub struct ThreadKey(String);
@@ -115,6 +119,120 @@ fn validate_thread_key(value: &str) -> Result<(), ThreadKeyError> {
     Ok(())
 }
 
+macro_rules! bounded_agent_text {
+    ($name:ident, $kind:literal, $max:ident) => {
+        #[derive(Clone, Debug, Eq, PartialEq, Hash)]
+        pub struct $name(String);
+
+        impl $name {
+            pub fn parse(value: impl Into<String>) -> Result<Self, AgentIdentityError> {
+                let value = value.into();
+                validate_agent_text($kind, &value, $max)?;
+                Ok(Self(value))
+            }
+
+            pub fn as_str(&self) -> &str {
+                &self.0
+            }
+
+            pub fn into_string(self) -> String {
+                self.0
+            }
+        }
+
+        impl fmt::Display for $name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str(self.as_str())
+            }
+        }
+
+        impl FromStr for $name {
+            type Err = AgentIdentityError;
+
+            fn from_str(value: &str) -> Result<Self, Self::Err> {
+                Self::parse(value)
+            }
+        }
+
+        impl TryFrom<String> for $name {
+            type Error = AgentIdentityError;
+
+            fn try_from(value: String) -> Result<Self, Self::Error> {
+                Self::parse(value)
+            }
+        }
+
+        impl AsRef<str> for $name {
+            fn as_ref(&self) -> &str {
+                self.as_str()
+            }
+        }
+
+        impl Serialize for $name {
+            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: Serializer,
+            {
+                serializer.serialize_str(self.as_str())
+            }
+        }
+
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: Deserializer<'de>,
+            {
+                let value = String::deserialize(deserializer)?;
+                Self::parse(value).map_err(de::Error::custom)
+            }
+        }
+    };
+}
+
+bounded_agent_text!(
+    AgentProfileId,
+    "agent profile id",
+    MAX_AGENT_PROFILE_ID_BYTES
+);
+bounded_agent_text!(AgentBoxId, "agent box id", MAX_AGENT_BOX_ID_BYTES);
+bounded_agent_text!(
+    AgentBoxOwnerKey,
+    "agent box owner key",
+    MAX_AGENT_BOX_OWNER_KEY_BYTES
+);
+bounded_agent_text!(
+    AgentBoxPrincipalId,
+    "agent box principal id",
+    MAX_AGENT_BOX_PRINCIPAL_BYTES
+);
+
+#[derive(Clone, Debug, Eq, PartialEq, Error)]
+pub enum AgentIdentityError {
+    #[error("{kind} is required")]
+    Empty { kind: &'static str },
+    #[error("{kind} must be at most {max} bytes")]
+    TooLong { kind: &'static str, max: usize },
+    #[error("{kind} must not contain ASCII control characters")]
+    ControlCharacter { kind: &'static str },
+}
+
+fn validate_agent_text(
+    kind: &'static str,
+    value: &str,
+    max: usize,
+) -> Result<(), AgentIdentityError> {
+    if value.is_empty() {
+        return Err(AgentIdentityError::Empty { kind });
+    }
+    if value.len() > max {
+        return Err(AgentIdentityError::TooLong { kind, max });
+    }
+    if value.chars().any(|ch| ch.is_ascii_control()) {
+        return Err(AgentIdentityError::ControlCharacter { kind });
+    }
+    Ok(())
+}
+
 #[derive(
     Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize, AsRefStr, Display, EnumString,
 )]
@@ -148,6 +266,79 @@ pub struct Session {
     /// iron-control principal OID this session's egress proxy binds to,
     /// captured at registration so a resumed session can recreate its sandbox.
     pub iron_control_principal: Option<String>,
+    pub created_at: OffsetDateTime,
+    pub updated_at: OffsetDateTime,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, AsRefStr, Display, EnumString)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum AgentBoxOwnerScope {
+    User,
+    Team,
+    Channel,
+    Project,
+    Repo,
+    Thread,
+    Custom,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, AsRefStr, Display, EnumString)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum AgentBoxStatus {
+    Active,
+    Suspended,
+    Failed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, AsRefStr, Display, EnumString)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum AgentBoxAccessRole {
+    Owner,
+    Member,
+    Viewer,
+    Automation,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AgentProfile {
+    pub profile_id: AgentProfileId,
+    pub display_name: String,
+    /// Optional distribution/source ref for Hermes-style profile packages.
+    pub distribution_ref: Option<String>,
+    pub metadata: Value,
+    pub created_at: OffsetDateTime,
+    pub updated_at: OffsetDateTime,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AgentBox {
+    pub box_id: AgentBoxId,
+    pub profile_id: AgentProfileId,
+    /// Ownership describes what this durable home represents. Access grants
+    /// decide who may use it, so principal resolution can evolve independently
+    /// from box identity.
+    pub owner_scope: AgentBoxOwnerScope,
+    pub owner_key: AgentBoxOwnerKey,
+    /// Stable volume key. The active sandbox may die and be replaced; the next
+    /// sandbox mounts this same state volume.
+    pub state_volume_key: String,
+    pub active_sandbox_id: Option<String>,
+    pub egress_principal_id: Option<String>,
+    pub status: AgentBoxStatus,
+    pub metadata: Value,
+    pub created_at: OffsetDateTime,
+    pub updated_at: OffsetDateTime,
+    pub last_used_at: OffsetDateTime,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AgentBoxAccessGrant {
+    pub box_id: AgentBoxId,
+    pub principal_id: AgentBoxPrincipalId,
+    pub role: AgentBoxAccessRole,
     pub created_at: OffsetDateTime,
     pub updated_at: OffsetDateTime,
 }
@@ -226,7 +417,7 @@ pub fn empty_object() -> Value {
 mod tests {
     use std::str::FromStr;
 
-    use super::{HarnessType, ThreadKey};
+    use super::*;
 
     #[test]
     fn thread_key_accepts_namespaced_values() {
@@ -274,5 +465,38 @@ mod tests {
     #[test]
     fn harness_type_rejects_unsupported_values() {
         assert!(HarnessType::from_str("claude-code").is_err());
+    }
+
+    #[test]
+    fn agent_box_identity_types_reject_empty_and_control_chars() {
+        assert!(AgentProfileId::parse("profile-default").is_ok());
+        assert!(AgentBoxId::parse("abox_123").is_ok());
+        assert!(AgentBoxOwnerKey::parse("slack-user-t123-u456").is_ok());
+        assert!(AgentBoxPrincipalId::parse("slack-channel-t123-c789").is_ok());
+
+        assert!(matches!(
+            AgentBoxOwnerKey::parse(""),
+            Err(AgentIdentityError::Empty { .. })
+        ));
+        assert!(matches!(
+            AgentBoxPrincipalId::parse("bad\nprincipal"),
+            Err(AgentIdentityError::ControlCharacter { .. })
+        ));
+    }
+
+    #[test]
+    fn agent_box_enums_parse_stable_storage_values() {
+        assert_eq!(
+            "team".parse::<AgentBoxOwnerScope>().unwrap(),
+            AgentBoxOwnerScope::Team
+        );
+        assert_eq!(
+            "automation".parse::<AgentBoxAccessRole>().unwrap(),
+            AgentBoxAccessRole::Automation
+        );
+        assert_eq!(
+            "suspended".parse::<AgentBoxStatus>().unwrap(),
+            AgentBoxStatus::Suspended
+        );
     }
 }

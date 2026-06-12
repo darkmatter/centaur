@@ -3,6 +3,8 @@
 use std::str::FromStr;
 
 use centaur_session_core::{
+    AgentBox, AgentBoxAccessGrant, AgentBoxAccessRole, AgentBoxId, AgentBoxOwnerKey,
+    AgentBoxOwnerScope, AgentBoxPrincipalId, AgentBoxStatus, AgentProfile, AgentProfileId,
     ExecutionStatus, HarnessType, Session, SessionEvent, SessionExecution, SessionMessage,
     SessionMessageInput, SessionStatus, ThreadKey, empty_object,
 };
@@ -613,6 +615,239 @@ impl PgSessionStore {
         Ok(())
     }
 
+    pub async fn ensure_agent_profile(
+        &self,
+        profile_id: &AgentProfileId,
+        display_name: &str,
+        distribution_ref: Option<&str>,
+        metadata: Value,
+    ) -> Result<AgentProfile, SessionStoreError> {
+        let row = sqlx::query_as::<_, AgentProfileRow>(
+            r#"
+            insert into agent_profiles
+                (profile_id, display_name, distribution_ref, metadata)
+            values ($1, $2, $3, $4)
+            on conflict (profile_id) do update
+            set
+                display_name = excluded.display_name,
+                distribution_ref = coalesce(excluded.distribution_ref, agent_profiles.distribution_ref),
+                metadata = case
+                    when excluded.metadata = '{}'::jsonb then agent_profiles.metadata
+                    else agent_profiles.metadata || excluded.metadata
+                end,
+                updated_at = now()
+            returning
+                profile_id,
+                display_name,
+                distribution_ref,
+                metadata,
+                created_at,
+                updated_at
+            "#,
+        )
+        .bind(profile_id.as_str())
+        .bind(display_name)
+        .bind(distribution_ref)
+        .bind(metadata)
+        .fetch_one(&self.pool)
+        .await?;
+
+        row.try_into()
+    }
+
+    pub async fn ensure_agent_box(
+        &self,
+        profile_id: &AgentProfileId,
+        owner_scope: AgentBoxOwnerScope,
+        owner_key: &AgentBoxOwnerKey,
+        egress_principal_id: Option<&str>,
+        metadata: Value,
+    ) -> Result<AgentBox, SessionStoreError> {
+        let box_id = prefixed_id("abox");
+        let state_volume_key = stable_box_volume_key(&box_id);
+        let row = sqlx::query_as::<_, AgentBoxRow>(
+            r#"
+            insert into agent_boxes
+                (
+                    box_id,
+                    profile_id,
+                    owner_scope,
+                    owner_key,
+                    state_volume_key,
+                    egress_principal_id,
+                    status,
+                    metadata
+                )
+            values ($1, $2, $3, $4, $5, $6, $7, $8)
+            on conflict (owner_scope, owner_key, profile_id) do update
+            set
+                egress_principal_id = coalesce(excluded.egress_principal_id, agent_boxes.egress_principal_id),
+                metadata = case
+                    when excluded.metadata = '{}'::jsonb then agent_boxes.metadata
+                    else agent_boxes.metadata || excluded.metadata
+                end,
+                updated_at = now(),
+                last_used_at = now()
+            returning
+                box_id,
+                profile_id,
+                owner_scope,
+                owner_key,
+                state_volume_key,
+                active_sandbox_id,
+                egress_principal_id,
+                status,
+                metadata,
+                created_at,
+                updated_at,
+                last_used_at
+            "#,
+        )
+        .bind(&box_id)
+        .bind(profile_id.as_str())
+        .bind(owner_scope.as_ref())
+        .bind(owner_key.as_str())
+        .bind(&state_volume_key)
+        .bind(egress_principal_id)
+        .bind(AgentBoxStatus::Active.as_ref())
+        .bind(metadata)
+        .fetch_one(&self.pool)
+        .await?;
+
+        row.try_into()
+    }
+
+    pub async fn get_agent_box(
+        &self,
+        box_id: &AgentBoxId,
+    ) -> Result<Option<AgentBox>, SessionStoreError> {
+        let row = sqlx::query_as::<_, AgentBoxRow>(
+            r#"
+            select
+                box_id,
+                profile_id,
+                owner_scope,
+                owner_key,
+                state_volume_key,
+                active_sandbox_id,
+                egress_principal_id,
+                status,
+                metadata,
+                created_at,
+                updated_at,
+                last_used_at
+            from agent_boxes
+            where box_id = $1
+            "#,
+        )
+        .bind(box_id.as_str())
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(TryInto::try_into).transpose()
+    }
+
+    pub async fn set_agent_box_sandbox(
+        &self,
+        box_id: &AgentBoxId,
+        active_sandbox_id: Option<&str>,
+        status: AgentBoxStatus,
+    ) -> Result<AgentBox, SessionStoreError> {
+        let row = sqlx::query_as::<_, AgentBoxRow>(
+            r#"
+            update agent_boxes
+            set
+                active_sandbox_id = $2,
+                status = $3,
+                updated_at = now(),
+                last_used_at = now()
+            where box_id = $1
+            returning
+                box_id,
+                profile_id,
+                owner_scope,
+                owner_key,
+                state_volume_key,
+                active_sandbox_id,
+                egress_principal_id,
+                status,
+                metadata,
+                created_at,
+                updated_at,
+                last_used_at
+            "#,
+        )
+        .bind(box_id.as_str())
+        .bind(active_sandbox_id)
+        .bind(status.as_ref())
+        .fetch_one(&self.pool)
+        .await?;
+
+        row.try_into()
+    }
+
+    pub async fn mark_agent_box_failed(
+        &self,
+        box_id: &AgentBoxId,
+        error: &str,
+    ) -> Result<AgentBox, SessionStoreError> {
+        let row = sqlx::query_as::<_, AgentBoxRow>(
+            r#"
+            update agent_boxes
+            set
+                status = $2,
+                metadata = metadata || jsonb_build_object('last_error', $3::text),
+                updated_at = now()
+            where box_id = $1
+            returning
+                box_id,
+                profile_id,
+                owner_scope,
+                owner_key,
+                state_volume_key,
+                active_sandbox_id,
+                egress_principal_id,
+                status,
+                metadata,
+                created_at,
+                updated_at,
+                last_used_at
+            "#,
+        )
+        .bind(box_id.as_str())
+        .bind(AgentBoxStatus::Failed.as_ref())
+        .bind(error)
+        .fetch_one(&self.pool)
+        .await?;
+
+        row.try_into()
+    }
+
+    pub async fn grant_agent_box_access(
+        &self,
+        box_id: &AgentBoxId,
+        principal_id: &AgentBoxPrincipalId,
+        role: AgentBoxAccessRole,
+    ) -> Result<AgentBoxAccessGrant, SessionStoreError> {
+        let row = sqlx::query_as::<_, AgentBoxAccessGrantRow>(
+            r#"
+            insert into agent_box_access_grants
+                (box_id, principal_id, role)
+            values ($1, $2, $3)
+            on conflict (box_id, principal_id) do update
+            set role = excluded.role, updated_at = now()
+            returning box_id, principal_id, role, created_at, updated_at
+            "#,
+        )
+        .bind(box_id.as_str())
+        .bind(principal_id.as_str())
+        .bind(role.as_ref())
+        .fetch_one(&self.pool)
+        .await?;
+
+        row.try_into()
+    }
+
     pub async fn update_harness_thread_id(
         &self,
         thread_key: &ThreadKey,
@@ -876,6 +1111,91 @@ impl TryFrom<SessionEventRow> for SessionEvent {
     }
 }
 
+#[derive(Debug, FromRow)]
+struct AgentProfileRow {
+    profile_id: String,
+    display_name: String,
+    distribution_ref: Option<String>,
+    metadata: Value,
+    created_at: OffsetDateTime,
+    updated_at: OffsetDateTime,
+}
+
+impl TryFrom<AgentProfileRow> for AgentProfile {
+    type Error = SessionStoreError;
+
+    fn try_from(row: AgentProfileRow) -> Result<Self, Self::Error> {
+        Ok(Self {
+            profile_id: parse_persisted(row.profile_id)?,
+            display_name: row.display_name,
+            distribution_ref: row.distribution_ref,
+            metadata: row.metadata,
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+        })
+    }
+}
+
+#[derive(Debug, FromRow)]
+struct AgentBoxRow {
+    box_id: String,
+    profile_id: String,
+    owner_scope: String,
+    owner_key: String,
+    state_volume_key: String,
+    active_sandbox_id: Option<String>,
+    egress_principal_id: Option<String>,
+    status: String,
+    metadata: Value,
+    created_at: OffsetDateTime,
+    updated_at: OffsetDateTime,
+    last_used_at: OffsetDateTime,
+}
+
+impl TryFrom<AgentBoxRow> for AgentBox {
+    type Error = SessionStoreError;
+
+    fn try_from(row: AgentBoxRow) -> Result<Self, Self::Error> {
+        Ok(Self {
+            box_id: parse_persisted(row.box_id)?,
+            profile_id: parse_persisted(row.profile_id)?,
+            owner_scope: parse_persisted(row.owner_scope)?,
+            owner_key: parse_persisted(row.owner_key)?,
+            state_volume_key: row.state_volume_key,
+            active_sandbox_id: row.active_sandbox_id,
+            egress_principal_id: row.egress_principal_id,
+            status: parse_persisted(row.status)?,
+            metadata: row.metadata,
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+            last_used_at: row.last_used_at,
+        })
+    }
+}
+
+#[derive(Debug, FromRow)]
+struct AgentBoxAccessGrantRow {
+    box_id: String,
+    principal_id: String,
+    role: String,
+    created_at: OffsetDateTime,
+    updated_at: OffsetDateTime,
+}
+
+impl TryFrom<AgentBoxAccessGrantRow> for AgentBoxAccessGrant {
+    type Error = SessionStoreError;
+
+    fn try_from(row: AgentBoxAccessGrantRow) -> Result<Self, Self::Error> {
+        Ok(Self {
+            box_id: parse_persisted(row.box_id)?,
+            principal_id: parse_persisted(row.principal_id)?,
+            role: parse_persisted(row.role)?,
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+        })
+    }
+}
+
 fn parse_persisted<T>(value: String) -> Result<T, SessionStoreError>
 where
     T: FromStr,
@@ -888,6 +1208,10 @@ where
 
 fn prefixed_id(prefix: &str) -> String {
     format!("{prefix}_{}", Uuid::new_v4().simple())
+}
+
+fn stable_box_volume_key(box_id: &str) -> String {
+    format!("agent-box-{}", box_id.replace('_', "-"))
 }
 
 pub fn default_metadata(metadata: Option<Value>) -> Value {

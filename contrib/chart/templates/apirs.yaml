@@ -41,7 +41,7 @@ rules:
     verbs: ["create", "delete", "get", "list", "watch"]
   - apiGroups: [""]
     resources: ["persistentvolumeclaims"]
-    verbs: ["delete", "get", "list", "watch"]
+    verbs: ["create", "delete", "get", "list", "watch"]
   - apiGroups: [""]
     resources: ["services"]
     verbs: ["create", "delete", "get", "list", "watch"]
@@ -143,6 +143,14 @@ spec:
               value: {{ .Values.apiRs.codeModeMcp.timeoutSeconds | quote }}
             - name: CODEMODE_MAX_CONCURRENCY
               value: {{ .Values.apiRs.codeModeMcp.maxConcurrency | quote }}
+            - name: CODEMODE_BOX_PROFILE_ID
+              value: {{ .Values.apiRs.codeModeMcp.boxProfileId | quote }}
+            - name: CODEMODE_BOX_PROFILE_DISPLAY_NAME
+              value: {{ .Values.apiRs.codeModeMcp.boxProfileDisplayName | quote }}
+{{- if .Values.apiRs.codeModeMcp.boxProfileDistributionRef }}
+            - name: CODEMODE_BOX_PROFILE_DISTRIBUTION_REF
+              value: {{ .Values.apiRs.codeModeMcp.boxProfileDistributionRef | quote }}
+{{- end }}
 {{- end }}
 {{- if .Values.overlay.systemPrompt }}
             - name: CENTAUR_OVERLAY_DIR
@@ -158,6 +166,16 @@ spec:
               value: {{ .Values.apiRs.sandboxWarmPoolSize | quote }}
             - name: SESSION_SANDBOX_WARM_POOL_REPLENISH_INTERVAL_SECS
               value: {{ .Values.apiRs.sandboxWarmPoolReplenishIntervalSecs | quote }}
+            - name: SESSION_SANDBOX_STATE_VOLUME_ENABLED
+              value: {{ .Values.sandbox.stateVolume.enabled | quote }}
+            - name: SESSION_SANDBOX_STATE_VOLUME_MOUNT_PATH
+              value: {{ .Values.sandbox.stateVolume.mountPath | quote }}
+            - name: SESSION_SANDBOX_STATE_VOLUME_SIZE
+              value: {{ .Values.sandbox.stateVolume.size | quote }}
+{{- if .Values.sandbox.stateVolume.storageClassName }}
+            - name: SESSION_SANDBOX_STATE_VOLUME_STORAGE_CLASS_NAME
+              value: {{ .Values.sandbox.stateVolume.storageClassName | quote }}
+{{- end }}
             - name: SESSION_SANDBOX_K8S_NAMESPACE
               value: {{ .Release.Namespace | quote }}
             - name: SESSION_SANDBOX_IMAGE

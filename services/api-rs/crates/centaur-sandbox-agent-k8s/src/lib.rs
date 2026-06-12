@@ -232,6 +232,28 @@ impl AgentSandboxBackend {
         }
     }
 
+    async fn ensure_named_volume_claims(&self, spec: &SandboxSpec) -> SandboxResult<()> {
+        let Some(state_volume) = &self.config.state_volume else {
+            return Ok(());
+        };
+        for mount in &spec.mounts {
+            let MountKind::NamedVolume(claim_name) = &mount.kind else {
+                continue;
+            };
+            let pvc = named_volume_claim_json(claim_name, state_volume)?;
+            match self
+                .persistent_volume_claims()
+                .create(&PostParams::default(), &pvc)
+                .await
+            {
+                Ok(_) => {}
+                Err(err) if is_already_exists(&err) => {}
+                Err(err) => return Err(map_kube_error("create named volume pvc", err)),
+            }
+        }
+        Ok(())
+    }
+
     async fn wait_until_running(&self, id: &SandboxId) -> SandboxResult<()> {
         let deadline = Instant::now() + self.config.ready_timeout;
         loop {
@@ -300,6 +322,7 @@ impl SandboxBackend for AgentSandboxBackend {
     async fn create(&self, spec: SandboxSpec) -> SandboxResult<SandboxHandle> {
         let id = SandboxId::new(next_sandbox_name());
         let mut spec = spec;
+        self.ensure_named_volume_claims(&spec).await?;
         let resolved_iron_proxy = self.resolve_iron_proxy(&id, &spec).await?;
         if let Some(resolved) = &resolved_iron_proxy {
             iron_proxy::apply_proxy_env(&mut spec, resolved);
@@ -534,7 +557,14 @@ fn build_agent_sandbox(
 
     let (mut volumes, mut volume_mounts) = mount_json(spec);
     let mut init_containers = Vec::new();
-    if let Some(state_volume) = &config.state_volume {
+    let explicit_state_mount = config.state_volume.as_ref().is_some_and(|state_volume| {
+        spec.mounts
+            .iter()
+            .any(|mount| mount.target_path == state_volume.mount_path)
+    });
+    if let Some(state_volume) = &config.state_volume
+        && !explicit_state_mount
+    {
         volume_mounts.push(json!({
             "name": "state",
             "mountPath": state_volume.mount_path,
@@ -625,7 +655,11 @@ fn build_agent_sandbox(
     insert_optional(
         &mut agent_spec,
         "volumeClaimTemplates",
-        config.state_volume.as_ref().map(state_volume_claim_json),
+        config
+            .state_volume
+            .as_ref()
+            .filter(|_| !explicit_state_mount)
+            .map(state_volume_claim_template_json),
     );
 
     let mut annotations = config.annotations.clone();
@@ -689,7 +723,7 @@ fn resources_json(spec: &SandboxSpec) -> Option<Value> {
     (!limits.is_empty()).then(|| json!({ "limits": limits }))
 }
 
-fn state_volume_claim_json(state_volume: &StateVolumeConfig) -> Vec<Value> {
+fn state_volume_claim_template_json(state_volume: &StateVolumeConfig) -> Vec<Value> {
     let mut pvc_spec = json!({
         "accessModes": ["ReadWriteOnce"],
         "resources": {
@@ -709,6 +743,32 @@ fn state_volume_claim_json(state_volume: &StateVolumeConfig) -> Vec<Value> {
         },
         "spec": pvc_spec,
     })]
+}
+
+fn named_volume_claim_json(
+    claim_name: &str,
+    state_volume: &StateVolumeConfig,
+) -> SandboxResult<PersistentVolumeClaim> {
+    let mut pvc = json!({
+        "metadata": {
+            "name": claim_name,
+        },
+        "spec": {
+            "accessModes": ["ReadWriteOnce"],
+            "resources": {
+                "requests": {
+                    "storage": state_volume.size,
+                },
+            },
+        },
+    });
+    insert_optional(
+        &mut pvc["spec"],
+        "storageClassName",
+        state_volume.storage_class_name.clone(),
+    );
+    serde_json::from_value(pvc)
+        .map_err(|err| SandboxError::InvalidSpec(format!("invalid named volume PVC: {err}")))
 }
 
 fn state_pvc_name(id: &SandboxId) -> String {
@@ -747,6 +807,10 @@ fn is_not_found(err: &Error) -> bool {
     matches!(err, Error::Api(api_error) if api_error.code == 404)
 }
 
+fn is_already_exists(err: &Error) -> bool {
+    matches!(err, Error::Api(api_error) if api_error.code == 409)
+}
+
 fn map_kube_error(operation: &str, err: Error) -> SandboxError {
     if is_not_found(&err) {
         SandboxError::NotFound(operation.to_owned())
@@ -757,8 +821,9 @@ fn map_kube_error(operation: &str, err: Error) -> SandboxError {
 
 #[cfg(test)]
 mod tests {
-    use centaur_sandbox_core::{ResourceLimits, SandboxSpec};
+    use centaur_sandbox_core::{Mount, ResourceLimits, SandboxSpec};
     use k8s_openapi::api::core::v1::{PodCondition, PodStatus};
+    use serde_json::json;
 
     use super::*;
 
@@ -801,6 +866,55 @@ mod tests {
         assert_eq!(container.stdin, Some(true));
         assert_eq!(container.volume_mounts.as_ref().unwrap().len(), 2);
         assert!(container.resources.as_ref().unwrap().limits.is_some());
+    }
+
+    #[test]
+    fn named_state_volume_replaces_sandbox_owned_state_template() {
+        let spec = SandboxSpec::new("centaur-agent:latest").mount(Mount::new(
+            MountKind::NamedVolume("agent-box-abox-123".to_owned()),
+            "/home/agent/state",
+        ));
+        let config = AgentSandboxConfig::new("centaur")
+            .state_volume(StateVolumeConfig::new("/home/agent/state", "10Gi"));
+
+        let sandbox = build_agent_sandbox(&SandboxId::new("asbx-test"), &spec, &config).unwrap();
+
+        assert!(sandbox.spec.volume_claim_templates.is_none());
+        let container = &sandbox.spec.pod_template.spec.containers[0];
+        let mounts = container.volume_mounts.as_ref().unwrap();
+        assert_eq!(
+            mounts
+                .iter()
+                .filter(|mount| mount.mount_path == "/home/agent/state")
+                .count(),
+            1
+        );
+        let state_mount = mounts
+            .iter()
+            .find(|mount| mount.mount_path == "/home/agent/state")
+            .unwrap();
+        let volumes = sandbox.spec.pod_template.spec.volumes.as_ref().unwrap();
+        let state_volume = volumes
+            .iter()
+            .find(|volume| volume.name == state_mount.name)
+            .unwrap();
+        let claim = state_volume.persistent_volume_claim.as_ref().unwrap();
+        assert_eq!(claim.claim_name, "agent-box-abox-123");
+        assert_eq!(claim.read_only, Some(false));
+    }
+
+    #[test]
+    fn named_volume_claim_uses_state_volume_storage_settings() {
+        let state_volume =
+            StateVolumeConfig::new("/home/agent/state", "10Gi").storage_class_name("fast");
+
+        let pvc = named_volume_claim_json("agent-box-abox-123", &state_volume).unwrap();
+        let encoded = serde_json::to_value(pvc).unwrap();
+
+        assert_eq!(encoded["metadata"]["name"], "agent-box-abox-123");
+        assert_eq!(encoded["spec"]["accessModes"], json!(["ReadWriteOnce"]));
+        assert_eq!(encoded["spec"]["resources"]["requests"]["storage"], "10Gi");
+        assert_eq!(encoded["spec"]["storageClassName"], "fast");
     }
 
     #[test]

@@ -149,6 +149,7 @@ sandbox:
   extraEnv: {}
   stateVolume:
     enabled: false
+    mountPath: /home/agent/state
     size: 10Gi
     storageClassName: ""
   resources:
@@ -243,9 +244,8 @@ apiRs:
     periodSeconds: 10
     timeoutSeconds: 5
   terminationGracePeriodSeconds: 35
-  # Code Mode MCP is served by api-rs at /mcp. Scripts execute in Centaur
-  # sandboxes via harness-server codemode-exec, so Kubernetes mode uses the
-  # normal per-sandbox iron-proxy and principal binding path.
+  # Code Mode MCP is served by api-rs at /mcp. Scripts execute in durable
+  # principal-owned Centaur boxes through harness-server multiplexer.
   codeModeMcp:
     enabled: false
     bootstrap: true
@@ -253,6 +253,9 @@ apiRs:
     maxOutputBytes: 10000
     timeoutSeconds: 120
     maxConcurrency: 8
+    boxProfileId: codemode-default
+    boxProfileDisplayName: Code Mode
+    boxProfileDistributionRef: ""
   extraEnv: {}
   resources: {}
 

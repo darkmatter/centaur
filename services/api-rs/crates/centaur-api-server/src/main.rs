@@ -33,7 +33,7 @@ async fn main() -> Result<(), ServerError> {
         .as_ref()
         .map(|runtime| runtime.registrar.clone());
     let codemode = args
-        .codemode_mcp_config(sandbox_runtime.clone(), codemode_registrar)
+        .codemode_mcp_config(store.clone(), sandbox_runtime.clone(), codemode_registrar)
         .await?;
     if let Some(iron_control) = iron_control {
         info!("iron-control session registration enabled");

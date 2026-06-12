@@ -1,6 +1,7 @@
 use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
 
 use axum::Router;
+use centaur_iron_control::SessionRegistrar;
 use centaur_sandbox_core::{SandboxId, SandboxIoGuard, SandboxRead, SandboxSpec, SandboxWrite};
 use centaur_session_runtime::SandboxRuntime;
 use rmcp::{
@@ -26,6 +27,7 @@ pub struct CodeModeMcpConfig {
     pub runtime: SandboxRuntime,
     pub sandbox_spec: SandboxSpec,
     pub index_path: PathBuf,
+    pub iron_control: Option<SessionRegistrar>,
     pub max_output_bytes: usize,
     pub default_timeout_seconds: u64,
     pub default_principal: String,
@@ -134,7 +136,10 @@ impl CodeModeServer {
         }): Parameters<RunPythonParams>,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
-        let principal = self.executor.principal_from_context(&context);
+        let principal = self
+            .executor
+            .resolve_principal(self.executor.principal_from_context(&context))
+            .await?;
         let output = self
             .executor
             .run_python(&principal, script, timeout_seconds)
@@ -177,6 +182,21 @@ struct SandboxSession {
 }
 
 #[derive(Debug)]
+struct PrincipalRequest {
+    key: String,
+    name: Option<String>,
+    thread_key: Option<String>,
+    slack_user_id: Option<String>,
+}
+
+#[derive(Debug)]
+struct ResolvedPrincipal {
+    session_key: String,
+    env_principal: String,
+    iron_control_principal: Option<String>,
+}
+
+#[derive(Debug)]
 struct PythonRunOutput {
     output: String,
     is_error: bool,
@@ -191,21 +211,65 @@ impl CodeModeExecutor {
         }
     }
 
-    fn principal_from_context(&self, context: &RequestContext<RoleServer>) -> String {
-        context
-            .extensions
-            .get::<http::request::Parts>()
-            .and_then(|parts| parts.headers.get("x-centaur-principal"))
-            .and_then(|value| value.to_str().ok())
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(ToOwned::to_owned)
-            .unwrap_or_else(|| self.config.default_principal.clone())
+    fn principal_from_context(&self, context: &RequestContext<RoleServer>) -> PrincipalRequest {
+        let parts = context.extensions.get::<http::request::Parts>();
+        let thread_key = header_value(parts, "x-centaur-thread-key");
+        let slack_user_id = header_value(parts, "x-centaur-slack-user-id")
+            .or_else(|| header_value(parts, "x-slack-user-id"));
+        let principal = header_value(parts, "x-centaur-principal")
+            .or_else(|| thread_key.clone())
+            .unwrap_or_else(|| self.config.default_principal.clone());
+        PrincipalRequest {
+            key: principal,
+            name: header_value(parts, "x-centaur-principal-name"),
+            thread_key,
+            slack_user_id,
+        }
+    }
+
+    async fn resolve_principal(
+        &self,
+        request: PrincipalRequest,
+    ) -> Result<ResolvedPrincipal, ErrorData> {
+        let Some(registrar) = &self.config.iron_control else {
+            return Ok(ResolvedPrincipal {
+                session_key: request.key.clone(),
+                env_principal: request.key,
+                iron_control_principal: None,
+            });
+        };
+
+        if request.key.starts_with("prn_") {
+            return Ok(ResolvedPrincipal {
+                session_key: request.key.clone(),
+                env_principal: request.key.clone(),
+                iron_control_principal: Some(request.key),
+            });
+        }
+
+        let principal = if let Some(thread_key) = request.thread_key.as_deref() {
+            registrar
+                .register_session(thread_key, request.slack_user_id.as_deref())
+                .await
+        } else {
+            registrar
+                .register_foreign_principal(&request.key, request.name.as_deref())
+                .await
+        }
+        .map_err(|err| {
+            ErrorData::internal_error(format!("registering Code Mode principal: {err}"), None)
+        })?;
+
+        Ok(ResolvedPrincipal {
+            session_key: principal.id.clone(),
+            env_principal: principal.foreign_id.unwrap_or(principal.id.clone()),
+            iron_control_principal: Some(principal.id),
+        })
     }
 
     async fn run_python(
         &self,
-        principal: &str,
+        principal: &ResolvedPrincipal,
         script: String,
         timeout_seconds: Option<u64>,
     ) -> Result<PythonRunOutput, ErrorData> {
@@ -215,7 +279,12 @@ impl CodeModeExecutor {
         {
             Ok(output) => Ok(output),
             Err(first) => {
-                tracing::warn!(%principal, error = %first, "Code Mode sandbox exec failed; reclaiming once");
+                tracing::warn!(
+                    principal = %principal.env_principal,
+                    session_key = %principal.session_key,
+                    error = %first,
+                    "Code Mode sandbox exec failed; reclaiming once"
+                );
                 self.drop_session(principal).await;
                 self.run_python_once(principal, script, timeout_seconds)
                     .await
@@ -225,7 +294,7 @@ impl CodeModeExecutor {
 
     async fn run_python_once(
         &self,
-        principal: &str,
+        principal: &ResolvedPrincipal,
         script: String,
         timeout_seconds: Option<u64>,
     ) -> Result<PythonRunOutput, ErrorData> {
@@ -235,7 +304,7 @@ impl CodeModeExecutor {
             script,
             timeout_seconds,
             max_output_bytes: Some(self.config.max_output_bytes),
-            principal: Some(principal.to_owned()),
+            principal: Some(principal.env_principal.clone()),
         };
         let request_id = request.id.clone();
         let (tx, rx) = oneshot::channel();
@@ -272,19 +341,34 @@ impl CodeModeExecutor {
         })
     }
 
-    async fn session(&self, principal: &str) -> Result<Arc<SandboxSession>, ErrorData> {
-        if let Some(session) = self.sessions.lock().await.get(principal).cloned() {
+    async fn session(
+        &self,
+        principal: &ResolvedPrincipal,
+    ) -> Result<Arc<SandboxSession>, ErrorData> {
+        if let Some(session) = self
+            .sessions
+            .lock()
+            .await
+            .get(&principal.session_key)
+            .cloned()
+        {
             return Ok(session);
         }
         let _claim_guard = self.claim_lock.lock().await;
-        if let Some(session) = self.sessions.lock().await.get(principal).cloned() {
+        if let Some(session) = self
+            .sessions
+            .lock()
+            .await
+            .get(&principal.session_key)
+            .cloned()
+        {
             return Ok(session);
         }
 
         let mut spec = self.config.sandbox_spec.clone();
-        spec = spec.env("CENTAUR_CODEMODE_PRINCIPAL", principal);
-        if principal.starts_with("prn_") {
-            spec.iron_control_principal = Some(principal.to_owned());
+        spec = spec.env("CENTAUR_CODEMODE_PRINCIPAL", &principal.env_principal);
+        if let Some(iron_control_principal) = &principal.iron_control_principal {
+            spec.iron_control_principal = Some(iron_control_principal.clone());
         }
         let (sandbox_id, io) =
             self.config
@@ -312,21 +396,31 @@ impl CodeModeExecutor {
         self.sessions
             .lock()
             .await
-            .insert(principal.to_owned(), Arc::clone(&session));
+            .insert(principal.session_key.clone(), Arc::clone(&session));
         tracing::info!(
-            principal,
+            principal = %principal.env_principal,
+            session_key = %principal.session_key,
             sandbox_id = %sandbox_id.as_str(),
             "claimed Code Mode sandbox"
         );
         Ok(session)
     }
 
-    async fn drop_session(&self, principal: &str) {
-        let session = self.sessions.lock().await.remove(principal);
+    async fn drop_session(&self, principal: &ResolvedPrincipal) {
+        let session = self.sessions.lock().await.remove(&principal.session_key);
         if let Some(session) = session {
             let _ = self.config.runtime.stop_sandbox(&session.sandbox_id).await;
         }
     }
+}
+
+fn header_value(parts: Option<&http::request::Parts>, name: &'static str) -> Option<String> {
+    parts
+        .and_then(|parts| parts.headers.get(name))
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
 }
 
 async fn read_responses(

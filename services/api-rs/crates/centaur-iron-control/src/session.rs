@@ -7,8 +7,9 @@
 
 use crate::IronControlClient;
 use crate::error::Result;
-use crate::models::Principal;
-use crate::principal::derive_principal;
+use crate::models::{IdentityInput, Principal};
+use crate::principal::{PrincipalRef, derive_principal};
+use crate::util::managed_labels;
 
 /// Registers a session's principal against iron-control at session start.
 ///
@@ -47,9 +48,34 @@ impl SessionRegistrar {
         slack_user_id: Option<&str>,
     ) -> Result<Principal> {
         let principal = derive_principal(thread_key, slack_user_id);
+        self.register_principal_ref(principal).await
+    }
+
+    /// Upsert a stable principal foreign id directly and assign the configured
+    /// roles. Code Mode uses this for authenticated MCP users, where the
+    /// request has already resolved to a user principal rather than a Centaur
+    /// thread key.
+    pub async fn register_foreign_principal(
+        &self,
+        foreign_id: &str,
+        name: Option<&str>,
+    ) -> Result<Principal> {
+        let principal = PrincipalRef {
+            foreign_id: foreign_id.to_owned(),
+            name: name.unwrap_or(foreign_id).to_owned(),
+        };
+        self.register_principal_ref(principal).await
+    }
+
+    async fn register_principal_ref(&self, principal: PrincipalRef) -> Result<Principal> {
         let record = self
             .client
-            .upsert_principal(&principal.to_identity_input(&self.namespace))
+            .upsert_principal(&IdentityInput {
+                namespace: self.namespace.clone(),
+                foreign_id: principal.foreign_id,
+                name: principal.name,
+                labels: managed_labels(),
+            })
             .await?;
         for role_id in &self.assign_role_ids {
             self.client.assign_role(&record.id, role_id).await?;

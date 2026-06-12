@@ -95,8 +95,11 @@ impl Args {
     pub(crate) async fn codemode_mcp_config(
         &self,
         sandbox_runtime: SandboxRuntime,
+        iron_control: Option<SessionRegistrar>,
     ) -> Result<Option<CodeModeMcpConfig>, ServerError> {
-        self.codemode.config(&self.sandbox, sandbox_runtime).await
+        self.codemode
+            .config(&self.sandbox, sandbox_runtime, iron_control)
+            .await
     }
 }
 
@@ -399,6 +402,8 @@ fn slug_path_component(value: &str) -> String {
 struct IronControlArgs {
     #[arg(long = "iron-control-url", env = "IRON_CONTROL_URL")]
     url: Option<String>,
+    #[arg(long = "iron-control-proxy-url", env = "IRON_CONTROL_PROXY_URL")]
+    proxy_url: Option<String>,
     #[arg(long = "iron-control-api-key", env = "IRON_CONTROL_API_KEY")]
     api_key: Option<String>,
     #[arg(
@@ -421,9 +426,10 @@ impl IronControlArgs {
     /// is configured.
     fn settings(&self) -> Option<IronControlSettings> {
         let url = non_empty(self.url.as_deref())?;
+        let proxy_url = non_empty(self.proxy_url.as_deref()).unwrap_or(url);
         Some(IronControlSettings {
             client: self.client()?,
-            control_url: url.to_owned(),
+            control_url: proxy_url.to_owned(),
             namespace: self.namespace.clone(),
         })
     }
@@ -505,6 +511,7 @@ impl CodeModeArgs {
         &self,
         sandbox: &SandboxArgs,
         runtime: SandboxRuntime,
+        iron_control: Option<SessionRegistrar>,
     ) -> Result<Option<CodeModeMcpConfig>, ServerError> {
         if !self.enabled {
             return Ok(None);
@@ -528,6 +535,7 @@ impl CodeModeArgs {
             runtime,
             sandbox_spec,
             index_path: bin_dir.join(".centaur-tools.json"),
+            iron_control,
             max_output_bytes: self.max_output_bytes,
             default_timeout_seconds: self.default_timeout_seconds,
             default_principal: self.default_principal.clone(),

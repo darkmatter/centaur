@@ -1,5 +1,5 @@
 [package]
-name = "acme-rust"
+name = "darkmatter-rust"
 version = "0.1.0"
 edition = "2021"
 

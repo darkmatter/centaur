@@ -1,4 +1,4 @@
-from tools.acme_crm.client import (
+from tools.darkmatter_crm.client import (
     get_account,
     health_summary,
     list_accounts,
@@ -26,4 +26,4 @@ def test_health_summary_marks_sample_data():
 def test_support_playbook_has_live_overlay_marker():
     playbook = support_playbook()
 
-    assert playbook["marker"] == "acme-live-overlay-2026-06-02"
+    assert playbook["marker"] == "darkmatter-live-overlay-2026-06-02"

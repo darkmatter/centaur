@@ -43,7 +43,7 @@ def health_summary() -> dict[str, object]:
 
 def support_playbook() -> dict[str, object]:
     return {
-        "marker": "acme-live-overlay-2026-06-02",
+        "marker": "darkmatter-live-overlay-2026-06-02",
         "priority_levels": ["low", "medium", "high"],
         "owner_action": "Send a concise account-owner next step after triage.",
         "sample_data": True,

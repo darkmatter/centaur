@@ -6,7 +6,7 @@ fn main() {
         Some("ping") => println!("rust-ok"),
         Some("health") => println!(r#"{{"runtime":"rust","ok":true}}"#),
         _ => {
-            eprintln!("usage: acme-rust <ping|health>");
+            eprintln!("usage: darkmatter-rust <ping|health>");
             process::exit(2);
         }
     }

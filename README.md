@@ -18,7 +18,7 @@
 
 ## Overview
 
-`centaur-acme` is a public, forkable template for creating an organization
+`centaur-darkmatter` is a public, forkable template for creating an organization
 overlay for [Centaur](https://github.com/paradigmxyz/centaur). It is
 intentionally small and free of private data. Use it as the starting point for
 shipping org-specific capabilities without forking the core platform.
@@ -26,7 +26,7 @@ shipping org-specific capabilities without forking the core platform.
 The overlay image is copied into Centaur at runtime:
 
 ```text
-centaur-acme repo
+centaur-darkmatter repo
     |
     v
 overlay image
@@ -39,7 +39,7 @@ overlay image
 
 1. Click **Use this template** in GitHub, or fork the repo if you want to keep a
    visible upstream relationship.
-2. Rename ACME examples to your organization or team name.
+2. Rename darkmatter examples to your organization or team name.
 3. Replace the toy CRM tool with one small real integration.
 4. Update the sandbox prompt and skill to match the behavior your agents should
    follow.
@@ -62,12 +62,12 @@ The template demonstrates the extension points an organization normally owns:
 
 ```text
 .
-├── .agents/skills/acme-support/     # sandbox skill loaded with the overlay
+├── .agents/skills/darkmatter-support/     # sandbox skill loaded with the overlay
 ├── services/sandbox/SYSTEM_PROMPT.md
-├── tools/acme_crm/                  # packaged Python CLI tool with sample data
-├── tools/acme_go/                   # minimal Go CLI tool
-├── tools/acme_rust/                 # minimal Rust CLI tool
-├── workflows/daily_acme_brief.py    # example durable workflow
+├── tools/darkmatter_crm/                  # packaged Python CLI tool with sample data
+├── tools/darkmatter_go/                   # minimal Go CLI tool
+├── tools/darkmatter_rust/                 # minimal Rust CLI tool
+├── workflows/daily_darkmatter_brief.py    # example durable workflow
 ├── tests/
 └── Dockerfile                       # copies the overlay to /overlay
 ```
@@ -94,19 +94,19 @@ overlay:
 ```
 
 For the full GitOps example, pair this repo with
-[`centaur-acme-infra`](https://github.com/paradigmxyz/centaur-acme-infra).
+[`centaur-darkmatter-infra`](https://github.com/paradigmxyz/centaur-darkmatter-infra).
 
 ## Included examples
 
-`tools/acme_crm` is a packaged Python CLI tool with no external credentials.
-`tools/acme_rust` and `tools/acme_go` are tiny compiled CLI examples that prove
+`tools/darkmatter_crm` is a packaged Python CLI tool with no external credentials.
+`tools/darkmatter_rust` and `tools/darkmatter_go` are tiny compiled CLI examples that prove
 an overlay can ship source-built tools across the supported runtimes.
 
-`workflows/daily_acme_brief.py` is a minimal recurring workflow that asks an
+`workflows/daily_darkmatter_brief.py` is a minimal recurring workflow that asks an
 agent for a daily operating summary.
 
-`.agents/skills/acme-support/SKILL.md` is a sandbox skill that demonstrates how
-ACME-specific playbooks are packaged.
+`.agents/skills/darkmatter-support/SKILL.md` is a sandbox skill that demonstrates how
+darkmatter-specific playbooks are packaged.
 
 `services/sandbox/SYSTEM_PROMPT.md` is appended to the base sandbox prompt when
 the overlay is mounted.

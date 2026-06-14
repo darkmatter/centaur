@@ -13,7 +13,7 @@ def emit(payload: object) -> None:
 
 @click.group()
 def main() -> None:
-    """Example ACME CRM tool."""
+    """Example darkmatter CRM tool."""
 
 
 @main.command()

@@ -3,5 +3,5 @@
 version = 4
 
 [[package]]
-name = "acme-rust"
+name = "darkmatter-rust"
 version = "0.1.0"

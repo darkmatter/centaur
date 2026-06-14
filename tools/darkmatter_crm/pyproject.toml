@@ -1,5 +1,5 @@
 [project]
-name = "acme-crm"
+name = "darkmatter-crm"
 version = "0.1.0"
 description = "Example Centaur overlay CRM tool"
 requires-python = ">=3.11"
@@ -7,13 +7,13 @@ license = "Apache-2.0 OR MIT"
 dependencies = ["click>=8.1.7"]
 
 [project.scripts]
-acme-crm = "centaur_tool_acme_crm.cli:main"
+darkmatter-crm = "centaur_tool_darkmatter_crm.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["."]
 
 [tool.hatch.build.targets.wheel.sources]
-"." = "centaur_tool_acme_crm"
+"." = "centaur_tool_darkmatter_crm"
 
 [build-system]
 requires = ["hatchling"]

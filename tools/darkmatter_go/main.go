@@ -7,7 +7,7 @@ import (
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: acme-go <ping|health>")
+		fmt.Fprintln(os.Stderr, "usage: darkmatter-go <ping|health>")
 		os.Exit(2)
 	}
 
@@ -17,7 +17,7 @@ func main() {
 	case "health":
 		fmt.Println(`{"runtime":"go","ok":true}`)
 	default:
-		fmt.Fprintln(os.Stderr, "usage: acme-go <ping|health>")
+		fmt.Fprintln(os.Stderr, "usage: darkmatter-go <ping|health>")
 		os.Exit(2)
 	}
 }

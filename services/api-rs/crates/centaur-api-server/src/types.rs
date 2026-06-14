@@ -24,6 +24,29 @@ pub struct AppendMessagesResponse {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct UploadAttachmentRequest {
+    pub thread_key: ThreadKey,
+    pub name: String,
+    pub mime_type: String,
+    pub data: String,
+    #[serde(default)]
+    pub source_url: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct UploadAttachmentResponse {
+    pub id: String,
+    pub name: String,
+    pub mime_type: String,
+    pub download_url: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct DownloadAttachmentQuery {
+    pub thread_key: ThreadKey,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ExecuteSessionRequest {
     pub idempotency_key: Option<String>,
     pub metadata: Option<Value>,

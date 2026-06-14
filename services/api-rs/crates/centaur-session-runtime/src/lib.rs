@@ -4,6 +4,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 
+use base64::{Engine as _, engine::general_purpose};
 use centaur_iron_control::SessionRegistrar;
 use centaur_sandbox_core::{
     Mount, SandboxBackend, SandboxError, SandboxId, SandboxIoGuard, SandboxRead, SandboxSpec,
@@ -18,7 +19,7 @@ use centaur_session_core::{
     SessionMessageInput, ThreadKey,
 };
 use centaur_session_sqlx::{
-    PgSessionStore, SessionEventListener, SessionStoreError, default_metadata,
+    AttachmentRecord, PgSessionStore, SessionEventListener, SessionStoreError, default_metadata,
 };
 use centaur_telemetry::{
     record_sandbox_warm_pool_claim, record_session_execution_finished,
@@ -315,7 +316,10 @@ impl SessionRuntime {
                 message_count = messages.len(),
                 "appending session messages"
             );
-            let message_ids = self.store.append_messages(thread_key, messages).await?;
+            let messages = self
+                .materialize_message_attachments(thread_key, messages)
+                .await?;
+            let message_ids = self.store.append_messages(thread_key, &messages).await?;
             info!(
                 component = COMPONENT_SESSION_RUNTIME,
                 event = "session_messages_append_completed",
@@ -343,9 +347,117 @@ impl SessionRuntime {
                 return Err(error);
             }
         };
-        self.forward_messages_to_active_execution(thread_key, messages, &message_ids)
+        let stored_messages = self.store.list_messages(thread_key).await?;
+        let appended_messages = message_ids
+            .iter()
+            .filter_map(|message_id| {
+                stored_messages
+                    .iter()
+                    .find(|message| message.message_id == *message_id)
+                    .map(|message| SessionMessageInput {
+                        client_message_id: message.client_message_id.clone(),
+                        role: message.role.clone(),
+                        parts: message.parts.clone(),
+                        metadata: message.metadata.clone(),
+                    })
+            })
+            .collect::<Vec<_>>();
+        self.forward_messages_to_active_execution(thread_key, &appended_messages, &message_ids)
             .await;
         Ok(message_ids)
+    }
+
+    pub async fn create_attachment(
+        &self,
+        thread_key: &ThreadKey,
+        name: &str,
+        mime_type: &str,
+        data: &[u8],
+        source_url: Option<&str>,
+    ) -> Result<AttachmentRecord, SessionRuntimeError> {
+        Ok(self
+            .store
+            .create_attachment(thread_key, name, mime_type, data, source_url)
+            .await?)
+    }
+
+    pub async fn get_attachment(
+        &self,
+        thread_key: &ThreadKey,
+        attachment_id: &str,
+    ) -> Result<AttachmentRecord, SessionRuntimeError> {
+        Ok(self.store.get_attachment(thread_key, attachment_id).await?)
+    }
+
+    async fn materialize_message_attachments(
+        &self,
+        thread_key: &ThreadKey,
+        messages: &[SessionMessageInput],
+    ) -> Result<Vec<SessionMessageInput>, SessionRuntimeError> {
+        let mut normalized = Vec::with_capacity(messages.len());
+        for message in messages {
+            let mut parts = Vec::with_capacity(message.parts.len());
+            for part in &message.parts {
+                parts.push(self.materialize_attachment_part(thread_key, part).await?);
+            }
+            normalized.push(SessionMessageInput {
+                client_message_id: message.client_message_id.clone(),
+                role: message.role.clone(),
+                parts,
+                metadata: message.metadata.clone(),
+            });
+        }
+        Ok(normalized)
+    }
+
+    async fn materialize_attachment_part(
+        &self,
+        thread_key: &ThreadKey,
+        part: &Value,
+    ) -> Result<Value, SessionRuntimeError> {
+        let Some(object) = part.as_object() else {
+            return Ok(part.clone());
+        };
+        if object.get("type").and_then(|value| value.as_str()) != Some("attachment") {
+            return Ok(part.clone());
+        }
+        let Some(data_base64) = object.get("dataBase64").and_then(|value| value.as_str()) else {
+            return Ok(part.clone());
+        };
+
+        let data = general_purpose::STANDARD
+            .decode(data_base64)
+            .map_err(|error| {
+                SessionRuntimeError::BadRequest(format!("invalid attachment dataBase64: {error}"))
+            })?;
+        let name = object
+            .get("name")
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or("attachment");
+        let mime_type = object
+            .get("mimeType")
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or("application/octet-stream");
+        let source_url = object.get("url").and_then(|value| value.as_str());
+        let attachment = self
+            .store
+            .create_attachment(thread_key, name, mime_type, &data, source_url)
+            .await?;
+
+        Ok(json!({
+            "type": "attachment_ref",
+            "attachment_id": attachment.id,
+            "name": attachment.name,
+            "mimeType": attachment.mime_type,
+            "size": attachment.data.len(),
+            "attachment_type": object
+                .get("attachment_type")
+                .or_else(|| object.get("attachmentType"))
+                .cloned()
+                .unwrap_or_else(|| Value::String("file".to_owned())),
+        }))
     }
 
     /// Stop every non-terminal sandbox the backend currently owns.

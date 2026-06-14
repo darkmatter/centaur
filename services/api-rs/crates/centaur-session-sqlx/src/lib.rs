@@ -6,7 +6,7 @@ use centaur_session_core::{
     ExecutionStatus, HarnessType, Session, SessionEvent, SessionExecution, SessionMessage,
     SessionMessageInput, SessionStatus, ThreadKey, empty_object,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::{
     FromRow, PgPool,
@@ -20,6 +20,17 @@ static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
 pub const SESSION_EVENTS_CHANNEL: &str = "centaur_session_events";
 const DEFAULT_MAX_CONNECTIONS: u32 = 500;
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AttachmentRecord {
+    pub id: String,
+    pub thread_key: ThreadKey,
+    pub name: String,
+    pub mime_type: String,
+    pub data: Vec<u8>,
+    pub source_url: Option<String>,
+    pub created_at: OffsetDateTime,
+}
 
 #[derive(Clone, Debug)]
 pub struct CreateExecutionResult {
@@ -181,6 +192,58 @@ impl PgSessionStore {
         .await?;
 
         rows.into_iter().map(TryInto::try_into).collect()
+    }
+
+    pub async fn create_attachment(
+        &self,
+        thread_key: &ThreadKey,
+        name: &str,
+        mime_type: &str,
+        data: &[u8],
+        source_url: Option<&str>,
+    ) -> Result<AttachmentRecord, SessionStoreError> {
+        let id = prefixed_id("att");
+        let row = sqlx::query_as::<_, AttachmentRow>(
+            r#"
+            insert into attachments (id, thread_key, name, mime_type, data, source_url)
+            values ($1, $2, $3, $4, $5, $6)
+            returning id, thread_key, name, mime_type, data, source_url, created_at
+            "#,
+        )
+        .bind(&id)
+        .bind(thread_key.as_str())
+        .bind(name)
+        .bind(mime_type)
+        .bind(data)
+        .bind(source_url)
+        .fetch_one(&self.pool)
+        .await?;
+
+        row.try_into()
+    }
+
+    pub async fn get_attachment(
+        &self,
+        thread_key: &ThreadKey,
+        attachment_id: &str,
+    ) -> Result<AttachmentRecord, SessionStoreError> {
+        let row = sqlx::query_as::<_, AttachmentRow>(
+            r#"
+            select id, thread_key, name, mime_type, data, source_url, created_at
+            from attachments
+            where thread_key = $1 and id = $2
+            "#,
+        )
+        .bind(thread_key.as_str())
+        .bind(attachment_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| SessionStoreError::AttachmentNotFound {
+            thread_key: thread_key.as_str().to_owned(),
+            attachment_id: attachment_id.to_owned(),
+        })?;
+
+        row.try_into()
     }
 
     pub async fn create_execution(
@@ -704,6 +767,11 @@ pub enum SessionStoreError {
         existing: Option<String>,
         requested: Option<String>,
     },
+    #[error("attachment {attachment_id} not found for thread_key {thread_key}")]
+    AttachmentNotFound {
+        thread_key: String,
+        attachment_id: String,
+    },
     #[error("invalid persisted value: {0}")]
     InvalidPersistedValue(String),
     #[error("invalid notification payload on {channel}: {payload}: {error}")]
@@ -758,6 +826,33 @@ struct SessionMessageRow {
     parts: Value,
     metadata: Value,
     created_at: OffsetDateTime,
+}
+
+#[derive(Debug, FromRow)]
+struct AttachmentRow {
+    id: String,
+    thread_key: String,
+    name: String,
+    mime_type: String,
+    data: Vec<u8>,
+    source_url: Option<String>,
+    created_at: OffsetDateTime,
+}
+
+impl TryFrom<AttachmentRow> for AttachmentRecord {
+    type Error = SessionStoreError;
+
+    fn try_from(row: AttachmentRow) -> Result<Self, Self::Error> {
+        Ok(Self {
+            id: row.id,
+            thread_key: parse_persisted(row.thread_key)?,
+            name: row.name,
+            mime_type: row.mime_type,
+            data: row.data,
+            source_url: row.source_url,
+            created_at: row.created_at,
+        })
+    }
 }
 
 impl TryFrom<SessionMessageRow> for SessionMessage {

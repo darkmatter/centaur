@@ -41,8 +41,9 @@ use crate::{
     ApiError,
     types::{
         AppendMessagesRequest, AppendMessagesResponse, CreateSessionRequest,
-        EmitWorkflowEventRequest, EventsQuery, ExecuteSessionRequest, ExecuteSessionResponse,
-        ListWorkflowRunsQuery, SessionSseEvent, stream_error_sse,
+        DownloadAttachmentQuery, EmitWorkflowEventRequest, EventsQuery, ExecuteSessionRequest,
+        ExecuteSessionResponse, ListWorkflowRunsQuery, SessionSseEvent, UploadAttachmentRequest,
+        UploadAttachmentResponse, stream_error_sse,
     },
 };
 
@@ -84,6 +85,14 @@ pub fn build_router_with_session_and_workflow_runtime(
         .route("/healthz", get(healthz))
         .route("/metrics", get(metrics))
         .route("/api/session/{thread_key}", post(create_or_get_session))
+        .route(
+            "/agent/attachments/upload",
+            post(upload_attachment).layer(DefaultBodyLimit::disable()),
+        )
+        .route(
+            "/agent/attachments/{attachment_id}/download",
+            get(download_attachment),
+        )
         .route(
             "/api/session/{thread_key}/messages",
             post(append_messages).layer(DefaultBodyLimit::disable()),
@@ -220,6 +229,76 @@ async fn append_messages(
         ok: true,
         message_ids,
     }))
+}
+
+async fn upload_attachment(
+    State(state): State<AppState>,
+    Json(request): Json<UploadAttachmentRequest>,
+) -> Result<Json<UploadAttachmentResponse>, ApiError> {
+    let data = general_purpose::STANDARD
+        .decode(request.data)
+        .map_err(|error| ApiError::BadRequest(format!("invalid attachment data: {error}")))?;
+    let name = safe_attachment_name(&request.name);
+    let mime_type = safe_mime_type(&request.mime_type);
+    let attachment = state
+        .runtime
+        .create_attachment(
+            &request.thread_key,
+            &name,
+            &mime_type,
+            &data,
+            request.source_url.as_deref(),
+        )
+        .await?;
+    Ok(Json(UploadAttachmentResponse {
+        download_url: format!("/agent/attachments/{}/download", attachment.id),
+        id: attachment.id,
+        name: attachment.name,
+        mime_type: attachment.mime_type,
+    }))
+}
+
+async fn download_attachment(
+    State(state): State<AppState>,
+    Path(attachment_id): Path<String>,
+    Query(query): Query<DownloadAttachmentQuery>,
+) -> Result<Response, ApiError> {
+    let attachment = state
+        .runtime
+        .get_attachment(&query.thread_key, &attachment_id)
+        .await?;
+    Ok((
+        [
+            ("content-type", attachment.mime_type),
+            (
+                "content-disposition",
+                format!(
+                    "attachment; filename=\"{}\"",
+                    attachment.name.replace('"', "")
+                ),
+            ),
+        ],
+        Body::from(attachment.data),
+    )
+        .into_response())
+}
+
+fn safe_attachment_name(name: &str) -> String {
+    name.rsplit(['/', '\\'])
+        .next()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("attachment")
+        .to_owned()
+}
+
+fn safe_mime_type(mime_type: &str) -> String {
+    let trimmed = mime_type.trim();
+    if trimmed.is_empty() {
+        "application/octet-stream".to_owned()
+    } else {
+        trimmed.to_owned()
+    }
 }
 
 async fn execute_session(
@@ -849,5 +928,19 @@ mod webhook_tests {
         )
         .unwrap_err();
         assert!(matches!(error, ApiError::Internal(_)));
+    }
+
+    #[test]
+    fn sanitizes_attachment_names() {
+        assert_eq!(safe_attachment_name("report.pdf"), "report.pdf");
+        assert_eq!(safe_attachment_name("../secret.txt"), "secret.txt");
+        assert_eq!(safe_attachment_name(r"C:\tmp\chart.png"), "chart.png");
+        assert_eq!(safe_attachment_name("   "), "attachment");
+    }
+
+    #[test]
+    fn defaults_empty_attachment_mime_type() {
+        assert_eq!(safe_mime_type("text/plain"), "text/plain");
+        assert_eq!(safe_mime_type("  "), "application/octet-stream");
     }
 }

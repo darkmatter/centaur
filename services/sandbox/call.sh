@@ -122,7 +122,10 @@ agent_execute() {
     return $?
   fi
 
-  if ! printf '%s' "$payload" | jq -e '(.message | type) == "string" and (.message | length) > 0' >/dev/null 2>&1; then
+  if ! printf '%s' "$payload" | jq -e '
+    ((.message | type) == "string" and (.message | length) > 0)
+    or ((.parts | type) == "array" and (.parts | length) > 0)
+  ' >/dev/null 2>&1; then
     request "POST" "$U/agent/execute" "$payload"
     return $?
   fi
@@ -162,7 +165,12 @@ agent_execute() {
       assignment_generation: $assignment_generation,
       message_id: (.message_id // $message_id),
       role: (.role // "user"),
-      parts: [{type: "text", text: .message}]
+      parts: (
+        if (.parts | type) == "array" and (.parts | length) > 0
+        then .parts
+        else [{type: "text", text: .message}]
+        end
+      )
     }
     + (if .user_id != null then {user_id: .user_id} else {} end)
     + (if .metadata != null then {metadata: .metadata} else {} end)
@@ -208,7 +216,7 @@ case "$tool" in
     ;;
   discover)
     if [ "$2" = "agent" ]; then
-      printf '%s\n' '{"tool":"agent","description":"Sub-agent dispatch (built-in, not a tool plugin)","methods":[{"name":"execute","description":"Spawn a sub-agent. Body: {\"thread_key\":\"task:<purpose>-<id>\",\"message\":\"...\",\"harness\":\"<persona>\"}. Returns {execution_id, status}."},{"name":"status","description":"Poll sub-agent. Usage: call agent status '\''?key=<thread_key>'\''"},{"name":"runtime","description":"Inspect active persona/overlay/available personas for a thread. Usage: call agent runtime '\''?key=<thread_key>'\''"},{"name":"stop","description":"Stop sub-agent. Body: {\"thread_key\":\"...\"}"}]}'
+      printf '%s\n' '{"tool":"agent","description":"Sub-agent dispatch (built-in, not a tool plugin)","methods":[{"name":"execute","description":"Spawn a sub-agent. Body: {\"thread_key\":\"task:<purpose>-<id>\",\"message\":\"...\",\"harness\":\"<persona>\"}. For multimodal input, pass \"parts\" instead of \"message\". Returns {execution_id, status}."},{"name":"status","description":"Poll sub-agent. Usage: call agent status '\''?key=<thread_key>'\''"},{"name":"runtime","description":"Inspect active persona/overlay/available personas for a thread. Usage: call agent runtime '\''?key=<thread_key>'\''"},{"name":"stop","description":"Stop sub-agent. Body: {\"thread_key\":\"...\"}"}]}'
     else
       request "GET" "$TU/tools/$2"
     fi

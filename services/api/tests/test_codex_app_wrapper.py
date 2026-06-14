@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import importlib.util
 from pathlib import Path
 import tomllib
@@ -128,6 +129,89 @@ def test_request_attaches_traceparent(monkeypatch) -> None:
             },
         }
     ]
+
+
+def test_input_items_materializes_data_url_image(monkeypatch, tmp_path) -> None:
+    wrapper = _load_wrapper()
+    monkeypatch.setattr(wrapper, "UPLOADS_DIR", tmp_path)
+
+    items = wrapper.input_items(
+        {
+            "message": {
+                "content": [
+                    {"type": "text", "text": "please inspect this"},
+                    {
+                        "type": "image",
+                        "name": "image.png",
+                        "url": "data:image/png;base64,"
+                        + base64.b64encode(b"png-bytes").decode(),
+                    },
+                ]
+            }
+        }
+    )
+
+    assert items == [
+        {
+            "type": "text",
+            "text": "please inspect this\n"
+            + f"[Attached image saved to {tmp_path / 'image.png'}]",
+        },
+        {"type": "localImage", "path": str(tmp_path / "image.png"), "detail": "auto"},
+    ]
+    assert (tmp_path / "image.png").read_bytes() == b"png-bytes"
+
+
+def test_attachment_chunks_materialize_staged_file(monkeypatch, tmp_path) -> None:
+    wrapper = _load_wrapper()
+    monkeypatch.setattr(wrapper, "UPLOADS_DIR", tmp_path)
+    wrapper.ATTACHMENT_UPLOADS.clear()
+    wrapper.STAGED_ATTACHMENTS.clear()
+
+    data = base64.b64encode(b"large-attachment").decode()
+    wrapper.handle_attachment_chunk(
+        {
+            "type": "attachment.chunk",
+            "attachmentId": "att-1",
+            "name": "report.pdf",
+            "mimeType": "application/pdf",
+            "attachmentType": "file",
+            "dataBase64": data[:8],
+            "final": False,
+        }
+    )
+    wrapper.handle_attachment_chunk(
+        {
+            "type": "attachment.chunk",
+            "attachmentId": "att-1",
+            "name": "report.pdf",
+            "mimeType": "application/pdf",
+            "attachmentType": "file",
+            "dataBase64": data[8:],
+            "final": True,
+        }
+    )
+
+    items = wrapper.input_items(
+        {
+            "message": {
+                "content": [
+                    {
+                        "type": "attachment",
+                        "attachment_type": "file",
+                        "mimeType": "application/pdf",
+                        "name": "report.pdf",
+                        "stagedAttachmentId": "att-1",
+                    }
+                ]
+            }
+        }
+    )
+
+    assert items == [
+        {"type": "text", "text": f"[Attached file saved to {tmp_path / 'report.pdf'}]"}
+    ]
+    assert (tmp_path / "report.pdf").read_bytes() == b"large-attachment"
 
 
 def test_configure_codex_otel_writes_startup_config(monkeypatch, tmp_path) -> None:
@@ -468,8 +552,7 @@ def test_start_or_resume_thread_falls_back_to_fresh_thread_on_resume_failure(
     assert len(failure_events) == 1
     assert "no rollout found" in failure_events[0]["message"]
     assert (
-        failure_events[0]["resume_thread_id"]
-        == "019ead10-eee3-74c3-a9fc-aa3e8bc53783"
+        failure_events[0]["resume_thread_id"] == "019ead10-eee3-74c3-a9fc-aa3e8bc53783"
     )
     assert {"type": "thread.started", "thread_id": "fresh-thread-id"} in emitted
 

@@ -89,6 +89,43 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn session_routes_accept_payloads_larger_than_axum_default_limit() {
+        for (uri, body) in [
+            (
+                "/api/session/test/messages",
+                format!(
+                    r#"{{"messages":[],"padding":"{}"}}"#,
+                    "x".repeat(3 * 1024 * 1024)
+                ),
+            ),
+            (
+                "/api/session/test/execute",
+                format!(r#"{{"input_lines":["{}"]"#, "x".repeat(3 * 1024 * 1024)),
+            ),
+        ] {
+            let pool = PgPool::connect_lazy("postgres://postgres:postgres@localhost/centaur_test")
+                .unwrap();
+            let app = build_router_with_runtime(
+                PgSessionStore::new(pool),
+                SandboxRuntime::backend(Arc::new(TestBackend::default()), SandboxSpec::new("test")),
+            );
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+    }
+
     #[derive(Default)]
     struct TestBackend {
         next_id: AtomicU64,

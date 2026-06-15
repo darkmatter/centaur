@@ -213,6 +213,9 @@ COPY --link --chmod=755 services/sandbox/slack-upload.sh /usr/local/bin/slack-up
 COPY --link --chmod=755 services/sandbox/md2docx.py /usr/local/bin/md2docx
 COPY --link --chmod=755 services/workflow-python/workflow_host.py /usr/local/bin/workflow-host
 COPY --link --chmod=755 services/sandbox/git-branch.sh /usr/local/bin/git-branch
+COPY --link --chmod=755 services/sandbox/instruction-observer.py /usr/local/bin/instruction-observer
+COPY --link --chmod=755 services/sandbox/git-observed.sh /usr/local/bin/git
+COPY --link --chmod=755 services/sandbox/gh-observed.sh /usr/local/bin/gh
 COPY --link --chmod=755 services/sandbox/install_tool_shims.py /usr/local/bin/install-tool-shims
 COPY --link --chmod=755 services/sandbox/entrypoint.sh /entrypoint.sh
 

@@ -63,6 +63,9 @@ COPY --link --chmod=755 services/sandbox/codex-app-wrapper.py /usr/local/bin/cod
 COPY --link --chmod=755 services/sandbox/harness_adapter.py /usr/local/bin/harness-adapter
 COPY --link --chmod=755 services/workflow-python/workflow_host.py /usr/local/bin/workflow-host
 COPY --link --chmod=755 services/sandbox/git-branch.sh /usr/local/bin/git-branch
+COPY --link --chmod=755 services/sandbox/instruction-observer.py /usr/local/bin/instruction-observer
+COPY --link --chmod=755 services/sandbox/git-observed.sh /usr/local/bin/git
+COPY --link --chmod=755 services/sandbox/gh-observed.sh /usr/local/bin/gh
 COPY --link --chmod=755 services/sandbox/entrypoint.sh /entrypoint.sh
 
 USER agent

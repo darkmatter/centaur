@@ -1,6 +1,5 @@
 {{- if .Values.networkPolicy.enabled }}
 {{- $ingressSourceNamespaces := default .Values.networkPolicy.ingressControllerNamespaces .Values.networkPolicy.ingressSourceNamespaces }}
-{{- $webIngressSourceNamespaces := default $ingressSourceNamespaces .Values.networkPolicy.webIngressSourceNamespaces }}
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -286,7 +285,7 @@ spec:
   ingress:
     # Only health probes reach discordbot; nothing routes traffic to it (the Gateway is outbound).
     - from:
-{{- range $webIngressSourceNamespaces }}
+{{- range $ingressSourceNamespaces }}
         - namespaceSelector:
             matchLabels:
               kubernetes.io/metadata.name: {{ . | quote }}

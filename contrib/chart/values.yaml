@@ -346,7 +346,6 @@ httpRoutes: []
 networkPolicy:
   enabled: true
   ingressSourceNamespaces: []
-  webIngressSourceNamespaces: []
   apiIngressSourceNamespaces: []
   ingressControllerNamespaces:
     - kube-system

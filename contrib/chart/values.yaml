@@ -173,11 +173,11 @@ overlay:
 # the repo's default branch. Directories missing from a repo are skipped at
 # runtime. Set a subdir to "" to explicitly disable that surface for a source.
 overlays:
-  sources:
-    - repo: paradigmxyz/centaur
-      ref: ""
-    - repo: paradigmxyz/centaur-paradigm
-      ref: main
+  sources: []
+  # - repo: paradigmxyz/centaur
+  #   ref: ""
+  # - repo: your-org/centaur-overlay
+  #   ref: main
   # - repo: your-org/workflows-only
   #   ref: main
   #   toolsSubdir: ""

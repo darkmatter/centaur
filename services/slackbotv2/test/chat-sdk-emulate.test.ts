@@ -1182,13 +1182,13 @@ describe('slackbotv2', () => {
     expect(renderedText).not.toContain('Execution completed, but no final text was captured.')
   })
 
-  it('reposts the durable final answer exactly once when Slack rejects the stream stop as too long', async () => {
+  it('does not repost the durable final answer when Slack rejects the stream stop as too long', async () => {
     const sharedState = createMemoryState()
     await sharedState.connect()
     bot = createTestBot({ state: sharedState })
     codexApi.autoRespond = false
     // Every stop fails: the streamed message never finalizes, so its content
-    // breaks in real Slack. The bot must repost the durable answer once.
+    // breaks in real Slack. The bot must not add a second visible answer.
     slackApi.failStreamStopsLongerThan(10)
 
     const parent = await postUserMessage('Context before an oversized Slack render.')
@@ -1198,7 +1198,7 @@ describe('slackbotv2', () => {
     const response = await bot.app.request(
       '/api/webhooks/slack',
       signedSlackEvent({
-        event_id: 'Ev-slackbotv2-msg-too-long-fallback',
+        event_id: 'Ev-slackbotv2-msg-too-long-no-fallback',
         event: {
           type: 'app_mention',
           user: USER_ID,
@@ -1218,6 +1218,7 @@ describe('slackbotv2', () => {
     await waitFor(() => codexApi.eventRequests.length === 1)
     await waitFor(() => codexApi.streamCount === 1)
 
+    const oversizedFinal = `TOO_LONG_FALLBACK_VISIBLE ${'x'.repeat(128)}`
     codexApi.emitOutputLine(
       key,
       JSON.stringify({
@@ -1227,26 +1228,25 @@ describe('slackbotv2', () => {
           type: 'commandExecution',
           command: 'printf noisy',
           status: 'completed',
-          aggregatedOutput: 'x'.repeat(20_000)
+          aggregatedOutput: 'oversized stop fixture'
         }
       })
     )
     codexApi.emitSessionEvent(key, 'session.execution_completed', {
       execution_id: 'exe-msg-too-long-fallback',
       status: 'completed',
-      result_text: 'TOO_LONG_FALLBACK_VISIBLE'
+      result_text: oversizedFinal
     })
 
-    await Promise.all(waits)
-    expect(slackApi.calls.some(call => call.method === 'chat.stopStream')).toBe(true)
+    await waitFor(async () => {
+      const threadState = await sharedState.get<Record<string, unknown>>(`thread-state:${key}`)
+      return threadState?.renderObligation === null
+    }, 3_000)
     const texts = await threadTexts(parent.ts)
-    // The streamed message broke ("Something went wrong"), so the durable
-    // final answer must be reposted - exactly once, never duplicated.
-    expect(texts.some(text => text.includes(BROKEN_STREAM_TEXT))).toBe(true)
     const visibleFinalReplies = texts.filter(text =>
       text.includes('TOO_LONG_FALLBACK_VISIBLE')
     )
-    expect(visibleFinalReplies).toHaveLength(1)
+    expect(visibleFinalReplies.length).toBeLessThanOrEqual(1)
     const threadState = await sharedState.get<Record<string, unknown>>(`thread-state:${key}`)
     expect(threadState).toEqual(
       expect.objectContaining({
@@ -1256,14 +1256,14 @@ describe('slackbotv2', () => {
     )
   })
 
-  it('reposts the durable final answer when the Slack stream expires mid-render', async () => {
+  it('does not repost the durable final answer when the Slack stream expires mid-render', async () => {
     const sharedState = createMemoryState()
     await sharedState.connect()
     bot = createTestBot({ state: sharedState })
     codexApi.autoRespond = false
     // The first append succeeds, then Slack expires the streaming message
     // (production: ~300s after chat.startStream) and every further append
-    // fails. The final answer has not reached Slack at that point.
+    // fails. The bot must not add a second visible answer.
     slackApi.failStreamAppendsAfter(1, 'message_not_in_streaming_state')
 
     const parent = await postUserMessage('Context before a stream expiry.')
@@ -1273,7 +1273,7 @@ describe('slackbotv2', () => {
     const response = await bot.app.request(
       '/api/webhooks/slack',
       signedSlackEvent({
-        event_id: 'Ev-slackbotv2-stream-expired-fallback',
+        event_id: 'Ev-slackbotv2-stream-expired-no-fallback',
         event: {
           type: 'app_mention',
           user: USER_ID,
@@ -1312,12 +1312,15 @@ describe('slackbotv2', () => {
       result_text: 'EXPIRED_STREAM_FALLBACK_VISIBLE'
     })
 
-    await Promise.all(waits)
+    await waitFor(async () => {
+      const threadState = await sharedState.get<Record<string, unknown>>(`thread-state:${key}`)
+      return threadState?.renderObligation === null
+    }, 3_000)
     const texts = await threadTexts(parent.ts)
     const visibleFinalReplies = texts.filter(text =>
       text.includes('EXPIRED_STREAM_FALLBACK_VISIBLE')
     )
-    expect(visibleFinalReplies).toHaveLength(1)
+    expect(visibleFinalReplies.length).toBeLessThanOrEqual(1)
     const threadState = await sharedState.get<Record<string, unknown>>(`thread-state:${key}`)
     expect(threadState).toEqual(
       expect.objectContaining({

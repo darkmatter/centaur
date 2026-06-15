@@ -54,7 +54,6 @@ pub struct AppState {
 }
 
 const MAX_WEBHOOK_BODY_BYTES: usize = 1024 * 1024;
-const MAX_SESSION_JSON_BODY_BYTES: usize = 256 * 1024 * 1024;
 const REDACTED_WEBHOOK_HEADERS: &[&str] = &[
     "authorization",
     "cookie",
@@ -87,14 +86,15 @@ pub fn build_router_with_session_and_workflow_runtime(
         .route("/api/session/{thread_key}", post(create_or_get_session))
         .route(
             "/api/session/{thread_key}/messages",
-            post(append_messages).layer(DefaultBodyLimit::max(MAX_SESSION_JSON_BODY_BYTES)),
+            post(append_messages).layer(DefaultBodyLimit::disable()),
         )
         .route(
             "/api/session/{thread_key}/execute",
-            post(execute_session).layer(DefaultBodyLimit::max(MAX_SESSION_JSON_BODY_BYTES)),
+            post(execute_session).layer(DefaultBodyLimit::disable()),
         )
         .route("/api/session/{thread_key}/events", get(stream_events))
         .route("/api/sandboxes/drain", post(drain_sandboxes))
+        .route("/api/workflows/schedules", get(list_workflow_schedules))
         .route(
             "/api/workflows/runs",
             post(create_workflow_run).get(list_workflow_runs),
@@ -316,6 +316,14 @@ async fn list_workflow_runs(
     let workflows = workflow_runtime(&state)?;
     let runs = workflows.list_runs(query.limit.unwrap_or(50)).await?;
     Ok(Json(json!({ "ok": true, "runs": runs })))
+}
+
+async fn list_workflow_schedules(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let workflows = workflow_runtime(&state)?;
+    let schedules = workflows.list_schedules();
+    Ok(Json(json!({ "ok": true, "schedules": schedules })))
 }
 
 async fn get_workflow_run(

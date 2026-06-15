@@ -95,6 +95,29 @@ ironControl:
     name: iron_control_production
   service:
     httpPort: 3000
+  # Optional Ingress for iron-control. Bring your own controller — Tailscale
+  # operator, Cloudflare, ingress-nginx, etc. — via className + annotations +
+  # tls. Mirrors the top-level `ingress` block (which is wired to the
+  # Slackbot). Add the controller's namespace to
+  # networkPolicy.ingressControllerNamespaces so its pods can reach
+  # iron-control; the iron-control NetworkPolicy admits those namespaces when
+  # this is enabled.
+  #
+  # Tailscale operator example (serves https://iron-control.<tailnet>.ts.net):
+  #   className: tailscale
+  #   defaultBackend: true
+  #   tls: [{hosts: [iron-control]}]
+  ingress:
+    enabled: false
+    className: ""
+    annotations: {}
+    # When true, render a single spec.defaultBackend instead of host/path
+    # rules. Required by the Tailscale operator; harmless otherwise.
+    defaultBackend: false
+    # Host for the path rule when not using defaultBackend; empty matches any
+    # host.
+    host: ""
+    tls: []
   resources: {}
   # Solid Queue worker (`bin/jobs`) that runs iron-control's background jobs —
   # most importantly the broker-credential OAuth refresh loop that mints and
@@ -167,9 +190,7 @@ sandbox:
   # Which harness the sandbox runs: codex | amp | claudecode. Selects the
   # iron-proxy auth fragment api-rs registers and must agree with the sandbox
   # image's default CMD (services/sandbox/Dockerfile).
-  # NOTE: claudecode is a preview-463 dogfood default — flip back to codex
-  # (together with the Dockerfile CMD) before merging.
-  harnessEngine: claudecode
+  harnessEngine: codex
   extraEnv: {}
   stateVolume:
     enabled: false
@@ -241,6 +262,11 @@ apiRs:
   sandboxReadyTimeoutSecs: 90
   sandboxWarmPoolSize: 0
   sandboxWarmPoolReplenishIntervalSecs: 5
+  # Reaper: stop sandboxes idle-paused longer than the idle TTL or older than
+  # the max lifetime. 0 disables that sweep. Interval must be >= 1.
+  sandboxIdleStopTtlSecs: 10800 # 3 hours
+  sandboxMaxLifetimeSecs: 259200 # 3 days
+  sandboxReapIntervalSecs: 300
   ironProxy:
     mode: enabled
   metrics:
@@ -283,6 +309,25 @@ slackbotv2:
   assistantStatus: ""
   externalOrgAllowlist: ""
   triggerBotAllowlist: ""
+  extraEnv: {}
+  resources: {}
+
+# Discord chat ingress — mirrors slackbotv2, forwards to the api-rs control plane (:8080) over a
+# persistent Discord Gateway connection. Off by default; needs a Discord app + Message Content
+# Intent + a guild allowlist. Always exactly one replica (singleton Gateway session).
+discordbot:
+  enabled: false
+  image:
+    repository: centaur-discordbot
+    tag: latest
+    pullPolicy: Always
+  userName: centaur
+  # Comma/space-separated Discord guild IDs. The bot is INERT (ignores all messages) until set.
+  guildAllowlist: ""
+  # Comma/space-separated role IDs whose mentions also trigger the bot.
+  mentionRoleIds: ""
+  # Rename auto-created threads to the triggering message; set false to keep generic names.
+  nameThreads: true
   extraEnv: {}
   resources: {}
 

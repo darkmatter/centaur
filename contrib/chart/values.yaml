@@ -156,16 +156,17 @@ overlay:
 #
 # Subdirs default to the conventional layout — toolsSubdir: tools,
 # workflowsSubdir: workflows, skillsSubdir: .agents/skills — so most sources
-# only need `repo` and `ref`. Directories missing from a repo are skipped at
+# only need `repo`; set `ref` to a branch, tag, or commit when you do not want
+# the repo's default branch. Directories missing from a repo are skipped at
 # runtime. Set a subdir to "" to explicitly disable that surface for a source.
 overlays:
   sources: []
   # - repo: paradigmxyz/centaur
   #   ref: ""
   # - repo: your-org/centaur-overlay
-  #   ref: abc1234
+  #   ref: main
   # - repo: your-org/workflows-only
-  #   ref: def5678
+  #   ref: main
   #   toolsSubdir: ""
   #   skillsSubdir: ""
 

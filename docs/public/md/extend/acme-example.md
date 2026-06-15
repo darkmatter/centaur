@@ -88,7 +88,7 @@ The Centaur chart's repo-cache DaemonSet checks out the overlay repo on each
 node, so changing tools, workflows, or skills is a Git push — no API, sandbox,
 or overlay image rebuild is required for overlay-only changes. New sandboxes see
 the latest cached checkout; existing sandboxes can run `centaur-tools refresh`
-when they need to pull the current overlay into their workspace.
+when they need to refresh tool shims from the current repo-cache checkout.
 
 Configure the ordered overlay sources in Helm values:
 
@@ -237,7 +237,9 @@ Start small:
    team already follows.
 3. Add your organization's sandbox prompt guidance to
    `services/sandbox/SYSTEM_PROMPT.md`.
-4. Push the overlay repo and update the infra repo's `overlays.sources[].ref`.
+4. Push the overlay repo. If the overlay source tracks `main`, repo-cache picks
+   up the merge; if it is pinned to a commit, update the infra repo's
+   `overlays.sources[].ref`.
 5. Verify discovery from the API pod and from a sandbox before adding more
    tools or workflows.
 

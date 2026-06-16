@@ -580,17 +580,6 @@ async function renderExecutionAttempt(
     const replaceMessageId = isSlackStreamSizeLimitError(error)
       ? slackStreamMessageId(error)
       : undefined
-    if (isSlackStreamSizeLimitError(error) && !replaceMessageId) {
-      // Size-limit failures should be prevented by stream segmentation. If
-      // Slack still rejects a stream as too large but does not expose the
-      // failed stream message id, do not post a separate duplicate fallback.
-      rendered = true
-      traceLog(options, 'slackbotv2_render_failed_size_limit_no_replacement', trace, {
-        error: errorMessage(error),
-        slack_answer_lost: answerLost ?? 'unknown'
-      })
-      return 'complete'
-    }
     const fallback = await renderFallbackFinalAnswer(
       thread,
       options,
@@ -977,17 +966,6 @@ async function recoverRenderObligation(
       const replaceMessageId = isSlackStreamSizeLimitError(error)
         ? slackStreamMessageId(error)
         : undefined
-      if (isSlackStreamSizeLimitError(error) && !replaceMessageId) {
-        // Size-limit failures should be prevented by stream segmentation. If
-        // Slack still rejects a stream as too large but does not expose the
-        // failed stream message id, do not post a separate duplicate fallback.
-        rendered = true
-        traceLog(options, 'slackbotv2_render_recovery_failed_size_limit_no_replacement', trace, {
-          error: errorMessage(error),
-          slack_answer_lost: answerLost ?? 'unknown'
-        })
-        return false
-      }
       const fallback = await renderFallbackFinalAnswer(
         thread,
         options,

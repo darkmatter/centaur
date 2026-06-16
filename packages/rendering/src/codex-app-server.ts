@@ -404,8 +404,11 @@ export class CodexAppServerRendererEventMapper
     if (!canStream) return
 
     if (this.state.commentaryText.length > this.state.streamedCommentaryText.length) return
-    if (this.state.answerText.length <= this.state.streamedAnswerText.length) return
-    const delta = this.state.answerText.slice(this.state.streamedAnswerText.length)
+    const committableAnswerText = opts.force
+      ? this.state.answerText
+      : stableAnswerPrefix(this.state.answerText)
+    if (committableAnswerText.length <= this.state.streamedAnswerText.length) return
+    const delta = committableAnswerText.slice(this.state.streamedAnswerText.length)
     if (!delta) return
     this.state.streamedAnswerText += delta
     out.push({
@@ -464,7 +467,10 @@ export class CodexAppServerRendererEventMapper
       const delta = extractDeltaText(event)
       if (!delta) return { bufferChanged: false }
       const byId = buffer === 'answer' ? this.state.answerByItemId : this.state.commentaryByItemId
-      byId.set(itemId, (byId.get(itemId) ?? '') + delta)
+      const previous = byId.get(itemId) ?? ''
+      const next = reconcileAgentMessageDelta(previous, delta)
+      if (next === previous) return { bufferChanged: false }
+      byId.set(itemId, next)
       recomposeBuffers(this.state)
       return { bufferChanged: true }
     }
@@ -866,6 +872,27 @@ function compose(byItemId: Map<string, string>, trailing: string): string {
   let out = ''
   for (const value of byItemId.values()) out += value
   return trailing ? out + trailing : out
+}
+
+function reconcileAgentMessageDelta(previous: string, delta: string): string {
+  if (!previous) return delta
+  if (delta === previous) return previous
+  if (previous.length >= 3 && delta.startsWith(previous)) return delta
+  const trimmedStart = delta.trimStart()
+  if (previous.length >= 3 && trimmedStart.startsWith(previous)) return trimmedStart
+  return previous + delta
+}
+
+function stableAnswerPrefix(value: string): string {
+  let boundary = 0
+  for (let index = 0; index < value.length; index += 1) {
+    if (isStableAnswerBoundary(value[index]!)) boundary = index + 1
+  }
+  return value.slice(0, boundary)
+}
+
+function isStableAnswerBoundary(char: string): boolean {
+  return /\s|[.,!?;:)\]}]/.test(char)
 }
 
 function extractDeltaText(event: any): string {

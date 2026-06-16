@@ -1255,6 +1255,76 @@ describe('slackbotv2', () => {
     )
   })
 
+  it('posts the durable final answer when Slack rejects an append as too large', async () => {
+    const sharedState = createMemoryState()
+    await sharedState.connect()
+    bot = createTestBot({ state: sharedState })
+    codexApi.autoRespond = false
+    slackApi.failStreamAppendsAfter(0, 'msg_too_long')
+
+    const parent = await postUserMessage('Context before an oversized append.')
+    const mention = await postUserMessage(`<@${BOT_USER_ID}> produce an oversized append`, parent.ts)
+    const key = threadKey(parent.ts)
+    const waits: Promise<unknown>[] = []
+    const response = await bot.app.request(
+      '/api/webhooks/slack',
+      signedSlackEvent({
+        event_id: 'Ev-slackbotv2-msg-too-long-append-fallback',
+        event: {
+          type: 'app_mention',
+          user: USER_ID,
+          channel: CHANNEL_ID,
+          team: TEAM_ID,
+          ts: mention.ts,
+          thread_ts: parent.ts,
+          text: `<@${BOT_USER_ID}> produce an oversized append`
+        }
+      }),
+      {},
+      waitUntilContext(waits)
+    )
+
+    expect(response.status).toBe(200)
+    await waitFor(() => codexApi.executes.length === 1)
+    await waitFor(() => codexApi.eventRequests.length === 1)
+    await waitFor(() => codexApi.streamCount === 1)
+
+    codexApi.emitOutputLine(
+      key,
+      JSON.stringify({
+        type: 'item.completed',
+        item: {
+          id: 'cmd-msg-too-long-append',
+          type: 'commandExecution',
+          command: 'render oversized payload',
+          status: 'completed',
+          aggregatedOutput: 'payload staged'
+        }
+      })
+    )
+    await waitFor(() => slackApi.calls.some(call => call.method === 'chat.startStream'))
+
+    codexApi.emitSessionEvent(key, 'session.execution_completed', {
+      execution_id: 'exe-msg-too-long-append',
+      status: 'completed',
+      result_text: 'TOO_LONG_APPEND_FALLBACK_VISIBLE'
+    })
+
+    await Promise.all(waits)
+    expect(codexApi.eventRequests.length).toBeGreaterThanOrEqual(2)
+    const texts = await threadTexts(parent.ts)
+    expect(texts.filter(text =>
+      text.includes('TOO_LONG_APPEND_FALLBACK_VISIBLE')
+    )).toHaveLength(1)
+    const threadState = await sharedState.get<Record<string, unknown>>(`thread-state:${key}`)
+    expect(threadState).toEqual(
+      expect.objectContaining({
+        activeExecution: false,
+        renderObligation: null
+      })
+    )
+  })
+
   it('reposts the durable final answer when the Slack stream expires mid-render', async () => {
     const sharedState = createMemoryState()
     await sharedState.connect()
@@ -2091,6 +2161,119 @@ describe('slackbotv2', () => {
         chunkText(chunk).includes('DUPLICATE_DELIVERY_GUARD_OK')
       )
     ).toHaveLength(1)
+  })
+
+  it('keeps progress cards and canonical final text when agent deltas are full snapshots', async () => {
+    codexApi.autoRespond = false
+
+    const parent = await postUserMessage('Context before a snapshot-style final answer.')
+    const mention = await postUserMessage(`<@${BOT_USER_ID}> avoid duplicated word fragments`, parent.ts)
+    const key = threadKey(parent.ts)
+    const answer = 'conversations with Centaur remain readable'
+    const waits: Promise<unknown>[] = []
+    const response = await bot.app.request(
+      '/api/webhooks/slack',
+      signedSlackEvent({
+        event_id: 'Ev-slackbotv2-snapshot-delta-canonical-text',
+        event: {
+          type: 'app_mention',
+          user: USER_ID,
+          channel: CHANNEL_ID,
+          team: TEAM_ID,
+          ts: mention.ts,
+          thread_ts: parent.ts,
+          text: `<@${BOT_USER_ID}> avoid duplicated word fragments`
+        }
+      }),
+      {},
+      waitUntilContext(waits)
+    )
+
+    expect(response.status).toBe(200)
+    await waitFor(() => codexApi.executes.length === 1)
+    await waitFor(() => codexApi.eventRequests.length === 1)
+    await waitFor(() => codexApi.streamCount === 1)
+
+    codexApi.emitOutputLine(
+      key,
+      JSON.stringify({
+        type: 'item.completed',
+        item: {
+          id: 'cmd-snapshot-context',
+          type: 'commandExecution',
+          command: 'slack thread --json',
+          status: 'completed',
+          aggregatedOutput: 'thread log loaded'
+        }
+      })
+    )
+    codexApi.emitOutputLine(
+      key,
+      JSON.stringify({
+        type: 'item.started',
+        item: {
+          id: 'answer-snapshot',
+          type: 'agentMessage',
+          text: '',
+          phase: 'final_answer'
+        }
+      })
+    )
+    for (const snapshot of ['con', ' conversations with Cent', ` ${answer}`]) {
+      codexApi.emitOutputLine(
+        key,
+        JSON.stringify({
+          type: 'item.agentMessage.delta',
+          itemId: 'answer-snapshot',
+          delta: snapshot
+        })
+      )
+    }
+    codexApi.emitOutputLine(
+      key,
+      JSON.stringify({
+        type: 'item.completed',
+        item: {
+          id: 'answer-snapshot',
+          type: 'agentMessage',
+          text: answer,
+          phase: 'final_answer'
+        }
+      })
+    )
+    codexApi.emitSessionEvent(key, 'session.execution_completed', {
+      execution_id: 'exe-snapshot-delta-canonical-text',
+      status: 'completed'
+    })
+
+    await Promise.all(waits)
+    const transcripts = slackStreamTranscripts(slackApi.calls)
+    expect(transcripts).toHaveLength(1)
+    const transcript = transcripts[0]!
+    const progressChunks = transcript.chunks.filter(chunk => chunk.type !== 'markdown_text')
+    expect(progressChunks).toContainEqual(
+      expect.objectContaining({
+        type: 'task_update',
+        id: 'cmd-snapshot-context',
+        title: '1. Command execution',
+        details: expect.stringContaining('slack thread --json')
+      })
+    )
+
+    const markdownText = transcript.chunks
+      .filter(chunk => chunk.type === 'markdown_text')
+      .map(chunk => stringField(chunk.text))
+      .join('')
+    expect(markdownText).toBe(answer)
+    expect(markdownText).not.toContain('con conversations')
+    expect(markdownText).not.toContain('conconversations')
+    expect(markdownText).not.toContain('CentCentaur')
+    expect(markdownText).not.toContain('Cent a ur')
+
+    const renderedText = transcript.chunks.map(chunkText).filter(Boolean).join('\n')
+    expect(renderedText).toContain('Command execution')
+    expect(renderedText).toContain('slack thread --json')
+    expect(renderedText.trim().endsWith(answer)).toBe(true)
   })
 
   it('omits large structured task output so final markdown still delivers', async () => {

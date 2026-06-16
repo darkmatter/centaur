@@ -472,6 +472,42 @@ describe('CodexAppServerRendererEventMapper', () => {
     })
   })
 
+  it('keeps separate Thinking tasks for distinct reasoning items', async () => {
+    const chunks = await collect(
+      codexAppServerToChatSdkStream(
+        toAsyncIterable([
+          {
+            method: 'item/reasoning/summaryTextDelta',
+            params: {
+              itemId: 'reasoning-1',
+              delta: 'First thought'
+            }
+          },
+          {
+            method: 'item/reasoning/summaryTextDelta',
+            params: {
+              itemId: 'reasoning-2',
+              delta: 'Second thought'
+            }
+          },
+          {
+            method: 'turn/completed',
+            params: {
+              turn: { id: 'turn-1', items: [], status: 'completed' }
+            }
+          }
+        ])
+      )
+    )
+
+    const thinkingIds = new Set(
+      chunks
+        .filter(chunk => chunk.type === 'task_update' && chunk.title === 'Thinking')
+        .map(chunk => (chunk as { id: string }).id)
+    )
+    expect(thinkingIds).toEqual(new Set(['reasoning-1', 'reasoning-2']))
+  })
+
   it('streams command details once and command output incrementally', async () => {
     const chunks = await collect(
       codexAppServerToChatSdkStream(

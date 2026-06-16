@@ -1092,6 +1092,7 @@ fn build_iron_proxy_network_policies(
         ),
         dns_egress_rule(),
     ];
+    sandbox_egress.extend(cluster_local_observability_egress_rules());
     if let Some(target) = otlp_egress {
         // Direct harness OTLP export (codex usage/cost spans). The collector
         // lives outside this namespace, so the sandbox bypasses iron-proxy for
@@ -1134,6 +1135,51 @@ fn build_iron_proxy_network_policies(
                 egress: Some(proxy_egress_rules(iron_proxy, control_port)),
             }),
         },
+    ]
+}
+
+fn cluster_local_observability_egress_rules() -> Vec<NetworkPolicyEgressRule> {
+    // Deployment overlays inject VictoriaMetrics/VictoriaLogs/Loki URLs and put
+    // the cluster-local service names in NO_PROXY. Keep the generated
+    // per-sandbox NetworkPolicy aligned so those direct HTTP calls can leave the
+    // sandbox without routing through iron-proxy.
+    vec![
+        egress_to(
+            vec![namespace_pod_peer(
+                "monitoring",
+                BTreeMap::from([
+                    ("app.kubernetes.io/name".to_owned(), "vmsingle".to_owned()),
+                    (
+                        "app.kubernetes.io/instance".to_owned(),
+                        "internal".to_owned(),
+                    ),
+                ]),
+            )],
+            vec![network_port(8428), network_port(8429)],
+        ),
+        egress_to(
+            vec![namespace_pod_peer(
+                "monitoring",
+                BTreeMap::from([
+                    ("app.kubernetes.io/name".to_owned(), "vlsingle".to_owned()),
+                    (
+                        "app.kubernetes.io/instance".to_owned(),
+                        "internal".to_owned(),
+                    ),
+                ]),
+            )],
+            vec![network_port(9428)],
+        ),
+        egress_to(
+            vec![namespace_pod_peer(
+                "monitoring",
+                BTreeMap::from([
+                    ("app.kubernetes.io/name".to_owned(), "loki".to_owned()),
+                    ("app.kubernetes.io/instance".to_owned(), "loki".to_owned()),
+                ]),
+            )],
+            vec![network_port(3100)],
+        ),
     ]
 }
 
@@ -1192,6 +1238,17 @@ fn namespace_peer(namespace: &str) -> NetworkPolicyPeer {
             "kubernetes.io/metadata.name".to_owned(),
             namespace.to_owned(),
         )]))),
+        ..Default::default()
+    }
+}
+
+fn namespace_pod_peer(namespace: &str, pod_labels: BTreeMap<String, String>) -> NetworkPolicyPeer {
+    NetworkPolicyPeer {
+        namespace_selector: Some(label_selector(BTreeMap::from([(
+            "kubernetes.io/metadata.name".to_owned(),
+            namespace.to_owned(),
+        )]))),
+        pod_selector: Some(label_selector(pod_labels)),
         ..Default::default()
     }
 }
@@ -1562,6 +1619,90 @@ mod tests {
                 .iter()
                 .any(|policy_port| policy_port.port == Some(IntOrString::Int(i32::from(port))))
         })
+    }
+
+    fn rule_allows_namespace_pod_port(
+        rule: &NetworkPolicyEgressRule,
+        namespace: &str,
+        pod_labels: &[(&str, &str)],
+        port: u16,
+    ) -> bool {
+        rule.to.as_ref().is_some_and(|peers| {
+            peers.iter().any(|peer| {
+                let namespace_matches = peer.namespace_selector.as_ref().is_some_and(|selector| {
+                    selector.match_labels.as_ref().is_some_and(|labels| {
+                        labels
+                            .get("kubernetes.io/metadata.name")
+                            .map(String::as_str)
+                            == Some(namespace)
+                    })
+                });
+                let pod_matches = peer.pod_selector.as_ref().is_some_and(|selector| {
+                    selector.match_labels.as_ref().is_some_and(|labels| {
+                        pod_labels.iter().all(|(key, value)| {
+                            labels.get(*key).map(String::as_str) == Some(*value)
+                        })
+                    })
+                });
+                namespace_matches && pod_matches
+            })
+        }) && rule.ports.as_ref().is_some_and(|ports| {
+            ports
+                .iter()
+                .any(|policy_port| policy_port.port == Some(IntOrString::Int(i32::from(port))))
+        })
+    }
+
+    #[test]
+    fn sandbox_egress_policy_allows_cluster_local_observability() {
+        let id = SandboxId::new("asbx-test");
+        let iron_proxy = IronProxyConfig::new("proxy:test", "ca-cert", "ca-key");
+
+        let policies = build_iron_proxy_network_policies(&id, &resolved(), &iron_proxy, 3000, None);
+        let sandbox_egress = policies[0]
+            .spec
+            .as_ref()
+            .unwrap()
+            .egress
+            .as_ref()
+            .unwrap()
+            .clone();
+
+        for port in [8428, 8429] {
+            assert!(sandbox_egress.iter().any(|rule| {
+                rule_allows_namespace_pod_port(
+                    rule,
+                    "monitoring",
+                    &[
+                        ("app.kubernetes.io/name", "vmsingle"),
+                        ("app.kubernetes.io/instance", "internal"),
+                    ],
+                    port,
+                )
+            }));
+        }
+        assert!(sandbox_egress.iter().any(|rule| {
+            rule_allows_namespace_pod_port(
+                rule,
+                "monitoring",
+                &[
+                    ("app.kubernetes.io/name", "vlsingle"),
+                    ("app.kubernetes.io/instance", "internal"),
+                ],
+                9428,
+            )
+        }));
+        assert!(sandbox_egress.iter().any(|rule| {
+            rule_allows_namespace_pod_port(
+                rule,
+                "monitoring",
+                &[
+                    ("app.kubernetes.io/name", "loki"),
+                    ("app.kubernetes.io/instance", "loki"),
+                ],
+                3100,
+            )
+        }));
     }
 
     #[test]

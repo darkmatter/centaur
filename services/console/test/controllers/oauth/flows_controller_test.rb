@@ -8,10 +8,12 @@ module Oauth
   # an HTTP double returning a canned token response.
   class FlowsControllerTest < ActionDispatch::IntegrationTest
     CLIENT_ID = "acme-google-client-id".freeze
+    SLACK_CLIENT_ID = "acme-slack-client-id".freeze
 
     setup do
       @app = oauth_apps(:acme_google) # slug "google"
       @app.update!(client_secret: "app-secret")
+      oauth_apps(:acme_slack).update!(client_secret: "slack-secret")
     end
 
     teardown do
@@ -42,6 +44,23 @@ module Oauth
       {
         access_token: "AT", refresh_token: "RT", expires_in: 3600, scope: scope,
         id_token: id_token({ "aud" => aud, "iss" => iss, "sub" => sub, "email" => email })
+      }.merge(overrides).to_json
+    end
+
+    def slack_token_body(sub: "U0R7MFMJM", scope: "chat:write", id_token_value: nil, **overrides)
+      {
+        ok: true, access_token: "xoxe.xoxb-1-bot", refresh_token: "xoxe-1-bot-refresh",
+        expires_in: 43_200, token_type: "bot", scope: "commands",
+        id_token: id_token_value,
+        authed_user: {
+          id: sub,
+          user: "grace",
+          access_token: "xoxe.xoxp-1-user",
+          refresh_token: "xoxe-1-refresh",
+          expires_in: 43_200,
+          scope: scope,
+          token_type: "user"
+        }
       }.merge(overrides).to_json
     end
 
@@ -81,6 +100,26 @@ module Oauth
                    .verified(q["state"], purpose: FlowsController::STATE_PURPOSE)
       assert_equal @app.oid, state["app"]
       assert response.cookies["oauth_flow"].present?
+    end
+
+    test "start redirects to Slack with comma separated scopes" do
+      get oauth_start_url(slug: "slack")
+      assert_response :redirect
+      uri = URI.parse(response.location)
+      assert_equal "slack.com", uri.host
+      assert_equal "/oauth/v2/authorize", uri.path
+      q = URI.decode_www_form(uri.query).to_h
+      assert_equal SLACK_CLIENT_ID, q["client_id"]
+      assert_equal "http://www.example.com/oauth/slack/callback", q["redirect_uri"]
+      assert_equal "code", q["response_type"]
+      assert_equal "S256", q["code_challenge_method"]
+      assert_nil q["scope"]
+      scopes = q["user_scope"].split(",")
+      assert_includes scopes, "chat:write"
+      assert_includes scopes, "channels:history"
+      refute_includes scopes, "openid"
+      refute_includes scopes, "email"
+      refute_includes scopes, "profile"
     end
 
     test "start works without any session" do
@@ -149,6 +188,30 @@ module Oauth
       assert cred.next_attempt_at.present?
       assert_nil cred.created_by
       assert_includes response.body, cred.oid
+    end
+
+    test "callback happy path supports Slack user tokens" do
+      state = start_flow(slug: "slack", scopes: "chat:write")
+      stub_exchange(status: 200, body: slack_token_body)
+
+      assert_difference -> { BrokerCredential.count } => 1 do
+        get oauth_callback_url(slug: "slack"), params: { state: state, code: "auth-code" }
+      end
+      assert_response :ok
+      assert_match "Connected", response.body
+
+      app = oauth_apps(:acme_slack)
+      cred = BrokerCredential.find_by(oauth_app: app, provider_subject: "U0R7MFMJM")
+      assert_equal "acme", cred.namespace
+      assert_equal "slack-slack-u0r7mfmjm", cred.foreign_id
+      assert_equal "Slack – grace", cred.name
+      assert_equal "https://slack.com/api/oauth.v2.access", cred.token_endpoint
+      assert_nil cred.provider_email
+      assert_equal %w[chat:write], cred.scopes
+      assert_equal "xoxe.xoxp-1-user", cred.access_token
+      assert_equal "xoxe-1-refresh", cred.refresh_token
+      assert_equal [ "slack.com" ], cred.static_secret.rules.map(&:host)
+      assert_equal "Slack – grace token", cred.static_secret.name
     end
 
     test "callback wraps the minted credential in a grantable static secret" do

@@ -49,6 +49,25 @@ module Console
       assert_equal @operator, app.created_by
     end
 
+    test "POST create builds a Granola app without preconfigured client credentials" do
+      assert_difference -> { OauthApp.count } => 1 do
+        post console_oauth_app_forms_url, params: {
+          oauth_app: {
+            slug: "new-granola", description: "New Granola integration",
+            provider: "granola", credential_namespace: "acme", enabled: "1",
+            allowed_scopes: "mcp\n"
+          }
+        }
+      end
+
+      app = OauthApp.find_by!(slug: "new-granola")
+      assert_redirected_to console_oauth_app_path(app.oid)
+      assert_equal "granola", app.provider
+      assert_nil app.client_id
+      assert_nil app.client_secret
+      assert_equal %w[mcp], app.allowed_scopes
+    end
+
     test "POST create with an invalid provider is rejected without writing" do
       assert_no_difference -> { OauthApp.count } do
         post console_oauth_app_forms_url, params: {

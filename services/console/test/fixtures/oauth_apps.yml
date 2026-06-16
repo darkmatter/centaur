@@ -25,3 +25,13 @@ acme_google_disabled:
   credential_namespace: acme
   enabled: false
   created_by: acme_admin
+
+acme_granola:
+  slug: granola
+  description: Acme Granola MCP integration
+  provider: granola
+  allowed_scopes:
+    - mcp
+  credential_namespace: acme
+  enabled: true
+  created_by: acme_admin

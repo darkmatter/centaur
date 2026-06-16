@@ -31,6 +31,10 @@ module Oauth
       def token_endpoint = TOKEN_ENDPOINT
       def identity_scopes = IDENTITY_SCOPES
       def api_hosts = API_HOSTS
+      def resource = nil
+      def dynamic_client_registration? = false
+      def client_id_required? = true
+      def client_secret_required? = true
 
       # Provider-specific query params for the authorization redirect. Both are
       # required to guarantee a refresh token, including on re-consent:

@@ -16,6 +16,8 @@ module Oauth
 
     teardown do
       FlowsController.exchange_client_factory = -> { Broker::AuthorizationCodeClient.new }
+      FlowsController.registration_client_factory = -> { Oauth::DynamicClientRegistrationClient.new }
+      StubRegistrationClient.reset!
     end
 
     class StubHTTP
@@ -33,12 +35,53 @@ module Oauth
       FlowsController.exchange_client_factory = -> { Broker::AuthorizationCodeClient.new(http: StubHTTP.new(status: status, body: body)) }
     end
 
+    class StubRegistrationClient
+      class << self
+        attr_accessor :captured, :result, :error
+
+        def reset!
+          self.captured = nil
+          self.result = Oauth::DynamicClientRegistrationClient::Result.new(
+            client_id: "granola-client-id",
+            client_secret: nil,
+            token_endpoint_auth_method: "none"
+          )
+          self.error = nil
+        end
+      end
+
+      reset!
+
+      def register(registration_endpoint:, metadata:, timeout: Oauth::DynamicClientRegistrationClient::DEFAULT_TIMEOUT)
+        self.class.captured = {
+          registration_endpoint: registration_endpoint,
+          metadata: metadata,
+          timeout: timeout
+        }
+        raise self.class.error if self.class.error
+        self.class.result
+      end
+    end
+
+    def stub_registration
+      StubRegistrationClient.reset!
+      FlowsController.registration_client_factory = -> { StubRegistrationClient.new }
+    end
+
     def id_token(claims)
       "h.#{Base64.urlsafe_encode64(claims.to_json, padding: false)}.s"
     end
 
     def token_body(sub: "google-sub-1", email: "user@example.com", aud: CLIENT_ID,
                    iss: "https://accounts.google.com", scope: "https://www.googleapis.com/auth/gmail.readonly openid", **overrides)
+      {
+        access_token: "AT", refresh_token: "RT", expires_in: 3600, scope: scope,
+        id_token: id_token({ "aud" => aud, "iss" => iss, "sub" => sub, "email" => email })
+      }.merge(overrides).to_json
+    end
+
+    def granola_token_body(sub: "granola-sub-1", email: "user@example.com", aud: "granola-client-id",
+                           iss: "https://mcp-auth.granola.ai", scope: "mcp openid email offline_access", **overrides)
       {
         access_token: "AT", refresh_token: "RT", expires_in: 3600, scope: scope,
         id_token: id_token({ "aud" => aud, "iss" => iss, "sub" => sub, "email" => email })
@@ -123,6 +166,45 @@ module Oauth
       refute_includes scopes, "https://www.googleapis.com/auth/gmail.readonly"
     end
 
+    test "start dynamically registers Granola and redirects with MCP resource" do
+      granola = oauth_apps(:acme_granola)
+      assert_nil granola.client_id
+      stub_registration
+
+      get oauth_start_url(slug: "granola")
+
+      assert_response :redirect
+      assert_equal "granola-client-id", granola.reload.client_id
+      assert_nil granola.client_secret
+      assert_equal "https://mcp-auth.granola.ai/oauth2/register", StubRegistrationClient.captured[:registration_endpoint]
+      metadata = StubRegistrationClient.captured[:metadata]
+      assert_equal [ "http://www.example.com/oauth/granola/callback" ], metadata["redirect_uris"]
+      assert_equal "none", metadata["token_endpoint_auth_method"]
+      assert_includes metadata["scope"].split, "mcp"
+
+      uri = URI.parse(response.location)
+      assert_equal "mcp-auth.granola.ai", uri.host
+      q = URI.decode_www_form(uri.query).to_h
+      assert_equal "granola-client-id", q["client_id"]
+      assert_equal "https://mcp.granola.ai/mcp", q["resource"]
+      assert_includes q["scope"].split, "offline_access"
+    end
+
+    test "start renders an error page when Granola dynamic registration fails" do
+      stub_registration
+      StubRegistrationClient.error = Broker::ExchangeError.new(
+        "registration endpoint rejected redirect uri",
+        stage: "oauth",
+        code: "invalid_redirect_uri"
+      )
+
+      get oauth_start_url(slug: "granola")
+
+      assert_response :unprocessable_entity
+      assert_match "invalid_redirect_uri", response.body
+      assert_nil oauth_apps(:acme_granola).reload.client_id
+    end
+
     # --- callback -------------------------------------------------------------
 
     test "callback happy path mints a live credential and renders a success page" do
@@ -171,6 +253,28 @@ module Oauth
       assert_equal [ "*.googleapis.com" ], secret.rules.map(&:host)
       # The source resolves the credential's live token at sync time.
       assert_equal({ "type" => "control_plane", "value" => "AT" }, secret.source.to_proxy_source)
+    end
+
+    test "Granola callback mints an MCP-scoped credential and wrapper" do
+      stub_registration
+      state = start_flow(slug: "granola")
+      stub_exchange(status: 200, body: granola_token_body)
+
+      assert_difference -> { BrokerCredential.count } => 1 do
+        get oauth_callback_url(slug: "granola"), params: { state: state, code: "auth-code" }
+      end
+      assert_response :ok
+
+      cred = BrokerCredential.find_by(oauth_app: oauth_apps(:acme_granola), provider_subject: "granola-sub-1")
+      assert_equal "https://mcp-auth.granola.ai/oauth2/token", cred.token_endpoint
+      assert_equal "https://mcp.granola.ai/mcp", cred.resource
+      assert_equal %w[mcp openid email offline_access], cred.scopes
+      assert_equal "AT", cred.access_token
+      assert_equal "RT", cred.refresh_token
+
+      secret = cred.static_secret
+      assert_equal [ "mcp.granola.ai" ], secret.rules.map(&:host)
+      assert_equal "token_broker", secret.source.source_type
     end
 
     test "re-consent neither duplicates the wrapping secret nor clobbers operator edits" do

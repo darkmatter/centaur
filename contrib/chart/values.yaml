@@ -106,6 +106,10 @@ console:
   # _SECRET), which must exist or the console pods CreateContainerConfigError.
   googleOauth:
     enabled: false
+  # Public HTTPS origin for OAuth redirect URIs and generated callback URLs,
+  # for example https://console.example.com. Leave empty to derive from the
+  # incoming request.
+  publicUrl: ""
   service:
     httpPort: 3000
   # Optional Ingress for the console. Bring your own controller — Tailscale

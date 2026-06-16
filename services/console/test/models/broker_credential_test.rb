@@ -203,11 +203,13 @@ class BrokerCredentialTest < ActiveSupport::TestCase
   test "refresh passes client credentials and token-endpoint headers to the client" do
     captured = {}
     bc = create_credential(client_id: "the-id", client_secret: "the-secret",
+                           resource: "https://mcp.example.com/mcp",
                            token_endpoint_headers: { "X-Api-Key" => "k" })
     bc.refresh_client = StubClient.new { |**kw| captured = kw; result }
     bc.refresh!
     assert_equal "the-id", captured[:client_id]
     assert_equal "the-secret", captured[:client_secret]
+    assert_equal "https://mcp.example.com/mcp", captured[:resource]
     assert_equal({ "X-Api-Key" => "k" }, captured[:headers])
   end
 

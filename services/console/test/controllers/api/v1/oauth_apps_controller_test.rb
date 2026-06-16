@@ -66,6 +66,26 @@ module Api
         assert_equal "acme", created.credential_namespace
       end
 
+      test "create allows Granola app without preconfigured client credentials" do
+        body = valid_body(
+          provider: "granola",
+          slug: "api-granola",
+          client_id: nil,
+          client_secret: nil,
+          allowed_scopes: [ "mcp" ]
+        )
+
+        assert_difference -> { OauthApp.count } => 1 do
+          post api_v1_oauth_apps_url, params: body.to_json, headers: auth_headers
+        end
+        assert_response :created
+        data = json_body.fetch("data")
+        assert_equal "granola", data["provider"]
+        assert_nil data["client_id"]
+        created = OauthApp.find_by_oid(data["id"])
+        assert_nil created.client_secret
+      end
+
       test "create rejects an unsupported provider" do
         assert_no_difference -> { OauthApp.count } do
           post api_v1_oauth_apps_url, params: valid_body(provider: "github").to_json, headers: auth_headers

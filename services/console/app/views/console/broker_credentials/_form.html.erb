@@ -37,6 +37,12 @@
           <p class="form-hint">The IdP endpoint control refreshes against.</p>
         </div>
         <div>
+          <label class="form-label" for="credential_resource">Resource</label>
+          <%= text_field_tag "credential[resource]", credential.resource, id: "credential_resource", class: "form-input #{field_error_class(credential, :resource)}", placeholder: "https://mcp.example.com/mcp" %>
+          <%= field_error(credential, :resource) %>
+          <p class="form-hint">Optional OAuth resource indicator sent on token requests.</p>
+        </div>
+        <div>
           <label class="form-label" for="credential_client_id">Client ID *</label>
           <%= text_field_tag "credential[client_id]", credential.client_id, id: "credential_client_id", class: "form-input #{field_error_class(credential, :client_id)}" %>
           <%= field_error(credential, :client_id) %>

@@ -35,6 +35,8 @@ module Oauth
     # Tests swap in an AuthorizationCodeClient built around an http double,
     # mirroring BrokerCredential#refresh_client.
     class_attribute :exchange_client_factory, default: -> { Broker::AuthorizationCodeClient.new }
+    class_attribute :registration_client_factory,
+                    default: -> { Oauth::DynamicClientRegistrationClient.new }
 
     before_action :set_app
 
@@ -46,6 +48,7 @@ module Oauth
       unless @app.scopes_allowed?(requested_scopes)
         return render_result(:error, status: :unprocessable_entity, message: "One or more requested scopes are not allowed for this integration.")
       end
+      return unless ensure_client_registration
 
       nonce = SecureRandom.urlsafe_base64(32)
       code_verifier = SecureRandom.urlsafe_base64(64)
@@ -122,6 +125,35 @@ module Oauth
       raw.split(/[,\s]+/).map(&:strip).reject(&:blank?)
     end
 
+    def ensure_client_registration
+      return true if @app.client_id.present?
+      unless @provider.dynamic_client_registration?
+        render_result(:error, status: :unprocessable_entity,
+                      message: "This integration has no OAuth client configured.")
+        return false
+      end
+
+      @app.with_lock do
+        @app.reload
+        next if @app.client_id.present?
+
+        result = registration_client_factory.call.register(
+          registration_endpoint: @provider.registration_endpoint,
+          metadata: @provider.registration_metadata(
+            app: @app,
+            redirect_uri: oauth_callback_redirect_uri(@app.slug)
+          )
+        )
+        @app.client_id = result.client_id
+        @app.client_secret = result.client_secret if result.client_secret.present?
+        @app.save!
+      end
+      true
+    rescue Broker::ExchangeError => e
+      render_result(:error, message: "Registering the integration failed (#{e.reason}).")
+      false
+    end
+
     def authorization_url(requested_scopes, state, code_verifier)
       challenge = Base64.urlsafe_encode64(Digest::SHA256.digest(code_verifier), padding: false)
       query = {
@@ -146,7 +178,8 @@ module Oauth
         client_secret: @app.client_secret,
         code: code.to_s,
         redirect_uri: oauth_callback_redirect_uri(@app.slug),
-        code_verifier: code_verifier.to_s
+        code_verifier: code_verifier.to_s,
+        resource: @provider.resource
       )
     end
 
@@ -163,15 +196,18 @@ module Oauth
           credential.foreign_id = "#{@app.provider}-#{@app.slug}-#{identity[:subject]}"
           credential.name = "#{@app.provider.capitalize} – #{identity[:email]}"
           credential.token_endpoint = @provider.token_endpoint
+          credential.resource = @provider.resource
           credential.external_user_key = SecureRandom.urlsafe_base64(16)
         end
 
         now = Time.current
         expires_in = result.expires_in&.positive? ? result.expires_in : BrokerCredential::DEFAULT_EXPIRES_IN_SECONDS
+        granted_scopes = result.scope.presence&.split || (Array(state["scopes"]) | @provider.identity_scopes)
         credential.assign_attributes(
           provider_email: identity[:email],
           # Store exactly what the IdP granted, so the refresh POST re-requests it.
-          scopes: (result.scope.presence&.split || Array(state["scopes"])),
+          scopes: granted_scopes,
+          resource: @provider.resource,
           refresh_token: result.refresh_token,
           access_token: result.access_token,
           expires_at: now + expires_in,

@@ -151,6 +151,7 @@ class BrokerCredential < ApplicationRecord
       client_secret: effective_client_secret,
       refresh_token: refresh_token,
       scopes: scopes,
+      resource: resource,
       headers: token_endpoint_headers || {},
       timeout: refresh_timeout_seconds
     )

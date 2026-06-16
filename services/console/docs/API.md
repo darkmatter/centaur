@@ -745,6 +745,7 @@ The OAuth client credentials it refreshes with are fields on the credential, res
 | `name`, `description`          | optional    | |
 | `labels`                       | optional    | |
 | `token_endpoint`               | required    | OAuth token endpoint the refresh request is sent to. |
+| `resource`                     | optional    | OAuth resource indicator sent on authorization-code and refresh-token requests. Required by MCP providers such as Granola. |
 | `scopes`                       | optional    | Array of strings. |
 | `client_id`                    | required    | OAuth client id. Returned in responses. |
 | `client_secret`                | optional    | OAuth client secret. Write-only and encrypted at rest; omit for public clients. Never returned. |
@@ -807,6 +808,7 @@ Returns `201`. The token blob, the `refresh_token` seed, and the `client_secret`
     "description": null,
     "labels": {},
     "token_endpoint": "https://oauth2.googleapis.com/token",
+    "resource": null,
     "scopes": ["https://www.googleapis.com/auth/gmail.readonly"],
     "client_id": "1234.apps.googleusercontent.com",
     "token_endpoint_header_names": [],
@@ -860,11 +862,16 @@ When a refresh fails unrecoverably (for example the IdP returns `invalid_grant` 
 
 ## OAuth apps
 
-An OAuth app registers an OAuth client (provider, client id, and client secret) and the scopes its [consent flow](#oauth-consent-flow) requests. The app's whole identity is a globally-unique `slug`: a team member who knows the integration (for example `google`) opens `/oauth/<slug>/start`, consents, and each completed consent mints (or updates) a [broker credential](#broker-credentials) linked back to the app. The minted credential is refreshed by the normal broker loop and delegates its `client_id` / `client_secret` to the app.
+An OAuth app registers an OAuth client (provider, client id, and optionally client secret) and the scopes its [consent flow](#oauth-consent-flow) requests. The app's whole identity is a globally-unique `slug`: a team member who knows the integration (for example `google` or `granola`) opens `/oauth/<slug>/start`, consents, and each completed consent mints (or updates) a [broker credential](#broker-credentials) linked back to the app. The minted credential is refreshed by the normal broker loop and delegates its `client_id` / `client_secret` to the app.
 
 Only managing the app's configuration requires API key auth. The consent flow endpoints themselves are unauthenticated and live on iron-control's own domain (see [OAuth consent flow](#oauth-consent-flow)).
 
-Google is the only supported provider in this release. The `provider` field is validated against the supported set, so an unknown provider returns `422`.
+Supported providers are:
+
+- `google` — static OAuth client. Supply `client_id` and `client_secret`.
+- `granola` — Granola MCP. Leave `client_id` and `client_secret` blank; `/oauth/<slug>/start` dynamically registers a public client with Granola DCR and stores the returned client id.
+
+The `provider` field is validated against the supported set, so an unknown provider returns `422`.
 
 ### Attributes
 
@@ -873,14 +880,14 @@ Google is the only supported provider in this release. The `provider` field is v
 | `slug`                 | required    | The app's identity: globally-unique, URL-safe, and the name in the well-known consent links (`/oauth/<slug>/start`). Must not start with the opaque-id prefix. |
 | `description`          | optional    | |
 | `labels`               | optional    | |
-| `provider`             | required    | The provider strategy. Currently only `"google"`. |
-| `client_id`            | required    | OAuth client id. Not secret; returned in responses. |
-| `client_secret`        | required on create | OAuth client secret. Write-only and encrypted at rest; on update it is only changed when supplied. Never returned. |
+| `provider`             | required    | The provider strategy: `"google"` or `"granola"`. |
+| `client_id`            | provider-specific | OAuth client id. Not secret; returned in responses. Required for Google; filled automatically for Granola after DCR. |
+| `client_secret`        | provider-specific | OAuth client secret. Write-only and encrypted at rest; required for Google, omitted for Granola's public client. On update it is only changed when supplied. Never returned. |
 | `allowed_scopes`       | required    | Non-empty array of scope strings the start endpoint requests. A flow's optional `scopes` param must be a subset; omitting it requests all of these. |
 | `credential_namespace` | optional    | Namespace for credentials minted by this app's flows. Defaults to `"default"`. |
 | `enabled`              | optional    | Defaults to `true`. A disabled app rejects new consent flows; existing credentials keep refreshing. |
 
-The `client_secret` is required and write-only: it is accepted on writes but never returned in any response.
+The `client_secret` is write-only: it is accepted on writes but never returned in any response.
 
 ### Create
 
@@ -920,6 +927,20 @@ Returns `201`. The `client_secret` is never echoed back:
 }
 ```
 
+Granola MCP apps use Dynamic Client Registration and can be created without client credentials:
+
+```json
+{
+  "data": {
+    "slug": "granola",
+    "description": "Granola MCP",
+    "provider": "granola",
+    "allowed_scopes": ["mcp"],
+    "credential_namespace": "default"
+  }
+}
+```
+
 ### Other operations
 
 | Method | Path | Notes |
@@ -933,6 +954,8 @@ Returns `201`. The `client_secret` is never echoed back:
 ## OAuth consent flow
 
 The consent flow turns a team member's OAuth consent into a managed broker credential. It runs on iron-control's own domain and is deliberately unauthenticated: the member reaches it with a single well-known link keyed by the app's `slug`. There is no external app to integrate with, so the start endpoint takes no `user` or `return_to`: after consent the member lands on an iron-control result page, and the credential's `external_user_key` is generated automatically. Safety comes from the consent itself (a credential is only created after a successful code exchange) and upsert-on-reconsent (re-consenting for the same provider account updates the existing credential instead of creating a new one).
+
+For Dynamic Client Registration providers, currently Granola MCP, `/oauth/<slug>/start` registers the app's redirect URI with the provider before building the authorization redirect. Set `CENTAUR_CONSOLE_PUBLIC_URL` to the HTTPS public origin so providers that reject plain HTTP redirect URIs can register successfully.
 
 One redirect URI is registered with the IdP per app, keyed by its slug:
 

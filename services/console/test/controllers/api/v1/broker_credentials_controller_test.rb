@@ -32,6 +32,7 @@ module Api
         data = json_body.fetch("data")
         assert_equal "https://oauth2.googleapis.com/token", data["token_endpoint"]
         assert_equal "gmail-client-id", data["client_id"]
+        assert_nil data["resource"]
         refute data.key?("client_secret")
         refute data.key?("access_token")
         refute data.key?("refresh_token")
@@ -47,6 +48,7 @@ module Api
         assert_response :ok
         data = json_body.fetch("data")
         assert_equal app.oid, data["oauth_app_id"]
+        assert_equal app.client_id, data["client_id"]
         assert_equal "sub-ser", data["provider_subject"]
         assert_equal "p@example.com", data["provider_email"]
         assert_equal "user-ser", data["external_user_key"]
@@ -57,6 +59,7 @@ module Api
           data: {
             namespace: "acme", foreign_id: "new-managed",
             token_endpoint: "https://idp.example/token",
+            resource: "https://mcp.example.com/mcp",
             scopes: [ "x" ],
             client_id: "the-client-id",
             client_secret: "the-client-secret",
@@ -71,6 +74,7 @@ module Api
         assert_response :created
         data = json_body.fetch("data")
         assert_equal "the-client-id", data["client_id"]
+        assert_equal "https://mcp.example.com/mcp", data["resource"]
         refute data.key?("client_secret")
         refute data.key?("refresh_token")
         assert_equal [ "X-Api-Key" ], data["token_endpoint_header_names"]
@@ -79,6 +83,7 @@ module Api
         created = BrokerCredential.find_by_oid(data["id"])
         assert_equal "super-secret-seed", created.refresh_token # persisted + decryptable
         assert_equal "the-client-secret", created.client_secret
+        assert_equal "https://mcp.example.com/mcp", created.resource
         assert_equal({ "X-Api-Key" => "k" }, created.token_endpoint_headers)
       end
 

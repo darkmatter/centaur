@@ -51,6 +51,12 @@ module Broker
       assert_equal "k", http.captured[:headers]["X-Api-Key"]
     end
 
+    test "resource indicator is included when supplied" do
+      client, http = client_with(status: 200, body: { access_token: "AT", expires_in: 60 }.to_json)
+      client.refresh(**base_args(resource: "https://mcp.example.com/mcp"))
+      assert_equal "https://mcp.example.com/mcp", http.captured[:form]["resource"]
+    end
+
     test "absent refresh_token in response means no rotation" do
       client, _ = client_with(status: 200, body: { access_token: "AT", expires_in: 60 }.to_json)
       result = client.refresh(**base_args)

@@ -57,6 +57,12 @@ module Broker
       assert_equal "verifier", form["code_verifier"]
     end
 
+    test "resource indicator is included when supplied" do
+      client, http = client_with(status: 200, body: success_body)
+      client.exchange(**base_args(resource: "https://mcp.example.com/mcp"))
+      assert_equal "https://mcp.example.com/mcp", http.captured[:form]["resource"]
+    end
+
     test "missing expires_in yields nil" do
       client, _ = client_with(status: 200, body: success_body(expires_in: nil))
       assert_nil client.exchange(**base_args).expires_in

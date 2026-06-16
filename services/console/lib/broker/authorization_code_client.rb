@@ -41,7 +41,8 @@ module Broker
     # the app is misconfigured. The console-login flow passes false: it requests no
     # offline access and only needs the id_token to identify the operator.
     def exchange(token_endpoint:, client_id:, client_secret:, code:, redirect_uri:,
-                 code_verifier:, timeout: DEFAULT_TIMEOUT, require_refresh_token: true)
+                 code_verifier:, resource: nil, timeout: DEFAULT_TIMEOUT,
+                 require_refresh_token: true)
       raise ArgumentError, "token endpoint is required" if token_endpoint.blank?
       raise ArgumentError, "client_id is required" if client_id.blank?
       raise ArgumentError, "code is required" if code.blank?
@@ -56,6 +57,7 @@ module Broker
         "code_verifier" => code_verifier
       }
       form["client_secret"] = client_secret if client_secret.present?
+      form["resource"] = resource if resource.present?
 
       response = perform(token_endpoint, form, timeout)
 

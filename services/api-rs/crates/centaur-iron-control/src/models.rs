@@ -366,6 +366,8 @@ pub struct BrokerCredentialInput {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub labels: BTreeMap<String, String>,
     pub token_endpoint: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resource: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub scopes: Vec<String>,
     pub client_id: String,
@@ -401,6 +403,8 @@ pub struct BrokerCredentialRecord {
     pub status: Option<String>,
     #[serde(default)]
     pub client_id: Option<String>,
+    #[serde(default)]
+    pub resource: Option<String>,
 }
 
 // ---------------------------------------------------------------------------

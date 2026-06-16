@@ -163,6 +163,10 @@ struct BrokerCreateArgs {
     #[arg(long)]
     token_endpoint: String,
 
+    /// OAuth resource indicator sent on refresh token requests.
+    #[arg(long)]
+    resource: Option<String>,
+
     /// OAuth client id (literal, not secret; echoed back by iron-control).
     #[arg(long)]
     client_id: String,
@@ -786,6 +790,7 @@ async fn broker_create(
         description: args.description.clone(),
         labels: managed_labels(),
         token_endpoint: args.token_endpoint.clone(),
+        resource: args.resource.clone(),
         scopes: args.scopes.clone(),
         client_id: args.client_id.clone(),
         client_secret: args.client_secret.clone(),

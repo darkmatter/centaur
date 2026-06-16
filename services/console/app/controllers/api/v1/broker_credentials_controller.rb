@@ -49,7 +49,7 @@ module Api
 
       def assign_and_save!(ref, attrs)
         base = attrs.permit(:namespace, :foreign_id, :name, :description, :token_endpoint,
-                            :client_id, :client_secret,
+                            :resource, :client_id, :client_secret,
                             :early_refresh_slack_seconds, :early_refresh_fraction,
                             :max_refresh_interval_seconds, :refresh_timeout_seconds,
                             labels: {}, scopes: [])
@@ -104,8 +104,9 @@ module Api
           description: ref.description,
           labels: ref.labels,
           token_endpoint: ref.token_endpoint,
+          resource: ref.resource,
           scopes: ref.scopes,
-          client_id: ref.client_id,
+          client_id: ref.effective_client_id,
           token_endpoint_header_names: (ref.token_endpoint_headers || {}).keys,
           early_refresh_slack_seconds: ref.early_refresh_slack_seconds,
           early_refresh_fraction: ref.early_refresh_fraction,

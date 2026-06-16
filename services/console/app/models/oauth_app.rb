@@ -1,6 +1,6 @@
 # An operator-registered OAuth application: the provider, the OAuth client
-# (client_id + encrypted client_secret), and the scopes its consent flow
-# requests.
+# (client_id + encrypted client_secret, unless dynamically registered), and the
+# scopes its consent flow requests.
 #
 # Each app has a globally-unique +slug+ that names its well-known consent links:
 # a team member who knows the integration ("google") clicks
@@ -13,8 +13,7 @@
 # the app, so rotating the app's secret fixes every credential it minted.
 #
 # Provider-generic by design: one model with a `provider` column and a small
-# strategy registry (Oauth::Providers), not a table per provider. Today the only
-# provider is Google.
+# strategy registry (Oauth::Providers), not a table per provider.
 class OauthApp < ApplicationRecord
   oid_prefix "oap"
 
@@ -38,8 +37,8 @@ class OauthApp < ApplicationRecord
             format: { with: URL_SAFE_FORMAT, message: URL_SAFE_MESSAGE }
   validate :slug_does_not_shadow_oid
   validates :provider, inclusion: { in: ->(_) { Oauth::Providers.keys }, message: "is not a supported provider" }
-  validates :client_id, presence: true
-  validates :client_secret, presence: true
+  validates :client_id, presence: true, if: :client_id_required?
+  validates :client_secret, presence: true, if: :client_secret_required?
   validates :credential_namespace, presence: true, format: { with: URL_SAFE_FORMAT, message: URL_SAFE_MESSAGE }
   validate :labels_is_a_hash
   validate :allowed_scopes_valid
@@ -50,6 +49,10 @@ class OauthApp < ApplicationRecord
 
   # True when every requested scope is within the allowlist.
   def scopes_allowed?(requested) = (Array(requested) - Array(allowed_scopes)).empty?
+
+  def client_id_required? = provider_strategy&.client_id_required? != false
+
+  def client_secret_required? = provider_strategy&.client_secret_required? != false
 
   private
 

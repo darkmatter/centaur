@@ -34,6 +34,7 @@ module Console
           credential: {
             namespace: "acme", foreign_id: "new-managed", name: "new-managed",
             token_endpoint: "https://idp.example/token", client_id: "cid",
+            resource: "https://mcp.example.com/mcp",
             client_secret: "shhh", scopes: "scope.a\nscope.b\n",
             refresh_token: "seed-token",
             early_refresh_fraction: "0.5", early_refresh_slack_seconds: "120",
@@ -50,6 +51,7 @@ module Console
       assert_equal({ "Authorization" => "Basic abc" }, cred.token_endpoint_headers)
       assert_equal({ "team" => "comms" }, cred.labels)
       assert_equal "shhh", cred.client_secret
+      assert_equal "https://mcp.example.com/mcp", cred.resource
       assert_equal "seed-token", cred.refresh_token
       assert_equal 0.5, cred.early_refresh_fraction
       assert_equal 120, cred.early_refresh_slack_seconds

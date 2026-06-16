@@ -33,7 +33,7 @@ module Broker
     # retryable vs. unrecoverable). scopes is an array; headers is a name=>value
     # hash applied verbatim to the token POST.
     def refresh(token_endpoint:, client_id:, refresh_token:, client_secret: nil,
-                scopes: [], headers: {}, timeout: DEFAULT_TIMEOUT)
+                scopes: [], resource: nil, headers: {}, timeout: DEFAULT_TIMEOUT)
       raise ArgumentError, "token endpoint is required" if token_endpoint.blank?
       raise ArgumentError, "client_id is required" if client_id.blank?
       raise ArgumentError, "refresh_token is required" if refresh_token.blank?
@@ -45,6 +45,7 @@ module Broker
       }
       form["client_secret"] = client_secret if client_secret.present?
       form["scope"] = scopes.join(" ") if scopes.present?
+      form["resource"] = resource if resource.present?
 
       response = perform(token_endpoint, form, headers, timeout)
 

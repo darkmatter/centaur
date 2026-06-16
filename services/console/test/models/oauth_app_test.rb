@@ -19,11 +19,16 @@ class OauthAppTest < ActiveSupport::TestCase
   test "provider must be a registered provider" do
     refute build_app(provider: "github").valid?
     assert build_app(provider: "google").valid?
+    assert build_app(provider: "granola", client_id: nil, client_secret: nil, allowed_scopes: %w[mcp]).valid?
   end
 
-  test "client_id and client_secret are required" do
+  test "client_id and client_secret are required for static-client providers" do
     refute build_app(client_id: nil).valid?
     refute build_app(client_secret: nil).valid?
+  end
+
+  test "dynamic-registration providers may start without client credentials" do
+    assert build_app(provider: "granola", client_id: nil, client_secret: nil, allowed_scopes: %w[mcp]).valid?
   end
 
   test "credential_namespace must be url-safe" do

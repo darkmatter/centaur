@@ -31,16 +31,16 @@
           <%= field_error(app, :provider) %>
         </div>
         <div>
-          <label class="form-label" for="oauth_app_client_id">Client ID *</label>
+          <label class="form-label" for="oauth_app_client_id">Client ID</label>
           <%= text_field_tag "oauth_app[client_id]", app.client_id, id: "oauth_app_client_id", class: "form-input #{field_error_class(app, :client_id)}" %>
           <%= field_error(app, :client_id) %>
-          <p class="form-hint">Not secret. Sent on every authorization and refresh.</p>
+          <p class="form-hint">Not secret. Leave blank for providers that register dynamically.</p>
         </div>
         <div>
-          <label class="form-label" for="oauth_app_client_secret">Client secret<%= " *".html_safe if app.new_record? %></label>
+          <label class="form-label" for="oauth_app_client_secret">Client secret</label>
           <%= password_field_tag "oauth_app[client_secret]", nil, id: "oauth_app_client_secret", class: "form-input #{field_error_class(app, :client_secret)}", autocomplete: "off", placeholder: app.new_record? ? nil : "•••••••• (unchanged)" %>
           <%= field_error(app, :client_secret) %>
-          <p class="form-hint">Stored encrypted.<%= " Leave blank to keep the current secret." unless app.new_record? %></p>
+          <p class="form-hint">Stored encrypted when present.<%= " Leave blank to keep the current secret." unless app.new_record? %></p>
         </div>
         <div>
           <label class="form-label" for="oauth_app_credential_namespace">Credential namespace</label>

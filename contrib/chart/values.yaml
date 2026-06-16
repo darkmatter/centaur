@@ -108,6 +108,18 @@ console:
     enabled: false
   service:
     httpPort: 3000
+  startupProbe:
+    failureThreshold: 30
+    periodSeconds: 10
+    timeoutSeconds: 5
+  readinessProbe:
+    failureThreshold: 6
+    periodSeconds: 10
+    timeoutSeconds: 5
+  livenessProbe:
+    failureThreshold: 6
+    periodSeconds: 10
+    timeoutSeconds: 5
   # Optional Ingress for the console. Bring your own controller — Tailscale
   # operator, Cloudflare, ingress-nginx, etc. — via className + annotations +
   # tls. Mirrors the top-level `ingress` block (which is wired to the

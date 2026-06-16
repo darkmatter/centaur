@@ -28,6 +28,9 @@
             "httpPort": { "type": "integer" }
           }
         },
+        "startupProbe": { "$ref": "#/definitions/probeConfig" },
+        "readinessProbe": { "$ref": "#/definitions/probeConfig" },
+        "livenessProbe": { "$ref": "#/definitions/probeConfig" },
         "ingress": {
           "type": "object",
           "properties": {
@@ -48,6 +51,14 @@
           }
         },
         "resources": { "type": "object" }
+      }
+    },
+    "probeConfig": {
+      "type": "object",
+      "properties": {
+        "failureThreshold": { "type": "integer" },
+        "periodSeconds": { "type": "integer" },
+        "timeoutSeconds": { "type": "integer" }
       }
     }
   },

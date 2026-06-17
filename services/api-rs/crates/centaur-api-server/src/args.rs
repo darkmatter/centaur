@@ -2415,6 +2415,24 @@ mod tests {
                         == Some("TOOL_API_KEY")
             })
         }));
+        assert!(roles[0].1.postgres.iter().any(|listener| {
+            listener.name.as_deref() == Some("centaur-database")
+                && listener
+                    .sandbox_env
+                    .as_ref()
+                    .and_then(|sandbox_env| sandbox_env.name.as_deref())
+                    == Some("CENTAUR_DATABASE_URL")
+                && listener
+                    .sandbox_env
+                    .as_ref()
+                    .and_then(|sandbox_env| sandbox_env.database.as_deref())
+                    == Some("ai_v2")
+                && listener
+                    .extra
+                    .get("role")
+                    .and_then(serde_yaml::Value::as_str)
+                    == Some("centaur_readonly")
+        }));
     }
 
     #[test]

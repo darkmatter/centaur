@@ -24,3 +24,11 @@ transforms:
             proxy_value: SLACK_BOT_TOKEN
             match_headers: ["Authorization"]
           rules: [{ host: "*.slack.com" }]
+postgres:
+  - name: centaur-database
+    upstream:
+      dsn: { placeholder: DATABASE_URL }
+    sandbox_env:
+      name: CENTAUR_DATABASE_URL
+      database: ai_v2
+    role: centaur_readonly

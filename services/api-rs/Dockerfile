@@ -12,6 +12,8 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     apt-get update && apt-get install -y --no-install-recommends \
         cmake perl build-essential pkg-config
 WORKDIR /build
+ENV CARGO_PROFILE_DEV_DEBUG=0 \
+    CARGO_PROFILE_DEV_SPLIT_DEBUGINFO=off
 
 FROM chef AS planner
 COPY services/api-rs/ ./

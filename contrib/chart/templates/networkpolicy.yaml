@@ -177,7 +177,7 @@ spec:
         - protocol: TCP
           port: 5432
 {{- end }}
-    # Per-sandbox iron-proxy listeners (HTTP proxy + postgres port).
+    # Per-sandbox iron-proxy listeners (HTTP proxy, management API, and postgres port).
     - to:
         - podSelector:
             matchLabels:
@@ -185,6 +185,8 @@ spec:
       ports:
         - protocol: TCP
           port: {{ .Values.ironProxy.service.proxyPort }}
+        - protocol: TCP
+          port: {{ .Values.ironProxy.service.managementPort }}
         - protocol: TCP
           port: {{ .Values.ironProxy.service.pgPort }}
 {{- if $console.enabled }}

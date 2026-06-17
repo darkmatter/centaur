@@ -112,3 +112,22 @@ jobs:
           IRON_CONTROL_DB_PASSWORD: postgres
           # RAILS_MASTER_KEY: ${{ secrets.RAILS_MASTER_KEY }}
         run: bin/rails db:test:prepare test
+
+  console-ci-success:
+    name: Console CI success
+    runs-on: ubuntu-latest
+    if: always()
+    needs:
+      - scan_ruby
+      - scan_js
+      - lint
+      - test
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: .
+    steps:
+      - name: Decide whether the needed jobs succeeded or failed
+        uses: re-actors/alls-green@05ac9388f0aebcb5727afa17fcccfecd6f8ec5fe # release/v1
+        with:
+          jobs: ${{ toJSON(needs) }}

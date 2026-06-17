@@ -88,6 +88,8 @@ logs/
 **/test/**
 **/tests/
 **/tests/**
+**/examples/
+**/examples/**
 
 # Environment (secrets)
 .env

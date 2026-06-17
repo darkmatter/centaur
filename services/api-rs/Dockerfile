@@ -23,8 +23,8 @@ ARG RUST_BUILD_PROFILE=release
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
     case "$RUST_BUILD_PROFILE" in \
-      release) cargo chef cook --release --package centaur-api-server --recipe-path recipe.json ;; \
-      debug|dev) cargo chef cook --package centaur-api-server --recipe-path recipe.json ;; \
+      release) cargo chef cook --locked --release --package centaur-api-server --recipe-path recipe.json ;; \
+      debug|dev) cargo chef cook --locked --package centaur-api-server --recipe-path recipe.json ;; \
       *) echo "unsupported RUST_BUILD_PROFILE=$RUST_BUILD_PROFILE" >&2; exit 2 ;; \
     esac
 
@@ -35,8 +35,8 @@ ARG RUST_BUILD_PROFILE=release
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
     case "$RUST_BUILD_PROFILE" in \
-      release) cargo build --release -p centaur-api-server && cp target/release/centaur-api-server /usr/local/bin/centaur-api-server ;; \
-      debug|dev) cargo build -p centaur-api-server && cp target/debug/centaur-api-server /usr/local/bin/centaur-api-server ;; \
+      release) cargo build --locked --release -p centaur-api-server && cp target/release/centaur-api-server /usr/local/bin/centaur-api-server ;; \
+      debug|dev) cargo build --locked -p centaur-api-server && cp target/debug/centaur-api-server /usr/local/bin/centaur-api-server ;; \
       *) echo "unsupported RUST_BUILD_PROFILE=$RUST_BUILD_PROFILE" >&2; exit 2 ;; \
     esac
 

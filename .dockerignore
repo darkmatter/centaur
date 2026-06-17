@@ -64,6 +64,8 @@ services/api-rs/target
 logs/
 
 # IDE / editor
+.github
+.github/**
 .claude
 .cursor
 .vscode
@@ -80,6 +82,12 @@ logs/
 !centaur_sdk/README.md
 !services/sandbox/SYSTEM_PROMPT.md
 !.agents/skills/**
+
+# Tests are validated by CI but are not needed in runtime images.
+**/test/
+**/test/**
+**/tests/
+**/tests/**
 
 # Environment (secrets)
 .env

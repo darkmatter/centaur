@@ -12,8 +12,14 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     apt-get update && apt-get install -y --no-install-recommends \
         cmake perl build-essential pkg-config
 WORKDIR /build
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
+    cargo install sccache --locked
 ENV CARGO_PROFILE_DEV_DEBUG=0 \
-    CARGO_PROFILE_DEV_SPLIT_DEBUGINFO=off
+    CARGO_PROFILE_DEV_SPLIT_DEBUGINFO=off \
+    CARGO_INCREMENTAL=0 \
+    RUSTC_WRAPPER=sccache \
+    SCCACHE_DIR=/sccache
 
 FROM chef AS planner
 COPY services/api-rs/ ./
@@ -24,11 +30,13 @@ COPY --from=planner /build/recipe.json recipe.json
 ARG RUST_BUILD_PROFILE=release
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,target=/sccache,sharing=shared \
     case "$RUST_BUILD_PROFILE" in \
       release) cargo chef cook --locked --release --package centaur-api-server --recipe-path recipe.json ;; \
       debug|dev) cargo chef cook --locked --package centaur-api-server --recipe-path recipe.json ;; \
       *) echo "unsupported RUST_BUILD_PROFILE=$RUST_BUILD_PROFILE" >&2; exit 2 ;; \
-    esac
+    esac && \
+    sccache --show-stats
 
 FROM chef AS builder
 COPY --from=cacher /build/target /build/target
@@ -36,11 +44,13 @@ COPY services/api-rs/ ./
 ARG RUST_BUILD_PROFILE=release
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,target=/sccache,sharing=shared \
     case "$RUST_BUILD_PROFILE" in \
       release) cargo build --locked --release -p centaur-api-server && cp target/release/centaur-api-server /usr/local/bin/centaur-api-server ;; \
       debug|dev) cargo build --locked -p centaur-api-server && cp target/debug/centaur-api-server /usr/local/bin/centaur-api-server ;; \
       *) echo "unsupported RUST_BUILD_PROFILE=$RUST_BUILD_PROFILE" >&2; exit 2 ;; \
-    esac
+    esac && \
+    sccache --show-stats
 
 FROM debian:bookworm-slim
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \

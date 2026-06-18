@@ -1,4 +1,3 @@
-import base64
 import email.message
 import json
 
@@ -176,6 +175,16 @@ def test_send_message_normalizes_escaped_line_breaks() -> None:
 
     assert fake_web_client.last_kwargs is not None
     assert fake_web_client.last_kwargs["text"] == "*Title*\n- one\n- two"
+
+
+def test_send_message_accepts_slack_channel_mention_destination() -> None:
+    client, fake_web_client = _make_client()
+    client._resolve_channel = SlackClient._resolve_channel.__get__(client, SlackClient)
+
+    client.send_message("<#C0AJ07U8Z1N>", "checking", no_attribution=True)
+
+    assert fake_web_client.last_kwargs is not None
+    assert fake_web_client.last_kwargs["channel"] == "C0AJ07U8Z1N"
 
 
 def test_send_message_opens_dm_for_user_id_destination() -> None:
@@ -637,6 +646,56 @@ def test_upload_file_defaults_to_api_slack_thread_context(monkeypatch) -> None:
 
     assert fake_web_client.last_kwargs is not None
     assert fake_web_client.last_kwargs["channel"] == "C-api"
+    assert fake_web_client.last_kwargs["thread_ts"] == "200.000000"
+
+
+def test_upload_file_falls_back_to_tool_context_when_api_context_disagrees(monkeypatch) -> None:
+    import slack.client as slack_client_module
+
+    client, fake_web_client = _make_client()
+    monkeypatch.setattr(
+        slack_client_module,
+        "current_slack_thread",
+        lambda: {"channel_id": "C-stale", "thread_ts": "199.000000"},
+    )
+    client._resolve_channel = lambda channel: channel  # type: ignore[method-assign]
+    token = set_tool_context(
+        ToolContext(name="slack", thread_key="slack:C-current:200.000000"),
+    )
+    try:
+        client.upload_file(content_base64="dGVzdA==", filename="chart.png")
+    finally:
+        reset_tool_context(token)
+
+    assert fake_web_client.last_kwargs is not None
+    assert fake_web_client.last_kwargs["channel"] == "C-current"
+    assert fake_web_client.last_kwargs["thread_ts"] == "200.000000"
+
+
+def test_upload_file_prefers_tool_context_over_env_when_api_context_disagrees(
+    monkeypatch,
+) -> None:
+    import slack.client as slack_client_module
+
+    client, fake_web_client = _make_client()
+    monkeypatch.setattr(
+        slack_client_module,
+        "current_slack_thread",
+        lambda: {"channel_id": "C-stale-api", "thread_ts": "199.000000"},
+    )
+    monkeypatch.setenv("SLACK_CHANNEL_ID", "C-stale-env")
+    monkeypatch.setenv("SLACK_THREAD_TS", "198.000000")
+    client._resolve_channel = lambda channel: channel  # type: ignore[method-assign]
+    token = set_tool_context(
+        ToolContext(name="slack", thread_key="slack:C-current:200.000000"),
+    )
+    try:
+        client.upload_file(content_base64="dGVzdA==", filename="chart.png")
+    finally:
+        reset_tool_context(token)
+
+    assert fake_web_client.last_kwargs is not None
+    assert fake_web_client.last_kwargs["channel"] == "C-current"
     assert fake_web_client.last_kwargs["thread_ts"] == "200.000000"
 
 

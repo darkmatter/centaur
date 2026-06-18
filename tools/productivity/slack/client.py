@@ -1506,26 +1506,43 @@ class SlackClient:
         """Return the active Slack channel/thread, if any.
 
         Prefer API-owned session context so warm pooled sandboxes do not depend
-        on per-thread environment mutation. Fall back to parsing the tool
+        on per-thread environment mutation. Cross-check it against the tool
+        context's thread_key when present so stale session metadata cannot
+        route uploads to the wrong channel. Fall back to parsing the tool
         context's thread_key for older runtimes/tests.
         """
+        context_destination: tuple[str | None, str | None] = (None, None)
+        try:
+            thread_key = get_tool_context().thread_key or ""
+            context_destination = self._slack_destination_from_thread_key(thread_key)
+        except LookupError:
+            pass
+
         try:
             slack = current_slack_thread()
             channel = slack.get("channel_id")
             thread_ts = slack.get("thread_ts")
-            if channel and thread_ts:
+            if channel and thread_ts and (
+                context_destination == (None, None) or context_destination == (channel, thread_ts)
+            ):
                 return channel, thread_ts
         except Exception:
             pass
 
-        env_channel = os.environ.get("SLACK_CHANNEL_ID", "").strip()
-        env_thread_ts = os.environ.get("SLACK_THREAD_TS", "").strip()
+        if context_destination != (None, None):
+            return context_destination
+
+        env_channel = os.environ.get("SLACK_CHANNEL_ID", "").strip()  # noqa: TID251
+        env_thread_ts = os.environ.get("SLACK_THREAD_TS", "").strip()  # noqa: TID251
         if env_channel and env_thread_ts:
             return env_channel, env_thread_ts
 
-        try:
-            thread_key = get_tool_context().thread_key or ""
-        except LookupError:
+        return None, None
+
+    @staticmethod
+    def _slack_destination_from_thread_key(thread_key: str) -> tuple[str | None, str | None]:
+        """Parse legacy and team-scoped Slack thread keys."""
+        if not thread_key:
             return None, None
         parts = thread_key.split(":")
         if parts[0] != "slack":

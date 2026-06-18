@@ -1436,10 +1436,15 @@ async function renderExecutionStream(
       )
     )
     if (!visibleStream) return
+    const taskDisplayMode = slackStreamTaskDisplayMode(options)
     await thread.post(
       new StreamingPlan(
         visibleStream,
-        { groupTasks: options.streamTaskDisplayMode ?? 'plan' }
+        {
+          // Slack supports "dense"; Chat SDK 4.31.0 forwards this value but
+          // its public type has not caught up yet.
+          groupTasks: taskDisplayMode as 'plan'
+        }
       )
     )
   } finally {
@@ -1476,13 +1481,14 @@ async function renderRecoveredExecutionStream(
       )
     )
     if (!visibleStream) return
+    const taskDisplayMode = slackStreamTaskDisplayMode(options)
     await thread.adapter.stream!(
       thread.id,
       visibleStream,
       {
         recipientTeamId: message.teamId,
         recipientUserId: message.author.userId,
-        taskDisplayMode: options.streamTaskDisplayMode ?? 'plan'
+        taskDisplayMode: taskDisplayMode as 'plan'
       }
     )
   } finally {
@@ -1605,6 +1611,10 @@ function isPlainTextOnlyRequest(text: string): boolean {
     || /\bno\s+interactive\s+blocks?\b/.test(normalized)
     || /\bno\s+dashboards?\b/.test(normalized)
   )
+}
+
+function slackStreamTaskDisplayMode(options: SlackbotV2Options): 'dense' | 'plan' | 'timeline' {
+  return options.streamTaskDisplayMode ?? 'dense'
 }
 
 function truncateSlackTaskField(value: string): string {

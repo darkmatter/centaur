@@ -102,7 +102,7 @@ export type SlackbotV2Options = {
   slackApiUrl?: string
   state?: StateAdapter
   stateKeyPrefix?: string
-  streamTaskDisplayMode?: 'plan' | 'timeline'
+  streamTaskDisplayMode?: 'dense' | 'plan' | 'timeline'
   triggerBotAllowlist?: readonly string[]
   userName?: string
   mapper?: CodexAppServerToChatStreamOptions

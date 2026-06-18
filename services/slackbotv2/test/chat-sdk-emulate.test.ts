@@ -4164,7 +4164,7 @@ function expectSlackPlanStreamShape(
         thread_ts: input.parentTs,
         recipient_user_id: USER_ID,
         recipient_team_id: TEAM_ID,
-        task_display_mode: 'plan'
+        task_display_mode: 'dense'
       })
     )
     expect(transcript.start.body.ts).toBeUndefined()
@@ -4228,7 +4228,7 @@ function expectSlackPlanStreamShape(
     expect(progressChunks).toContainEqual(
       expect.objectContaining({
         type: 'task_update',
-        id: 'thinking-commentary-1',
+        id: 'thinking-commentary',
         title: 'Thinking',
         status: 'complete'
       })

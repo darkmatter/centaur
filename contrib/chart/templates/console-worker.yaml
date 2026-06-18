@@ -119,6 +119,10 @@ spec:
                 secretKeyRef:
                   name: {{ $secretEnv }}
                   key: {{ printf "%sIRON_CONTROL_SECRET_KEY_BASE" $prefix }}
+{{- with $console.publicUrl }}
+            - name: CENTAUR_CONSOLE_PUBLIC_URL
+              value: {{ . | quote }}
+{{- end }}
 {{- if $console.googleOauth.enabled }}
             # Google OAuth app credentials, needed by the broker-credential
             # OAuth refresh loop. Gated on console.googleOauth.enabled.

@@ -92,6 +92,11 @@ console:
     # IfNotPresent would pin pods to whatever digest a node already cached.
     pullPolicy: Always
   railsEnv: production
+  # Public origin for this console deployment, for example
+  # https://console.example.com. When set, the chart renders
+  # CENTAUR_CONSOLE_PUBLIC_URL so OAuth redirect URLs do not depend on the
+  # internal service host.
+  publicUrl: ""
   database:
     # Logical DB created on the bundled Postgres by the create-db init
     # container. Must match the primary connection's `database:` in the image's

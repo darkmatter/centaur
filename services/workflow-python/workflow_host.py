@@ -207,7 +207,6 @@ class RegisteredWorkflow:
     input_cls: type | None
     webhooks: Any
     schedule: Any
-    run_on_staging: bool
 
 
 def install_api_compat_module() -> None:
@@ -627,13 +626,7 @@ def runtime_namespace() -> str | None:
 
 
 def runtime_environment() -> str | None:
-    for name in (
-        "CENTAUR_ENVIRONMENT",
-        "DEPLOY_ENV",
-        "ENVIRONMENT",
-        "DEPLOYMENT_ENVIRONMENT",
-        "METRICS_ENVIRONMENT",
-    ):
+    for name in ("METRICS_ENVIRONMENT", "ENVIRONMENT", "DEPLOYMENT_ENVIRONMENT"):
         value = clean_metric_label_value(os.environ.get(name))
         if value:
             return value
@@ -651,7 +644,7 @@ def runtime_environment() -> str | None:
     namespace = runtime_namespace()
     if namespace == "centaur-system":
         return "production"
-    if is_staging_environment(namespace):
+    if namespace and namespace.startswith("stg-"):
         return "staging"
     return None
 
@@ -737,43 +730,6 @@ def workflow_enabled(workflow_name: str) -> bool:
     raise RuntimeError(f'WORKFLOW_ENABLE_MODE must be "all" or "allowlist", got {mode!r}')
 
 
-def config_bool(value: Any, default: bool = False) -> bool:
-    if value is None:
-        return default
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, str):
-        return value.strip().lower() not in {"0", "false", "no", "off"}
-    if isinstance(value, (int, float)):
-        return value != 0
-    return default
-
-
-def workflow_run_on_staging(module: Any) -> bool:
-    config = getattr(module, "WORKFLOW_CONFIG", None)
-    if isinstance(config, dict) and "run_on_staging" in config:
-        return config_bool(config.get("run_on_staging"), default=False)
-    return False
-
-
-def is_staging_environment(value: str | None) -> bool:
-    if value is None:
-        return False
-    normalized = value.strip().lower()
-    return (
-        normalized in {"staging", "stage", "stg"}
-        or normalized.startswith("stg-")
-        or normalized.endswith("-staging")
-        or normalized.endswith("_staging")
-    )
-
-
-def workflow_allowed_in_current_environment(workflow: RegisteredWorkflow) -> bool:
-    if not is_staging_environment(runtime_environment()):
-        return True
-    return workflow.run_on_staging
-
-
 def configure_workflow_import_paths(dirs: list[Path]) -> None:
     for directory in dirs:
         candidate_paths = [directory.parent, directory]
@@ -800,15 +756,13 @@ def load_workflow_file(path: Path) -> RegisteredWorkflow | None:
     handler = getattr(module, "handler", None)
     if not isinstance(workflow_name, str) or not callable(handler):
         return None
-    schedule = getattr(module, "SCHEDULE", None)
     return RegisteredWorkflow(
         workflow_name=workflow_name,
         source_path=str(path),
         handler=handler,
         input_cls=getattr(module, "Input", None),
         webhooks=getattr(module, "WEBHOOKS", None),
-        schedule=schedule,
-        run_on_staging=workflow_run_on_staging(module),
+        schedule=getattr(module, "SCHEDULE", None),
     )
 
 
@@ -848,8 +802,6 @@ def discover_workflows() -> dict[str, RegisteredWorkflow]:
             if registered is None:
                 continue
             if not workflow_enabled(registered.workflow_name):
-                continue
-            if not workflow_allowed_in_current_environment(registered):
                 continue
             if registered.workflow_name in discovered:
                 raise RuntimeError(f"duplicate workflow name {registered.workflow_name!r}")
@@ -959,7 +911,6 @@ def normalize_schedule(workflow: RegisteredWorkflow) -> dict[str, Any] | None:
     schedule.setdefault("schedule_id", workflow.workflow_name)
     schedule.setdefault("workflow_name", workflow.workflow_name)
     schedule.setdefault("source_path", workflow.source_path)
-    schedule["run_on_staging"] = workflow.run_on_staging
     return schedule
 
 
@@ -1002,7 +953,6 @@ def discovery_payload() -> dict[str, Any]:
             {
                 "workflow_name": workflow.workflow_name,
                 "source_path": workflow.source_path,
-                "run_on_staging": workflow.run_on_staging,
                 "webhooks": normalize_webhooks(workflow),
                 "schedule": normalize_schedule(workflow),
             }

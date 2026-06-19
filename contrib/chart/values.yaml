@@ -286,10 +286,8 @@ apiRs:
   # Connect control plane and infra secrets are managed out of band.
   syncInfraSecrets: true
   # Workflow enablement policy. Production defaults to all workflows enabled.
-  # Staging schedule/webhook discovery is additionally gated by each workflow's
-  # config: set `WORKFLOW_CONFIG = {"run_on_staging": True}` to opt a workflow
-  # into staging. The central allowlist remains as an optional extra gate across
-  # all environments.
+  # Set workflowEnableMode: allowlist in staging and list allowed workflow names
+  # in workflowAllowedNames as a comma/whitespace-separated string.
   workflowEnableMode: all
   workflowAllowedNames: ""
   # Reaper: stop sandboxes idle-paused longer than the idle TTL or older than

@@ -52,20 +52,6 @@ const WORKFLOW_RECONCILE_INTERVAL_SECS_ENV: &str = "WORKFLOW_RECONCILE_INTERVAL_
 const DEFAULT_WORKFLOW_RECONCILE_INTERVAL_SECS: u64 = 60;
 const WORKFLOW_ENABLE_MODE_ENV: &str = "WORKFLOW_ENABLE_MODE";
 const WORKFLOW_ALLOWED_NAMES_ENV: &str = "WORKFLOW_ALLOWED_NAMES";
-const WORKFLOW_RUN_ON_STAGING_KEY: &str = "run_on_staging";
-const WORKFLOW_ENVIRONMENT_VARS: &[&str] = &[
-    "CENTAUR_ENVIRONMENT",
-    "DEPLOY_ENV",
-    "ENVIRONMENT",
-    "DEPLOYMENT_ENVIRONMENT",
-    "METRICS_ENVIRONMENT",
-];
-const WORKFLOW_NAMESPACE_VARS: &[&str] = &[
-    "SESSION_SANDBOX_K8S_NAMESPACE",
-    "KUBERNETES_NAMESPACE",
-    "POD_NAMESPACE",
-    "METRICS_NAMESPACE",
-];
 /// How many consecutive reconcile passes a workflow must be missing from
 /// discovery before its active tasks are cancelled. 0 disables reaping.
 const WORKFLOW_REAP_REMOVED_AFTER_TICKS_ENV: &str = "WORKFLOW_REAP_REMOVED_AFTER_TICKS";
@@ -97,7 +83,6 @@ struct WorkflowRuntimeInner {
     _etl_worker: Worker,
     _etl_backfill_worker: Worker,
     _schedule_worker: Worker,
-    workflow_names: Arc<RwLock<BTreeSet<String>>>,
     webhook_registry: Arc<RwLock<BTreeMap<String, RegisteredWorkflowWebhook>>>,
     schedule_registry: Arc<RwLock<BTreeMap<String, RegisteredWorkflowSchedule>>>,
 }
@@ -106,7 +91,6 @@ struct WorkflowRuntimeInner {
 struct WorkflowEnablement {
     mode: WorkflowEnableMode,
     allowed_names: BTreeSet<String>,
-    staging_filter: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -120,7 +104,6 @@ impl WorkflowEnablement {
         Self {
             mode: WorkflowEnableMode::All,
             allowed_names: BTreeSet::new(),
-            staging_filter: false,
         }
     }
 
@@ -128,25 +111,23 @@ impl WorkflowEnablement {
         Self {
             mode: WorkflowEnableMode::Allowlist,
             allowed_names: parse_workflow_allowed_names(raw_allowed_names),
-            staging_filter: false,
         }
     }
 
     fn from_env() -> Result<Self, WorkflowRuntimeError> {
         let raw_mode = env::var(WORKFLOW_ENABLE_MODE_ENV).unwrap_or_default();
         let mode = raw_mode.trim();
-        let mut enablement = if mode.is_empty() || mode.eq_ignore_ascii_case("all") {
-            Self::all()
-        } else if mode.eq_ignore_ascii_case("allowlist") {
-            Self::allowlist(&env::var(WORKFLOW_ALLOWED_NAMES_ENV).unwrap_or_default())
-        } else {
-            return Err(WorkflowRuntimeError::BadRequest(format!(
-                "{WORKFLOW_ENABLE_MODE_ENV} must be \"all\" or \"allowlist\", got {mode:?}"
-            )));
-        };
-        enablement.staging_filter =
-            is_staging_environment(current_workflow_environment().as_deref());
-        Ok(enablement)
+        if mode.is_empty() || mode.eq_ignore_ascii_case("all") {
+            return Ok(Self::all());
+        }
+        if mode.eq_ignore_ascii_case("allowlist") {
+            return Ok(Self::allowlist(
+                &env::var(WORKFLOW_ALLOWED_NAMES_ENV).unwrap_or_default(),
+            ));
+        }
+        Err(WorkflowRuntimeError::BadRequest(format!(
+            "{WORKFLOW_ENABLE_MODE_ENV} must be \"all\" or \"allowlist\", got {mode:?}"
+        )))
     }
 
     fn is_enabled(&self, workflow_name: &str) -> bool {
@@ -165,60 +146,23 @@ impl WorkflowEnablement {
         )))
     }
 
-    fn ensure_enabled_for_discovered(
-        &self,
-        workflow_name: &str,
-        discovered_workflow_names: &BTreeSet<String>,
-    ) -> Result<(), WorkflowRuntimeError> {
-        self.ensure_enabled(workflow_name)?;
-        if self.staging_filter
-            && !is_native_workflow(workflow_name)
-            && !discovered_workflow_names.contains(workflow_name.trim())
-        {
-            return Err(WorkflowRuntimeError::Disabled(format!(
-                "workflow {workflow_name:?} is not allowed to run in staging; set \
-                 WORKFLOW_CONFIG[{WORKFLOW_RUN_ON_STAGING_KEY:?}] to true"
-            )));
-        }
-        Ok(())
-    }
-
     fn filter_metadata(&self, metadata: &mut PythonWorkflowMetadata) {
-        if self.mode == WorkflowEnableMode::All && !self.staging_filter {
+        if self.mode == WorkflowEnableMode::All {
             return;
         }
-        let enabled_names = metadata
+        metadata
             .workflow_names
-            .iter()
-            .filter(|workflow_name| self.is_enabled(workflow_name))
-            .filter(|workflow_name| {
-                !self.staging_filter
-                    || metadata
-                        .workflow_run_on_staging
-                        .get(*workflow_name)
-                        .copied()
-                        .unwrap_or(false)
-            })
-            .cloned()
-            .collect::<BTreeSet<_>>();
-        metadata.workflow_names = enabled_names.clone();
+            .retain(|workflow_name| self.is_enabled(workflow_name));
         metadata
             .webhooks
-            .retain(|webhook| enabled_names.contains(&webhook.workflow_name));
+            .retain(|webhook| self.is_enabled(&webhook.workflow_name));
         metadata.schedules.retain(|schedule| {
             schedule
                 .get("workflow_name")
                 .and_then(Value::as_str)
-                .is_some_and(|workflow_name| enabled_names.contains(workflow_name))
+                .is_some_and(|workflow_name| self.is_enabled(workflow_name))
         });
     }
-}
-
-fn is_native_workflow(workflow_name: &str) -> bool {
-    matches!(
-        workflow_name.trim(),
-        "echo" | "sleep_echo" | "agent_turn" | "tool_and_slack"
-    )
 }
 
 fn parse_workflow_allowed_names(raw: &str) -> BTreeSet<String> {
@@ -228,65 +172,6 @@ fn parse_workflow_allowed_names(raw: &str) -> BTreeSet<String> {
             (!name.is_empty()).then(|| name.to_owned())
         })
         .collect()
-}
-
-fn current_workflow_environment() -> Option<String> {
-    for name in WORKFLOW_ENVIRONMENT_VARS {
-        if let Some(value) = nonempty_env(name) {
-            return Some(value);
-        }
-    }
-    if let Some(value) = deployment_environment_from_otel_resource_attributes() {
-        return Some(value);
-    }
-    for name in WORKFLOW_NAMESPACE_VARS {
-        if let Some(namespace) = nonempty_env(name) {
-            if namespace == "centaur-system" {
-                return Some("production".to_owned());
-            }
-            if is_staging_environment(Some(&namespace)) {
-                return Some("staging".to_owned());
-            }
-        }
-    }
-    None
-}
-
-fn nonempty_env(name: &str) -> Option<String> {
-    env::var(name)
-        .ok()
-        .map(|value| value.trim().to_owned())
-        .filter(|value| !value.is_empty())
-}
-
-fn deployment_environment_from_otel_resource_attributes() -> Option<String> {
-    let raw = env::var("OTEL_RESOURCE_ATTRIBUTES").ok()?;
-    for attr in raw.split(',') {
-        let Some((key, value)) = attr.split_once('=') else {
-            continue;
-        };
-        if matches!(
-            key.trim(),
-            "deployment.environment" | "deployment.environment.name"
-        ) {
-            let value = value.trim();
-            if !value.is_empty() {
-                return Some(value.to_owned());
-            }
-        }
-    }
-    None
-}
-
-fn is_staging_environment(environment: Option<&str>) -> bool {
-    let Some(environment) = environment else {
-        return false;
-    };
-    let normalized = environment.trim().to_ascii_lowercase();
-    matches!(normalized.as_str(), "staging" | "stage" | "stg")
-        || normalized.starts_with("stg-")
-        || normalized.ends_with("-staging")
-        || normalized.ends_with("_staging")
 }
 
 #[derive(Clone)]
@@ -427,8 +312,6 @@ pub struct RegisteredWorkflowSchedule {
     #[serde(default)]
     pub enabled: bool,
     #[serde(default)]
-    pub run_on_staging: bool,
-    #[serde(default)]
     pub no_delivery: bool,
 }
 
@@ -555,80 +438,37 @@ impl WorkflowRuntime {
             &discovery,
             &enablement,
         )?));
-        let workflow_names = Arc::new(RwLock::new(discovery.workflow_names.clone()));
 
         let task_session_runtime = session_runtime.clone();
         let task_workflow_host_sandbox = workflow_host_sandbox.clone();
-        let task_workflow_names = workflow_names.clone();
         client.register_task(WORKFLOW_TASK, move |input: WorkflowTaskInput, ctx| {
             let session_runtime = task_session_runtime.clone();
             let workflow_host_sandbox = task_workflow_host_sandbox.clone();
-            let workflow_names = task_workflow_names.clone();
-            async move {
-                run_centaur_workflow(
-                    input,
-                    ctx,
-                    session_runtime,
-                    workflow_host_sandbox,
-                    workflow_names,
-                )
-                .await
-            }
+            async move { run_centaur_workflow(input, ctx, session_runtime, workflow_host_sandbox).await }
         })?;
         let slack_live_session_runtime = session_runtime.clone();
         let slack_live_workflow_host_sandbox = workflow_host_sandbox.clone();
-        let slack_live_workflow_names = workflow_names.clone();
         slack_live_client.register_task(WORKFLOW_TASK, move |input: WorkflowTaskInput, ctx| {
             let session_runtime = slack_live_session_runtime.clone();
             let workflow_host_sandbox = slack_live_workflow_host_sandbox.clone();
-            let workflow_names = slack_live_workflow_names.clone();
-            async move {
-                run_centaur_workflow(
-                    input,
-                    ctx,
-                    session_runtime,
-                    workflow_host_sandbox,
-                    workflow_names,
-                )
-                .await
-            }
+            async move { run_centaur_workflow(input, ctx, session_runtime, workflow_host_sandbox).await }
         })?;
         let etl_session_runtime = session_runtime.clone();
         let etl_workflow_host_sandbox = workflow_host_sandbox.clone();
-        let etl_workflow_names = workflow_names.clone();
         etl_client.register_task(WORKFLOW_TASK, move |input: WorkflowTaskInput, ctx| {
             let session_runtime = etl_session_runtime.clone();
             let workflow_host_sandbox = etl_workflow_host_sandbox.clone();
-            let workflow_names = etl_workflow_names.clone();
-            async move {
-                run_centaur_workflow(
-                    input,
-                    ctx,
-                    session_runtime,
-                    workflow_host_sandbox,
-                    workflow_names,
-                )
-                .await
-            }
+            async move { run_centaur_workflow(input, ctx, session_runtime, workflow_host_sandbox).await }
         })?;
         let etl_backfill_session_runtime = session_runtime.clone();
         let etl_backfill_workflow_host_sandbox = workflow_host_sandbox.clone();
-        let etl_backfill_workflow_names = workflow_names.clone();
         etl_backfill_client.register_task(
             WORKFLOW_TASK,
             move |input: WorkflowTaskInput, ctx| {
                 let session_runtime = etl_backfill_session_runtime.clone();
                 let workflow_host_sandbox = etl_backfill_workflow_host_sandbox.clone();
-                let workflow_names = etl_backfill_workflow_names.clone();
                 async move {
-                    run_centaur_workflow(
-                        input,
-                        ctx,
-                        session_runtime,
-                        workflow_host_sandbox,
-                        workflow_names,
-                    )
-                    .await
+                    run_centaur_workflow(input, ctx, session_runtime, workflow_host_sandbox).await
                 }
             },
         )?;
@@ -735,7 +575,6 @@ impl WorkflowRuntime {
                 },
                 webhook_registry.clone(),
                 schedule_registry.clone(),
-                workflow_names.clone(),
                 interval,
             );
         }
@@ -751,7 +590,6 @@ impl WorkflowRuntime {
                 _etl_worker: etl_worker,
                 _etl_backfill_worker: etl_backfill_worker,
                 _schedule_worker: schedule_worker,
-                workflow_names,
                 webhook_registry,
                 schedule_registry,
             }),
@@ -768,14 +606,7 @@ impl WorkflowRuntime {
                 "workflow_name must not be empty".to_owned(),
             ));
         }
-        let discovered_workflow_names = self
-            .inner
-            .workflow_names
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone();
-        WorkflowEnablement::from_env()?
-            .ensure_enabled_for_discovered(workflow_name, &discovered_workflow_names)?;
+        WorkflowEnablement::from_env()?.ensure_enabled(workflow_name)?;
         let client = self.client_for_workflow(workflow_name);
         let spawn = client
             .spawn(
@@ -1040,18 +871,13 @@ fn build_webhook_registry(
 ) -> Result<BTreeMap<String, RegisteredWorkflowWebhook>, WorkflowRuntimeError> {
     let mut registry = BTreeMap::new();
     for webhook in discovery.webhooks.clone() {
-        if !enablement.is_enabled(&webhook.workflow_name)
-            || !discovery.workflow_names.contains(&webhook.workflow_name)
-        {
+        if !enablement.is_enabled(&webhook.workflow_name) {
             continue;
         }
         insert_webhook(&mut registry, webhook)?;
     }
     for webhook in default_workflow_webhooks() {
-        if !enablement.is_enabled(&webhook.workflow_name)
-            || (enablement.staging_filter
-                && !discovery.workflow_names.contains(&webhook.workflow_name))
-        {
+        if !enablement.is_enabled(&webhook.workflow_name) {
             continue;
         }
         insert_webhook_if_absent(&mut registry, webhook)?;
@@ -1061,10 +887,7 @@ fn build_webhook_registry(
         if !trimmed.is_empty() {
             let webhooks: Vec<RegisteredWorkflowWebhook> = serde_json::from_str(trimmed)?;
             for webhook in webhooks {
-                if !enablement.is_enabled(&webhook.workflow_name)
-                    || (enablement.staging_filter
-                        && !discovery.workflow_names.contains(&webhook.workflow_name))
-                {
+                if !enablement.is_enabled(&webhook.workflow_name) {
                     continue;
                 }
                 insert_webhook_replace(&mut registry, webhook)?;
@@ -1081,9 +904,7 @@ fn build_schedule_registry(
     let mut registry = BTreeMap::new();
     for schedule in &discovery.schedules {
         let schedule = normalize_schedule(schedule.clone())?;
-        if !enablement.is_enabled(&schedule.workflow_name)
-            || !discovery.workflow_names.contains(&schedule.workflow_name)
-        {
+        if !enablement.is_enabled(&schedule.workflow_name) {
             continue;
         }
         if registry
@@ -1224,14 +1045,6 @@ fn valid_webhook_slug(slug: &str) -> bool {
 }
 
 fn normalize_schedule(raw: Value) -> Result<RegisteredWorkflowSchedule, WorkflowRuntimeError> {
-    let environment = current_workflow_environment();
-    normalize_schedule_for_environment(raw, environment.as_deref())
-}
-
-fn normalize_schedule_for_environment(
-    raw: Value,
-    environment: Option<&str>,
-) -> Result<RegisteredWorkflowSchedule, WorkflowRuntimeError> {
     let object = raw.as_object().ok_or_else(|| {
         WorkflowRuntimeError::BadRequest("workflow SCHEDULE must be an object".to_owned())
     })?;
@@ -1254,9 +1067,7 @@ fn normalize_schedule_for_environment(
             "invalid workflow schedule_id {schedule_id:?}"
         )));
     }
-    let run_on_staging = schedule_bool(object.get(WORKFLOW_RUN_ON_STAGING_KEY), false);
-    let enabled = schedule_bool(object.get("enabled"), true)
-        && (!is_staging_environment(environment) || run_on_staging);
+    let enabled = schedule_bool(object.get("enabled"), true);
     let no_delivery = schedule_bool(object.get("no_delivery"), false);
     let timezone = object
         .get("timezone")
@@ -1297,7 +1108,6 @@ fn normalize_schedule_for_environment(
         timezone,
         input,
         enabled,
-        run_on_staging,
         no_delivery,
     })
 }
@@ -1467,8 +1277,6 @@ struct PythonWorkflowDiscovery {
     workflow_name: String,
     source_path: String,
     #[serde(default)]
-    run_on_staging: bool,
-    #[serde(default)]
     webhooks: Vec<RegisteredWorkflowWebhook>,
     #[serde(default)]
     schedule: Option<Value>,
@@ -1484,7 +1292,6 @@ struct PythonWorkflowMetadata {
     webhooks: Vec<RegisteredWorkflowWebhook>,
     schedules: Vec<Value>,
     workflow_names: BTreeSet<String>,
-    workflow_run_on_staging: BTreeMap<String, bool>,
 }
 
 fn metadata_from_discovery_payload(
@@ -1492,13 +1299,9 @@ fn metadata_from_discovery_payload(
 ) -> PythonWorkflowMetadata {
     let mut metadata = PythonWorkflowMetadata::default();
     for workflow in payload.workflows {
-        let run_on_staging = workflow.run_on_staging;
         metadata
             .workflow_names
             .insert(workflow.workflow_name.clone());
-        metadata
-            .workflow_run_on_staging
-            .insert(workflow.workflow_name.clone(), run_on_staging);
         metadata.webhooks.extend(workflow.webhooks);
         if let Some(mut schedule) = workflow.schedule {
             if let Some(object) = schedule.as_object_mut() {
@@ -1508,10 +1311,6 @@ fn metadata_from_discovery_payload(
                 object
                     .entry("source_path".to_owned())
                     .or_insert_with(|| json!(workflow.source_path));
-                object.insert(
-                    WORKFLOW_RUN_ON_STAGING_KEY.to_owned(),
-                    json!(run_on_staging),
-                );
             }
             metadata.schedules.push(schedule);
         }
@@ -1636,7 +1435,6 @@ fn spawn_workflow_metadata_reconciler(
     workflow_clients: WorkflowQueueClients,
     webhook_registry: Arc<RwLock<BTreeMap<String, RegisteredWorkflowWebhook>>>,
     schedule_registry: Arc<RwLock<BTreeMap<String, RegisteredWorkflowSchedule>>>,
-    workflow_names: Arc<RwLock<BTreeSet<String>>>,
     interval: Duration,
 ) {
     tokio::spawn(async move {
@@ -1651,7 +1449,6 @@ fn spawn_workflow_metadata_reconciler(
                 &schedule_client,
                 &webhook_registry,
                 &schedule_registry,
-                &workflow_names,
             )
             .await
             {
@@ -1687,7 +1484,6 @@ async fn reconcile_workflow_metadata_once(
     schedule_client: &Client,
     webhook_registry: &Arc<RwLock<BTreeMap<String, RegisteredWorkflowWebhook>>>,
     schedule_registry: &Arc<RwLock<BTreeMap<String, RegisteredWorkflowSchedule>>>,
-    workflow_names: &Arc<RwLock<BTreeSet<String>>>,
 ) -> Result<
     (
         PythonWorkflowMetadata,
@@ -1710,12 +1506,6 @@ async fn reconcile_workflow_metadata_once(
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         *schedules = next_schedules.clone();
-    }
-    {
-        let mut names = workflow_names
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        *names = discovery.workflow_names.clone();
     }
     reconcile_schedules(schedule_client, &next_schedules).await?;
     info!(
@@ -2310,20 +2100,12 @@ async fn run_centaur_workflow(
     ctx: TaskContext,
     session_runtime: SessionRuntime,
     workflow_host_sandbox: Option<WorkflowHostSandboxRuntime>,
-    workflow_names: Arc<RwLock<BTreeSet<String>>>,
 ) -> absurd::Result<WorkflowResult> {
     let _heartbeat_guard = start_workflow_task_heartbeat(ctx.clone())
         .await
         .map_err(absurd_error)?;
-    let discovered_workflow_names = workflow_names
-        .read()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .clone();
     WorkflowEnablement::from_env()
-        .and_then(|enablement| {
-            enablement
-                .ensure_enabled_for_discovered(&input.workflow_name, &discovered_workflow_names)
-        })
+        .and_then(|enablement| enablement.ensure_enabled(&input.workflow_name))
         .map_err(absurd_error)?;
     match input.workflow_name.as_str() {
         "echo" => {
@@ -3545,58 +3327,6 @@ mod tests {
     }
 
     #[test]
-    fn staging_schedule_requires_run_on_staging_flag() {
-        let schedule = normalize_schedule_for_environment(
-            json!({
-                "workflow_name": "slack_sync",
-                "schedule_id": "slack_sync",
-                "interval_seconds": 60,
-                "enabled": true,
-            }),
-            Some("staging"),
-        )
-        .unwrap();
-
-        assert!(!schedule.enabled);
-        assert!(!schedule.run_on_staging);
-    }
-
-    #[test]
-    fn staging_schedule_honors_discovered_run_on_staging_flag() {
-        let schedule = normalize_schedule_for_environment(
-            json!({
-                "workflow_name": "slack_sync",
-                "schedule_id": "slack_sync",
-                "interval_seconds": 60,
-                "enabled": true,
-                "run_on_staging": true,
-            }),
-            Some("staging"),
-        )
-        .unwrap();
-
-        assert!(schedule.enabled);
-        assert!(schedule.run_on_staging);
-    }
-
-    #[test]
-    fn production_schedule_does_not_require_staging_flag() {
-        let schedule = normalize_schedule_for_environment(
-            json!({
-                "workflow_name": "slack_sync",
-                "schedule_id": "slack_sync",
-                "interval_seconds": 60,
-                "enabled": true,
-            }),
-            Some("production"),
-        )
-        .unwrap();
-
-        assert!(schedule.enabled);
-        assert!(!schedule.run_on_staging);
-    }
-
-    #[test]
     fn cron_schedule_uses_configured_timezone() {
         let schedule = normalize_schedule(json!({
             "workflow_name": "chief_of_staff_daily",
@@ -3845,91 +3575,6 @@ mod tests {
         );
         assert_eq!(metadata.webhooks.len(), 1);
         assert_eq!(metadata.webhooks[0].workflow_name, "allowed_workflow");
-    }
-
-    #[test]
-    fn staging_filter_uses_workflow_config_flag() {
-        let payload: PythonWorkflowDiscoveryPayload = serde_json::from_value(json!({
-            "workflows": [
-                {
-                    "workflow_name": "allowed_workflow",
-                    "source_path": "workflows/allowed_workflow.py",
-                    "run_on_staging": true,
-                    "schedule": {"schedule_id": "allowed", "cron": "*/5 * * * *"},
-                    "webhooks": [{
-                        "workflow_name": "allowed_workflow",
-                        "source_path": "workflows/allowed_workflow.py",
-                        "spec": {
-                            "slug": "allowed",
-                            "auth": {"type": "none"}
-                        }
-                    }]
-                },
-                {
-                    "workflow_name": "blocked_workflow",
-                    "source_path": "workflows/blocked_workflow.py",
-                    "schedule": {"schedule_id": "blocked", "cron": "*/10 * * * *"},
-                    "webhooks": [{
-                        "workflow_name": "blocked_workflow",
-                        "source_path": "workflows/blocked_workflow.py",
-                        "spec": {
-                            "slug": "blocked",
-                            "auth": {"type": "none"}
-                        }
-                    }]
-                },
-            ],
-        }))
-        .unwrap();
-        let mut metadata = metadata_from_discovery_payload(payload);
-        let mut enablement = WorkflowEnablement::all();
-        enablement.staging_filter = true;
-        enablement.filter_metadata(&mut metadata);
-
-        assert_eq!(
-            metadata.workflow_names,
-            BTreeSet::from(["allowed_workflow".to_owned()])
-        );
-        assert_eq!(metadata.schedules.len(), 1);
-        assert_eq!(
-            metadata.schedules[0].get("schedule_id"),
-            Some(&json!("allowed"))
-        );
-        assert_eq!(metadata.webhooks.len(), 1);
-        assert_eq!(metadata.webhooks[0].workflow_name, "allowed_workflow");
-    }
-
-    #[test]
-    fn staging_filter_ignores_schedule_level_flag() {
-        let payload: PythonWorkflowDiscoveryPayload = serde_json::from_value(json!({
-            "workflows": [
-                {
-                    "workflow_name": "scheduled_workflow",
-                    "source_path": "workflows/scheduled_workflow.py",
-                    "schedule": {
-                        "schedule_id": "scheduled_workflow",
-                        "cron": "*/5 * * * *",
-                        "run_on_staging": true
-                    },
-                },
-            ],
-        }))
-        .unwrap();
-        let mut metadata = metadata_from_discovery_payload(payload);
-        assert_eq!(
-            metadata
-                .schedules
-                .first()
-                .and_then(|schedule| schedule.get(WORKFLOW_RUN_ON_STAGING_KEY)),
-            Some(&json!(false))
-        );
-
-        let mut enablement = WorkflowEnablement::all();
-        enablement.staging_filter = true;
-        enablement.filter_metadata(&mut metadata);
-
-        assert!(metadata.workflow_names.is_empty());
-        assert!(metadata.schedules.is_empty());
     }
 
     #[test]

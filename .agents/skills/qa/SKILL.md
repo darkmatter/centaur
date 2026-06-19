@@ -233,21 +233,28 @@ A deployment is ready for promotion only when:
 
 ## Report Format
 
-Reply in the Slack thread with a compact table:
+Reply in the Slack thread with a compact Slack-friendly report. Do not use a
+GitHub-style Markdown pipe table for the user-visible report: Slack `mrkdwn`
+does not render pipe tables, and long evidence cells wrap poorly in threads.
+For links in Slack reports, use Slack link syntax (`<url|label>`) rather than
+GitHub Markdown links (`[label](url)`), which Slack displays as raw text.
 
-| Check | Result | Evidence |
-|-------|--------|----------|
-| Tool loading | PASS/FAIL | tool count and missing expected tools |
-| Upload current-thread file | PASS/FAIL | file id or permalink |
-| Download current-thread file | PASS/FAIL | filename and size |
-| Re-upload current-channel file | PASS/FAIL/SKIP | source and new file id |
-| Search uploaded token | PASS/WARN/FAIL | attempts and result count |
-| Search overall messages | PASS/WARN/FAIL | query and result count |
-| Thread history | PASS/FAIL | message count |
-| Paradigm DB | PASS/FAIL | document count or error |
-| VictoriaLogs | PASS/FAIL | result count or error |
-| VictoriaMetrics | PASS/FAIL | query status or error |
-| Extended checks | PASS/FAIL/SKIP | concurrency, scheduler, user context, or promotion evidence |
+Use this format:
+
+```text
+QA: PASS|FAIL|PARTIAL
+Tool loading: PASS - tool count and missing expected tools
+Upload current-thread file: PASS|FAIL - file id or permalink
+Download current-thread file: PASS|FAIL - filename and size
+Re-upload current-channel file: PASS|FAIL|SKIP - source and new file id
+Search uploaded token: PASS|WARN|FAIL - attempts and result count
+Search overall messages: PASS|WARN|FAIL - query and result count
+Thread history: PASS|FAIL - message count
+Paradigm DB: PASS|FAIL - document count or error
+VictoriaLogs: PASS|FAIL - result count or error
+VictoriaMetrics: PASS|FAIL - query status or error
+Extended checks: PASS|FAIL|SKIP - concurrency, scheduler, user context, or promotion evidence
+```
 
 End with `Overall: PASS`, `Overall: FAIL`, or `Overall: PARTIAL`. Include the highest-signal failure details, suggested next owner, and promotion recommendation when relevant. Do not include secrets or raw credential values.
 

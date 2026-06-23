@@ -443,15 +443,16 @@ impl SessionRuntime {
                 .and_then(Value::as_str)
                 .map(ToOwned::to_owned);
             // The human-readable conversation name the chat bot resolved
-            // (Slack channel/DM, or Discord channel), used as the principal's
-            // display name. Read it here for the same reason, before `metadata`
-            // is consumed below.
+            // (Slack channel/DM, Discord channel, or Linear issue), used as the
+            // principal's display name. Read it here for the same reason, before
+            // `metadata` is consumed below.
             let conversation_name = metadata
                 .as_ref()
                 .and_then(|metadata| {
                     metadata
                         .get("slack_conversation_name")
                         .or_else(|| metadata.get("discord_conversation_name"))
+                        .or_else(|| metadata.get("linear_conversation_name"))
                 })
                 .and_then(Value::as_str)
                 .map(ToOwned::to_owned);

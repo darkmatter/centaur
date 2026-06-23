@@ -224,7 +224,7 @@ describe('slackbotv2', () => {
       threadKey(parent.ts),
       threadKey(parent.ts)
     ])
-    expect(codexApi.executes).toHaveLength(2)
+    expect(codexApi.executes).toHaveLength(3)
 
     const firstAppend = codexApi.appends[0]!
     expect(firstAppend.threadKey).toBe(threadKey(parent.ts))
@@ -268,25 +268,30 @@ describe('slackbotv2', () => {
     expect(sessionMessageTexts(followUpAppend.body.messages)).toEqual([
       'Additional detail for the subscribed thread.'
     ])
+    const followUpExecute = codexApi.executes[1]!
+    expect(followUpExecute.body.idempotency_key).toBe(followUp.ts)
+    expect(JSON.stringify(JSON.parse(followUpExecute.body.input_lines[0]!))).toContain(
+      'Additional detail for the subscribed thread.'
+    )
 
     const secondMentionAppend = codexApi.appends[2]!
     expect(sessionMessageTexts(secondMentionAppend.body.messages)[0]).toContain(
       'now execute with the latest'
     )
-    const secondExecute = codexApi.executes[1]!
+    const secondExecute = codexApi.executes[2]!
     expect(secondExecute.body.idempotency_key).toBe(secondMention.ts)
     expect(JSON.stringify(JSON.parse(secondExecute.body.input_lines[0]!))).toContain(
       'now execute with the latest'
     )
 
     expectSlackPlanStreamShape(slackApi.calls, {
-      answers: ['Executed request 1.', 'Executed request 2.'],
+      answers: ['Executed request 1.', 'Executed request 2.', 'Executed request 3.'],
       parentTs: parent.ts
     })
     const assistantStatuses = slackApi.calls
       .filter(call => call.method === 'assistant.threads.setStatus')
       .map(call => stringField(call.body.status))
-    expect(assistantStatuses).toEqual(['Thinking...', '', 'Thinking...', ''])
+    expect(assistantStatuses).toEqual(['Thinking...', '', 'Thinking...', '', 'Thinking...', ''])
     expect(
       slackApi.calls
         .filter(call => call.method === 'assistant.threads.setTitle')
@@ -294,8 +299,10 @@ describe('slackbotv2', () => {
     ).toEqual([
       'run with this screenshot',
       'Codex request 1',
+      'Additional detail for the subscribed thread.',
+      'Codex request 2',
       'now execute with the latest',
-      'Codex request 2'
+      'Codex request 3'
     ])
 
     const text = await threadText(parent.ts)
@@ -308,13 +315,15 @@ describe('slackbotv2', () => {
     expect(text).not.toContain('tests passed')
     expect(text).toContain('Executed request 1.')
     expect(text).toContain('Executed request 2.')
+    expect(text).toContain('Executed request 3.')
 
     const renderedReplies = (await threadTexts(parent.ts)).filter(reply =>
       reply.includes('Executed request')
     )
-    expect(renderedReplies).toHaveLength(2)
+    expect(renderedReplies).toHaveLength(3)
     expectSlackRenderedReply(renderedReplies[0]!, 'Executed request 1.')
     expectSlackRenderedReply(renderedReplies[1]!, 'Executed request 2.')
+    expectSlackRenderedReply(renderedReplies[2]!, 'Executed request 3.')
   })
 
   it('includes all preceding Slack thread messages for a first mid-thread mention', async () => {

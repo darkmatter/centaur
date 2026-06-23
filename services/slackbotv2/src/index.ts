@@ -149,7 +149,7 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
     if (!isAllowedSlackMessage(message, options, logger)) return
     await handleSlackMessageHandoff(thread, message, {
       assistantStatusRequested: message.isMention === true,
-      mode: message.isMention === true ? 'execute' : 'append',
+      mode: 'execute',
       options,
       state,
       trigger: 'subscribed_message'

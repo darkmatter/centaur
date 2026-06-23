@@ -412,17 +412,19 @@ from centaur_sdk.tool_sdk import ToolContext, reset_tool_context, set_tool_conte
 
 project_dir = Path(sys.argv[1])
 client_module = sys.argv[2]
-method = sys.argv[3]
-payload = json.loads(sys.argv[4])
+entrypoint = sys.argv[3]
+method = sys.argv[4]
+payload = json.loads(sys.argv[5])
 
 module_path = project_dir / client_module
-package_name = project_dir.name.replace("-", "_")
-if (project_dir / "__init__.py").is_file() and package_name.isidentifier() and module_path.suffix == ".py":
-    parent = str(project_dir.parent)
-    if parent not in sys.path:
-        sys.path.insert(0, parent)
+entrypoint_module = entrypoint.split(":", 1)[0]
+if "." in entrypoint_module and module_path.suffix == ".py":
+    package_name = entrypoint_module.rsplit(".", 1)[0]
     module = importlib.import_module(f"{{package_name}}.{{module_path.stem}}")
 else:
+    project_dir_str = str(project_dir)
+    if project_dir_str not in sys.path:
+        sys.path.insert(0, project_dir_str)
     spec = importlib.util.spec_from_file_location("_centaur_tool_client", module_path)
     if spec is None or spec.loader is None:
         raise RuntimeError(f"cannot load client module from {{module_path}}")
@@ -475,6 +477,7 @@ def call_tool(tool, method, payload):
             CALL_RUNNER,
             str(project_dir),
             client_module,
+            tool.get("entrypoint", ""),
             method,
             json.dumps(payload, separators=(",", ":")),
         ],

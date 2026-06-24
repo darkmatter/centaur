@@ -40,8 +40,6 @@ pub fn resolve_principal(
 
 #[cfg(test)]
 mod tests {
-    use base64::Engine;
-
     use super::*;
 
     #[test]
@@ -63,10 +61,8 @@ mod tests {
 
     #[test]
     fn teams_adapter_thread_key_can_be_tenant_scoped() {
-        let conversation =
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode("19:abc123@thread.tacv2");
-        let service_url = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .encode("https://smba.trafficmanager.net/amer/");
+        let conversation = "MTk6YWJjMTIzQHRocmVhZC50YWN2Mg";
+        let service_url = "aHR0cHM6Ly9zbWJhLnRyYWZmaWNtYW5hZ2VyLm5ldC9hbWVyLw";
         let id = resolve_principal(
             &format!("teams:{conversation}:{service_url}"),
             Some("aad-user-1"),
@@ -81,10 +77,8 @@ mod tests {
 
     #[test]
     fn teams_adapter_thread_suffix_does_not_change_the_conversation_principal() {
-        let conversation = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .encode("19:abc123@thread.tacv2;messageid=root-message-1");
-        let service_url = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .encode("https://smba.trafficmanager.net/amer/");
+        let conversation = "MTk6YWJjMTIzQHRocmVhZC50YWN2MjttZXNzYWdlaWQ9cm9vdC1tZXNzYWdlLTE";
+        let service_url = "aHR0cHM6Ly9zbWJhLnRyYWZmaWNtYW5hZ2VyLm5ldC9hbWVyLw";
         let id = resolve_principal(
             &format!("teams:{conversation}:{service_url}"),
             Some("aad-user-1"),

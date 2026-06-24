@@ -863,7 +863,6 @@ dependencies = [
 name = "centaur-perms"
 version = "0.1.0"
 dependencies = [
- "base64",
  "centaur-iron-control",
  "centaur-iron-proxy",
  "clap",

@@ -39,12 +39,11 @@ def test_credential_status_does_not_treat_stub_placeholders_as_present():
 
     assert status["PREQIN_USERNAME"]["present"] is False
     assert status["PREQIN_API_KEY"]["present"] is False
-    assert status["PREQIN_PASSWORD"]["present"] is False
 
 
-def test_auth_uses_password_grant_with_username_password_and_api_key():
+def test_auth_uses_username_and_apikey_form_fields():
     fake = FakeHttpClient()
-    client = PreqinClient(username="user", password="pass", api_key="api-key")
+    client = PreqinClient(username="user", api_key="api-key")
     client._client = fake
 
     assert client._operational_access_token(force_refresh=True) == "token-123"
@@ -52,10 +51,8 @@ def test_auth_uses_password_grant_with_username_password_and_api_key():
     request = fake.posts[0]
     assert request["url"] == "https://api.preqin.com/connect/token"
     assert request["data"] == {
-        "grant_type": "password",
-        "username": "user",
-        "password": "pass",
-        "client_id": "api-key",
+        "Username": "user",
+        "APIKey": "api-key",
     }
 
 

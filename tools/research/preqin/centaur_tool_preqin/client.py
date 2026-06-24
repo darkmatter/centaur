@@ -84,7 +84,6 @@ class PreqinClient:
         fields = {
             "PREQIN_USERNAME": self._username_value(),
             "PREQIN_API_KEY": self._api_key_value(),
-            "PREQIN_PASSWORD": self._password_value(),
         }
         return {
             name: {
@@ -101,30 +100,30 @@ class PreqinClient:
 
         username = self._username_value()
         api_key = self._api_key_value()
-        password = self._password_value()
         if not username:
             raise RuntimeError("PREQIN_USERNAME not set.")
         if not api_key:
             raise RuntimeError("PREQIN_API_KEY not set.")
-        if not password:
-            raise RuntimeError("PREQIN_PASSWORD not set.")
 
+        # Preqin's Operational API token endpoint does not use a standard OAuth2
+        # password grant. It expects these exact form fields.
         response = self.client.post(
             f"{OPERATIONAL_BASE_URL}/connect/token",
             data={
-                "grant_type": "password",
-                "username": username,
-                "password": password,
-                "client_id": api_key,
+                "Username": username,
+                "APIKey": api_key,
             },
-            headers={"Accept": "application/json"},
+            headers={
+                "Accept": "application/json",
+                "Content-Type": "application/x-www-form-urlencoded",
+            },
         )
         if response.status_code >= 400:
             body = response.text.strip()
             detail = f" - {body}" if body else ""
             raise RuntimeError(
                 "Preqin Operational API auth failed "
-                f"({response.status_code}) at /connect/token using password grant{detail}"
+                f"({response.status_code}) at /connect/token{detail}"
             )
 
         data = response.json()
@@ -144,14 +143,14 @@ class PreqinClient:
             return {
                 "ok": True,
                 "auth_url": f"{OPERATIONAL_BASE_URL}/connect/token",
-                "method": "password grant",
+                "method": "username+apikey form",
                 "token_length": len(token),
             }
         except Exception as exc:
             return {
                 "ok": False,
                 "auth_url": f"{OPERATIONAL_BASE_URL}/connect/token",
-                "method": "password grant",
+                "method": "username+apikey form",
                 "error": str(exc),
                 "credentials": self.credential_status(),
             }

@@ -414,7 +414,10 @@ async fn assert_projected_documents(conn: &mut PgConnection) -> Result<(), sqlx:
     let body: String = row.get("body");
     let metadata: serde_json::Value = row.get("metadata");
 
-    assert!(body.contains("user a dm"), "projected body should contain message text");
+    assert!(
+        body.contains("user a dm"),
+        "projected body should contain message text"
+    );
     assert!(
         body.contains("Alpha attachment"),
         "projected body should contain attachment search text"

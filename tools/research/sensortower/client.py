@@ -7,6 +7,14 @@ import httpx
 from centaur_sdk import secret
 
 
+def _secret_with_aliases(primary: str, *aliases: str) -> str:
+    for name in (primary, *aliases):
+        value = secret(name, "")
+        if value and value != name:
+            return value
+    return primary
+
+
 class SensorTowerClient:
     """Client for SensorTower API.
 
@@ -30,7 +38,7 @@ class SensorTowerClient:
         """Get auth token from instance or env var."""
         if self._auth_token:
             return self._auth_token
-        token = secret("SENSOR_TOWER_AUTH_TOKEN", "") or secret("SENSORTOWER_AUTH_TOKEN", "")
+        token = _secret_with_aliases("SENSOR_TOWER_AUTH_TOKEN", "SENSORTOWER_AUTH_TOKEN")
         if not token:
             raise RuntimeError(
                 "SENSOR_TOWER_AUTH_TOKEN not set. "
@@ -62,9 +70,11 @@ class SensorTowerClient:
             response.raise_for_status()
             return response.json()
         except httpx.HTTPStatusError as e:
-            raise RuntimeError(f"API error: {e.response.status_code} - {e.response.text}")
+            raise RuntimeError(
+                f"API error: {e.response.status_code} - {e.response.text}"
+            ) from e
         except httpx.RequestError as e:
-            raise RuntimeError(f"Request failed: {e}")
+            raise RuntimeError(f"Request failed: {e}") from e
 
     @staticmethod
     def _format_date(d: date | str) -> str:

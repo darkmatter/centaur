@@ -14,6 +14,7 @@ build-backend = "hatchling.build"
 
 [tool.centaur]
 module = "client.py"
+agent_facing = false
 hosts = ["sentry.io", "*.sentry.io"]
 secrets = [
     {type = "http", name = "SENTRY_AUTH_TOKEN", match_headers = ["Authorization"], hosts = ["sentry.io", "*.sentry.io"]},

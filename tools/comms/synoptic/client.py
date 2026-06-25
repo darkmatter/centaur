@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import os
 import re
 
 import httpx
@@ -55,7 +56,7 @@ class SynopticClient:
         base_url: str | None = None,
     ):
         self._api_key = api_key or secret("SYNOPTIC_API_KEY", "")
-        url = base_url or secret("SYNOPTIC_BASE_URL", "https://api.synoptic.com")
+        url = base_url or os.getenv("SYNOPTIC_BASE_URL", "https://api.synoptic.com")  # noqa: TID251
         if url and not url.startswith(("http://", "https://")):
             url = f"https://{url}"
         self._base_url = url

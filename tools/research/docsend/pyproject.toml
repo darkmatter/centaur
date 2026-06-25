@@ -16,4 +16,5 @@ build-backend = "hatchling.build"
 
 [tool.centaur]
 module = "client.py"
+agent_facing = false
 secrets = [{type = "http", name = "BROWSER_USE_API_KEY", match_query = true, hosts = ["connect.browser-use.com"]}]

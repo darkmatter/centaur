@@ -13,3 +13,4 @@ build-backend = "hatchling.build"
 
 [tool.centaur]
 module = "client.py"
+agent_facing = false

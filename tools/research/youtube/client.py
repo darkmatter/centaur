@@ -18,6 +18,14 @@ _INNERTUBE_API_KEY_RE = re.compile(r'"INNERTUBE_API_KEY":\s*"([A-Za-z0-9_-]+)"')
 _TAG_RE = re.compile(r"<[^>]+>")
 
 
+def _secret_with_aliases(primary: str, *aliases: str) -> str:
+    for name in (primary, *aliases):
+        value = secret(name, "")
+        if value and value != name:
+            return value
+    return primary
+
+
 class YouTubeClient:
     """Client for YouTube Data API v3."""
 
@@ -339,7 +347,7 @@ class YouTubeClient:
         """Get API key from instance, env var, or 1Password."""
         if self._api_key:
             return self._api_key
-        key = secret("YOUTUBE_API_KEY", "") or secret("GOOGLE_API_KEY", "")
+        key = _secret_with_aliases("YOUTUBE_API_KEY", "GOOGLE_API_KEY")
         if key:
             return key
         try:

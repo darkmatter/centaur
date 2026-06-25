@@ -16,6 +16,7 @@ packages = ["."]
 
 [tool.centaur]
 module = "client.py"
+agent_facing = false
 secrets = [
     {type = "http", name = "COMPOSIO_API_KEY", mode = "inject", inject_header = "x-api-key", hosts = ["backend.composio.dev"]},
 ]

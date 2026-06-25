@@ -8,6 +8,14 @@ from urllib.request import Request, urlopen
 from centaur_sdk import secret
 
 
+def _secret_with_aliases(primary: str, *aliases: str) -> str:
+    for name in (primary, *aliases):
+        value = secret(name, "")
+        if value and value != name:
+            return value
+    return primary
+
+
 @dataclass
 class FigmaDesignSystem:
     """Extracted design system information from a Figma file."""
@@ -28,7 +36,7 @@ class FigmaClient:
     BASE_URL = "https://api.figma.com/v1"
 
     def __init__(self, token: str | None = None):
-        self.token = token or secret("FIGMA_ACCESS_TOKEN", "") or secret("FIGMA", "")
+        self.token = token or _secret_with_aliases("FIGMA_ACCESS_TOKEN", "FIGMA")
         if not self.token:
             raise ValueError("FIGMA token not found. Set FIGMA_ACCESS_TOKEN env var or pass token.")
 
@@ -99,7 +107,7 @@ class FigmaClient:
 
     def crawl(self, url: str) -> FigmaDesignSystem:
         """Crawl a Figma file/frame URL and extract all design system info."""
-        file_key, node_id = self.parse_url(url)
+        file_key, _node_id = self.parse_url(url)
 
         # Get file data
         file_data = self.get_file(file_key)

@@ -13,6 +13,6 @@ build-backend = "hatchling.build"
 
 [tool.centaur]
 module = "client.py"
+agent_facing = false
 hosts = ["docs.google.com", "drive.google.com", "docsend.com"]
 secrets = []
-

@@ -145,20 +145,13 @@ class ToolUsageLoggingTest(unittest.TestCase):
 
             raw_log = log_path.read_text()
             self.assertNotIn("secret query", raw_log)
-            entries = [json.loads(line) for line in raw_log.splitlines()]
             self.assertEqual(
-                [entry["event"] for entry in entries],
-                ["tool_call_started", "tool_call_completed"],
+                raw_log,
+                "centaur_tool_invoked "
+                "tool=websearch "
+                "package=centaur-tool-websearch "
+                "source=cli_shim\n",
             )
-            completed = entries[-1]
-            self.assertEqual(completed["tool_name"], "websearch")
-            self.assertEqual(completed["tool_method"], "cli")
-            self.assertEqual(completed["tool_package"], "centaur-tool-websearch")
-            self.assertEqual(completed["tool_call_source"], "cli_shim")
-            self.assertEqual(completed["thread_key"], "slack:T123:C123:1.000")
-            self.assertEqual(completed["exit_code"], 7)
-            self.assertEqual(completed["success"], "false")
-            self.assertIsInstance(completed["duration_ms"], int)
 
     def test_catalog_call_logs_usage_to_configured_sink(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -205,19 +198,14 @@ class ToolUsageLoggingTest(unittest.TestCase):
 
             raw_log = log_path.read_text()
             self.assertNotIn('"value":1', raw_log)
-            entries = [json.loads(line) for line in raw_log.splitlines()]
             self.assertEqual(
-                [entry["event"] for entry in entries],
-                ["tool_call_started", "tool_call_completed"],
+                raw_log,
+                "centaur_tool_invoked "
+                "tool=demo "
+                "package=centaur-tool-demo "
+                "method=ping "
+                "source=centaur_tools_call\n",
             )
-            completed = entries[-1]
-            self.assertEqual(completed["tool_name"], "demo")
-            self.assertEqual(completed["tool_method"], "ping")
-            self.assertEqual(completed["tool_call_source"], "centaur_tools_call")
-            self.assertEqual(completed["thread_key"], "slack:T123:C123:1.000")
-            self.assertEqual(completed["exit_code"], 0)
-            self.assertEqual(completed["success"], "true")
-            self.assertIsInstance(completed["duration_ms"], int)
 
 
 if __name__ == "__main__":

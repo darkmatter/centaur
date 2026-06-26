@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import contextlib
 import io
+import json
+import os
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -99,6 +102,122 @@ class CopyPublishedToolsTest(unittest.TestCase):
                 scripts_all = install_tool_shims._discover_scripts([root])
             self.assertIn("websearch", scripts_all)
             self.assertIn("linear", scripts_all)
+
+
+class ToolUsageLoggingTest(unittest.TestCase):
+    def test_tool_shim_logs_usage_to_configured_sink(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            uvx = fake_bin / "uvx"
+            uvx.write_text("#!/bin/sh\nexit 7\n")
+            uvx.chmod(0o755)
+
+            shim = root / "websearch"
+            install_tool_shims._write_tool_shim(
+                shim,
+                {
+                    "name": "websearch",
+                    "package": "centaur-tool-websearch",
+                    "project_dir": str(root / "project"),
+                },
+                "",
+            )
+
+            log_path = root / "tool-usage.jsonl"
+            env = os.environ.copy()
+            env["PATH"] = f"{fake_bin}{os.pathsep}{env.get('PATH', '')}"
+            env["CENTAUR_TOOL_USAGE_LOG"] = str(log_path)
+            env["CENTAUR_THREAD_KEY"] = "slack:T123:C123:1.000"
+
+            result = subprocess.run(
+                [str(shim), "search", "secret query"],
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 7)
+            self.assertEqual(result.stdout, "")
+            self.assertEqual(result.stderr, "")
+
+            raw_log = log_path.read_text()
+            self.assertNotIn("secret query", raw_log)
+            entries = [json.loads(line) for line in raw_log.splitlines()]
+            self.assertEqual(
+                [entry["event"] for entry in entries],
+                ["tool_call_started", "tool_call_completed"],
+            )
+            completed = entries[-1]
+            self.assertEqual(completed["tool_name"], "websearch")
+            self.assertEqual(completed["tool_method"], "cli")
+            self.assertEqual(completed["tool_package"], "centaur-tool-websearch")
+            self.assertEqual(completed["tool_call_source"], "cli_shim")
+            self.assertEqual(completed["thread_key"], "slack:T123:C123:1.000")
+            self.assertEqual(completed["exit_code"], 7)
+            self.assertEqual(completed["success"], "false")
+            self.assertIsInstance(completed["duration_ms"], int)
+
+    def test_catalog_call_logs_usage_to_configured_sink(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            uvx = fake_bin / "uvx"
+            uvx.write_text("#!/bin/sh\nprintf '%s\\n' '{\"ok\":true}'\n")
+            uvx.chmod(0o755)
+
+            index_path = root / ".centaur-tools.json"
+            index_path.write_text(
+                json.dumps(
+                    [
+                        {
+                            "name": "demo",
+                            "package": "centaur-tool-demo",
+                            "project_dir": str(root / "project"),
+                            "client_module": "client.py",
+                        }
+                    ]
+                )
+            )
+            catalog = root / "centaur-tools"
+            install_tool_shims._write_catalog(catalog, index_path, "")
+
+            log_path = root / "tool-usage.jsonl"
+            env = os.environ.copy()
+            env["PATH"] = f"{fake_bin}{os.pathsep}{env.get('PATH', '')}"
+            env["CENTAUR_TOOL_USAGE_LOG"] = str(log_path)
+            env["CENTAUR_THREAD_KEY"] = "slack:T123:C123:1.000"
+
+            result = subprocess.run(
+                [str(catalog), "call", "demo", "ping", '{"value":1}'],
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0)
+            self.assertEqual(result.stdout, '{"ok":true}\n')
+            self.assertEqual(result.stderr, "")
+
+            raw_log = log_path.read_text()
+            self.assertNotIn('"value":1', raw_log)
+            entries = [json.loads(line) for line in raw_log.splitlines()]
+            self.assertEqual(
+                [entry["event"] for entry in entries],
+                ["tool_call_started", "tool_call_completed"],
+            )
+            completed = entries[-1]
+            self.assertEqual(completed["tool_name"], "demo")
+            self.assertEqual(completed["tool_method"], "ping")
+            self.assertEqual(completed["tool_call_source"], "centaur_tools_call")
+            self.assertEqual(completed["thread_key"], "slack:T123:C123:1.000")
+            self.assertEqual(completed["exit_code"], 0)
+            self.assertEqual(completed["success"], "true")
+            self.assertIsInstance(completed["duration_ms"], int)
 
 
 if __name__ == "__main__":

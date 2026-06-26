@@ -390,8 +390,82 @@ def _write_executable(path: Path, content: str) -> None:
 
 def _write_tool_shim(path: Path, script: dict[str, str], pythonpath: str) -> None:
     content = f"""#!/bin/sh
-set -e
 _centaur_tool_pythonpath={shlex.quote(pythonpath)}
+_centaur_tool_name={shlex.quote(script["name"])}
+_centaur_tool_package={shlex.quote(script["package"])}
+_centaur_now_ms() {{
+  date +%s%3N 2>/dev/null || printf '%s000' "$(date +%s)"
+}}
+_centaur_emit_tool_usage_log() {{
+  _centaur_tool_event="$1"
+  _centaur_tool_status="$2"
+  _centaur_tool_duration_ms="$3"
+  CENTAUR_TOOL_LOG_EVENT="$_centaur_tool_event" \\
+  CENTAUR_TOOL_LOG_NAME="$_centaur_tool_name" \\
+  CENTAUR_TOOL_LOG_PACKAGE="$_centaur_tool_package" \\
+  CENTAUR_TOOL_LOG_METHOD="cli" \\
+  CENTAUR_TOOL_LOG_STATUS="$_centaur_tool_status" \\
+  CENTAUR_TOOL_LOG_DURATION_MS="$_centaur_tool_duration_ms" \\
+  python3 - <<'PY' >/dev/null 2>&1 || true
+import json
+import os
+
+
+def _clean_env(name):
+    value = os.environ.get(name, "").strip()
+    return value or None
+
+
+sink = os.environ.get("CENTAUR_TOOL_USAGE_LOG", "/proc/1/fd/2").strip()
+if sink.lower() in {{"", "0", "false", "no", "off"}}:
+    raise SystemExit(0)
+
+event = os.environ.get("CENTAUR_TOOL_LOG_EVENT", "tool_call_completed")
+tool_name = os.environ.get("CENTAUR_TOOL_LOG_NAME", "unknown").strip() or "unknown"
+method = os.environ.get("CENTAUR_TOOL_LOG_METHOD", "cli").strip() or "cli"
+payload = {{
+    "level": "info",
+    "service": "sandbox",
+    "component": "tool_shim",
+    "event": event,
+    "message": event.replace("_", " "),
+    "tool_name": tool_name,
+    "tool_method": method,
+    "tool_call_source": "cli_shim",
+}}
+
+if tool_package := _clean_env("CENTAUR_TOOL_LOG_PACKAGE"):
+    payload["tool_package"] = tool_package
+if thread_key := _clean_env("CENTAUR_THREAD_KEY"):
+    payload["thread_key"] = thread_key
+if workload := _clean_env("CENTAUR_WORKLOAD"):
+    payload["workload"] = workload
+if persona := _clean_env("AGENT_PERSONA"):
+    payload["persona"] = persona
+
+status = _clean_env("CENTAUR_TOOL_LOG_STATUS")
+if status is not None:
+    try:
+        exit_code = int(status)
+    except ValueError:
+        exit_code = 1
+    payload["exit_code"] = exit_code
+    payload["success"] = "true" if exit_code == 0 else "false"
+
+duration_ms = _clean_env("CENTAUR_TOOL_LOG_DURATION_MS")
+if duration_ms is not None:
+    try:
+        payload["duration_ms"] = max(0, int(duration_ms))
+    except ValueError:
+        payload["duration_ms"] = 0
+
+try:
+    with open(sink, "a", encoding="utf-8") as f:
+        f.write(json.dumps(payload, separators=(",", ":"), sort_keys=True) + "\\n")
+except OSError:
+    pass
+PY
+}}
 if [ -n "$_centaur_tool_pythonpath" ]; then
   if [ -n "${{PYTHONPATH:-}}" ]; then
     export PYTHONPATH="$_centaur_tool_pythonpath:$PYTHONPATH"
@@ -399,7 +473,20 @@ if [ -n "$_centaur_tool_pythonpath" ]; then
     export PYTHONPATH="$_centaur_tool_pythonpath"
   fi
 fi
-exec uvx --from {shlex.quote(script["project_dir"])} {shlex.quote(script["name"])} "$@"
+_centaur_start_ms="$(_centaur_now_ms)"
+_centaur_emit_tool_usage_log tool_call_started "" ""
+uvx --from {shlex.quote(script["project_dir"])} {shlex.quote(script["name"])} "$@"
+_centaur_status=$?
+_centaur_end_ms="$(_centaur_now_ms)"
+case "$_centaur_start_ms$_centaur_end_ms" in
+  ""|*[!0-9]*) _centaur_duration_ms=0 ;;
+  *) _centaur_duration_ms=$((_centaur_end_ms - _centaur_start_ms)) ;;
+esac
+if [ "$_centaur_duration_ms" -lt 0 ] 2>/dev/null; then
+  _centaur_duration_ms=0
+fi
+_centaur_emit_tool_usage_log tool_call_completed "$_centaur_status" "$_centaur_duration_ms"
+exit "$_centaur_status"
 """
     _write_executable(path, content)
 
@@ -413,6 +500,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import time
 
 INDEX = {str(index_path)!r}
 PYTHONPATH_VALUE = {pythonpath!r}
@@ -426,6 +514,50 @@ def load():
 def usage():
     print("usage: centaur-tools [list|json|refresh|which <name>|run <name> [args...]|call <name> <method> [json]]", file=sys.stderr)
     return 2
+
+
+def _clean_env(name):
+    value = os.environ.get(name, "").strip()
+    return value or None
+
+
+def tool_usage_log_sink():
+    sink = os.environ.get("CENTAUR_TOOL_USAGE_LOG", "/proc/1/fd/2").strip()
+    if sink.lower() in {{"", "0", "false", "no", "off"}}:
+        return None
+    return sink
+
+
+def emit_tool_usage_log(event, tool_name, method, *, returncode=None, duration_ms=None):
+    sink = tool_usage_log_sink()
+    if sink is None:
+        return
+    payload = {{
+        "level": "info",
+        "service": "sandbox",
+        "component": "tool_shim",
+        "event": event,
+        "message": event.replace("_", " "),
+        "tool_name": tool_name or "unknown",
+        "tool_method": method or "call",
+        "tool_call_source": "centaur_tools_call",
+    }}
+    if thread_key := _clean_env("CENTAUR_THREAD_KEY"):
+        payload["thread_key"] = thread_key
+    if workload := _clean_env("CENTAUR_WORKLOAD"):
+        payload["workload"] = workload
+    if persona := _clean_env("AGENT_PERSONA"):
+        payload["persona"] = persona
+    if returncode is not None:
+        payload["exit_code"] = int(returncode)
+        payload["success"] = "true" if int(returncode) == 0 else "false"
+    if duration_ms is not None:
+        payload["duration_ms"] = max(0, int(duration_ms))
+    try:
+        with open(sink, "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, separators=(",", ":"), sort_keys=True) + "\\n")
+    except OSError:
+        pass
 
 
 CALL_RUNNER = r'''
@@ -495,24 +627,46 @@ def call_tool(tool, method, payload):
             env["PYTHONPATH"] = f"{{PYTHONPATH_VALUE}}:{{env['PYTHONPATH']}}"
         else:
             env["PYTHONPATH"] = PYTHONPATH_VALUE
-    return subprocess.run(
-        [
-            "uvx",
-            "--from",
-            str(project_dir),
-            "python",
-            "-c",
-            CALL_RUNNER,
-            str(project_dir),
-            client_module,
+    started_at = time.monotonic()
+    emit_tool_usage_log("tool_call_started", tool.get("name"), method)
+    try:
+        result = subprocess.run(
+            [
+                "uvx",
+                "--from",
+                str(project_dir),
+                "python",
+                "-c",
+                CALL_RUNNER,
+                str(project_dir),
+                client_module,
+                method,
+                json.dumps(payload, separators=(",", ":")),
+            ],
+            check=False,
+            text=True,
+            capture_output=True,
+            env=env,
+        )
+    except Exception:
+        duration_ms = int((time.monotonic() - started_at) * 1000)
+        emit_tool_usage_log(
+            "tool_call_completed",
+            tool.get("name"),
             method,
-            json.dumps(payload, separators=(",", ":")),
-        ],
-        check=False,
-        text=True,
-        capture_output=True,
-        env=env,
+            returncode=1,
+            duration_ms=duration_ms,
+        )
+        raise
+    duration_ms = int((time.monotonic() - started_at) * 1000)
+    emit_tool_usage_log(
+        "tool_call_completed",
+        tool.get("name"),
+        method,
+        returncode=result.returncode,
+        duration_ms=duration_ms,
     )
+    return result
 
 
 def main(argv):

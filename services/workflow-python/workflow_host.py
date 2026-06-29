@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import ast
 import dataclasses
+import importlib.machinery
 import importlib.util
 import inspect
 import json
@@ -218,8 +219,12 @@ def install_api_compat_module() -> None:
             api_mod = imported_api
         except ImportError:
             api_mod = types.ModuleType("api")
-            api_mod.__path__ = []  # Mark as package so compat submodules can import.
             sys.modules["api"] = api_mod
+    if not hasattr(api_mod, "__path__"):
+        # Some workflow-host environments have an unrelated top-level api.py on
+        # sys.path. Mark it as a namespace package so our compat submodules can
+        # satisfy imports like api.runtime_control and api.vm_metrics.
+        api_mod.__path__ = []  # type: ignore[attr-defined]
 
     workflow_engine = types.ModuleType("api.workflow_engine")
     workflow_engine.WorkflowContext = WorkflowContext
@@ -1160,7 +1165,13 @@ def discover_workflows() -> dict[str, RegisteredWorkflow]:
             try:
                 registered = load_workflow_file(path)
             except Exception as exc:
-                print(f"workflow_load_error path={path} error={exc}", file=sys.stderr)
+                print(
+                    "workflow_load_error "
+                    f"path={path} "
+                    f"error={exc} "
+                    f"diagnostics={json.dumps(workflow_import_diagnostics(dirs), sort_keys=True)}",
+                    file=sys.stderr,
+                )
                 continue
             if registered is None:
                 continue
@@ -1170,6 +1181,37 @@ def discover_workflows() -> dict[str, RegisteredWorkflow]:
                 raise RuntimeError(f"duplicate workflow name {registered.workflow_name!r}")
             discovered[registered.workflow_name] = registered
     return discovered
+
+
+def workflow_import_diagnostics(dirs: list[Path]) -> dict[str, Any]:
+    api_mod = sys.modules.get("api")
+    module_specs: dict[str, dict[str, Any] | None] = {}
+    for module_name in ("api", "api.runtime_control", "api.vm_metrics"):
+        try:
+            spec = importlib.util.find_spec(module_name)
+        except (ImportError, AttributeError, ValueError):
+            spec = None
+        module_specs[module_name] = import_spec_diagnostics(spec)
+    return {
+        "workflow_dirs": [str(path) for path in dirs],
+        "cwd": os.getcwd(),
+        "sys_path_head": sys.path[:8],
+        "api_module_file": getattr(api_mod, "__file__", None),
+        "api_module_is_package": hasattr(api_mod, "__path__"),
+        "module_specs": module_specs,
+    }
+
+
+def import_spec_diagnostics(
+    spec: importlib.machinery.ModuleSpec | None,
+) -> dict[str, Any] | None:
+    if spec is None:
+        return None
+    return {
+        "origin": spec.origin,
+        "is_package": spec.submodule_search_locations is not None,
+        "submodule_search_locations": list(spec.submodule_search_locations or []),
+    }
 
 
 def coerce_value(value: Any, target_type: type) -> Any:

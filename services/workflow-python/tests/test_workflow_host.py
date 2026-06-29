@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 import sys
+import types
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -36,6 +37,15 @@ class FakeRpc:
 
 
 class WorkflowHostTests(unittest.TestCase):
+    def tearDown(self) -> None:
+        for name in [
+            "api",
+            "api.runtime_control",
+            "api.vm_metrics",
+            "api.workflow_engine",
+        ]:
+            sys.modules.pop(name, None)
+
     def test_workflow_result_includes_grouping_identifiers(self) -> None:
         host = load_workflow_host()
         pool = FakePool()
@@ -92,6 +102,21 @@ class WorkflowHostTests(unittest.TestCase):
         )
         self.assertTrue(rpc.drained)
         self.assertTrue(pool.closed)
+
+    def test_api_compat_marks_existing_api_module_as_package(self) -> None:
+        host = load_workflow_host()
+        api_module = types.ModuleType("api")
+        sys.modules["api"] = api_module
+
+        host.install_api_compat_module()
+
+        self.assertTrue(hasattr(api_module, "__path__"))
+        self.assertIs(sys.modules["api.runtime_control"], api_module.runtime_control)
+        self.assertIs(sys.modules["api.vm_metrics"], api_module.vm_metrics)
+        self.assertEqual(
+            host.canonical_json({"b": 1, "a": 2}),
+            '{"a":2,"b":1}',
+        )
 
 
 if __name__ == "__main__":

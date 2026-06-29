@@ -8,6 +8,12 @@ import types
 from pathlib import Path
 
 
+def _clear_api_modules():
+    for name in list(sys.modules):
+        if name == "api" or name.startswith("api."):
+            del sys.modules[name]
+
+
 def _load_sync():
     repo_root = Path(__file__).resolve().parents[3]
     if str(repo_root) not in sys.path:
@@ -53,6 +59,32 @@ def _load_sync():
     centaur_sdk.secret = lambda _name, default=None: default
 
     return importlib.import_module("workflows.slack.sync")
+
+
+def test_sync_and_backfill_import_without_api_compat_modules(monkeypatch):
+    repo_root = Path(__file__).resolve().parents[3]
+    if str(repo_root) not in sys.path:
+        sys.path.insert(0, str(repo_root))
+
+    _clear_api_modules()
+    for name in (
+        "workflows.slack.compat",
+        "workflows.slack.shared",
+        "workflows.slack.sync",
+        "workflows.slack.backfill",
+    ):
+        sys.modules.pop(name, None)
+
+    centaur_sdk = types.ModuleType("centaur_sdk")
+    centaur_sdk.secret = lambda _name, default=None: default
+    monkeypatch.setitem(sys.modules, "centaur_sdk", centaur_sdk)
+
+    sync = importlib.import_module("workflows.slack.sync")
+    backfill = importlib.import_module("workflows.slack.backfill")
+
+    assert sync.WORKFLOW_NAME == "slack_sync"
+    assert backfill.WORKFLOW_NAME == "slack_backfill"
+    assert "api" not in sys.modules
 
 
 class FakeContext:

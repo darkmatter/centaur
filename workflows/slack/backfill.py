@@ -9,7 +9,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-from api.vm_metrics import (
+from workflows.slack.compat import (
     record_etl_items_deleted,
     record_etl_items_enqueued,
     record_etl_items_failed,
@@ -29,7 +29,6 @@ from api.vm_metrics import (
     set_etl_backfill_job_age_seconds,
     set_etl_backfill_jobs,
 )
-from api.workflow_engine import WorkflowContext
 from workflows.slack.shared import (
     BACKFILL_JOB_CHANNEL_BOOTSTRAP,
     BACKFILL_JOB_CHANNEL_CONTINUATION,
@@ -204,7 +203,7 @@ def _watermark_lag_seconds(ts: str | None) -> float | None:
     return max((dt.datetime.now(dt.timezone.utc) - occurred_at).total_seconds(), 0.0)
 
 
-async def handler(inp: Input, ctx: WorkflowContext) -> dict[str, Any]:
+async def handler(inp: Input, ctx: Any) -> dict[str, Any]:
     """Drain queued Slack backfill continuations in small, bounded batches."""
     started_at = time.monotonic()
     mode = "backfill"

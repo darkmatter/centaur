@@ -9,8 +9,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-from api.runtime_control import canonical_json
-from api.vm_metrics import (
+from workflows.slack.compat import (
+    canonical_json,
     record_etl_items_enqueued,
     record_etl_items_failed,
     record_etl_items_seen,
@@ -25,7 +25,6 @@ from api.vm_metrics import (
     set_slack_retention_last_failure_timestamp,
     set_slack_retention_watermark_lag_seconds,
 )
-from api.workflow_engine import WorkflowContext
 from workflows.slack.shared import (
     BACKFILL_JOB_CHANNEL_BOOTSTRAP,
     BACKFILL_JOB_CHANNEL_CONTINUATION,
@@ -329,7 +328,7 @@ async def _update_checkpoint_failure(
     )
 
 
-async def handler(inp: Input, ctx: WorkflowContext) -> dict[str, Any]:
+async def handler(inp: Input, ctx: Any) -> dict[str, Any]:
     """Sync public Slack channels visible through the configured ETL user token."""
     started_at = time.monotonic()
     mode = "incremental"

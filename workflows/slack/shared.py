@@ -15,8 +15,8 @@ from urllib import error as urllib_error
 from urllib import request as urllib_request
 
 from centaur_sdk import secret
-from api.runtime_control import canonical_json
-from api.vm_metrics import (
+from workflows.slack.compat import (
+    canonical_json,
     record_slack_etl_rate_limit,
     set_etl_active_scopes,
     set_etl_failed_scopes,

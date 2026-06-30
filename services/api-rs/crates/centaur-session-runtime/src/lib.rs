@@ -36,10 +36,11 @@ use thiserror::Error;
 use tokio::{
     io,
     sync::Mutex,
-    time::{Instant, Interval, MissedTickBehavior, interval_at, sleep},
+    time::{Instant, Interval, MissedTickBehavior, interval_at, sleep, timeout},
 };
 use tokio_util::codec::{FramedRead, FramedWrite, LinesCodec, LinesCodecError};
 use tracing::{Instrument, Span, error, info, info_span, warn};
+use uuid::Uuid;
 
 pub use cleanup::SessionSandboxCleanupConfig;
 
@@ -63,6 +64,8 @@ type SessionInputSink = FramedWrite<SandboxWrite, LinesCodec>;
 type ExecutionSpanRegistry = Arc<Mutex<HashMap<String, Span>>>;
 type SessionPipeMap = Arc<DashMap<String, SessionPipe>>;
 type SessionPipeOpenLocks = Arc<DashMap<String, Arc<Mutex<()>>>>;
+type ToolRunnerMap = Arc<DashMap<String, Arc<PersistentToolRunner>>>;
+type ToolRunnerOpenLocks = Arc<DashMap<String, Arc<Mutex<()>>>>;
 
 #[derive(Clone)]
 pub struct SessionRuntime {
@@ -70,6 +73,8 @@ pub struct SessionRuntime {
     sandbox_runtime: SandboxRuntime,
     sandbox_pipes: SessionPipeMap,
     sandbox_pipe_open_locks: SessionPipeOpenLocks,
+    tool_runners: ToolRunnerMap,
+    tool_runner_open_locks: ToolRunnerOpenLocks,
     execution_spans: ExecutionSpanRegistry,
     iron_control: Option<SessionRegistrar>,
     warm_pool: Option<Arc<WarmPoolManager>>,
@@ -253,9 +258,62 @@ pub struct ExecuteSessionInput {
     pub max_duration_ms: Option<u64>,
 }
 
+#[derive(Debug)]
+pub struct PersistentToolCallInput {
+    pub principal_id: String,
+    pub token_id: Option<String>,
+    pub tool_name: String,
+    pub method: String,
+    pub arguments: Value,
+    pub timeout: Duration,
+}
+
+#[derive(Debug)]
+pub struct PersistentToolCallOutput {
+    pub sandbox_id: String,
+    pub stdout: String,
+    pub stderr: String,
+    pub exit_status: Option<i32>,
+    pub timed_out: bool,
+}
+
 #[derive(Clone)]
 struct SessionPipe {
     stdin: Arc<Mutex<SessionInputSink>>,
+}
+
+struct PersistentToolRunner {
+    sandbox_id: SandboxId,
+    io: Mutex<PersistentToolRunnerIo>,
+}
+
+struct PersistentToolRunnerIo {
+    stdin: FramedWrite<SandboxWrite, LinesCodec>,
+    stdout: FramedRead<SandboxRead, LinesCodec>,
+    _guard: SandboxIoGuard,
+}
+
+#[derive(Serialize)]
+struct PersistentToolRunnerRequest {
+    id: String,
+    tool: String,
+    method: String,
+    arguments: Value,
+    principal_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    token_id: Option<String>,
+    timeout_seconds: u64,
+}
+
+#[derive(Deserialize)]
+struct PersistentToolRunnerResponse {
+    status: Option<i32>,
+    #[serde(default)]
+    stdout: String,
+    #[serde(default)]
+    stderr: String,
+    #[serde(default)]
+    timed_out: bool,
 }
 
 /// Shared handles threaded through background session tasks (stdout pump,
@@ -315,6 +373,8 @@ impl SessionRuntime {
             sandbox_runtime,
             sandbox_pipes: Arc::new(DashMap::new()),
             sandbox_pipe_open_locks: Arc::new(DashMap::new()),
+            tool_runners: Arc::new(DashMap::new()),
+            tool_runner_open_locks: Arc::new(DashMap::new()),
             execution_spans: Arc::new(Mutex::new(HashMap::new())),
             iron_control: None,
             warm_pool: None,
@@ -391,11 +451,225 @@ impl SessionRuntime {
         }
     }
 
+    pub async fn run_persistent_tool_call(
+        &self,
+        input: PersistentToolCallInput,
+    ) -> Result<PersistentToolCallOutput, SessionRuntimeError> {
+        if input.principal_id.trim().is_empty() {
+            return Err(SessionRuntimeError::BadRequest(
+                "persistent tool runner principal_id is required".to_owned(),
+            ));
+        }
+        if input.tool_name.trim().is_empty() {
+            return Err(SessionRuntimeError::BadRequest(
+                "persistent tool runner tool_name is required".to_owned(),
+            ));
+        }
+        if input.method.trim().is_empty() {
+            return Err(SessionRuntimeError::BadRequest(
+                "persistent tool runner method is required".to_owned(),
+            ));
+        }
+        if input.timeout.is_zero() {
+            return Err(SessionRuntimeError::BadRequest(
+                "persistent tool runner timeout must be non-zero".to_owned(),
+            ));
+        }
+
+        let runner = self
+            .ensure_persistent_tool_runner(input.principal_id.trim())
+            .await?;
+        match runner.call(&input).await {
+            Ok(output) => Ok(output),
+            Err(error) => {
+                warn!(
+                    component = COMPONENT_SESSION_RUNTIME,
+                    event = "persistent_tool_runner_call_failed",
+                    principal_id = input.principal_id.trim(),
+                    sandbox_id = %runner.sandbox_id.as_str(),
+                    %error,
+                    "persistent tool runner call failed; recreating runner and retrying once"
+                );
+                self.discard_persistent_tool_runner(input.principal_id.trim(), &runner)
+                    .await;
+                let retry_runner = self
+                    .ensure_persistent_tool_runner(input.principal_id.trim())
+                    .await?;
+                retry_runner.call(&input).await
+            }
+        }
+    }
+
+    async fn ensure_persistent_tool_runner(
+        &self,
+        principal_id: &str,
+    ) -> Result<Arc<PersistentToolRunner>, SessionRuntimeError> {
+        if let Some(runner) = self.cached_persistent_tool_runner(principal_id) {
+            return Ok(runner);
+        }
+
+        let open_lock = {
+            let entry = self
+                .tool_runner_open_locks
+                .entry(principal_id.to_owned())
+                .or_insert_with(|| Arc::new(Mutex::new(())));
+            entry.clone()
+        };
+        let _open_guard = open_lock.lock().await;
+
+        if let Some(runner) = self.cached_persistent_tool_runner(principal_id) {
+            return Ok(runner);
+        }
+
+        let runner = Arc::new(self.create_persistent_tool_runner(principal_id).await?);
+        self.tool_runners
+            .insert(principal_id.to_owned(), runner.clone());
+        Ok(runner)
+    }
+
+    fn cached_persistent_tool_runner(
+        &self,
+        principal_id: &str,
+    ) -> Option<Arc<PersistentToolRunner>> {
+        self.tool_runners
+            .get(principal_id)
+            .map(|entry| entry.clone())
+    }
+
+    async fn create_persistent_tool_runner(
+        &self,
+        principal_id: &str,
+    ) -> Result<PersistentToolRunner, SessionRuntimeError> {
+        let thread_key = ThreadKey::parse(format!("mcp:{principal_id}"))
+            .map_err(|error| SessionRuntimeError::BadRequest(error.to_string()))?;
+        let harness = self
+            .sandbox_runtime
+            .warm_harness
+            .clone()
+            .unwrap_or(HarnessType::Codex);
+        let execution_id = format!("mcp-runner-{}", Uuid::new_v4().simple());
+        let mut spec =
+            (self.sandbox_runtime.spec_factory)(&thread_key, &execution_id, &harness, None);
+        spec.labels.insert(
+            "centaur.ai/component".to_owned(),
+            "mcp-tool-runner".to_owned(),
+        );
+        spec.labels.insert(
+            "centaur.ai/workload".to_owned(),
+            "persistent-tool-runner".to_owned(),
+        );
+        spec.iron_control_principal = Some(principal_id.to_owned());
+        upsert_spec_env(
+            &mut spec,
+            "CENTAUR_MCP_PRINCIPAL_ID",
+            principal_id.to_owned(),
+        );
+        configure_persistent_tool_runner_command(&mut spec);
+
+        let handle = self.sandbox_runtime.manager.create_running(spec).await?;
+        let sandbox_id = handle.id.clone();
+        let io = self
+            .sandbox_runtime
+            .manager
+            .open_io(&sandbox_id)
+            .await?
+            .into_parts();
+        let stdin = io.stdin;
+        let stdout = io.stdout;
+        let stderr = io.stderr;
+        let guard = io.guard;
+        let stderr_sandbox_id = sandbox_id.clone();
+        tokio::spawn(async move {
+            if let Err(error) = drain_stderr(stderr).await {
+                warn!(
+                    component = COMPONENT_SESSION_RUNTIME,
+                    event = "persistent_tool_runner_stderr_drain_failed",
+                    sandbox_id = %stderr_sandbox_id.as_str(),
+                    %error,
+                    "persistent tool runner stderr drain failed"
+                );
+            }
+        });
+
+        info!(
+            component = COMPONENT_SESSION_RUNTIME,
+            event = "persistent_tool_runner_created",
+            principal_id,
+            sandbox_id = %handle.id.as_str(),
+            "persistent tool runner created"
+        );
+
+        Ok(PersistentToolRunner {
+            sandbox_id: handle.id,
+            io: Mutex::new(PersistentToolRunnerIo {
+                stdin: FramedWrite::new(stdin, LinesCodec::new()),
+                stdout: FramedRead::new(stdout, LinesCodec::new()),
+                _guard: guard,
+            }),
+        })
+    }
+
+    async fn discard_persistent_tool_runner(
+        &self,
+        principal_id: &str,
+        runner: &Arc<PersistentToolRunner>,
+    ) {
+        let removed = self
+            .tool_runners
+            .remove_if(principal_id, |_key, current| Arc::ptr_eq(current, runner));
+        if removed.is_none() {
+            return;
+        }
+        if let Err(error) = self.sandbox_runtime.stop_sandbox(&runner.sandbox_id).await {
+            warn!(
+                component = COMPONENT_SESSION_RUNTIME,
+                event = "persistent_tool_runner_stop_failed",
+                principal_id,
+                sandbox_id = %runner.sandbox_id.as_str(),
+                %error,
+                "failed to stop discarded persistent tool runner"
+            );
+        }
+    }
+
     /// Attach an iron-control registrar so each new session upserts its
-    /// principal and assigns the configured roles.
+    /// principal and assigns it the configured roles.
     pub fn with_iron_control(mut self, registrar: SessionRegistrar) -> Self {
         self.iron_control = Some(registrar);
         self
+    }
+
+    /// Register the shared unauthenticated MCP runner principal when
+    /// iron-control is enabled, so proxy-backed tool calls can resolve an
+    /// effective config without minting per-user credentials in this layer.
+    pub async fn register_mcp_runner_principal(
+        &self,
+        principal_id: &str,
+    ) -> Result<String, SessionRuntimeError> {
+        let principal_id = principal_id.trim();
+        if principal_id.is_empty() {
+            return Err(SessionRuntimeError::BadRequest(
+                "mcp runner principal_id is required".to_owned(),
+            ));
+        }
+        if principal_id.contains(':') {
+            return Err(SessionRuntimeError::BadRequest(
+                "mcp runner principal_id must not contain ':'".to_owned(),
+            ));
+        }
+        let thread_key = ThreadKey::parse(format!("mcp:{principal_id}"))
+            .map_err(|error| SessionRuntimeError::BadRequest(error.to_string()))?;
+        if let Some(registrar) = &self.iron_control {
+            let metadata = json!({
+                "mcp_runner": true,
+                "mcp_principal_id": principal_id,
+            });
+            let principal = registrar
+                .register_session(thread_key.as_str(), Some(&metadata))
+                .await?;
+            return Ok(principal.id);
+        }
+        Ok(principal_id.to_owned())
     }
 
     pub fn with_warm_pool(mut self, config: WarmPoolConfig) -> Self {
@@ -2093,6 +2367,92 @@ impl SessionRuntime {
                 "failed to record orphaned execution failure"
             );
         }
+    }
+}
+
+impl PersistentToolRunner {
+    async fn call(
+        &self,
+        input: &PersistentToolCallInput,
+    ) -> Result<PersistentToolCallOutput, SessionRuntimeError> {
+        let request_id = format!("mcp-call-{}", Uuid::new_v4().simple());
+        let request = PersistentToolRunnerRequest {
+            id: request_id.clone(),
+            tool: input.tool_name.trim().to_owned(),
+            method: input.method.trim().to_owned(),
+            arguments: input.arguments.clone(),
+            principal_id: input.principal_id.trim().to_owned(),
+            token_id: input.token_id.clone(),
+            timeout_seconds: input.timeout.as_secs().max(1),
+        };
+        let line = serde_json::to_string(&request).map_err(|error| {
+            SessionRuntimeError::Sandbox(SandboxError::io_source(
+                "encode persistent tool runner request",
+                error,
+            ))
+        })?;
+        let response_timeout = input.timeout.saturating_add(Duration::from_secs(5));
+        let mut io = self.io.lock().await;
+        io.stdin.send(line).await.map_err(|error| {
+            SessionRuntimeError::Sandbox(SandboxError::io_source(
+                "write persistent tool runner request",
+                error,
+            ))
+        })?;
+
+        let response = match timeout(response_timeout, async {
+            loop {
+                let Some(line) = io.stdout.next().await else {
+                    return Err(SessionRuntimeError::Sandbox(SandboxError::io(
+                        "persistent tool runner stdout closed",
+                    )));
+                };
+                let line = line.map_err(|error| {
+                    SessionRuntimeError::Sandbox(SandboxError::io_source(
+                        "read persistent tool runner response",
+                        error,
+                    ))
+                })?;
+                let Ok(value) = serde_json::from_str::<Value>(&line) else {
+                    continue;
+                };
+                if value.get("id").and_then(Value::as_str) != Some(request_id.as_str()) {
+                    continue;
+                }
+                return serde_json::from_value::<PersistentToolRunnerResponse>(value).map_err(
+                    |error| {
+                        SessionRuntimeError::Sandbox(SandboxError::io_source(
+                            "decode persistent tool runner response",
+                            error,
+                        ))
+                    },
+                );
+            }
+        })
+        .await
+        {
+            Ok(result) => result?,
+            Err(_) => {
+                return Ok(PersistentToolCallOutput {
+                    sandbox_id: self.sandbox_id.as_str().to_owned(),
+                    stdout: String::new(),
+                    stderr: format!(
+                        "persistent tool runner timed out after {} ms",
+                        response_timeout.as_millis()
+                    ),
+                    exit_status: None,
+                    timed_out: true,
+                });
+            }
+        };
+
+        Ok(PersistentToolCallOutput {
+            sandbox_id: self.sandbox_id.as_str().to_owned(),
+            stdout: response.stdout,
+            stderr: response.stderr,
+            exit_status: response.status,
+            timed_out: response.timed_out,
+        })
     }
 }
 
@@ -4785,6 +5145,98 @@ fn nonzero_duration_millis(value: u64) -> Result<Duration, SessionRuntimeError> 
     Ok(Duration::from_millis(value))
 }
 
+const PERSISTENT_TOOL_RUNNER_SCRIPT: &str = r#"
+import json
+import os
+import subprocess
+import sys
+import traceback
+
+print("__CENTAUR_TOOL_RUNNER_READY", flush=True)
+
+for raw_line in sys.stdin:
+    raw_line = raw_line.strip()
+    if not raw_line:
+        continue
+    request_id = None
+    try:
+        request = json.loads(raw_line)
+        request_id = request.get("id")
+        tool = request["tool"]
+        method = request["method"]
+        arguments = request.get("arguments", {})
+        timeout_seconds = max(1, int(request.get("timeout_seconds") or 120))
+        env = os.environ.copy()
+        principal_id = request.get("principal_id")
+        token_id = request.get("token_id")
+        if principal_id:
+            env["CENTAUR_MCP_PRINCIPAL_ID"] = str(principal_id)
+        if token_id:
+            env["CENTAUR_MCP_TOKEN_ID"] = str(token_id)
+        try:
+            completed = subprocess.run(
+                [
+                    "centaur-tools",
+                    "call",
+                    str(tool),
+                    str(method),
+                    json.dumps(arguments, separators=(",", ":")),
+                ],
+                check=False,
+                text=True,
+                capture_output=True,
+                timeout=timeout_seconds,
+                env=env,
+            )
+            response = {
+                "id": request_id,
+                "status": completed.returncode,
+                "stdout": completed.stdout,
+                "stderr": completed.stderr,
+                "timed_out": False,
+            }
+        except subprocess.TimeoutExpired as exc:
+            response = {
+                "id": request_id,
+                "status": None,
+                "stdout": exc.stdout or "",
+                "stderr": (exc.stderr or "") + f"\ncentaur tool call timed out after {timeout_seconds}s",
+                "timed_out": True,
+            }
+    except Exception:
+        response = {
+            "id": request_id,
+            "status": 1,
+            "stdout": "",
+            "stderr": traceback.format_exc(),
+            "timed_out": False,
+        }
+    print(json.dumps(response, separators=(",", ":")), flush=True)
+"#;
+
+fn configure_persistent_tool_runner_command(spec: &mut SandboxSpec) {
+    if should_preserve_entrypoint_for_tool_runner(spec) {
+        spec.command = Some(vec!["/entrypoint.sh".to_owned()]);
+        spec.args = vec![
+            "python3".to_owned(),
+            "-u".to_owned(),
+            "-c".to_owned(),
+            PERSISTENT_TOOL_RUNNER_SCRIPT.to_owned(),
+        ];
+    } else {
+        spec.command = Some(vec!["python3".to_owned(), "-u".to_owned(), "-c".to_owned()]);
+        spec.args = vec![PERSISTENT_TOOL_RUNNER_SCRIPT.to_owned()];
+    }
+}
+
+fn should_preserve_entrypoint_for_tool_runner(spec: &SandboxSpec) -> bool {
+    spec.command
+        .as_ref()
+        .and_then(|command| command.first())
+        .is_some_and(|program| program == "/entrypoint.sh")
+        || spec.args.first().is_some_and(|arg| arg == "harness-server")
+}
+
 fn execution_metadata(
     metadata: Option<Value>,
     idle_timeout_ms: Option<u64>,
@@ -4889,6 +5341,26 @@ mod tests {
                 .is_none()
         );
         assert!(PersonaRegistry::new(Vec::new(), Some("missing".to_owned()), Vec::new()).is_err());
+    }
+
+    #[test]
+    fn persistent_tool_runner_command_preserves_sandbox_entrypoint_for_tool_setup() {
+        let thread_key = ThreadKey::parse("mcp:test").unwrap();
+        let workload = SandboxWorkloadMode::codex_app_server(
+            "centaur-agent:latest",
+            [("TOOL_DIRS".to_owned(), "/app/tools".to_owned())],
+            HarnessType::Codex,
+        );
+        let mut spec = workload.spec(&thread_key, &HarnessType::Codex, None);
+
+        configure_persistent_tool_runner_command(&mut spec);
+
+        assert_eq!(spec.command, Some(vec!["/entrypoint.sh".to_owned()]));
+        assert_eq!(spec.args[0], "python3");
+        assert_eq!(spec.args[1], "-u");
+        assert_eq!(spec.args[2], "-c");
+        assert!(spec.args[3].contains("__CENTAUR_TOOL_RUNNER_READY"));
+        assert_eq!(env_value(&spec, "TOOL_DIRS"), Some("/app/tools"));
     }
 
     #[test]

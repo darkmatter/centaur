@@ -23,6 +23,12 @@ type RecordedRequest = {
   url: string
 }
 
+type CapturedLog = {
+  data?: unknown
+  event: string
+  level: 'debug' | 'error' | 'info' | 'warn'
+}
+
 function apiMessage(
   text: string,
   overrides: Partial<SlackbotV2ApiMessage> = {}
@@ -101,6 +107,17 @@ function options(fetchFn: SlackbotV2Options['fetch']): SlackbotV2Options {
   }
 }
 
+function captureLogger(logs: CapturedLog[]): NonNullable<SlackbotV2Options['logger']> {
+  const logger: NonNullable<SlackbotV2Options['logger']> = {
+    debug: (event: string, data?: unknown) => logs.push({ data, event, level: 'debug' }),
+    error: (event: string, data?: unknown) => logs.push({ data, event, level: 'error' }),
+    info: (event: string, data?: unknown) => logs.push({ data, event, level: 'info' }),
+    warn: (event: string, data?: unknown) => logs.push({ data, event, level: 'warn' }),
+    child: () => logger
+  }
+  return logger
+}
+
 function executeBody(requests: RecordedRequest[]): Record<string, unknown> {
   const execute = requests.find(request => request.url.endsWith('/execute'))
   return (execute?.body ?? {}) as Record<string, unknown>
@@ -135,6 +152,16 @@ function textPartIncludes(part: JsonObject, text: string): boolean {
 
 function isJsonRecord(value: JsonValue | undefined): value is JsonObject {
   return Boolean(value && typeof value === 'object' && !Array.isArray(value))
+}
+
+function logData(logs: CapturedLog[], event: string): Record<string, unknown> | undefined {
+  const data = logs.find(log => log.event === event)?.data
+  if (!data || typeof data !== 'object' || Array.isArray(data)) return undefined
+  return data as Record<string, unknown>
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms))
 }
 
 describe('session event streaming', () => {
@@ -854,6 +881,60 @@ describe('session principal display name', () => {
     expect(slackCalls).toBe(1)
     expect('slack_conversation_name' in (createBody(requests).metadata ?? {})).toBe(false)
     expect(requests.some(request => request.url.endsWith('/execute'))).toBe(true)
+  })
+
+  test('times session API create from the request after Slack preflight', async () => {
+    const requests: RecordedRequest[] = []
+    const logs: CapturedLog[] = []
+    const fetchFn = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      const body = init?.body ? JSON.parse(String(init.body)) : undefined
+      requests.push({ body, url })
+      return new Promise<Response>(() => undefined)
+    }) as SlackbotV2Options['fetch']
+
+    await withSlackStub(
+      async url => {
+        if (url.includes('conversations.info')) {
+          await sleep(35)
+          return Response.json({ channel: { id: 'C1', name_normalized: 'eng-oncall' }, ok: true })
+        }
+        return Response.json({ ok: true })
+      },
+      async () => {
+        await expect(
+          forwardToSessionApi(
+            {
+              ...slackOptions(fetchFn),
+              logger: captureLogger(logs),
+              sessionApiTimeoutMs: 25,
+              slackApiTimeoutMs: 100
+            },
+            forwardInput(apiMessage('hi'))
+          )
+        ).rejects.toThrow('create session timed out after 25ms')
+      }
+    )
+
+    expect(requests.some(request => request.url.endsWith('.000100'))).toBe(true)
+    expect(logData(logs, 'slackbotv2_session_create_preflight_complete')).toEqual(
+      expect.objectContaining({
+        conversation_kind: 'channel',
+        conversation_name_resolved: true
+      })
+    )
+    expect(logData(logs, 'slackbotv2_session_create_request_started')).toEqual(
+      expect.objectContaining({
+        harness_type: 'codex',
+        has_conversation_name: true,
+        on_harness_conflict: 'reject'
+      })
+    )
+    expect(logData(logs, 'slackbotv2_session_create_request_failed')).toEqual(
+      expect.objectContaining({
+        error: 'create session timed out after 25ms'
+      })
+    )
   })
 
   test('DM sessions name the principal after the DM partner', async () => {

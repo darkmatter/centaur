@@ -15,7 +15,8 @@ import type {
   SlackbotV2Fetch,
   SlackbotV2Options,
   SlackbotV2RendererSource,
-  SlackbotV2SessionMessage
+  SlackbotV2SessionMessage,
+  SlackbotV2Trace
 } from './types'
 import { observeSeconds, slackbotMetrics } from './metrics'
 import { rawSlackUserId } from './slack-user'
@@ -83,14 +84,12 @@ class FetchTimeoutError extends Error {
 
 async function recordSessionApiOperation<T>(
   operation: string,
-  fn: () => Promise<T>,
-  timeoutMs?: number,
-  timeoutAction = operation
+  fn: () => Promise<T>
 ): Promise<T> {
   const startedAtMs = nowMs()
   let outcome = 'success'
   try {
-    return await withTimeout(timeoutAction, timeoutMs, fn)
+    return await fn()
   } catch (error) {
     outcome = isRetryableSessionApiError(error) ? 'retryable_error' : 'error'
     throw error
@@ -474,10 +473,9 @@ export async function forwardToSessionApi(
       options,
       input.threadId,
       input.harnessType,
-      sessionRequesterMessage(input)
-    ),
-    sessionApiTimeoutMs(options),
-    'create session'
+      sessionRequesterMessage(input),
+      input.trace
+    )
   )
   traceLog(options, 'slackbotv2_session_create_complete', input.trace, {
     harness_switched: created.harnessSwitched,
@@ -490,9 +488,7 @@ export async function forwardToSessionApi(
     const appendStartedAtMs = nowMs()
     await recordSessionApiOperation(
       'append_messages',
-      () => appendSessionMessages(options, input.threadId, input.messages, !input.executeMessage),
-      sessionApiTimeoutMs(options),
-      'append session messages'
+      () => appendSessionMessages(options, input.threadId, input.messages, !input.executeMessage)
     )
     traceLog(options, 'slackbotv2_session_append_complete', input.trace, {
       message_count: input.messages.length,
@@ -518,9 +514,7 @@ export async function forwardToSessionApi(
       input.contextPreamble,
       input.reasoning,
       input.provider
-    ),
-    sessionApiTimeoutMs(options),
-    'execute session'
+    )
   )
   traceLog(options, 'slackbotv2_session_execute_complete', input.trace, {
     execution_id: execution.execution_id,
@@ -544,9 +538,7 @@ export async function openSessionEventStream(
       input.afterEventId,
       input.executionId,
       input.onEventId
-    ),
-    sessionApiTimeoutMs(options),
-    'stream events'
+    )
   )
   traceLog(options, 'slackbotv2_session_events_opened', input.trace, {
     after_event_id: input.afterEventId,
@@ -709,7 +701,8 @@ async function createSession(
   options: SlackbotV2Options,
   threadId: string,
   harnessType?: string,
-  message?: SlackbotV2ApiMessage
+  message?: SlackbotV2ApiMessage,
+  trace?: SlackbotV2Trace
 ): Promise<CreateSessionOutcome> {
   const requested = harnessType ?? options.defaultHarnessType ?? DEFAULT_HARNESS_TYPE
   // A sticky --claude/--amp/--codex selection restarts a thread pinned to
@@ -719,7 +712,8 @@ async function createSession(
     threadId,
     requested,
     message,
-    harnessType ? 'restart' : undefined
+    harnessType ? 'restart' : undefined,
+    trace
   )
   if (response.ok) {
     return { harnessSwitched: await harnessSwitchedFromResponse(response) }
@@ -737,7 +731,7 @@ async function createSession(
   // harness instead of failing the message.
   const existing = response.status === 409 ? existingHarnessFromConflict(body) : undefined
   if (existing && existing !== requested) {
-    const retry = await postCreateSession(options, threadId, existing, message)
+    const retry = await postCreateSession(options, threadId, existing, message, undefined, trace)
     await ensureApiOk(retry, 'create session')
     return { harnessSwitched: false }
   }
@@ -755,13 +749,16 @@ async function postCreateSession(
   threadId: string,
   harnessType: string,
   message?: SlackbotV2ApiMessage,
-  onHarnessConflict?: 'reject' | 'restart'
+  onHarnessConflict?: 'reject' | 'restart',
+  trace?: SlackbotV2Trace
 ): Promise<Response> {
   const fetchFn = options.fetch ?? fetch
   // The conversation name becomes the session principal's display name in
   // iron-control; resolve it here so it rides the create-session metadata that
   // api-rs reads when it registers the principal.
-  const conversationName = message ? await resolveConversationName(options, message) : undefined
+  const conversationName = message
+    ? await resolveCreateSessionConversationName(options, message, trace)
+    : undefined
   const body: SlackbotV2CreateSessionRequest = {
     harness_type: harnessType,
     metadata: {
@@ -773,17 +770,65 @@ async function postCreateSession(
     },
     ...(onHarnessConflict ? { on_harness_conflict: onHarnessConflict } : {})
   }
-  return fetchWithTimeout(
-    fetchFn,
-    apiSessionUrl(options.apiUrl, threadId),
-    {
-      method: 'POST',
-      headers: apiHeaders(options),
-      body: JSON.stringify(body)
-    },
-    sessionApiTimeoutMs(options),
-    'create session'
-  )
+  const requestStartedAtMs = nowMs()
+  traceLog(options, 'slackbotv2_session_create_request_started', trace, {
+    harness_type: harnessType,
+    has_conversation_name: Boolean(conversationName),
+    on_harness_conflict: onHarnessConflict ?? 'reject'
+  })
+  try {
+    const response = await fetchWithTimeout(
+      fetchFn,
+      apiSessionUrl(options.apiUrl, threadId),
+      {
+        method: 'POST',
+        headers: apiHeaders(options),
+        body: JSON.stringify(body)
+      },
+      sessionApiTimeoutMs(options),
+      'create session'
+    )
+    traceLog(options, 'slackbotv2_session_create_request_complete', trace, {
+      ok: response.ok,
+      phase_ms: elapsedMs(requestStartedAtMs),
+      status: response.status
+    })
+    return response
+  } catch (error) {
+    traceLog(
+      options,
+      'slackbotv2_session_create_request_failed',
+      trace,
+      {
+        error: errorMessage(error),
+        phase_ms: elapsedMs(requestStartedAtMs)
+      },
+      'warn'
+    )
+    throw error
+  }
+}
+
+async function resolveCreateSessionConversationName(
+  options: SlackbotV2Options,
+  message: SlackbotV2ApiMessage,
+  trace?: SlackbotV2Trace
+): Promise<string | undefined> {
+  const conversationId = slackConversationId(message)
+  const conversationKind = slackConversationKind(conversationId)
+  const startedAtMs = nowMs()
+  traceLog(options, 'slackbotv2_session_create_preflight_started', trace, {
+    conversation_id: conversationId,
+    conversation_kind: conversationKind
+  })
+  const conversationName = await resolveConversationName(options, message)
+  traceLog(options, 'slackbotv2_session_create_preflight_complete', trace, {
+    conversation_id: conversationId,
+    conversation_kind: conversationKind,
+    conversation_name_resolved: conversationName !== undefined,
+    phase_ms: elapsedMs(startedAtMs)
+  })
+  return conversationName
 }
 
 async function harnessSwitchedFromResponse(response: Response): Promise<boolean> {

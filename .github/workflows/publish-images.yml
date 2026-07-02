@@ -4,17 +4,6 @@ on:
   push:
     branches: [main]
     tags: [v*]
-    paths:
-      - .github/workflows/publish-images.yml
-      - services/**
-      - centaur_sdk/**
-      - packages/**
-      - tools/**
-      - scripts/bootstrap-k8s-secrets.sh
-      - package.json
-      - pnpm-lock.yaml
-      - pnpm-workspace.yaml
-      - .agents/skills/**
   pull_request:
   workflow_dispatch:
 

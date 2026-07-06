@@ -66,6 +66,15 @@ impl AnthropicStreamEvent {
         }
     }
 
+    pub fn is_message_stop(&self) -> bool {
+        matches!(
+            self,
+            Self::StreamEvent {
+                event: AnthropicRawStreamEvent::MessageStop,
+            }
+        )
+    }
+
     pub fn token_usage(&self) -> Option<NormalizedTokenUsage> {
         match self {
             Self::Assistant { message, .. } => {

@@ -677,19 +677,7 @@ async function syncThreadMessageToSession(
     )
   }
   if (!shouldStartExecution && input.initialAssistantStatusVisible) {
-    if (state.activeExecution === true && input.mode === 'execute') {
-      const visible = await setAssistantStatus(
-        thread,
-        input.options.assistantStatus ?? 'Still working...',
-        input.options,
-        trace
-      )
-      traceLog(input.options, 'slackbotv2_forward_active_execution_status_refreshed', trace, {
-        visible
-      })
-    } else {
-      await setAssistantStatus(thread, '', input.options, trace)
-    }
+    await setAssistantStatus(thread, '', input.options, trace)
   }
 
   const serializeStartedAtMs = nowMs()

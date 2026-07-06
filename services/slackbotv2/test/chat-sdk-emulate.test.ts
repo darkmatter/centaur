@@ -1562,14 +1562,6 @@ describe('slackbotv2', () => {
     const secondAppendTexts = sessionMessageTexts(codexApi.appends[1]!.body.messages)
     expect(secondAppendTexts[0]).toContain('# Requester Context')
     expect(secondAppendTexts.at(-1)).toBe(`@${BOT_USER_ID} add this while still running`)
-    await waitFor(
-      () =>
-        slackApi.calls
-          .filter(call => call.method === 'assistant.threads.setStatus')
-          .map(call => stringField(call.body.status))
-          .filter(status => status === 'Thinking...').length >= 2,
-      2000
-    )
 
     codexApi.closeStreams()
     await Promise.all(firstWaits)

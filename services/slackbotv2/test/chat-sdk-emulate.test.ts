@@ -13,6 +13,7 @@ import { createMemoryState } from '@chat-adapter/state-memory'
 import type { ServerNotification } from '@centaur/harness-events'
 import {
   createSlackbotV2,
+  hasLiveActiveExecution,
   normalizeSlackText,
   type SlackbotV2,
   type SlackbotV2AppendMessagesRequest,
@@ -49,6 +50,34 @@ describe('normalizeSlackText', () => {
     expect(normalizeSlackText('<#C0AJ07U8Z1N|eng-centaur>')).toBe(
       '#eng-centaur (C0AJ07U8Z1N)'
     )
+  })
+})
+
+describe('hasLiveActiveExecution', () => {
+  const ttlMs = 30 * 60 * 1000
+
+  it('trusts only fresh active-execution markers', () => {
+    const now = 1_000_000_000
+    expect(hasLiveActiveExecution({}, ttlMs, now)).toBe(false)
+    expect(hasLiveActiveExecution({ activeExecution: false }, ttlMs, now)).toBe(false)
+    expect(
+      hasLiveActiveExecution(
+        { activeExecution: true, activeExecutionStartedAt: now - 1_000 },
+        ttlMs,
+        now
+      )
+    ).toBe(true)
+    expect(
+      hasLiveActiveExecution(
+        { activeExecution: true, activeExecutionStartedAt: now - ttlMs - 1 },
+        ttlMs,
+        now
+      )
+    ).toBe(false)
+    expect(hasLiveActiveExecution({ activeExecution: true }, ttlMs, now)).toBe(false)
+    expect(
+      hasLiveActiveExecution({ activeExecution: true, activeExecutionStartedAt: null }, ttlMs, now)
+    ).toBe(false)
   })
 })
 
@@ -430,6 +459,47 @@ describe('slackbotv2', () => {
         model: 'claude-fable-5'
       })
     )
+  })
+
+  it('does not let a stale activeExecution flag block a new execution', async () => {
+    const sharedState = createMemoryState()
+    await sharedState.connect()
+    bot = createTestBot({ activeExecutionTtlMs: 50, state: sharedState })
+
+    const parent = await postUserMessage('Context before stale active execution.')
+    const mention = await postUserMessage(`<@${BOT_USER_ID}> run despite stale state`, parent.ts)
+    const key = threadKey(parent.ts)
+    await sharedState.set(`thread-state:${key}`, {
+      activeExecution: true,
+      activeExecutionStartedAt: Date.now() - 1_000,
+      forwardedMessageIds: [parent.ts],
+      historyForwarded: true,
+      lastEventId: 0
+    })
+
+    const waits: Promise<unknown>[] = []
+    const response = await bot.app.request(
+      '/api/webhooks/slack',
+      signedSlackEvent({
+        event_id: 'Ev-slackbotv2-stale-active-execution',
+        event: {
+          type: 'app_mention',
+          user: USER_ID,
+          channel: CHANNEL_ID,
+          team: TEAM_ID,
+          ts: mention.ts,
+          thread_ts: parent.ts,
+          text: `<@${BOT_USER_ID}> run despite stale state`
+        }
+      }),
+      {},
+      waitUntilContext(waits)
+    )
+
+    expect(response.status).toBe(200)
+    await Promise.all(waits)
+    expect(codexApi.executes).toHaveLength(1)
+    expect(codexApi.executes[0]?.threadKey).toBe(key)
   })
 
   it('appends an Open-session-in-Console context block to the first assistant message only', async () => {
@@ -3218,6 +3288,63 @@ describe('slackbotv2', () => {
         .filter(call => call.method === 'assistant.threads.setStatus')
         .map(call => stringField(call.body.status))
     ).toEqual(expect.arrayContaining(['Thinking...', '']))
+  })
+
+  it('bounds foreground webhook handoff waits and asks Slack to retry', async () => {
+    const logs: CapturedLog[] = []
+    bot = createTestBot({
+      logger: captureLogger(logs),
+      sessionApiTimeoutMs: 5_000,
+      webhookHandoffTimeoutMs: 25
+    })
+    const releaseExecute = codexApi.holdNextExecute()
+
+    const parent = await postUserMessage('Context before the wedged run.')
+    const mention = await postUserMessage(`<@${BOT_USER_ID}> do not wait forever`, parent.ts)
+    const waits: Promise<unknown>[] = []
+    try {
+      const response = await bot.app.request(
+        '/api/webhooks/slack',
+        signedSlackEvent({
+          event_id: 'Ev-slackbotv2-handoff-timeout',
+          event: {
+            type: 'app_mention',
+            user: USER_ID,
+            channel: CHANNEL_ID,
+            team: TEAM_ID,
+            ts: mention.ts,
+            thread_ts: parent.ts,
+            text: `<@${BOT_USER_ID}> do not wait forever`
+          }
+        }),
+        {},
+        waitUntilContext(waits)
+      )
+
+      expect(response.status).toBe(503)
+      expect(await response.text()).toBe('temporary upstream unavailable')
+      await waitFor(() => hasLog(logs, 'slackbotv2_webhook_handoff_wait_complete'))
+      expect(logData(logs, 'slackbotv2_webhook_handoff_wait_complete')).toEqual(
+        expect.objectContaining({
+          error: 'Slack webhook handoff timed out after 25ms',
+          retryable_error_count: 1,
+          slack_event_id: 'Ev-slackbotv2-handoff-timeout',
+          timeout_ms: 25
+        })
+      )
+      expect(logData(logs, 'slackbotv2_webhook_retry_requested')).toEqual(
+        expect.objectContaining({
+          error: 'Slack webhook handoff timed out after 25ms'
+        })
+      )
+    } finally {
+      releaseExecute()
+    }
+    await waitFor(() => codexApi.executes.length === 1, 3000)
+    await waitFor(() => hasLog(logs, 'slackbotv2_handoff_complete'), 3000)
+    await waitFor(() => codexApi.eventRequests.length === 1, 3000)
+    codexApi.closeStreams()
+    await Promise.all(waits)
   })
 
   it('does not wait for hung assistant status before creating Slack sessions', async () => {

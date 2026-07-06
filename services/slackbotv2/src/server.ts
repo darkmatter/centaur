@@ -25,6 +25,7 @@ const consoleLogger = {
 }
 
 const options: SlackbotV2Options = {
+  activeExecutionTtlMs: optionalNumberEnv('SLACKBOTV2_ACTIVE_EXECUTION_TTL_MS'),
   apiUrl,
   apiKey: optionalEnv('SLACKBOT_API_KEY'),
   assistantStatus: optionalEnv('SLACKBOTV2_ASSISTANT_STATUS'),
@@ -55,6 +56,7 @@ const options: SlackbotV2Options = {
   slackApiTimeoutMs: optionalNumberEnv('SLACKBOTV2_SLACK_API_TIMEOUT_MS'),
   stateKeyPrefix: optionalEnv('SLACKBOTV2_STATE_KEY_PREFIX'),
   userName: stringEnv('SLACKBOTV2_USER_NAME', 'centaur'),
+  webhookHandoffTimeoutMs: optionalNumberEnv('SLACKBOTV2_WEBHOOK_HANDOFF_TIMEOUT_MS'),
   logger: consoleLogger
 }
 

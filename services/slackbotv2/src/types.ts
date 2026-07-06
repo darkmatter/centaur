@@ -94,6 +94,11 @@ export type SlackbotV2ExecuteSessionResponse = {
 export type SlackbotV2Fetch = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>
 
 export type SlackbotV2Options = {
+  /**
+   * Milliseconds a persisted active-execution marker is trusted. Older markers
+   * are treated as stale so a crash mid-handoff cannot wedge a Slack thread.
+   */
+  activeExecutionTtlMs?: number
   allowedExternalTeamIds?: readonly string[]
   apiKey?: string
   apiUrl: string
@@ -147,6 +152,8 @@ export type SlackbotV2Options = {
   streamTaskDisplayMode?: 'none' | 'plan' | 'timeline'
   triggerBotAllowlist?: readonly string[]
   userName?: string
+  /** Deadline for the Slack webhook's foreground handoff wait. */
+  webhookHandoffTimeoutMs?: number
   mapper?: CodexAppServerToChatStreamOptions
 }
 
@@ -157,6 +164,7 @@ export type SlackbotV2 = {
 
 export type SlackbotV2ThreadState = {
   activeExecution?: boolean
+  activeExecutionStartedAt?: number | null
   executedMessageIds?: string[]
   forwardedMessageIds?: string[]
   /** Last thread-level harness selected by Slack flags. Null clears persisted state. */

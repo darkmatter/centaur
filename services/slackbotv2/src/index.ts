@@ -108,6 +108,8 @@ type SlackbotV2RequestContext = {
 }
 
 const requestContext = new AsyncLocalStorage<SlackbotV2RequestContext>()
+const ACTIVE_EXECUTION_TTL_MS = 30 * 60 * 1000
+const WEBHOOK_HANDOFF_TIMEOUT_MS = 30_000
 const RENDER_OBLIGATION_INDEX_KEY = 'slackbotv2:render:index'
 const RENDER_OBLIGATION_INDEX_MAX_LENGTH = 2000
 const RENDER_INDEX_TTL_MS = 30 * 24 * 60 * 60 * 1000
@@ -129,6 +131,13 @@ const LATE_SLACK_FILE_CONSUMED_TTL_MS = 5 * 60_000
 const LATE_SLACK_FILE_IDLE_WAIT_MS = 90_000
 const LATE_SLACK_FILE_IDLE_POLL_MS = 500
 const LATE_SLACK_FILE_MESSAGE_TEXT = 'Late Slack file attachment for the previous message.'
+
+class HandoffTimeoutError extends Error {
+  constructor(timeoutMs: number) {
+    super(`Slack webhook handoff timed out after ${timeoutMs}ms`)
+    this.name = 'AbortError'
+  }
+}
 
 type PendingLateSlackFileMention = {
   channel: string
@@ -266,10 +275,12 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
       })
       if (awaitHandoff && response.ok) {
         const waitStartedAtMs = nowMs()
+        const timeoutMs = webhookHandoffTimeoutMs(options)
         const waitFields = {
           ...webhookFields,
           response_status: response.status,
-          task_count: handoffTasks.length
+          task_count: handoffTasks.length,
+          timeout_ms: timeoutMs
         }
         traceLog(options, 'slackbotv2_webhook_handoff_wait_started', undefined, waitFields)
         const stopPendingLog = startPendingOperationLog(
@@ -281,7 +292,7 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
         )
         let waitError: unknown
         try {
-          await Promise.all(handoffTasks)
+          await waitForWebhookHandoff(handoffTasks, timeoutMs)
         } catch (error) {
           waitError = error
           if (isRetryableSessionApiError(error)) context.retryableErrors.push(error)
@@ -529,6 +540,33 @@ function recordFallback(outcome: string, startedAtMs: number): void {
   }
 }
 
+function webhookHandoffTimeoutMs(options: SlackbotV2Options): number {
+  return options.webhookHandoffTimeoutMs ?? WEBHOOK_HANDOFF_TIMEOUT_MS
+}
+
+async function waitForWebhookHandoff(
+  handoffTasks: Promise<unknown>[],
+  timeoutMs: number
+): Promise<void> {
+  const handoff = Promise.all(handoffTasks)
+  let timer: ReturnType<typeof globalThis.setTimeout> | undefined
+  const timeout = new Promise<never>((_, reject) => {
+    timer = globalThis.setTimeout(() => {
+      reject(new HandoffTimeoutError(timeoutMs))
+    }, timeoutMs)
+    const unref = (timer as { unref?: () => void }).unref
+    if (unref) unref.call(timer)
+  })
+  try {
+    await Promise.race([handoff, timeout])
+  } catch (error) {
+    void handoff.catch(() => undefined)
+    throw error
+  } finally {
+    if (timer !== undefined) globalThis.clearTimeout(timer)
+  }
+}
+
 function createDefaultState(options: SlackbotV2Options, logger: Logger): StateAdapter {
   const stateLogger = logger.child('postgres-state')
   // Own the pool so we can attach an error handler. pg.Pool emits 'error' for
@@ -577,6 +615,16 @@ async function ensureStateConnected(state: StateAdapter, options: SlackbotV2Opti
   }
 }
 
+export function hasLiveActiveExecution(
+  state: Pick<SlackbotV2ThreadState, 'activeExecution' | 'activeExecutionStartedAt'>,
+  ttlMs: number,
+  nowEpochMs = Date.now()
+): boolean {
+  if (state.activeExecution !== true) return false
+  if (typeof state.activeExecutionStartedAt !== 'number') return false
+  return nowEpochMs - state.activeExecutionStartedAt <= ttlMs
+}
+
 /**
  * Persists a Slack thread update into the session API. In execute mode the create/append/execute
  * handoff completes before Slack is acknowledged; SSE rendering continues in background.
@@ -596,8 +644,12 @@ async function syncThreadMessageToSession(
   const state = (await thread.state) ?? {}
   const messageIds = new Set(state.forwardedMessageIds ?? [])
   const executedMessageIds = new Set(state.executedMessageIds ?? [])
+  const liveActiveExecution = hasLiveActiveExecution(
+    state,
+    input.options.activeExecutionTtlMs ?? ACTIVE_EXECUTION_TTL_MS
+  )
   const shouldStartExecution =
-    input.mode === 'execute' && state.activeExecution !== true && !executedMessageIds.has(message.id)
+    input.mode === 'execute' && !liveActiveExecution && !executedMessageIds.has(message.id)
   const shouldRefreshThreadContext = shouldStartExecution && isSlackThreadReply(message)
   const shouldIncludeContext =
     shouldStartExecution && (state.historyForwarded !== true || shouldRefreshThreadContext)
@@ -622,6 +674,7 @@ async function syncThreadMessageToSession(
   }
   traceLog(input.options, 'slackbotv2_forward_started', trace, {
     active_execution: state.activeExecution === true,
+    active_execution_live: liveActiveExecution,
     history_forwarded: state.historyForwarded === true
   })
   const assistantStatusVisible = shouldStartExecution
@@ -812,6 +865,7 @@ async function syncThreadMessageToSession(
     await thread.setState({
       ...(stickyOverridesUpdate ?? {}),
       activeExecution: true,
+      activeExecutionStartedAt: Date.now(),
       executedMessageIds: Array.from(latestExecutedMessageIds).slice(-1000),
       lastEventId,
       renderObligation: {
@@ -868,7 +922,10 @@ async function syncThreadMessageToSession(
   }
 
   try {
-    await thread.setState({ activeExecution: true })
+    await thread.setState({
+      activeExecution: true,
+      activeExecutionStartedAt: Date.now()
+    })
     traceLog(input.options, 'slackbotv2_forward_active_execution_marked', trace)
     await forwardToSessionApi(input.options, forwardInput, {
       onExecutionStarted: commitExecutionStarted,
@@ -897,6 +954,7 @@ async function syncThreadMessageToSession(
     const latest = (await thread.state) ?? {}
     await thread.setState({
       activeExecution: false,
+      activeExecutionStartedAt: null,
       lastEventId: Math.max(latest.lastEventId ?? 0, lastEventId)
     })
     if (isRetryableSessionApiError(error)) {
@@ -1149,6 +1207,7 @@ async function renderExecutionAttempt(
     const latest = (await thread.state) ?? {}
     await thread.setState({
       activeExecution: retry,
+      activeExecutionStartedAt: retry ? Date.now() : null,
       lastEventId: Math.max(latest.lastEventId ?? 0, getLastEventId(), fallbackLastEventId),
       ...(rendered ? { renderObligation: null } : {})
     })
@@ -1387,6 +1446,7 @@ async function recoverRenderObligations(
         })
         await thread.setState({
           activeExecution: false,
+          activeExecutionStartedAt: null,
           lastEventId: threadState?.lastEventId ?? 0,
           renderObligation: null
         })
@@ -1412,6 +1472,7 @@ async function recoverRenderObligations(
         )
         await thread.setState({
           activeExecution: false,
+          activeExecutionStartedAt: null,
           lastEventId: threadState?.lastEventId ?? 0,
           renderObligation: null
         })
@@ -1585,6 +1646,7 @@ async function recoverRenderObligation(
     await renderRecoveredExecutionStream(thread, streamError(error), obligation.message, options, trace)
     await thread.setState({
       activeExecution: false,
+      activeExecutionStartedAt: null,
       lastEventId,
       renderObligation: null
     })
@@ -1597,6 +1659,7 @@ async function recoverRenderObligation(
   try {
     await thread.setState({
       activeExecution: true,
+      activeExecutionStartedAt: Date.now(),
       lastEventId
     })
     const streamResult = await renderRecoveredExecutionStream(
@@ -1695,6 +1758,7 @@ async function recoverRenderObligation(
     const latest = (await thread.state) ?? {}
     await thread.setState({
       activeExecution: false,
+      activeExecutionStartedAt: null,
       lastEventId: Math.max(latest.lastEventId ?? 0, lastEventId),
       ...(rendered ? { renderObligation: null } : {})
     })
@@ -2312,7 +2376,11 @@ async function waitForThreadIdle(
   const startedAtMs = nowMs()
   while (elapsedMs(startedAtMs) < LATE_SLACK_FILE_IDLE_WAIT_MS) {
     const latest = (await thread.state) ?? {}
-    if (latest.activeExecution !== true) return true
+    if (
+      !hasLiveActiveExecution(latest, options.activeExecutionTtlMs ?? ACTIVE_EXECUTION_TTL_MS)
+    ) {
+      return true
+    }
     traceLog(options, 'slackbotv2_late_file_repair_waiting_for_idle', trace, {
       waited_ms: elapsedMs(startedAtMs)
     })

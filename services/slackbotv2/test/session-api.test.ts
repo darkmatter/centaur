@@ -3,6 +3,7 @@ import {
   clearConversationNameCacheForTests,
   clearRequesterIdentityCacheForTests,
   DEFAULT_SESSION_IDLE_TIMEOUT_MS,
+  cancelSessionExecution,
   forwardToSessionApi,
   harnessRestartPreamble,
   openSessionEventStream,
@@ -80,6 +81,14 @@ function fakeApi(responses: { createSession?: Array<{ body?: unknown; status: nu
         execution_id: 'exec-1',
         ok: true,
         status: 'running',
+        thread_key: 'slack:C1:1700000000.000100'
+      })
+    }
+    if (url.endsWith('/cancel')) {
+      return Response.json({
+        cancelled: true,
+        execution_id: 'exec-1',
+        ok: true,
         thread_key: 'slack:C1:1700000000.000100'
       })
     }
@@ -184,6 +193,25 @@ describe('session event streaming', () => {
       eventKind: 'session.execution_completed'
     })
     expect(seenEventIds).toEqual([1, 2])
+  })
+})
+
+describe('session cancellation', () => {
+  test('posts cancellation reason to the thread cancel endpoint', async () => {
+    const { fetchFn, requests } = fakeApi()
+
+    const response = await cancelSessionExecution(
+      options(fetchFn),
+      'slack:C1:1700000000.000100',
+      'Cancelled from Slack by U1'
+    )
+
+    expect(response.cancelled).toBe(true)
+    const cancel = requests.find(request => request.url.endsWith('/cancel'))
+    expect(cancel?.url).toBe(
+      'http://api.test/api/session/slack%3AC1%3A1700000000.000100/cancel'
+    )
+    expect(cancel?.body).toEqual({ reason: 'Cancelled from Slack by U1' })
   })
 })
 

@@ -272,6 +272,12 @@ pub struct CreateOrGetSessionOutcome {
     pub harness_switched: bool,
 }
 
+#[derive(Clone, Debug)]
+pub struct CancelExecutionOutcome {
+    pub cancelled: bool,
+    pub execution_id: Option<String>,
+}
+
 /// Outcome of [`SessionRuntime::drain`]: the sandboxes that were stopped and
 /// any that failed to stop (with the backend error text).
 #[derive(Debug, Default)]
@@ -2078,6 +2084,61 @@ impl SessionRuntime {
         {
             warn!(%thread_key, %error, "failed to record steering delivery");
         }
+    }
+
+    pub async fn cancel_active_execution(
+        &self,
+        thread_key: &ThreadKey,
+        reason: &str,
+    ) -> Result<CancelExecutionOutcome, SessionRuntimeError> {
+        let Some(execution) = self.store.active_execution_for_thread(thread_key).await? else {
+            return Ok(CancelExecutionOutcome {
+                cancelled: false,
+                execution_id: None,
+            });
+        };
+        let session = self.store.get_session(thread_key).await?;
+        if let Some(sandbox_id) = session.sandbox_id.as_deref() {
+            self.sandbox_pipes.remove(sandbox_id);
+            match self
+                .sandbox_runtime
+                .manager
+                .stop(&SandboxId::new(sandbox_id))
+                .await
+            {
+                Ok(()) | Err(SandboxError::NotFound(_)) => {}
+                Err(error) => return Err(SessionRuntimeError::Sandbox(error)),
+            }
+            self.store
+                .clear_sandbox_id_if_matches(thread_key, sandbox_id)
+                .await?;
+        }
+        let Some(cancelled) = self
+            .store
+            .cancel_execution_if_active(&execution.execution_id, reason)
+            .await?
+        else {
+            return Ok(CancelExecutionOutcome {
+                cancelled: false,
+                execution_id: Some(execution.execution_id),
+            });
+        };
+        self.store
+            .append_event(
+                thread_key,
+                Some(cancelled.execution_id.as_str()),
+                "session.execution_cancelled",
+                json!({
+                    "execution_id": cancelled.execution_id,
+                    "thread_key": thread_key.as_str(),
+                    "error": reason,
+                }),
+            )
+            .await?;
+        Ok(CancelExecutionOutcome {
+            cancelled: true,
+            execution_id: Some(cancelled.execution_id),
+        })
     }
 
     async fn wait_for_active_steering_pipe(

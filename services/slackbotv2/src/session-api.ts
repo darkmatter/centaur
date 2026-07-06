@@ -9,6 +9,7 @@ import type {
   SlackbotV2ApiMessageLink,
   SlackbotV2ApiMessage,
   SlackbotV2AppendMessagesRequest,
+  SlackbotV2CancelSessionResponse,
   SlackbotV2CreateSessionRequest,
   SlackbotV2ExecuteSessionRequest,
   SlackbotV2ExecuteSessionResponse,
@@ -555,6 +556,19 @@ export async function openSessionEventStream(
     phase_ms: elapsedMs(streamStartedAtMs)
   })
   return stream
+}
+
+export async function cancelSessionExecution(
+  options: SlackbotV2Options,
+  threadId: string,
+  reason: string
+): Promise<SlackbotV2CancelSessionResponse> {
+  return recordSessionApiOperation(
+    'cancel_session',
+    () => postCancelSessionExecution(options, threadId, reason),
+    sessionApiTimeoutMs(options),
+    'cancel session'
+  )
 }
 
 const RESTART_CONTEXT_MAX_CHARS = 24_000
@@ -1226,6 +1240,27 @@ async function executeSession(
   )
   await ensureApiOk(response, 'execute session')
   return (await response.json()) as SlackbotV2ExecuteSessionResponse
+}
+
+async function postCancelSessionExecution(
+  options: SlackbotV2Options,
+  threadId: string,
+  reason: string
+): Promise<SlackbotV2CancelSessionResponse> {
+  const fetchFn = options.fetch ?? fetch
+  const response = await fetchWithTimeout(
+    fetchFn,
+    apiSessionUrl(options.apiUrl, threadId, 'cancel'),
+    {
+      method: 'POST',
+      headers: apiHeaders(options),
+      body: JSON.stringify({ reason })
+    },
+    sessionApiTimeoutMs(options),
+    'cancel session'
+  )
+  await ensureApiOk(response, 'cancel session')
+  return (await response.json()) as SlackbotV2CancelSessionResponse
 }
 
 async function ensureApiOk(response: Response, action: string): Promise<void> {

@@ -91,6 +91,13 @@ export type SlackbotV2ExecuteSessionResponse = {
   thread_key: string
 }
 
+export type SlackbotV2CancelSessionResponse = {
+  cancelled: boolean
+  execution_id?: string
+  ok: boolean
+  thread_key: string
+}
+
 export type SlackbotV2Fetch = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>
 
 export type SlackbotV2Options = {

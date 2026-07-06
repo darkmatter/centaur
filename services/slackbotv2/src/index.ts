@@ -28,6 +28,7 @@ import { renderSlackDisplayText, slackMessagePromptText } from './slack-display-
 import { slackUserIdForMessage } from './slack-user'
 import {
   collectInitialContext,
+  cancelSessionExecution,
   forwardToSessionApi,
   harnessRestartPreamble,
   isRetryableSessionApiError,
@@ -45,6 +46,7 @@ import {
 } from './console-session-link'
 import { extractMessageOverrides } from './overrides'
 import { isAllowedSlackMessage, isAllowedSlackWebhookBody } from './slack-events'
+import { isSlackStopCommand } from './stop-command'
 import type {
   ForwardSessionInput,
   JsonObject,
@@ -205,6 +207,7 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
 
   chat.onNewMention(async (thread, message) => {
     if (!isAllowedSlackMessage(message, options, logger)) return
+    if (await handleSlackStopCommand(thread, message, options, 'new_mention')) return
     lateSlackFiles.rememberFilelessMention(thread, message)
     await handleSlackMessageHandoff(thread, message, {
       assistantStatusRequested: true,
@@ -218,6 +221,9 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
 
   chat.onSubscribedMessage(async (thread, message) => {
     if (!isAllowedSlackMessage(message, options, logger)) return
+    if (message.isMention === true) {
+      if (await handleSlackStopCommand(thread, message, options, 'subscribed_message')) return
+    }
     lateSlackFiles.rememberFilelessMention(thread, message)
     await handleSlackMessageHandoff(thread, message, {
       assistantStatusRequested: message.isMention === true,
@@ -329,6 +335,42 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
   }
 
   return { app, chat }
+}
+
+async function handleSlackStopCommand(
+  thread: Thread<SlackbotV2ThreadState>,
+  message: ChatMessage,
+  options: SlackbotV2Options,
+  trigger: string
+): Promise<boolean> {
+  if (!isSlackStopCommand(message)) return false
+  const trace = createHandoffTrace(thread, message, 'append')
+  traceLog(options, 'slackbotv2_stop_command_started', trace, { trigger })
+  const latest = (await thread.state) ?? {}
+  const reason = `Cancelled from Slack by ${slackUserIdForMessage(message) ?? 'unknown user'}`
+  let cancelled = false
+  try {
+    const response = await cancelSessionExecution(options, thread.id, reason)
+    cancelled = response.cancelled
+    await thread.setState({
+      activeExecution: false,
+      lastEventId: latest.lastEventId ?? latest.renderObligation?.afterEventId ?? 0,
+      renderObligation: null
+    })
+    await setAssistantStatus(thread, '', options, trace)
+    traceLog(options, 'slackbotv2_stop_command_complete', trace, {
+      cancelled,
+      execution_id: response.execution_id,
+      trigger
+    })
+    return true
+  } catch (error) {
+    traceWarn(options, 'slackbotv2_stop_command_failed', trace, {
+      error: errorMessage(error),
+      trigger
+    })
+    throw error
+  }
 }
 
 async function handleSlackMessageHandoff(

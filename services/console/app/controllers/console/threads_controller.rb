@@ -1,6 +1,9 @@
 class Console::ThreadsController < ApplicationController
   layout "console"
 
+  # Injectable for tests, mirroring Console::WorkflowsController.
+  class_attribute :client_factory, default: -> { CentaurApiClient.new }
+
   THREAD_LIMIT = 250
   MESSAGE_LIMIT = 80
   EXECUTION_LIMIT = 8
@@ -80,6 +83,32 @@ class Console::ThreadsController < ApplicationController
 
   SlackThreadOwner = Struct.new(:user_id, :team_id, keyword_init: true)
 
+  # Harnesses the composer can start a chat on, in display order. Wire values
+  # match api-rs's HarnessType enum (serde lowercase).
+  COMPOSER_HARNESSES = [
+    [ "claudecode", "Claude Code" ],
+    [ "codex", "Codex" ],
+    [ "amp", "Amp" ]
+  ].freeze
+  COMPOSER_DEFAULT_HARNESS = "claudecode".freeze
+  # Models offered per harness. The blocks-protocol user line carries `model`
+  # and every harness honors it; the ids here are the ones the bots' --model
+  # flags expand to (services/slackbotv2/src/overrides.ts). Amp maps to an
+  # empty list on purpose: it manages its own model per turn, so the composer
+  # shows a note instead of a selector.
+  COMPOSER_MODELS = {
+    "claudecode" => [
+      [ "claude-opus-4-8", "Claude Opus 4.8" ],
+      [ "claude-sonnet-4-6", "Claude Sonnet 4.6" ],
+      [ "claude-haiku-4-5", "Claude Haiku 4.5" ],
+      [ "claude-fable-5", "Claude Fable 5" ]
+    ],
+    "codex" => [
+      [ "gpt-5.5", "GPT-5.5" ]
+    ],
+    "amp" => []
+  }.freeze
+
   helper_method :thread_title,
                 :thread_source_icon,
                 :thread_source_label,
@@ -88,7 +117,11 @@ class Console::ThreadsController < ApplicationController
                 :thread_user_label,
                 :thread_message_text,
                 :thread_text_preview,
-                :thread_status_classes
+                :thread_status_classes,
+                :composer_harness_choices,
+                :composer_default_harness,
+                :composer_model_choices,
+                :composer_model_choices_by_harness
 
   def index
     @query = params[:q].to_s.strip
@@ -111,11 +144,28 @@ class Console::ThreadsController < ApplicationController
     @thread_db_unavailable = true
   end
 
+  # Composer submit: no thread_key starts a new chat (create session + first
+  # message + execute), a thread_key sends a follow-up into an existing chat.
+  # Both paths talk to api-rs through CentaurApiClient; the transcript itself
+  # is still read from the sessions DB by #index after the redirect.
   def create
-    redirect_to(
-      console_threads_path(thread: params[:thread_key].presence),
-      alert: READ_ONLY_REASON
-    )
+    thread_key = params[:thread_key].to_s.strip.presence
+
+    if console_threads_read_only?
+      redirect_to(console_threads_path(thread: thread_key), alert: READ_ONLY_REASON)
+      return
+    end
+
+    prompt = params[:prompt].to_s.strip
+    if prompt.blank?
+      redirect_to(
+        thread_key ? console_threads_path(thread: reply_redirect_keys(thread_key)) : console_threads_path(new: 1),
+        alert: "Type a message first."
+      )
+      return
+    end
+
+    thread_key ? reply_to_thread(thread_key, prompt) : start_thread(prompt)
   end
 
   # Lazily-loaded sidebar thread list, requested by the Turbo Frame in
@@ -128,6 +178,157 @@ class Console::ThreadsController < ApplicationController
   end
 
   private
+
+  def api_client
+    @api_client ||= client_factory.call
+  end
+
+  def composer_harness_choices
+    COMPOSER_HARNESSES
+  end
+
+  def composer_default_harness
+    COMPOSER_DEFAULT_HARNESS
+  end
+
+  # Model options for one harness, default first and annotated. The default
+  # comes from the same env/config resolution the thread header uses, so the
+  # composer never claims a default the sandbox would not actually run.
+  def composer_model_choices(harness)
+    options = COMPOSER_MODELS.fetch(harness, [])
+    default = default_model_for_harness(harness)
+    return options if default.blank?
+
+    default_label = options.find { |value, _label| value == default }&.last || default
+    [ [ default, "#{default_label} (default)" ] ] +
+      options.reject { |value, _label| value == default }
+  end
+
+  def composer_model_choices_by_harness
+    COMPOSER_HARNESSES.to_h { |value, _label| [ value, composer_model_choices(value) ] }
+  end
+
+  def start_thread(prompt)
+    harness = params[:harness_type].to_s.strip.presence || composer_default_harness
+    unless COMPOSER_MODELS.key?(harness)
+      redirect_to console_threads_path(new: 1), alert: "Unknown harness #{harness.inspect}."
+      return
+    end
+
+    model = composer_model_param(harness)
+    thread_key = "console:#{SecureRandom.uuid}"
+
+    api_client.create_session(
+      thread_key: thread_key,
+      harness_type: harness,
+      metadata: console_actor_metadata.merge(model.present? ? { model: model } : {})
+    )
+    send_prompt(thread_key, prompt, model: model)
+    redirect_to console_threads_path(thread: thread_key)
+  rescue CentaurApiClient::Error => e
+    redirect_to console_threads_path(new: 1), alert: "Could not start the chat: #{e.message}"
+  end
+
+  def reply_to_thread(thread_key, prompt)
+    # Resolve through the owner scope so a crafted thread_key cannot post into
+    # another user's chat — same rule the read side applies to ?thread=.
+    session = visible_thread_scope.where(thread_key: thread_key).first
+    if session.nil?
+      redirect_to console_threads_path, alert: "Chat not found."
+      return
+    end
+
+    send_prompt(session.thread_key, prompt, model: reply_model_for(session))
+    redirect_to console_threads_path(thread: reply_redirect_keys(session.thread_key))
+  rescue CentaurApiClient::Error => e
+    redirect_to console_threads_path(thread: reply_redirect_keys(thread_key)),
+                alert: "Could not send the message: #{e.message}"
+  rescue ActiveRecord::ActiveRecordError, PG::Error => e
+    Rails.logger.warn("console_threads_reply_lookup_failed error=#{e.class}: #{e.message}")
+    redirect_to console_threads_path, alert: "Chat database is unavailable."
+  end
+
+  # Append persists the turn in conversation history; execute runs it. The
+  # shared client_message_id lets api-rs dedupe the copy of the message the
+  # harness echoes back.
+  def send_prompt(thread_key, prompt, model: nil)
+    message_id = SecureRandom.uuid
+
+    api_client.append_session_messages(
+      thread_key: thread_key,
+      messages: [
+        {
+          client_message_id: message_id,
+          role: "user",
+          parts: [ { type: "text", text: prompt } ],
+          metadata: console_actor_metadata
+        }
+      ]
+    )
+
+    execute_metadata = console_actor_metadata.merge(action: "execute")
+    execute_metadata[:model] = model if model.present?
+    api_client.execute_session(
+      thread_key: thread_key,
+      idempotency_key: SecureRandom.uuid,
+      metadata: execute_metadata,
+      input_lines: [ composer_input_line(thread_key, prompt, model: model, client_message_id: message_id) ]
+    )
+  end
+
+  # One blocks-protocol user line, the shape harness-server parses from
+  # execute's input_lines. `model` is honored by every harness; omitted (e.g.
+  # for Amp) the harness runs its own default.
+  def composer_input_line(thread_key, prompt, model:, client_message_id:)
+    line = {
+      type: "user",
+      thread_key: thread_key,
+      client_user_message_id: client_message_id,
+      trace_metadata: { action: "execute", source: "console" },
+      message: { role: "user", content: [ { type: "text", text: prompt } ] }
+    }
+    line[:model] = model if model.present?
+    line.to_json
+  end
+
+  # Follow-ups reuse the model the chat has been running on (mirrors the
+  # display resolution in thread_model_label, minus the upcasing): last
+  # execution's recorded model, session metadata, then the deploy default.
+  def reply_model_for(session)
+    recorded_model(latest_executions_for([ session.thread_key ])[session.thread_key]&.metadata) ||
+      recorded_model(session.metadata_hash) ||
+      default_model_for_harness(session.harness_type.to_s)
+  end
+
+  # An unknown model falls back to the harness default rather than erroring:
+  # the select is populated from the same list, so mismatches only come from
+  # hand-crafted posts.
+  def composer_model_param(harness)
+    model = params[:model].to_s.strip
+    return nil if model.blank?
+
+    allowed = COMPOSER_MODELS.fetch(harness, []).map(&:first) +
+      [ default_model_for_harness(harness) ]
+    allowed.compact.include?(model) ? model : nil
+  end
+
+  # Keeps split-view panes open across a composer submit: the form carries the
+  # page's full ?thread= list, and the redirect re-orders it so the posted
+  # thread stays primary. Unowned keys are filtered again by #index on render.
+  def reply_redirect_keys(thread_key)
+    open_keys = params[:open_threads].to_s.split(",").map(&:strip).reject(&:blank?)
+    ([ thread_key ] + open_keys).uniq.first(PANEL_LIMIT).join(",")
+  end
+
+  def console_actor_metadata
+    email = current_user&.email.to_s
+    {
+      platform: "console",
+      source: "console",
+      user_email: email,
+      actor_email: email
+    }
+  end
 
   def load_threads
     session_scope = visible_thread_scope

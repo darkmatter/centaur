@@ -818,6 +818,159 @@
         opacity: 1;
       }
 
+      /* Chat composer — the full-page New-chat card and the dock pinned under
+         open transcripts share one box; the dock only adds placement. */
+      .console-composer-dock {
+        flex: 0 0 auto;
+        padding: 0.75rem 0 1rem;
+        border-top: 1px solid rgba(255, 255, 255, 0.08);
+      }
+
+      .console-composer-dock--panel {
+        padding: 0.6rem 0.75rem 0.75rem;
+      }
+
+      .console-composer-box {
+        display: flex;
+        flex-direction: column;
+        gap: 0.4rem;
+        border: 1px solid rgba(255, 255, 255, 0.1);
+        border-radius: 1.25rem;
+        background: rgba(255, 255, 255, 0.035);
+        padding: 0.75rem 0.875rem 0.625rem;
+        transition: border-color 120ms ease;
+      }
+
+      .console-composer-box:focus-within {
+        border-color: rgba(255, 255, 255, 0.22);
+      }
+
+      .console-composer-input {
+        width: 100%;
+        resize: none;
+        border: 0;
+        background: transparent;
+        color: #f4f4f5;
+        font-size: 0.875rem;
+        line-height: 1.5;
+        outline: none;
+      }
+
+      .console-composer-input::placeholder {
+        color: #71717a;
+      }
+
+      .console-composer-controls {
+        display: flex;
+        align-items: center;
+        gap: 0.75rem;
+        min-width: 0;
+      }
+
+      .console-composer-spacer {
+        flex: 1;
+      }
+
+      .console-composer-control {
+        display: flex;
+        align-items: center;
+        gap: 0.4rem;
+        min-width: 0;
+      }
+
+      .console-composer-control-label {
+        color: #71717a;
+        font-size: 0.75rem;
+        font-weight: 500;
+      }
+
+      .console-composer-select {
+        max-width: 14rem;
+        border: 1px solid rgba(255, 255, 255, 0.1);
+        border-radius: 0.625rem;
+        background: rgba(11, 11, 13, 0.45);
+        color: #d4d4d8;
+        font-size: 0.8125rem;
+        padding: 0.3rem 0.5rem;
+      }
+
+      .console-composer-note,
+      .console-composer-meta {
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        color: #71717a;
+        font-size: 0.75rem;
+      }
+
+      .console-composer-send {
+        display: grid;
+        height: 2rem;
+        width: 2rem;
+        flex: 0 0 auto;
+        place-items: center;
+        border-radius: 999px;
+        background: #28c26a;
+        color: #0b0b0d;
+        transition: background 120ms ease;
+      }
+
+      .console-composer-send:hover {
+        background: #3ace79;
+      }
+
+      /* Full-page New-chat composer: centered column, chat-app style. */
+      .console-new-chat {
+        width: 100%;
+        max-width: 42rem;
+        display: flex;
+        flex-direction: column;
+        gap: 0.5rem;
+      }
+
+      .console-new-chat-title {
+        color: #f4f4f5;
+        font-size: 1.375rem;
+        font-weight: 600;
+        text-align: center;
+      }
+
+      .console-new-chat-subtitle {
+        margin-bottom: 1rem;
+        color: #71717a;
+        font-size: 0.875rem;
+        text-align: center;
+      }
+
+      .console-new-chat-link {
+        color: #a1a1aa;
+      }
+
+      .console-new-chat-cta {
+        border-radius: 999px;
+        padding: 0.375rem 1rem;
+        background: rgba(40, 194, 106, 0.12);
+        box-shadow: inset 0 0 0 1px rgba(40, 194, 106, 0.3);
+        color: #3ace79;
+        font-size: 0.875rem;
+        font-weight: 500;
+        text-decoration: none;
+        transition: background 120ms ease;
+      }
+
+      .console-new-chat-cta:hover {
+        background: rgba(40, 194, 106, 0.2);
+      }
+
+      .console-new-chat-link .console-nav-icon {
+        position: absolute;
+        left: 0.95rem;
+        top: 50%;
+        transform: translateY(-50%);
+        display: grid;
+        place-items: center;
+      }
+
       .console-control-tabs {
         display: flex;
         gap: 0.25rem;
@@ -1256,6 +1409,57 @@
         color: #8c9198;
       }
 
+      /* Composer: plain-CSS component classes, so the utility-class remaps
+         above never reach them — they need their own light overrides. */
+      html[data-console-theme="light"] .console-composer-dock {
+        border-top-color: rgba(15, 18, 20, 0.08);
+      }
+
+      html[data-console-theme="light"] .console-composer-box {
+        border-color: rgba(15, 18, 20, 0.14);
+        background: #ffffff;
+      }
+
+      html[data-console-theme="light"] .console-composer-box:focus-within {
+        border-color: rgba(15, 18, 20, 0.3);
+      }
+
+      html[data-console-theme="light"] .console-composer-input {
+        color: #1c1f23;
+      }
+
+      html[data-console-theme="light"] .console-composer-input::placeholder {
+        color: #8c9198;
+      }
+
+      html[data-console-theme="light"] .console-composer-select {
+        border-color: rgba(15, 18, 20, 0.14);
+        background: #f4f5f6;
+        color: #30343a;
+      }
+
+      html[data-console-theme="light"] .console-composer-control-label,
+      html[data-console-theme="light"] .console-composer-note,
+      html[data-console-theme="light"] .console-composer-meta {
+        color: #6f757c;
+      }
+
+      html[data-console-theme="light"] .console-composer-send {
+        color: #ffffff;
+      }
+
+      html[data-console-theme="light"] .console-new-chat-title {
+        color: #1c1f23;
+      }
+
+      html[data-console-theme="light"] .console-new-chat-subtitle {
+        color: #6f757c;
+      }
+
+      html[data-console-theme="light"] .console-new-chat-link {
+        color: #565c63;
+      }
+
       @media (max-width: 760px) {
         .console-sidebar {
           width: 11rem;
@@ -1356,6 +1560,15 @@
               <span class="console-nav-icon"><%= console_icon("message-square", classes: "size-4") %></span>
               <span class="console-nav-label">Chats</span>
             </a>
+            <% unless console_threads_read_only? %>
+              <a href="<%= console_threads_path(new: 1) %>"
+                 class="console-thread-link console-new-chat-link <%= "console-thread-link-active" if threads_view && params[:new].present? %>"
+                 aria-label="New chat"
+                 title="New chat">
+                <span class="console-nav-icon"><%= console_icon("plus", classes: "size-4") %></span>
+                <span class="console-thread-title">New chat</span>
+              </a>
+            <% end %>
             <%# The thread list is loaded lazily via a Turbo Frame so the
                 unindexed cross-database sessions query never blocks the primary
                 page render. See ApplicationController#init_console_sidebar_threads

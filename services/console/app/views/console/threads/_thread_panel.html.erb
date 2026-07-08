@@ -39,4 +39,9 @@
       <%= render "console/threads/transcript", items: panel[:transcript_items] %>
     </div>
   </div>
+  <% unless console_threads_read_only? %>
+    <div class="console-composer-dock console-composer-dock--panel">
+      <%= render "console/threads/composer", mode: :thread, session: session %>
+    </div>
+  <% end %>
 </section>

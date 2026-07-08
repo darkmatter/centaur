@@ -11,6 +11,7 @@ class ApplicationController < ActionController::Base
 
   helper_method :current_user, :acting_admin?, :descoped?
   helper_method :public_base_url, :oauth_callback_redirect_uri
+  helper_method :console_threads_read_only?
 
   # The public origin the console is reached at. Derived from the request by
   # default; CENTAUR_CONSOLE_PUBLIC_URL overrides it for deployments behind
@@ -57,7 +58,21 @@ class ApplicationController < ActionController::Base
   CONSOLE_SIDEBAR_THREAD_OWNER_METADATA_KEYS = %w[actor_email user_email].freeze
   ConsoleSidebarSlackThreadOwner = Struct.new(:user_id, :team_id, keyword_init: true)
 
+  # Env values that switch chats out of the read-only default.
+  CONSOLE_THREADS_WRITABLE_ENV_VALUES = %w[0 false off no].freeze
+
   private
+
+  # Whether chats are read-only. Defaults to read-only — deployments that browse
+  # a mirrored snapshot of the sessions DB (or have no reachable Centaur API)
+  # must not render a composer that cannot work. Deployments wired to a live
+  # api-rs opt in to posting by setting CENTAUR_CONSOLE_THREADS_READ_ONLY=0.
+  # Rendered into the global sidebar (New chat affordance), hence defined here
+  # rather than on Console::ThreadsController.
+  def console_threads_read_only?
+    value = ConsoleEnv["THREADS_READ_ONLY"].to_s.strip.downcase
+    !CONSOLE_THREADS_WRITABLE_ENV_VALUES.include?(value)
+  end
 
   # The signed-in operator for cookie-session (console) requests, or nil. Distinct
   # from Api::BaseController#current_user, which resolves a User from an API key.

@@ -37,8 +37,10 @@ class Console::ThreadsControllerTest < ActionDispatch::IntegrationTest
   end
 
   test "threads page does not render composer when session database is unavailable" do
-    with_recent_first_error do
-      get console_threads_url
+    with_threads_read_only do
+      with_recent_first_error do
+        get console_threads_url
+      end
     end
 
     assert_response :ok
@@ -57,15 +59,19 @@ class Console::ThreadsControllerTest < ActionDispatch::IntegrationTest
   end
 
   test "blank prompt is blocked by read only mode" do
-    post console_threads_url, params: { prompt: " " }
+    with_threads_read_only do
+      post console_threads_url, params: { prompt: " " }
+    end
 
     assert_redirected_to console_threads_path
     assert_equal "Chats are read-only while browsing a mirrored production snapshot.", flash[:alert]
   end
 
   test "threads page hides composer controls" do
-    with_recent_first_error do
-      get console_threads_url
+    with_threads_read_only do
+      with_recent_first_error do
+        get console_threads_url
+      end
     end
 
     assert_response :ok
@@ -77,7 +83,9 @@ class Console::ThreadsControllerTest < ActionDispatch::IntegrationTest
   end
 
   test "posts are blocked without calling the session api" do
-    post console_threads_url, params: { prompt: "Do not run this." }
+    with_threads_read_only do
+      post console_threads_url, params: { prompt: "Do not run this." }
+    end
 
     assert_redirected_to console_threads_path
     assert_equal "Chats are read-only while browsing a mirrored production snapshot.", flash[:alert]
@@ -626,22 +634,179 @@ class Console::ThreadsControllerTest < ActionDispatch::IntegrationTest
   end
 
   test "starting a thread is blocked without calling the session api" do
-    post console_threads_url, params: { prompt: "Reply with PONG.", harness_type: "amp" }
+    with_threads_read_only do
+      post console_threads_url, params: { prompt: "Reply with PONG.", harness_type: "amp" }
+    end
 
     assert_redirected_to console_threads_path
     assert_equal "Chats are read-only while browsing a mirrored production snapshot.", flash[:alert]
   end
 
   test "posting to an existing thread is blocked without calling the session api" do
-    post console_threads_url,
-         params: {
-           prompt: "Continue from here.",
-           thread_key: "console:existing",
-           harness_type: "codex"
-         }
+    with_threads_read_only do
+      post console_threads_url,
+           params: {
+             prompt: "Continue from here.",
+             thread_key: "console:existing",
+             harness_type: "codex"
+           }
+    end
 
     assert_redirected_to console_threads_path(thread: "console:existing")
     assert_equal "Chats are read-only while browsing a mirrored production snapshot.", flash[:alert]
+  end
+
+  test "writable mode renders the sidebar New chat link and the full-page composer" do
+    with_composer do
+      with_recent_first_error do
+        get console_threads_url(new: 1)
+      end
+    end
+
+    assert_response :ok
+    assert_select "a[aria-label=?]", "New chat", count: 1
+    assert_select "form[action=?]", console_threads_path do
+      assert_select "textarea[name=prompt]", count: 1
+      assert_select "select[name=harness_type]", count: 1
+      assert_select "select[name=model]", count: 1
+    end
+  end
+
+  test "writable mode renders a follow-up composer on an open chat" do
+    skip_unless_session_table
+    insert_console_session("console:composer-open")
+
+    with_composer do
+      get console_threads_url(thread: "console:composer-open")
+    end
+
+    assert_response :ok
+    assert_select "form[action=?]", console_threads_path do
+      assert_select "input[type=hidden][name=thread_key][value=?]", "console:composer-open"
+      assert_select "textarea[name=prompt]", count: 1
+      # Follow-ups stay on the chat's existing harness/model: no pickers.
+      assert_select "select[name=harness_type]", count: 0
+    end
+  end
+
+  test "starting a chat creates a session, appends the prompt, and executes it" do
+    client = RecordingApiClient.new
+    with_composer(client: client) do
+      post console_threads_url,
+           params: { prompt: "Reply with PONG.", harness_type: "claudecode", model: "claude-opus-4-8" }
+    end
+
+    assert_equal %i[create_session append_session_messages execute_session], client.calls.map(&:first)
+
+    create = client.calls[0].last
+    assert create[:thread_key].start_with?("console:"), "expected a console:-namespaced thread key"
+    assert_equal "claudecode", create[:harness_type]
+    assert_equal "console", create[:metadata][:platform]
+    assert_equal "console", create[:metadata][:source]
+    assert_equal @operator.email, create[:metadata][:actor_email]
+    assert_equal "claude-opus-4-8", create[:metadata][:model]
+
+    append = client.calls[1].last
+    assert_equal create[:thread_key], append[:thread_key]
+    message = append[:messages].first
+    assert_equal "user", message[:role]
+    assert_equal "Reply with PONG.", message[:parts].first[:text]
+    assert_equal @operator.email, message[:metadata][:user_email]
+
+    execute = client.calls[2].last
+    assert_equal create[:thread_key], execute[:thread_key]
+    assert execute[:idempotency_key].present?
+    assert_equal "claude-opus-4-8", execute[:metadata][:model]
+    line = JSON.parse(execute[:input_lines].first)
+    assert_equal "user", line["type"]
+    assert_equal create[:thread_key], line["thread_key"]
+    assert_equal "claude-opus-4-8", line["model"]
+    assert_equal message[:client_message_id], line["client_user_message_id"]
+    assert_equal "Reply with PONG.", line.dig("message", "content", 0, "text")
+
+    assert_redirected_to console_threads_path(thread: create[:thread_key])
+  end
+
+  test "starting an amp chat sends no model" do
+    client = RecordingApiClient.new
+    with_composer(client: client) do
+      post console_threads_url,
+           params: { prompt: "Reply with PONG.", harness_type: "amp", model: "claude-opus-4-8" }
+    end
+
+    create = client.calls[0].last
+    assert_equal "amp", create[:harness_type]
+    assert_not create[:metadata].key?(:model)
+
+    execute = client.calls[2].last
+    assert_not execute[:metadata].key?(:model)
+    line = JSON.parse(execute[:input_lines].first)
+    assert_not line.key?("model")
+  end
+
+  test "starting a chat with an unknown harness is rejected" do
+    client = RecordingApiClient.new
+    with_composer(client: client) do
+      post console_threads_url, params: { prompt: "Reply with PONG.", harness_type: "hal9000" }
+    end
+
+    assert_empty client.calls
+    assert_redirected_to console_threads_path(new: 1)
+    assert_match(/Unknown harness/, flash[:alert])
+  end
+
+  test "a blank prompt in writable mode asks for a message" do
+    client = RecordingApiClient.new
+    with_composer(client: client) do
+      post console_threads_url, params: { prompt: "   " }
+    end
+
+    assert_empty client.calls
+    assert_redirected_to console_threads_path(new: 1)
+    assert_equal "Type a message first.", flash[:alert]
+  end
+
+  test "replying appends and executes on an owned chat without creating a session" do
+    skip_unless_session_table
+    insert_console_session("console:composer-reply")
+
+    client = RecordingApiClient.new
+    with_composer(client: client) do
+      post console_threads_url,
+           params: {
+             prompt: "Continue from here.",
+             thread_key: "console:composer-reply",
+             open_threads: "console:composer-reply,console:other"
+           }
+    end
+
+    assert_equal %i[append_session_messages execute_session], client.calls.map(&:first)
+    assert_equal "console:composer-reply", client.calls[0].last[:thread_key]
+    assert_redirected_to console_threads_path(thread: "console:composer-reply,console:other")
+  end
+
+  test "replying into a chat outside the owner scope is rejected" do
+    skip_unless_session_table
+
+    client = RecordingApiClient.new
+    with_composer(client: client) do
+      post console_threads_url,
+           params: { prompt: "Continue from here.", thread_key: "console:not-mine" }
+    end
+
+    assert_empty client.calls
+    assert_redirected_to console_threads_path
+    assert_equal "Chat not found.", flash[:alert]
+  end
+
+  test "a session api error surfaces as a flash alert" do
+    client = RecordingApiClient.new(error: CentaurApiClient::Error.new("boom"))
+    with_composer(client: client) do
+      post console_threads_url, params: { prompt: "Reply with PONG.", harness_type: "codex" }
+    end
+
+    assert_redirected_to console_threads_path(new: 1)
+    assert_match(/boom/, flash[:alert])
   end
 
   # Fix 6: the sidebar thread list is loaded lazily via a Turbo Frame so the
@@ -1152,6 +1317,46 @@ class Console::ThreadsControllerTest < ActionDispatch::IntegrationTest
   end
 
   private
+
+  # Fake CentaurApiClient recording every composer call; raises `error` from
+  # each method instead when given, to exercise the failure paths.
+  class RecordingApiClient
+    attr_reader :calls
+
+    def initialize(error: nil)
+      @calls = []
+      @error = error
+    end
+
+    def create_session(**kwargs) = record(:create_session, kwargs)
+    def append_session_messages(**kwargs) = record(:append_session_messages, kwargs)
+    def execute_session(**kwargs) = record(:execute_session, kwargs)
+
+    private
+
+    def record(name, kwargs)
+      raise @error if @error
+
+      @calls << [ name, kwargs ]
+      {}
+    end
+  end
+
+  # Read-only is the unset-env default; pinned explicitly so the suite is
+  # deterministic when the runner exports CENTAUR_CONSOLE_THREADS_READ_ONLY=0
+  # (the local dev container does).
+  def with_threads_read_only(&block)
+    with_env("CENTAUR_CONSOLE_THREADS_READ_ONLY" => nil, "IRON_CONTROL_THREADS_READ_ONLY" => nil, &block)
+  end
+
+  # Runs the block with chats writable and the injected fake session client.
+  def with_composer(client: RecordingApiClient.new)
+    original_factory = Console::ThreadsController.client_factory
+    Console::ThreadsController.client_factory = -> { client }
+    with_env("CENTAUR_CONSOLE_THREADS_READ_ONLY" => "0") { yield client }
+  ensure
+    Console::ThreadsController.client_factory = original_factory
+  end
 
   # Sets each env var for the block (nil deletes) and restores the previous
   # values afterwards.

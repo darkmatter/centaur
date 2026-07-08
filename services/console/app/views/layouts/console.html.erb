@@ -240,6 +240,12 @@
         font-weight: 500;
       }
 
+      /* Keep stacked group tabs (Workflows / New chat / Chats) on the same
+         0.125rem rhythm as the nav rows above them. */
+      .console-thread-group + .console-thread-group {
+        margin-top: 0.125rem;
+      }
+
       .console-thread-group-title {
         display: flex;
         height: 2.35rem;
@@ -977,26 +983,6 @@
         text-align: center;
       }
 
-      .console-new-chat-link {
-        color: #a1a1aa;
-      }
-
-      /* New chat is an action row, not a nav destination: hover brightens the
-         text instead of drawing a pill, so it never stacks against the active
-         Chats pill right below it. */
-      .console-new-chat-link:hover {
-        background: transparent;
-        color: #f4f4f5;
-      }
-
-      .console-new-chat-link .console-nav-icon {
-        position: absolute;
-        left: 0.95rem;
-        top: 50%;
-        transform: translateY(-50%);
-        display: grid;
-        place-items: center;
-      }
 
       .console-control-tabs {
         display: flex;
@@ -1486,15 +1472,6 @@
         color: #1c1f23;
       }
 
-      html[data-console-theme="light"] .console-new-chat-link {
-        color: #565c63;
-      }
-
-      html[data-console-theme="light"] .console-new-chat-link:hover {
-        background: transparent;
-        color: #1c1f23;
-      }
-
       @media (max-width: 760px) {
         .console-sidebar {
           width: 11rem;
@@ -1588,16 +1565,19 @@
             </div>
           <% end %>
 
-          <div class="console-thread-group">
-            <% unless console_threads_read_only? %>
+          <% unless console_threads_read_only? %>
+            <div class="console-thread-group">
               <a href="<%= console_threads_path(new: 1) %>"
-                 class="console-thread-link console-new-chat-link"
+                 class="console-thread-group-title"
                  aria-label="New chat"
                  title="New chat">
                 <span class="console-nav-icon"><%= console_icon("plus", classes: "size-4") %></span>
-                <span class="console-thread-title">New chat</span>
+                <span class="console-nav-label">New chat</span>
               </a>
-            <% end %>
+            </div>
+          <% end %>
+
+          <div class="console-thread-group">
             <a href="<%= console_threads_path %>"
                class="console-thread-group-title <%= "console-thread-group-title-active" if threads_view %>"
                title="Chats">

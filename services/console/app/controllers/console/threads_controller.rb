@@ -89,7 +89,11 @@ class Console::ThreadsController < ApplicationController
   # expand to (services/slackbotv2/src/overrides.ts). Amp appears as a plain
   # entry with no model: it picks its own model per turn.
   ComposerAgent = Struct.new(:value, :label, :harness, :model, keyword_init: true)
+  # First entry doubles as the default pick (unless the deploy's default-model
+  # resolution for its harness names another listed model).
   COMPOSER_AGENTS = [
+    ComposerAgent.new(value: "gpt-5.5", label: "GPT-5.5",
+                      harness: "codex", model: "gpt-5.5"),
     ComposerAgent.new(value: "claude-opus-4-8", label: "Claude Opus 4.8",
                       harness: "claudecode", model: "claude-opus-4-8"),
     ComposerAgent.new(value: "claude-sonnet-4-6", label: "Claude Sonnet 4.6",
@@ -98,8 +102,6 @@ class Console::ThreadsController < ApplicationController
                       harness: "claudecode", model: "claude-haiku-4-5"),
     ComposerAgent.new(value: "claude-fable-5", label: "Claude Fable 5",
                       harness: "claudecode", model: "claude-fable-5"),
-    ComposerAgent.new(value: "gpt-5.5", label: "GPT-5.5",
-                      harness: "codex", model: "gpt-5.5"),
     ComposerAgent.new(value: "amp", label: "Amp",
                       harness: "amp", model: nil)
   ].freeze

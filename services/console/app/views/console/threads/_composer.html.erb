@@ -28,7 +28,9 @@
         <span class="console-composer-meta">
           <%= thread_harness_label(composer_session) %><% if (model_label = thread_model_label(composer_session)) %> · <%= model_label %><% end %>
         </span>
-      <% else %>
+      <% end %>
+      <span class="console-composer-spacer"></span>
+      <% unless thread_mode %>
         <% default_value = composer_default_agent_value %>
         <% default_label = composer_agent_choices.find { |_label, value| value == default_value }&.first %>
         <div class="console-composer-model" data-console-model-picker>
@@ -57,7 +59,6 @@
           </div>
         </div>
       <% end %>
-      <span class="console-composer-spacer"></span>
       <button type="submit" class="console-composer-send" aria-label="Send message" title="Send">
         <%= console_icon("arrow-up", classes: "size-4") %>
       </button>

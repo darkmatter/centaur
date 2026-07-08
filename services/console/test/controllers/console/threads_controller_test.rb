@@ -675,6 +675,18 @@ class Console::ThreadsControllerTest < ActionDispatch::IntegrationTest
     end
   end
 
+  test "writable mode shows the new chat screen when nothing is selected" do
+    with_composer do
+      with_recent_first_error do
+        get console_threads_url
+      end
+    end
+
+    assert_response :ok
+    assert_select "textarea[name=prompt]", count: 1
+    assert_select "body", text: /No chats yet/, count: 0
+  end
+
   test "writable mode renders a follow-up composer on an open chat" do
     skip_unless_session_table
     insert_console_session("console:composer-open")

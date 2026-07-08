@@ -51,7 +51,11 @@
       </div>
       <% end %>
 
-      <% if @starting_new_thread && !console_threads_read_only? %>
+      <%# With posting enabled, an empty selection IS the new-chat screen —
+          both the explicit ?new=1 entry point and the nothing-selected /
+          no-chats-yet cases. Read-only keeps the plain empty states below;
+          an unresolvable ?thread= still renders as not-found. %>
+      <% if (@starting_new_thread || @selected_session.nil?) && !@thread_not_found && !console_threads_read_only? %>
         <div class="flex min-h-0 flex-1 items-start justify-center overflow-y-auto px-6">
           <div class="console-new-chat">
             <h1 class="console-new-chat-title">Start a new chat</h1>
@@ -83,11 +87,6 @@
               <p class="text-sm leading-6 text-zinc-500">
                 Chats you start — from Slack or the Console — will show up here.
               </p>
-              <% unless console_threads_read_only? %>
-                <a href="<%= console_threads_path(new: 1) %>" class="console-new-chat-cta">
-                  Start a chat
-                </a>
-              <% end %>
             </div>
           </div>
         <% else %>

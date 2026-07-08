@@ -1577,12 +1577,6 @@
           <% end %>
 
           <div class="console-thread-group">
-            <a href="<%= console_threads_path %>"
-               class="console-thread-group-title <%= "console-thread-group-title-active" if threads_view %>"
-               title="Chats">
-              <span class="console-nav-icon"><%= console_icon("message-square", classes: "size-4") %></span>
-              <span class="console-nav-label">Chats</span>
-            </a>
             <% unless console_threads_read_only? %>
               <a href="<%= console_threads_path(new: 1) %>"
                  class="console-thread-link console-new-chat-link"
@@ -1592,6 +1586,12 @@
                 <span class="console-thread-title">New chat</span>
               </a>
             <% end %>
+            <a href="<%= console_threads_path %>"
+               class="console-thread-group-title <%= "console-thread-group-title-active" if threads_view %>"
+               title="Chats">
+              <span class="console-nav-icon"><%= console_icon("message-square", classes: "size-4") %></span>
+              <span class="console-nav-label">Chats</span>
+            </a>
             <%# The thread list is loaded lazily via a Turbo Frame so the
                 unindexed cross-database sessions query never blocks the primary
                 page render. See ApplicationController#init_console_sidebar_threads

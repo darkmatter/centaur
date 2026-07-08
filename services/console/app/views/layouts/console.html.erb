@@ -825,11 +825,12 @@
       }
 
       /* Chat composer — the full-page New-chat card and the dock pinned under
-         open transcripts share one box; the dock only adds placement. */
+         open transcripts share one box; the dock only adds placement. No
+         separator rule: the rounded box already reads as the boundary, and a
+         full-bleed hairline over the narrower transcript column looks off. */
       .console-composer-dock {
         flex: 0 0 auto;
-        padding: 0.75rem 0 1rem;
-        border-top: 1px solid rgba(255, 255, 255, 0.08);
+        padding: 0.25rem 0 1rem;
       }
 
       .console-composer-dock--panel {
@@ -1424,10 +1425,6 @@
 
       /* Composer: plain-CSS component classes, so the utility-class remaps
          above never reach them — they need their own light overrides. */
-      html[data-console-theme="light"] .console-composer-dock {
-        border-top-color: rgba(15, 18, 20, 0.08);
-      }
-
       html[data-console-theme="light"] .console-composer-box {
         border-color: rgba(15, 18, 20, 0.14);
         background: #ffffff;
@@ -1830,7 +1827,56 @@
           });
         };
 
-        document.addEventListener("turbo:load", syncSidebarActiveThreads);
+        // A chat the turbo-permanent list has never seen (just started from
+        // the composer, or older than the list window) appears immediately as
+        // an optimistic row, then the frame refetches so the server's row,
+        // title, and ordering replace it.
+        const SIDEBAR_THREADS_PATH = "<%= console_sidebar_threads_path %>";
+
+        const ensureActiveThreadRow = () => {
+          const url = new URL(window.location.href);
+          if (!url.pathname.startsWith(THREADS_PATH)) return;
+          const openKeys = (url.searchParams.get("thread") || "").split(",").filter(Boolean);
+          const primary = openKeys[0];
+          if (!primary) return;
+
+          const frame = document.getElementById("console_sidebar_threads");
+          if (!frame) return;
+          // Still on the lazy-load placeholder: the initial fetch carries the
+          // thread param and will include this chat on its own.
+          if (!frame.querySelector("[data-console-thread-link], .console-thread-empty")) return;
+
+          const known = Array.from(frame.querySelectorAll("[data-console-thread-link]")).some((link) =>
+            new URL(link.href, window.location.origin).searchParams.get("thread") === primary
+          );
+          if (known) return;
+
+          frame.querySelector(".console-thread-empty")?.remove();
+          const title = document.querySelector(".console-thread-detail-header h1")?.textContent?.trim() || primary;
+          const link = document.createElement("a");
+          link.href = `${THREADS_PATH}?thread=${encodeURIComponent(primary)}`;
+          link.className = "console-thread-link";
+          link.setAttribute("data-console-thread-link", "true");
+          link.title = title;
+          const titleSpan = document.createElement("span");
+          titleSpan.className = "console-thread-title";
+          titleSpan.textContent = title;
+          const timeSpan = document.createElement("span");
+          timeSpan.className = "console-thread-time";
+          timeSpan.textContent = "now";
+          link.append(titleSpan, timeSpan);
+          frame.prepend(link);
+          syncSidebarActiveThreads();
+
+          const src = new URL(SIDEBAR_THREADS_PATH, window.location.origin);
+          src.searchParams.set("thread", openKeys.join(","));
+          frame.setAttribute("src", src.toString());
+        };
+
+        document.addEventListener("turbo:load", () => {
+          syncSidebarActiveThreads();
+          ensureActiveThreadRow();
+        });
         document.addEventListener("turbo:frame-load", (event) => {
           if (event.target && event.target.id === "console_sidebar_threads") syncSidebarActiveThreads();
         });

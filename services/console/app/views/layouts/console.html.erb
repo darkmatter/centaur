@@ -871,14 +871,65 @@
         flex: 1;
       }
 
-      .console-composer-select {
-        max-width: 14rem;
-        border: 1px solid rgba(255, 255, 255, 0.1);
-        border-radius: 0.625rem;
-        background: rgba(11, 11, 13, 0.45);
-        color: #d4d4d8;
+      /* Model picker: a pill trigger opening a popover that reuses the
+         account-menu panel/item classes, so both dropdowns share one design. */
+      .console-composer-model {
+        position: relative;
+        min-width: 0;
+      }
+
+      .console-composer-model-trigger {
+        display: flex;
+        align-items: center;
+        gap: 0.4rem;
+        max-width: 16rem;
+        border-radius: 999px;
+        background: rgba(255, 255, 255, 0.05);
+        padding: 0.3rem 0.75rem;
+        color: #a1a1aa;
         font-size: 0.8125rem;
-        padding: 0.3rem 0.5rem;
+        font-weight: 500;
+        transition: background 120ms ease, color 120ms ease;
+      }
+
+      .console-composer-model-trigger:hover,
+      .console-composer-model-trigger[aria-expanded="true"] {
+        background: rgba(255, 255, 255, 0.09);
+        color: #f4f4f5;
+      }
+
+      .console-composer-model-chevron {
+        display: grid;
+        place-items: center;
+        transform: rotate(90deg);
+        transition: transform 120ms ease;
+      }
+
+      .console-composer-model-trigger[aria-expanded="true"] .console-composer-model-chevron {
+        transform: rotate(-90deg);
+      }
+
+      .console-composer-model-menu {
+        top: calc(100% + 0.4rem);
+        right: auto;
+        bottom: auto;
+        left: 0;
+        width: 15rem;
+      }
+
+      .console-composer-model-option-label {
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        flex: 1;
+        text-align: left;
+      }
+
+      .console-composer-model-check {
+        display: grid;
+        place-items: center;
+        color: #3ace79;
       }
 
       .console-composer-meta {
@@ -1414,10 +1465,19 @@
         color: #8c9198;
       }
 
-      html[data-console-theme="light"] .console-composer-select {
-        border-color: rgba(15, 18, 20, 0.14);
-        background: #f4f5f6;
-        color: #30343a;
+      html[data-console-theme="light"] .console-composer-model-trigger {
+        background: rgba(15, 18, 20, 0.06);
+        color: #565c63;
+      }
+
+      html[data-console-theme="light"] .console-composer-model-trigger:hover,
+      html[data-console-theme="light"] .console-composer-model-trigger[aria-expanded="true"] {
+        background: rgba(15, 18, 20, 0.1);
+        color: #1c1f23;
+      }
+
+      html[data-console-theme="light"] .console-composer-model-check {
+        color: #1f9d55;
       }
 
       html[data-console-theme="light"] .console-composer-meta {

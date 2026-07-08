@@ -667,9 +667,11 @@ class Console::ThreadsControllerTest < ActionDispatch::IntegrationTest
     assert_select "a[aria-label=?]", "New chat", count: 1
     assert_select "form[action=?]", console_threads_path do
       assert_select "textarea[name=prompt]", count: 1
-      assert_select "select[name=model]", count: 1
-      assert_select "select[name=model] option[value=?]", "amp"
-      assert_select "select[name=harness_type]", count: 0
+      # The model picker is a custom menu (account-dropdown style) posting
+      # through a hidden field, not a native select.
+      assert_select "input[type=hidden][name=model]", count: 1
+      assert_select "[data-console-model-option][data-value=?]", "amp"
+      assert_select "select", count: 0
     end
   end
 
@@ -686,7 +688,7 @@ class Console::ThreadsControllerTest < ActionDispatch::IntegrationTest
       assert_select "input[type=hidden][name=thread_key][value=?]", "console:composer-open"
       assert_select "textarea[name=prompt]", count: 1
       # Follow-ups stay on the chat's existing harness/model: no picker.
-      assert_select "select[name=model]", count: 0
+      assert_select "[data-console-model-picker]", count: 0
     end
   end
 

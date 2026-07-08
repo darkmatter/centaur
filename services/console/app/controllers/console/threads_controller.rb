@@ -177,18 +177,14 @@ class Console::ThreadsController < ApplicationController
   end
 
   # Selector options as [label, value] pairs, the deploy's default model
-  # annotated and listed first. The default comes from the same env/config
-  # resolution the thread header uses, so the composer never claims a default
-  # the sandbox would not actually run.
+  # first (pre-checked in the menu). The default comes from the same
+  # env/config resolution the thread header uses, so the composer never
+  # claims a default the sandbox would not actually run.
   def composer_agent_choices
     default_value = composer_default_agent_value
-    sorted = COMPOSER_AGENTS.sort_by.with_index do |agent, index|
-      agent.value == default_value ? -1 : index
-    end
-    sorted.map do |agent|
-      label = agent.value == default_value ? "#{agent.label} (default)" : agent.label
-      [ label, agent.value ]
-    end
+    COMPOSER_AGENTS
+      .sort_by.with_index { |agent, index| agent.value == default_value ? -1 : index }
+      .map { |agent| [ agent.label, agent.value ] }
   end
 
   def composer_default_agent_value

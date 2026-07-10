@@ -738,6 +738,36 @@ class Console::ThreadsControllerTest < ActionDispatch::IntegrationTest
     assert_equal "gpt-5.5", create[:metadata][:model]
   end
 
+  test "a codex chat carries the picked reasoning effort" do
+    client = RecordingApiClient.new
+    with_composer(client: client) do
+      post console_threads_url,
+           params: { prompt: "Reply with PONG.", model: "gpt-5.6-sol", effort: "max" }
+    end
+
+    execute = client.calls[2].last
+    assert_equal "max", execute[:metadata][:reasoning]
+    line = JSON.parse(execute[:input_lines].first)
+    assert_equal "max", line["reasoning"]
+  end
+
+  test "an effort the model does not offer is dropped" do
+    client = RecordingApiClient.new
+    with_composer(client: client) do
+      # max is 5.6-only; claude models take no effort at all.
+      post console_threads_url,
+           params: { prompt: "Reply with PONG.", model: "gpt-5.5", effort: "max" }
+      post console_threads_url,
+           params: { prompt: "Reply with PONG.", model: "claude-opus-4-8", effort: "high" }
+    end
+
+    [ 2, 5 ].each do |index|
+      execute = client.calls[index].last
+      assert_not execute[:metadata].key?(:reasoning)
+      assert_not JSON.parse(execute[:input_lines].first).key?("reasoning")
+    end
+  end
+
   test "a blank prompt asks for a message" do
     client = RecordingApiClient.new
     with_composer(client: client) do

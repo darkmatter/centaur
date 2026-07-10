@@ -926,6 +926,25 @@
         width: 15rem;
       }
 
+      /* Root rows of the picker menu: setting name left, current value and a
+         chevron on the right (codex-app style). */
+      .console-composer-menu-value {
+        margin-left: auto;
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        color: #71717a;
+        font-weight: 400;
+      }
+
+      .console-composer-menu-chevron {
+        display: grid;
+        flex: 0 0 auto;
+        place-items: center;
+        color: #71717a;
+      }
+
       .console-composer-model-option-label {
         min-width: 0;
         overflow: hidden;
@@ -1461,6 +1480,11 @@
 
       html[data-console-theme="light"] .console-composer-model-check {
         color: #1f9d55;
+      }
+
+      html[data-console-theme="light"] .console-composer-menu-value,
+      html[data-console-theme="light"] .console-composer-menu-chevron {
+        color: #8c9198;
       }
 
       html[data-console-theme="light"] .console-thinking-pending {

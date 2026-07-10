@@ -81,27 +81,41 @@ class Console::ThreadsController < ApplicationController
 
   SlackThreadOwner = Struct.new(:user_id, :team_id, keyword_init: true)
 
-  # The composer's single model selector, in display order. Each entry pins
-  # the harness the choice runs on (wire values match api-rs's HarnessType
-  # enum, serde lowercase); the model ids are the ones the bots' --model flags
+  # The composer's model selector, in display order. Each entry pins the
+  # harness the choice runs on (wire values match api-rs's HarnessType enum,
+  # serde lowercase); the model ids are the ones the bots' --model flags
   # expand to (services/slackbotv2/src/overrides.ts). Amp appears as a plain
-  # entry with no model: it picks its own model per turn.
-  ComposerAgent = Struct.new(:value, :label, :harness, :model, keyword_init: true)
+  # entry with no model: it picks its own model per turn. `efforts` are the
+  # per-turn reasoning efforts the harness accepts for the model (codex only —
+  # harness-server discards `reasoning` for claude/amp; enum per
+  # crates/harness-server/src/codex.rs, `max` being 5.6-specific).
+  ComposerAgent = Struct.new(:value, :label, :harness, :model, :efforts, keyword_init: true)
+  CODEX_EFFORTS = [
+    %w[minimal Minimal],
+    %w[low Low],
+    %w[medium Medium],
+    %w[high High],
+    [ "xhigh", "Extra High" ]
+  ].freeze
   # First entry doubles as the default pick (unless the deploy's default-model
   # resolution for its harness names another listed model).
   COMPOSER_AGENTS = [
+    ComposerAgent.new(value: "gpt-5.6-sol", label: "GPT-5.6 Sol",
+                      harness: "codex", model: "gpt-5.6-sol",
+                      efforts: CODEX_EFFORTS + [ %w[max Max] ]),
     ComposerAgent.new(value: "gpt-5.5", label: "GPT-5.5",
-                      harness: "codex", model: "gpt-5.5"),
+                      harness: "codex", model: "gpt-5.5",
+                      efforts: CODEX_EFFORTS),
     ComposerAgent.new(value: "claude-opus-4-8", label: "Claude Opus 4.8",
-                      harness: "claudecode", model: "claude-opus-4-8"),
+                      harness: "claudecode", model: "claude-opus-4-8", efforts: []),
     ComposerAgent.new(value: "claude-sonnet-4-6", label: "Claude Sonnet 4.6",
-                      harness: "claudecode", model: "claude-sonnet-4-6"),
+                      harness: "claudecode", model: "claude-sonnet-4-6", efforts: []),
     ComposerAgent.new(value: "claude-haiku-4-5", label: "Claude Haiku 4.5",
-                      harness: "claudecode", model: "claude-haiku-4-5"),
+                      harness: "claudecode", model: "claude-haiku-4-5", efforts: []),
     ComposerAgent.new(value: "claude-fable-5", label: "Claude Fable 5",
-                      harness: "claudecode", model: "claude-fable-5"),
+                      harness: "claudecode", model: "claude-fable-5", efforts: []),
     ComposerAgent.new(value: "amp", label: "Amp",
-                      harness: "amp", model: nil)
+                      harness: "amp", model: nil, efforts: [])
   ].freeze
 
   helper_method :thread_title,
@@ -115,6 +129,7 @@ class Console::ThreadsController < ApplicationController
                 :thread_status_classes,
                 :composer_agent_choices,
                 :composer_default_agent_value,
+                :composer_agents_json,
                 :thread_execution_active?
 
   def index
@@ -196,6 +211,21 @@ class Console::ThreadsController < ApplicationController
       COMPOSER_AGENTS.first.value
   end
 
+  # Per-agent metadata the picker script needs to rebuild the effort submenu
+  # when the model changes: { value => { label:, efforts: [[value, label]] } }.
+  def composer_agents_json
+    COMPOSER_AGENTS.to_h do |agent|
+      [ agent.value, { label: agent.label, efforts: agent.efforts } ]
+    end.to_json
+  end
+
+  def composer_effort_param(agent)
+    effort = params[:effort].to_s.strip
+    return nil if effort.blank?
+
+    agent.efforts.map(&:first).include?(effort) ? effort : nil
+  end
+
   def composer_agent_for(raw)
     value = raw.to_s.strip
     value = composer_default_agent_value if value.blank?
@@ -216,7 +246,7 @@ class Console::ThreadsController < ApplicationController
       harness_type: agent.harness,
       metadata: console_actor_metadata.merge(agent.model.present? ? { model: agent.model } : {})
     )
-    send_prompt(thread_key, prompt, model: agent.model)
+    send_prompt(thread_key, prompt, model: agent.model, effort: composer_effort_param(agent))
     redirect_to console_threads_path(thread: thread_key)
   rescue CentaurApiClient::Error => e
     redirect_to console_threads_path(new: 1), alert: "Could not start the chat: #{e.message}"
@@ -244,7 +274,7 @@ class Console::ThreadsController < ApplicationController
   # Append persists the turn in conversation history; execute runs it. The
   # shared client_message_id lets api-rs dedupe the copy of the message the
   # harness echoes back.
-  def send_prompt(thread_key, prompt, model: nil)
+  def send_prompt(thread_key, prompt, model: nil, effort: nil)
     message_id = SecureRandom.uuid
 
     api_client.append_session_messages(
@@ -261,18 +291,26 @@ class Console::ThreadsController < ApplicationController
 
     execute_metadata = console_actor_metadata.merge(action: "execute")
     execute_metadata[:model] = model if model.present?
+    execute_metadata[:reasoning] = effort if effort.present?
     api_client.execute_session(
       thread_key: thread_key,
       idempotency_key: SecureRandom.uuid,
       metadata: execute_metadata,
-      input_lines: [ composer_input_line(thread_key, prompt, model: model, client_message_id: message_id) ]
+      input_lines: [
+        composer_input_line(
+          thread_key, prompt,
+          model: model, effort: effort, client_message_id: message_id
+        )
+      ]
     )
   end
 
   # One blocks-protocol user line, the shape harness-server parses from
   # execute's input_lines. `model` is honored by every harness; omitted (e.g.
-  # for Amp) the harness runs its own default.
-  def composer_input_line(thread_key, prompt, model:, client_message_id:)
+  # for Amp) the harness runs its own default. `reasoning` is the per-turn
+  # codex effort; other harnesses discard it, and validation upstream only
+  # accepts it for codex models anyway.
+  def composer_input_line(thread_key, prompt, model:, effort:, client_message_id:)
     line = {
       type: "user",
       thread_key: thread_key,
@@ -281,6 +319,7 @@ class Console::ThreadsController < ApplicationController
       message: { role: "user", content: [ { type: "text", text: prompt } ] }
     }
     line[:model] = model if model.present?
+    line[:reasoning] = effort if effort.present?
     line.to_json
   end
 

@@ -7,6 +7,9 @@
     across Turbo visits. %>
 <% thread_mode = defined?(mode) && mode == :thread %>
 <% composer_session = thread_mode ? session : nil %>
+<%# compact: single-row textarea for new-chat composers docked in a pane,
+    matching the thread composer's height. %>
+<% compact_mode = defined?(compact) && compact %>
 <%= form_with url: console_threads_path,
               method: :post,
               class: "console-composer #{thread_mode ? "console-composer--thread" : "console-composer--new"}",
@@ -20,7 +23,7 @@
   <%= form.hidden_field :open_threads, value: params[:thread].to_s.presence %>
   <div class="console-composer-box">
     <%= form.text_area :prompt,
-                       rows: thread_mode ? 1 : 3,
+                       rows: thread_mode || compact_mode ? 1 : 3,
                        placeholder: thread_mode ? "Follow up" : "Do anything",
                        required: true,
                        autofocus: !thread_mode,
@@ -135,24 +138,27 @@
       const text = (input?.value || "").trim();
       if (!text) return;
 
-      if (form.dataset.consoleComposer === "new") {
-        // The form stays in the DOM (hidden) so the in-flight submission is
-        // undisturbed; the heading gives way to the painted conversation.
-        const container = form.closest(".console-new-chat");
-        if (!container) return;
+      // Full-page new chat: the form stays in the DOM (hidden) so the
+      // in-flight submission is undisturbed; the heading gives way to the
+      // painted conversation.
+      const container = form.dataset.consoleComposer === "new" && form.closest(".console-new-chat");
+      if (container) {
         const column = document.createElement("div");
         column.className = "flex w-full flex-col gap-6";
         column.append(userBubble(text), thinkingRow());
         container.querySelector(".console-new-chat-title")?.setAttribute("hidden", "");
         container.insertBefore(column, form);
         form.hidden = true;
-      } else {
-        const transcript = form.closest("section")?.querySelector(".console-transcript-scroll > div");
-        if (!transcript) return;
-        transcript.querySelector("[data-console-thinking-indicator]")?.remove();
-        transcript.append(userBubble(text), thinkingRow());
-        input.value = "";
+        return;
       }
+
+      // Docked composers (thread panes and new-chat panes) paint into their
+      // pane's transcript.
+      const transcript = form.closest("section")?.querySelector(".console-transcript-scroll > div");
+      if (!transcript) return;
+      transcript.querySelector("[data-console-thinking-indicator]")?.remove();
+      transcript.append(userBubble(text), thinkingRow());
+      input.value = "";
     });
 
     document.addEventListener("keydown", (event) => {

@@ -241,6 +241,9 @@ COPY --link --chmod=755 services/sandbox/centaur_tool_host.py /usr/local/bin/cen
 COPY --link --chmod=755 services/sandbox/repo_cache_sync.py /usr/local/bin/repo-cache-sync
 COPY --link --chmod=755 services/sandbox/repo_cache_watch.py /usr/local/bin/repo-cache-watch
 COPY --link --chmod=755 services/sandbox/mint-github-token.mjs /usr/local/bin/mint-github-token.mjs
+# Shadows apt's /usr/bin/gh on PATH: re-reads the background-refreshed
+# installation token per invocation (see entrypoint.sh github token section).
+COPY --link --chmod=755 services/sandbox/gh-wrapper.sh /usr/local/bin/gh
 COPY --link --chmod=755 services/sandbox/entrypoint.sh /entrypoint.sh
 COPY --link --chown=1001:1001 crates/harness-server/ /opt/centaur/harness-server-src/
 

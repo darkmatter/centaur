@@ -524,7 +524,25 @@ elif [ -f "$HOME_DIR/AGENTS.md" ]; then
     cp "$HOME_DIR/AGENTS.md" "$TARGET_PROMPT"
 fi
 
-if [ -f "$HOME_DIR/AGENTS_OVERLAY.md" ] && [ -f "$TARGET_PROMPT" ]; then
+# Repo-cache-backed overlay prompt (chart: overlays.sources[].promptPath),
+# rendered as ordered sandbox-side file paths under the repos mount. Later
+# overlay sources shadow earlier ones, so the last existing file wins; a
+# repo-provided prompt also shadows the legacy inline/org-repo branches below.
+_centaur_overlay_prompt_file=""
+if [ -n "${CENTAUR_OVERLAY_PROMPT_FILES:-}" ]; then
+    IFS=':' read -ra _centaur_prompt_candidates <<< "$CENTAUR_OVERLAY_PROMPT_FILES"
+    for _centaur_prompt_candidate in "${_centaur_prompt_candidates[@]}"; do
+        if [ -n "$_centaur_prompt_candidate" ] && [ -f "$_centaur_prompt_candidate" ]; then
+            _centaur_overlay_prompt_file="$_centaur_prompt_candidate"
+        fi
+    done
+    unset _centaur_prompt_candidate _centaur_prompt_candidates
+fi
+
+if [ -n "$_centaur_overlay_prompt_file" ] && [ -f "$TARGET_PROMPT" ]; then
+    printf '\n\n---\n\n' >> "$TARGET_PROMPT"
+    cat "$_centaur_overlay_prompt_file" >> "$TARGET_PROMPT"
+elif [ -f "$HOME_DIR/AGENTS_OVERLAY.md" ] && [ -f "$TARGET_PROMPT" ]; then
     printf '\n\n---\n\n' >> "$TARGET_PROMPT"
     cat "$HOME_DIR/AGENTS_OVERLAY.md" >> "$TARGET_PROMPT"
 # Repo-cache-era org prompt: with overlay images gone, point CENTAUR_OVERLAY_DIR
@@ -537,6 +555,7 @@ elif [ -n "${CENTAUR_OVERLAY_DIR:-}" ] \
     printf '\n\n---\n\n' >> "$TARGET_PROMPT"
     cat "${CENTAUR_OVERLAY_DIR}/services/sandbox/SYSTEM_PROMPT.md" >> "$TARGET_PROMPT"
 fi
+unset _centaur_overlay_prompt_file
 
 if [ "${CENTAUR_SANDBOX_OBSERVABILITY_ENABLED:-true}" = "false" ] && [ -f "$TARGET_PROMPT" ]; then
     cat >> "$TARGET_PROMPT" <<'EOF'

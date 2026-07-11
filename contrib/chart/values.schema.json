@@ -380,6 +380,7 @@
     "postgres": {
       "type": "object",
       "properties": {
+        "deriveDatabaseUrl": { "type": "boolean" },
         "persistence": {
           "type": "object",
           "properties": {

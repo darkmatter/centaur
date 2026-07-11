@@ -16,14 +16,17 @@ providers:
     auth: apiKey
     api: openai-completions
 
-# Subscription models ride the per-sandbox iron-proxy: the sandbox only holds
-# placeholder OPENAI_CODEX_OAUTH_TOKEN / ANTHROPIC_OAUTH_TOKEN env values
-# (which make omp register the providers as available and emit OAuth-shaped
-# requests); iron-control's token broker mints real access tokens from the
-# `openai-codex` / `anthropic-claude` broker credentials and iron-proxy
-# overwrites the Authorization header (+ chatgpt-account-id) on chatgpt.com /
-# api.anthropic.com. Deployments without those grants simply fall through the
-# retry chains to the gateway.
+# Subscription models resolve credentials through omp's NATIVE auth broker
+# (OMP_AUTH_BROKER_URL / OMP_AUTH_BROKER_TOKEN in the sandbox env, gitops
+# manifests/omp-auth-broker): the broker owns its own OAuth refresh-token
+# family for the subscription account, hands sandboxes a redacted snapshot
+# plus short-lived access tokens, and is the only writer — enabling
+# multi-account stacking/ranking per provider and clean rotation. This is
+# deliberately NOT iron-proxy header injection (iron-control's broker
+# credentials keep a separate family for the codex/claude harnesses; two
+# systems sharing one family race refresh rotations until the provider
+# revokes it). Deployments without a broker configured simply fall through
+# the retry chains to the gateway.
 modelRoles:
   default: "litellm/glm-5.2-fp8"
   smol: "litellm/glm-5.2-fp8"

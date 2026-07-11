@@ -1,6 +1,7 @@
 # Baked omp (oh-my-pi) agent config. Copied to $PI_CODING_AGENT_DIR/config.yml
 # at container start by entrypoint.sh, which substitutes __OMP_LITELLM_BASE_URL__
-# (default https://litellm.drkmttr.dev/v1) so deployments can point elsewhere.
+# (default https://litellm.drkmttr.dev/v1) so in-cluster deployments can point
+# at a local Service.
 #
 # Model id is glm-5.2-fp8 — the gateway name with a working OpenRouter fallback
 # when the hosted_vllm upstream is down (the `glm-local` alias has NO fallback;
@@ -15,17 +16,57 @@ providers:
     auth: apiKey
     api: openai-completions
 
+# Subscription models resolve credentials through omp's NATIVE auth broker
+# (OMP_AUTH_BROKER_URL / OMP_AUTH_BROKER_TOKEN in the sandbox env, gitops
+# manifests/omp-auth-broker): the broker owns its own OAuth refresh-token
+# family for the subscription account, hands sandboxes a redacted snapshot
+# plus short-lived access tokens, and is the only writer — enabling
+# multi-account stacking/ranking per provider and clean rotation. This is
+# deliberately NOT iron-proxy header injection (iron-control's broker
+# credentials keep a separate family for the codex/claude harnesses; two
+# systems sharing one family race refresh rotations until the provider
+# revokes it). Deployments without a broker configured simply fall through
+# the retry chains to the gateway.
 modelRoles:
   default: "litellm/glm-5.2-fp8"
   smol: "litellm/glm-5.2-fp8"
   commit: "litellm/glm-5.2-fp8"
   task: "litellm/glm-5.2-fp8"
-  # v1 posture: EVERY role stays on the internal gateway — sandboxes carry no
-  # frontier-provider keys (credential-safe injection via iron-proxy is the
-  # tracked follow-up). Point slow/plan/advisor at a frontier model only in
-  # deployments that actually inject its key.
-  slow: "litellm/glm-5.2-fp8"
-  plan: "litellm/glm-5.2-fp8"
   advisor: "litellm/glm-5.2-fp8"
+  # Subscription-backed frontier roles (planners/slow thinking); glm fallback
+  # below covers quota exhaustion and revoked/missing credentials.
+  slow: "anthropic/claude-fable-5:xhigh"
+  plan: "openai-codex/gpt-5.6-sol:xhigh"
+
+# Usage-exhaustion / outage fallback: when a subscription model errors (quota,
+# auth, upstream), the retry chain falls back to the self-hosted gateway.
+retry:
+  enabled: true
+  maxRetries: 3
+  baseDelayMs: 2000
+  fallbackChains:
+    default:
+      - litellm/glm-5.2-fp8
+    task:
+      - litellm/glm-5.2-fp8
+    slow:
+      - litellm/glm-5.2-fp8
+    plan:
+      - anthropic/claude-fable-5:xhigh
+      - litellm/glm-5.2-fp8
+    advisor:
+      - litellm/glm-5.2-fp8
+
+# Long-term memory: Hindsight Cloud. The apiToken is a literal placeholder —
+# iron-proxy swaps it in the Authorization header on api.hindsight.vectorize.io
+# (console static secret omp-hindsight-api-token); the sandbox never holds the
+# real token. bankId `centaur` keeps deployment memory separate from personal
+# banks.
+memory:
+  backend: hindsight
+hindsight:
+  apiUrl: https://api.hindsight.vectorize.io
+  bankId: centaur
+  apiToken: HINDSIGHT_API_TOKEN
 
 defaultThinkingLevel: medium

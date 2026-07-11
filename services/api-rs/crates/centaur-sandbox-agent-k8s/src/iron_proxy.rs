@@ -463,18 +463,45 @@ impl AgentSandboxBackend {
             };
             match self.pods().patch(&name, &params, &patch).await {
                 Ok(_) => {}
-                Err(err) if is_not_found(&err) => {}
-                Err(err) => return Err(map_kube_error("adopt iron-proxy pod", err)),
+                Err(err) if is_not_found(&err) => tracing::warn!(
+                    sandbox_id = id.as_str(),
+                    resource_kind = "Pod",
+                    resource_name = name,
+                    %err,
+                    "iron-proxy resource disappeared during owner adoption"
+                ),
+                Err(err) => {
+                    tracing::warn!(
+                        sandbox_id = id.as_str(),
+                        resource_kind = "Pod",
+                        resource_name = name,
+                        %err,
+                        "failed to patch ownerReference onto iron-proxy resource"
+                    );
+                    return Err(map_kube_error("adopt iron-proxy pod", err));
+                }
             }
         }
-        match self
-            .services()
-            .patch(&iron_proxy_service_name(id), &params, &patch)
-            .await
-        {
+        let service_name = iron_proxy_service_name(id);
+        match self.services().patch(&service_name, &params, &patch).await {
             Ok(_) => {}
-            Err(err) if is_not_found(&err) => {}
-            Err(err) => return Err(map_kube_error("adopt iron-proxy service", err)),
+            Err(err) if is_not_found(&err) => tracing::warn!(
+                sandbox_id = id.as_str(),
+                resource_kind = "Service",
+                resource_name = service_name,
+                %err,
+                "iron-proxy resource disappeared during owner adoption"
+            ),
+            Err(err) => {
+                tracing::warn!(
+                    sandbox_id = id.as_str(),
+                    resource_kind = "Service",
+                    resource_name = service_name,
+                    %err,
+                    "failed to patch ownerReference onto iron-proxy resource"
+                );
+                return Err(map_kube_error("adopt iron-proxy service", err));
+            }
         }
         for name in [
             iron_proxy_sandbox_egress_policy_name(id),
@@ -482,8 +509,23 @@ impl AgentSandboxBackend {
         ] {
             match self.network_policies().patch(&name, &params, &patch).await {
                 Ok(_) => {}
-                Err(err) if is_not_found(&err) => {}
-                Err(err) => return Err(map_kube_error("adopt iron-proxy network policy", err)),
+                Err(err) if is_not_found(&err) => tracing::warn!(
+                    sandbox_id = id.as_str(),
+                    resource_kind = "NetworkPolicy",
+                    resource_name = name,
+                    %err,
+                    "iron-proxy resource disappeared during owner adoption"
+                ),
+                Err(err) => {
+                    tracing::warn!(
+                        sandbox_id = id.as_str(),
+                        resource_kind = "NetworkPolicy",
+                        resource_name = name,
+                        %err,
+                        "failed to patch ownerReference onto iron-proxy resource"
+                    );
+                    return Err(map_kube_error("adopt iron-proxy network policy", err));
+                }
             }
         }
         tracing::info!(

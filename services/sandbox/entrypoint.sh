@@ -377,23 +377,76 @@ done
 # (fail-closed policy, no direct 443), and the proxy pod can lag this
 # entrypoint by a few seconds — retry across that window instead of losing the
 # whole boot's GitHub access to one refused connect (verified 2026-07-09: the
-# same mint succeeds seconds later). Fail-soft: exhausted retries leave
-# GITHUB_TOKEN as whatever stub the runtime provided.
-if [ -n "${GITHUB_APP_ID:-}" ] && [ -n "${GITHUB_APP_PRIVATE_KEY:-}" ]; then
-    minted_token=""
-    for mint_attempt in 1 2 3 4 5; do
-        if minted_token="$(bun /usr/local/bin/mint-github-token.mjs 2>/tmp/mint-github-token.err)"; then
-            break
+# same mint succeeds seconds later).
+#
+# Installation tokens expire after 60 minutes — fixed by GitHub, not
+# extendable. Warm-pool sandboxes idle past that hour (and any session running
+# longer) used to serve dead tokens: every GitHub call 401'd (verified
+# 2026-07-10, nixmac#514). Two changes close that hole:
+#   1. A background loop re-mints on an interval (default 50 min — hourly
+#      cadence with margin so a live token always exists) and rewrites the
+#      credential FILES below for the sandbox's whole life.
+#   2. No GITHUB_TOKEN/GH_TOKEN env export: env freezes into the exec'd
+#      harness at boot and goes stale where files can be refreshed. gh
+#      resolves the current token per invocation via the /usr/local/bin/gh
+#      wrapper reading $HOME/.centaur/github-token; git reads the refreshed
+#      credential store. Both env vars are explicitly unset so no runtime
+#      stub or stale value can shadow the fresh sources.
+# Fail-soft throughout: a failed re-mint keeps the previous token and retries
+# on a short interval; a sandbox without App creds behaves as before.
+GITHUB_TOKEN_FILE_PATH="$HOME_DIR/.centaur/github-token"
+
+mint_github_token() {
+    # 5 attempts with linear backoff; token on stdout, diagnostics to stderr.
+    local attempt token
+    for attempt in 1 2 3 4 5; do
+        if token="$(bun /usr/local/bin/mint-github-token.mjs 2>/tmp/mint-github-token.err)" \
+            && [ -n "$token" ]; then
+            printf '%s' "$token"
+            return 0
         fi
-        minted_token=""
-        sleep $((mint_attempt * 2))
+        sleep $((attempt * 2))
     done
-    if [ -n "$minted_token" ]; then
-        export GITHUB_TOKEN="$minted_token"
-        export GH_TOKEN="$minted_token"
-        # Scoped to github.com, kept out of URLs/reflog (legacy configureGit).
-        printf 'https://x-access-token:%s@github.com\n' "$minted_token" > "$HOME_DIR/.git-credentials"
-        chmod 600 "$HOME_DIR/.git-credentials"
+    return 1
+}
+
+install_github_token() {
+    # Atomically publish the token file and the git credential store.
+    local token="$1" tmp
+    tmp="$(mktemp "$GITHUB_TOKEN_FILE_PATH.XXXXXX")"
+    printf '%s' "$token" > "$tmp"
+    chmod 600 "$tmp"
+    mv -f "$tmp" "$GITHUB_TOKEN_FILE_PATH"
+    # Scoped to github.com, kept out of URLs/reflog (legacy configureGit).
+    tmp="$(mktemp "$HOME_DIR/.git-credentials.XXXXXX")"
+    printf 'https://x-access-token:%s@github.com\n' "$token" > "$tmp"
+    chmod 600 "$tmp"
+    mv -f "$tmp" "$HOME_DIR/.git-credentials"
+}
+
+github_token_refresh_loop() {
+    # Re-mint before the 60-minute expiry; on failure keep the previous token
+    # (it may still be live) and retry sooner. stderr only — stdout is
+    # reserved for harness/workflow-host JSONL.
+    local interval="${GITHUB_TOKEN_REFRESH_SECONDS:-3000}" token
+    while true; do
+        sleep "$interval"
+        if token="$(mint_github_token)"; then
+            install_github_token "$token"
+            echo "github installation token re-minted" >&2
+            interval="${GITHUB_TOKEN_REFRESH_SECONDS:-3000}"
+        else
+            echo "github token re-mint failed, retrying in 300s: $(head -c 200 /tmp/mint-github-token.err 2>/dev/null)" >&2
+            interval=300
+        fi
+    done
+}
+
+if [ -n "${GITHUB_APP_ID:-}" ] && [ -n "${GITHUB_APP_PRIVATE_KEY:-}" ]; then
+    mkdir -p "$HOME_DIR/.centaur"
+    chmod 700 "$HOME_DIR/.centaur"
+    if minted_token="$(mint_github_token)"; then
+        install_github_token "$minted_token"
         git config --global credential.helper store
         # stdout is reserved for harness/workflow-host JSONL (see
         # install_tool_shims.py) — a stray line here poisons the workflow-host
@@ -402,6 +455,13 @@ if [ -n "${GITHUB_APP_ID:-}" ] && [ -n "${GITHUB_APP_PRIVATE_KEY:-}" ]; then
     else
         echo "github token mint failed after 5 attempts: $(head -c 200 /tmp/mint-github-token.err 2>/dev/null)" >&2
     fi
+    minted_token=""
+    github_token_refresh_loop &
+    # Stale/stub env must never shadow the refreshed file sources (gh prefers
+    # env over everything; see services/sandbox/gh-wrapper.sh). Scoped to the
+    # mint path: legacy deployments pass a real GITHUB_TOKEN env and no App
+    # creds — that flow (and the tail auth block) stays untouched.
+    unset GITHUB_TOKEN GH_TOKEN
 fi
 
 # ── Per-session workspace clone (no shared worktree metadata) ────────────────
@@ -535,13 +595,17 @@ fi
 # Signal readiness
 touch "$HOME_DIR/.ready"
 
-# ── Background: slow auth tasks ─────────────────────────────────────────────
+# ── Background: slow auth tasks (legacy env-token path only) ─────────────────
+# GITHUB_TOKEN env survives only when the App-creds mint above did NOT run.
+# /usr/bin/gh bypasses the /usr/local/bin/gh wrapper: with no minted token
+# file the wrapper is a passthrough, but be explicit — `gh auth login` must
+# see the legacy env, not a wrapper-injected file token.
 {
     if [ -n "${GITHUB_TOKEN:-}" ]; then
         git config --global credential.helper store
         printf 'https://oauth2:%s@github.com\n' "$GITHUB_TOKEN" > "$HOME_DIR/.git-credentials"
-        echo "${GITHUB_TOKEN}" | gh auth login --with-token 2>/dev/null || true
-        gh auth setup-git 2>/dev/null || true
+        echo "${GITHUB_TOKEN}" | /usr/bin/gh auth login --with-token 2>/dev/null || true
+        /usr/bin/gh auth setup-git 2>/dev/null || true
     fi
 } &
 

@@ -359,6 +359,7 @@
       "type": "object",
       "properties": {
         "mcpPublicUrl": { "type": "string" },
+        "databaseUrlSecretKey": { "type": "string", "minLength": 1 },
         "metrics": {
           "type": "object",
           "properties": {

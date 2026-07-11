@@ -65,7 +65,7 @@ spec:
               valueFrom:
                 secretKeyRef:
                   name: {{ include "centaur.secretEnvName" . }}
-                  key: {{ printf "%sDATABASE_URL" .Values.secretManager.envPrefix }}
+                  key: {{ printf "%s%s" .Values.secretManager.envPrefix .Values.slackbotv2.databaseUrlSecretKey }}
             - name: SLACKBOTV2_USER_NAME
               value: {{ .Values.slackbotv2.userName | quote }}
             - name: SLACKBOTV2_ACTIVITY_SUMMARY_STATUS_ENABLED

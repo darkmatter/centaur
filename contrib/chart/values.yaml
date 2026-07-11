@@ -354,6 +354,7 @@ agentSandbox:
 apiRs:
   enabled: true
   replicaCount: 1
+  runtimeClassName: ""
   image:
     repository: centaur-api-rs
     tag: latest

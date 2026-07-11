@@ -198,6 +198,9 @@ spec:
       terminationGracePeriodSeconds: {{ .Values.apiRs.terminationGracePeriodSeconds }}
       automountServiceAccountToken: true
       serviceAccountName: {{ $apiRsName }}
+{{- if .Values.apiRs.runtimeClassName }}
+      runtimeClassName: {{ .Values.apiRs.runtimeClassName | quote }}
+{{- end }}
       {{- with .Values.global.imagePullSecrets }}
       imagePullSecrets:
 {{ toYaml . | nindent 8 }}
@@ -328,6 +331,10 @@ spec:
 {{- end }}
             - name: SESSION_SANDBOX_K8S_NAMESPACE
               value: {{ .Release.Namespace | quote }}
+{{- if .Values.sandbox.runtimeClassName }}
+            - name: SESSION_SANDBOX_RUNTIME_CLASS_NAME
+              value: {{ .Values.sandbox.runtimeClassName | quote }}
+{{- end }}
             - name: SESSION_SANDBOX_IMAGE
               value: {{ printf "%s:%s" .Values.sandbox.image.repository .Values.sandbox.image.tag | quote }}
             - name: SESSION_SANDBOX_IMAGE_PULL_POLICY

@@ -355,6 +355,55 @@ cat > "$HOME_DIR/.pi/agent/settings.json" <<EOF
 }
 EOF
 
+# ── omp (oh-my-pi) settings ──────────────────────────────────────────────────
+# Baked harness/omp/{config.yml,models.yml} land in $PI_CODING_AGENT_DIR with
+# the LiteLLM base URL substituted (OMP_LITELLM_BASE_URL, default the public
+# darkmatter gateway) so in-cluster deployments can point at a local Service.
+export PI_CODING_AGENT_DIR="${PI_CODING_AGENT_DIR:-$HOME_DIR/.omp/agent}"
+mkdir -p "$PI_CODING_AGENT_DIR"
+OMP_LITELLM_BASE_URL="${OMP_LITELLM_BASE_URL:-https://litellm.drkmttr.dev/v1}"
+for omp_cfg in config.yml models.yml; do
+    if [ -f "$HARNESS_CONFIG_DIR/omp/$omp_cfg" ]; then
+        sed "s|__OMP_LITELLM_BASE_URL__|$OMP_LITELLM_BASE_URL|g" \
+            "$HARNESS_CONFIG_DIR/omp/$omp_cfg" > "$PI_CODING_AGENT_DIR/$omp_cfg"
+    fi
+done
+
+# ── GitHub App installation token (darkmatter deployments) ──────────────────
+# When the App credentials are passed through, mint a short-lived installation
+# token at boot so the agent can clone/push and reply on GitHub — legacy
+# github-executor parity (the App key lived in the agent's trust domain there
+# too). All api.github.com traffic rides the per-sandbox egress proxy
+# (fail-closed policy, no direct 443), and the proxy pod can lag this
+# entrypoint by a few seconds — retry across that window instead of losing the
+# whole boot's GitHub access to one refused connect (verified 2026-07-09: the
+# same mint succeeds seconds later). Fail-soft: exhausted retries leave
+# GITHUB_TOKEN as whatever stub the runtime provided.
+if [ -n "${GITHUB_APP_ID:-}" ] && [ -n "${GITHUB_APP_PRIVATE_KEY:-}" ]; then
+    minted_token=""
+    for mint_attempt in 1 2 3 4 5; do
+        if minted_token="$(bun /usr/local/bin/mint-github-token.mjs 2>/tmp/mint-github-token.err)"; then
+            break
+        fi
+        minted_token=""
+        sleep $((mint_attempt * 2))
+    done
+    if [ -n "$minted_token" ]; then
+        export GITHUB_TOKEN="$minted_token"
+        export GH_TOKEN="$minted_token"
+        # Scoped to github.com, kept out of URLs/reflog (legacy configureGit).
+        printf 'https://x-access-token:%s@github.com\n' "$minted_token" > "$HOME_DIR/.git-credentials"
+        chmod 600 "$HOME_DIR/.git-credentials"
+        git config --global credential.helper store
+        # stdout is reserved for harness/workflow-host JSONL (see
+        # install_tool_shims.py) — a stray line here poisons the workflow-host
+        # handshake with "expected value at line 1 column 1".
+        echo "github installation token minted" >&2
+    else
+        echo "github token mint failed after 5 attempts: $(head -c 200 /tmp/mint-github-token.err 2>/dev/null)" >&2
+    fi
+fi
+
 # ── Per-session workspace clone (no shared worktree metadata) ────────────────
 if [ "${CENTAUR_PERSISTENT_STATE:-0}" = "1" ]; then
     WORKSPACE_DIR="$STATE_DIR/workspace"

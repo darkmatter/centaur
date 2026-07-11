@@ -1,0 +1,31 @@
+# Baked omp (oh-my-pi) agent config. Copied to $PI_CODING_AGENT_DIR/config.yml
+# at container start by entrypoint.sh, which substitutes __OMP_LITELLM_BASE_URL__
+# (default https://litellm.drkmttr.dev/v1) so deployments can point elsewhere.
+#
+# Model id is glm-5.2-fp8 — the gateway name with a working OpenRouter fallback
+# when the hosted_vllm upstream is down (the `glm-local` alias has NO fallback;
+# verified during the 2026-07-07 vLLM outage). The models.dev fuzzy-merge trap
+# that motivated the alias (skills presets/omp, 2026-07-06) only affects
+# DISCOVERY-based registries; models.yml here defines the model STATICALLY, and
+# the id goes on the wire unchanged (verified empirically both ways).
+providers:
+  litellm:
+    baseUrl: __OMP_LITELLM_BASE_URL__
+    apiKey: LITELLM_API_KEY
+    auth: apiKey
+    api: openai-completions
+
+modelRoles:
+  default: "litellm/glm-5.2-fp8"
+  smol: "litellm/glm-5.2-fp8"
+  commit: "litellm/glm-5.2-fp8"
+  task: "litellm/glm-5.2-fp8"
+  # v1 posture: EVERY role stays on the internal gateway — sandboxes carry no
+  # frontier-provider keys (credential-safe injection via iron-proxy is the
+  # tracked follow-up). Point slow/plan/advisor at a frontier model only in
+  # deployments that actually inject its key.
+  slow: "litellm/glm-5.2-fp8"
+  plan: "litellm/glm-5.2-fp8"
+  advisor: "litellm/glm-5.2-fp8"
+
+defaultThinkingLevel: medium

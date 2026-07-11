@@ -525,6 +525,11 @@ struct SandboxArgs {
     )]
     k8s_namespace: String,
     #[arg(
+        long = "session-sandbox-runtime-class-name",
+        env = "SESSION_SANDBOX_RUNTIME_CLASS_NAME"
+    )]
+    runtime_class_name: Option<String>,
+    #[arg(
         long = "session-sandbox-image",
         alias = "kubernetes-agent-image",
         env = "SESSION_SANDBOX_IMAGE"
@@ -1352,6 +1357,7 @@ impl TryFrom<&SandboxArgs> for AgentSandboxConfig {
     fn try_from(args: &SandboxArgs) -> Result<Self, Self::Error> {
         let mut config = AgentSandboxConfig::new(args.k8s_namespace.clone());
         config.image_pull_policy = args.agent_image_pull_policy.clone();
+        config.runtime_class_name = args.runtime_class_name.clone();
         config.image_pull_secrets = args
             .image_pull_secrets
             .iter()

@@ -263,6 +263,7 @@
     "apiRs": {
       "type": "object",
       "properties": {
+        "runtimeClassName": { "type": "string" },
         "syncInfraSecrets": { "type": "boolean" },
         "mcpPublicUrl": { "type": "string" },
         "sandboxRunningLimit": { "type": "integer", "minimum": 0 },

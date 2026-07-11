@@ -243,23 +243,17 @@ spec:
             httpGet:
               path: /up
               port: http
-            failureThreshold: 30
-            periodSeconds: 10
-            timeoutSeconds: 5
+{{ toYaml $console.startupProbe | nindent 12 }}
           readinessProbe:
             httpGet:
               path: /up
               port: http
-            failureThreshold: 6
-            periodSeconds: 10
-            timeoutSeconds: 5
+{{ toYaml $console.readinessProbe | nindent 12 }}
           livenessProbe:
             httpGet:
               path: /up
               port: http
-            failureThreshold: 6
-            periodSeconds: 10
-            timeoutSeconds: 5
+{{ toYaml $console.livenessProbe | nindent 12 }}
           securityContext:
 {{ toYaml .Values.containerSecurityContext | nindent 12 }}
             # No readOnlyRootFilesystem — Rails writes to tmp/ at runtime.

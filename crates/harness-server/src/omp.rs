@@ -110,6 +110,8 @@ pub struct OmpMessage {
     pub usage: Option<OmpUsage>,
     #[serde(default, rename = "stopReason")]
     pub stop_reason: Option<String>,
+    #[serde(default, rename = "errorMessage")]
+    pub error_message: Option<String>,
     #[serde(default, rename = "responseId")]
     pub response_id: Option<String>,
 }
@@ -249,6 +251,14 @@ impl OmpEventNormalizer {
                 let mut out = Vec::new();
                 if let Some(usage) = message.token_usage() {
                     out.push(NormalizedEvent::TokenUsage { usage });
+                }
+                if message.stop_reason.as_deref() == Some("error") {
+                    out.push(NormalizedEvent::Error {
+                        message: message
+                            .error_message
+                            .unwrap_or_else(|| "omp assistant message failed".to_owned()),
+                    });
+                    return out;
                 }
                 let stop_reason = message.stop_reason.as_deref().map(normalized_stop_reason);
                 out.push(NormalizedEvent::AssistantMessage {
@@ -482,6 +492,20 @@ mod tests {
                         [NormalizedContent::ToolUse { raw_id, tool, .. }]
                             if raw_id == "toolu_01CnTRcRztUD24oiuqg4wQq8" && tool == "bash"
                     )
+        ));
+    }
+
+    #[test]
+    fn assistant_error_message_end_is_terminal_failure() {
+        let mut normalizer = OmpEventNormalizer;
+        let events = normalize(
+            &mut normalizer,
+            r#"{"type":"message_end","message":{"role":"assistant","content":[],"provider":"litellm","model":"glm-5.2-fp8","stopReason":"error","errorStatus":401,"errorId":16781312,"errorMessage":"401 LiteLLM Virtual Key expected"}}"#,
+        );
+        assert!(matches!(
+            events.as_slice(),
+            [NormalizedEvent::Error { message }]
+                if message == "401 LiteLLM Virtual Key expected"
         ));
     }
 

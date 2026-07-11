@@ -1564,7 +1564,17 @@ async fn discover_python_workflow_metadata() -> Result<PythonWorkflowMetadata, W
         if line.trim().is_empty() {
             continue;
         }
-        let message: Value = serde_json::from_str(&line)?;
+        // The stream can carry stray non-JSON lines (sandbox entrypoint or a
+        // tool writing to fd1 — the 2026-07-10 cold-boot "expected value at
+        // line 1 column 1" class). Skip them; valid JSON with an unknown
+        // `type` below remains a protocol error.
+        let message: Value = match serde_json::from_str(&line) {
+            Ok(message) => message,
+            Err(_) => {
+                warn!(line = %clip(&line, 200), "ignoring non-JSON workflow host stdout line");
+                continue;
+            }
+        };
         match message.get("type").and_then(Value::as_str) {
             Some("workflow.discovery") => {
                 let _ = child.wait().await;
@@ -2296,6 +2306,11 @@ fn next_schedule_time(
     }
 }
 
+/// UTF-8-safe truncation for logging stray host-output lines.
+fn clip(line: &str, max_chars: usize) -> String {
+    line.chars().take(max_chars).collect()
+}
+
 fn normalize_cron_expression(expr: &str) -> String {
     let fields = expr.split_whitespace().collect::<Vec<_>>();
     if fields.len() == 5 {
@@ -2655,7 +2670,13 @@ async fn run_python_workflow_host_local(
         if line.trim().is_empty() {
             continue;
         }
-        let message: Value = serde_json::from_str(&line)?;
+        let message: Value = match serde_json::from_str(&line) {
+            Ok(message) => message,
+            Err(_) => {
+                warn!(line = %clip(&line, 200), "ignoring non-JSON workflow host stdout line");
+                continue;
+            }
+        };
         match message.get("type").and_then(Value::as_str) {
             Some("workflow.result") => {
                 drop(stdin);
@@ -2799,7 +2820,13 @@ where
         if line.trim().is_empty() {
             continue;
         }
-        let message: Value = serde_json::from_str(&line)?;
+        let message: Value = match serde_json::from_str(&line) {
+            Ok(message) => message,
+            Err(_) => {
+                warn!(line = %clip(&line, 200), "ignoring non-JSON workflow host stdout line");
+                continue;
+            }
+        };
         match message.get("type").and_then(Value::as_str) {
             Some("workflow.result") => {
                 return Ok(message.get("result").cloned().unwrap_or(Value::Null));

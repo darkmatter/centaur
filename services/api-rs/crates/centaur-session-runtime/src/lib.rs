@@ -3699,6 +3699,7 @@ fn harness_server_subcommand(harness: &HarnessType) -> &'static str {
         HarnessType::Codex => "codex",
         HarnessType::ClaudeCode => "claude-code",
         HarnessType::Amp => "amp",
+        HarnessType::Omp => "omp",
     }
 }
 
@@ -7592,10 +7593,12 @@ mod tests {
         let codex_spec = workload.spec(&thread_key, &HarnessType::Codex, None);
         let claude_spec = workload.spec(&thread_key, &HarnessType::ClaudeCode, None);
         let amp_spec = workload.spec(&thread_key, &HarnessType::Amp, None);
+        let omp_spec = workload.spec(&thread_key, &HarnessType::Omp, None);
 
         assert_eq!(codex_spec.args, vec!["harness-server", "codex"]);
         assert_eq!(claude_spec.args, vec!["harness-server", "claude-code"]);
         assert_eq!(amp_spec.args, vec!["harness-server", "amp"]);
+        assert_eq!(omp_spec.args, vec!["harness-server", "omp"]);
         // The image entrypoint must be preserved: only CMD is overridden.
         assert_eq!(codex_spec.command, None);
     }

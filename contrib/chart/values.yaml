@@ -179,6 +179,18 @@ console:
     # host.
     host: ""
     tls: []
+  startupProbe:
+    failureThreshold: 30
+    periodSeconds: 10
+    timeoutSeconds: 5
+  readinessProbe:
+    failureThreshold: 6
+    periodSeconds: 10
+    timeoutSeconds: 5
+  livenessProbe:
+    failureThreshold: 6
+    periodSeconds: 10
+    timeoutSeconds: 5
   resources: {}
   # Solid Queue worker (`bin/jobs`) that runs the console's background jobs —
   # most importantly the broker-credential OAuth refresh loop that mints and

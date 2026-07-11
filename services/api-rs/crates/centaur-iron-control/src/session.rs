@@ -3,8 +3,10 @@
 //! Roles are registered once at startup (see [`crate::register_role`]); a
 //! [`SessionRegistrar`] carries the resulting role OIDs and, when a session
 //! starts, upserts the session's principal. Brand-new principals receive the
-//! default roles once; existing principals keep their current assignments so
-//! operator revocations in console or ``centaur-perms`` remain sticky. The
+//! default roles once; existing principals with at least one role keep their
+//! current assignments so operator revocations in console or
+//! ``centaur-perms`` remain sticky, while a role-less principal (an
+//! interrupted earlier registration) is repaired with the defaults. The
 //! principal is derived from the thread key (see [`crate::derive_principal`]).
 
 use serde_json::Value;
@@ -79,10 +81,10 @@ impl SessionRegistrar {
     /// the OID) so callers can bind the session's egress proxy to the same
     /// identity.
     ///
-    /// Default roles are assigned only when the principal does not already
-    /// exist. Re-registering an existing channel/user still refreshes identity
-    /// metadata, but it must not restore roles that an operator manually
-    /// removed.
+    /// Default roles are assigned when the principal is brand new, or when an
+    /// existing principal has no roles at all — a stranded state left by a
+    /// registration that failed between creation and assignment. Partial
+    /// operator removals are never restored.
     pub async fn register_session(
         &self,
         thread_key: &str,
@@ -118,18 +120,43 @@ impl SessionRegistrar {
                 .as_ref()
                 .is_some_and(|permission| is_direct_message(Some(&permission.channel_id)));
         let record = self.client.upsert_principal(&input).await?;
-        if should_upsert_slack_permission && let Some(permission) = slack_permission {
-            self.client
-                .upsert_slack_channel_permission(&record.id, &permission)
-                .await?;
-        }
-        if !exists {
+        // Roles converge before any later step can fail: a failure between
+        // principal creation and role assignment used to strand a role-less
+        // principal forever — the retry saw it as existing and skipped
+        // assignment, leaving its fail-closed proxy with zero secrets
+        // (2026-07-11, both stacks). Sticky revocation still holds for
+        // partial removals: an existing principal is only repaired when it
+        // has NO roles at all, which is never a functional operator-intended
+        // state for a session principal.
+        let assign_roles = !self.assign_role_ids.is_empty()
+            && (!exists
+                || self
+                    .client
+                    .list_principal_roles(&record.id)
+                    .await?
+                    .is_empty());
+        if assign_roles {
             for role_id in &self.assign_role_ids {
                 match self.client.assign_role(&record.id, role_id).await {
                     Ok(()) => {}
                     Err(error) if is_status(&error, 409) || is_status(&error, 422) => {}
                     Err(error) => return Err(error),
                 }
+            }
+        }
+        if should_upsert_slack_permission && let Some(permission) = slack_permission {
+            match self
+                .client
+                .upsert_slack_channel_permission(&record.id, &permission)
+                .await
+            {
+                Ok(()) => {}
+                // Consoles without the slack_channel_permissions route 404
+                // (the pinned upstream console does). The permission is
+                // additive Slack UX and must never fail — or poison —
+                // session registration.
+                Err(error) if is_status(&error, 404) => {}
+                Err(error) => return Err(error),
             }
         }
         Ok(record)
@@ -198,7 +225,9 @@ fn is_status(err: &IronControlError, code: u16) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
+
+    use parking_lot::Mutex;
 
     use serde_json::json;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -309,7 +338,7 @@ mod tests {
             .await
             .unwrap();
 
-        let requests = requests.lock().unwrap();
+        let requests = requests.lock();
         assert!(
             requests.contains(
                 &"GET /api/v1/principals/lookup/default/slack-channel-t123-c123".to_owned()
@@ -344,7 +373,7 @@ mod tests {
             .await
             .unwrap();
 
-        let requests = requests.lock().unwrap();
+        let requests = requests.lock();
         assert!(
             requests.contains(
                 &"GET /api/v1/principals/lookup/default/slack-channel-t123-c123".to_owned()
@@ -362,6 +391,70 @@ mod tests {
                 .iter()
                 .any(|request| request == "POST /api/v1/principals/prn_channel/roles"),
             "existing principals must not have manually removed roles restored"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn register_session_assigns_roles_when_permission_route_is_missing() {
+        let (base_url, requests, server) = spawn_iron_control_stub_with(StubOptions {
+            principal_exists: false,
+            permission_route_missing: true,
+            existing_role_count: 0,
+        })
+        .await;
+        let registrar = SessionRegistrar::new(
+            IronControlClient::new(base_url, "test-key"),
+            "default",
+            vec!["role_infra".to_owned()],
+        );
+        let metadata = json!({
+            "slack_user_id": "U123",
+            "slack_team_id": "T123",
+            "slack_conversation_name": "general"
+        });
+
+        registrar
+            .register_session("slack:T123:C123:1773364194.179929", Some(&metadata))
+            .await
+            .expect("a console without the permission route must not fail registration");
+
+        let requests = requests.lock();
+        assert!(
+            requests.contains(&"POST /api/v1/principals/prn_channel/roles".to_owned()),
+            "default roles must be assigned even when the permission upsert 404s"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn register_session_repairs_role_less_existing_principal() {
+        let (base_url, requests, server) = spawn_iron_control_stub_with(StubOptions {
+            principal_exists: true,
+            permission_route_missing: false,
+            existing_role_count: 0,
+        })
+        .await;
+        let registrar = SessionRegistrar::new(
+            IronControlClient::new(base_url, "test-key"),
+            "default",
+            vec!["role_infra".to_owned()],
+        );
+        let metadata = json!({
+            "slack_user_id": "U123",
+            "slack_team_id": "T123",
+            "slack_conversation_name": "general"
+        });
+
+        registrar
+            .register_session("slack:T123:C123:1773364194.179929", Some(&metadata))
+            .await
+            .unwrap();
+
+        let requests = requests.lock();
+        assert!(
+            requests.contains(&"POST /api/v1/principals/prn_channel/roles".to_owned()),
+            "a role-less principal is an interrupted registration and must be repaired"
         );
         server.abort();
     }
@@ -385,7 +478,7 @@ mod tests {
             .await
             .unwrap();
 
-        let requests = requests.lock().unwrap();
+        let requests = requests.lock();
         assert!(requests.contains(&"PUT /api/v1/principals/slack-user-t123-u123".to_owned()));
         assert!(
             requests
@@ -413,7 +506,7 @@ mod tests {
             .await
             .unwrap();
 
-        let requests = requests.lock().unwrap();
+        let requests = requests.lock();
         assert!(requests.contains(&"PUT /api/v1/principals/slack-user-t123-u123".to_owned()));
         assert!(
             requests
@@ -428,6 +521,37 @@ mod tests {
         server.abort();
     }
 
+    #[tokio::test]
+    async fn register_session_tolerates_missing_permission_route_for_existing_dm() {
+        // DMs re-upsert the permission on EVERY registration, so a console
+        // without the route 404s recurringly — not just at first creation.
+        let (base_url, requests, server) = spawn_iron_control_stub_with(StubOptions {
+            principal_exists: true,
+            permission_route_missing: true,
+            existing_role_count: 1,
+        })
+        .await;
+        let registrar = SessionRegistrar::new(
+            IronControlClient::new(base_url, "test-key"),
+            "default",
+            vec!["role_infra".to_owned()],
+        );
+        let metadata = json!({
+            "slack_user_id": "U123",
+            "slack_team_id": "T123",
+            "slack_conversation_name": "Ada Lovelace"
+        });
+
+        registrar
+            .register_session("slack:T123:D123:1773364194.179929", Some(&metadata))
+            .await
+            .expect("recurring DM permission 404 must not fail registration");
+
+        let requests = requests.lock();
+        assert!(requests.contains(&"PUT /api/v1/principals/slack-user-t123-u123".to_owned()));
+        server.abort();
+    }
+
     #[test]
     fn slack_permission_for_thread_skips_dm_channel_fallback_without_user() {
         let mut labels = BTreeMap::new();
@@ -436,9 +560,30 @@ mod tests {
         assert_eq!(slack_permission_for_thread("slack:D123:ts", &labels), None);
     }
 
+    #[derive(Clone, Copy)]
+    struct StubOptions {
+        principal_exists: bool,
+        permission_route_missing: bool,
+        existing_role_count: usize,
+    }
+
     async fn spawn_iron_control_stub(
         principal_exists: bool,
     ) -> (String, Arc<Mutex<Vec<String>>>, tokio::task::JoinHandle<()>) {
+        spawn_iron_control_stub_with(StubOptions {
+            principal_exists,
+            permission_route_missing: false,
+            // Existing principals keep operator-managed assignments; model
+            // them with one role so sticky-revocation tests stay meaningful.
+            existing_role_count: 1,
+        })
+        .await
+    }
+
+    async fn spawn_iron_control_stub_with(
+        options: StubOptions,
+    ) -> (String, Arc<Mutex<Vec<String>>>, tokio::task::JoinHandle<()>) {
+        let principal_exists = options.principal_exists;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base_url = format!("http://{}", listener.local_addr().unwrap());
         let requests = Arc::new(Mutex::new(Vec::new()));
@@ -461,7 +606,7 @@ mod tests {
                 let mut parts = first_line.split_whitespace();
                 let method = parts.next().unwrap_or_default();
                 let path = parts.next().unwrap_or_default();
-                seen.lock().unwrap().push(format!("{method} {path}"));
+                seen.lock().push(format!("{method} {path}"));
 
                 let (status_line, body) = match (method, path) {
                     ("GET", "/api/v1/principals/lookup/default/slack-channel-t123-c123")
@@ -488,10 +633,26 @@ mod tests {
                         "POST",
                         "/api/v1/principals/prn_channel/slack_channel_permissions"
                         | "/api/v1/principals/prn_user/slack_channel_permissions",
-                    ) => ("200 OK", r#"{"data":{"ok":true}}"#.to_owned()),
-                    ("POST", "/api/v1/principals/prn_channel/roles") => {
-                        ("200 OK", r#"{"data":{"ok":true}}"#.to_owned())
+                    ) => {
+                        if options.permission_route_missing {
+                            (
+                                "404 Not Found",
+                                r#"{"error":{"message":"not found"}}"#.to_owned(),
+                            )
+                        } else {
+                            ("200 OK", r#"{"data":{"ok":true}}"#.to_owned())
+                        }
                     }
+                    (
+                        "POST",
+                        "/api/v1/principals/prn_channel/roles"
+                        | "/api/v1/principals/prn_user/roles",
+                    ) => ("200 OK", r#"{"data":{"ok":true}}"#.to_owned()),
+                    (
+                        "GET",
+                        "/api/v1/principals/prn_channel/roles"
+                        | "/api/v1/principals/prn_user/roles",
+                    ) => ("200 OK", roles_body(options.existing_role_count)),
                     _ => (
                         "500 Internal Server Error",
                         r#"{"error":"unexpected"}"#.to_owned(),
@@ -514,5 +675,15 @@ mod tests {
 
     fn user_principal_body() -> String {
         r#"{"data":{"id":"prn_user","namespace":"default","foreign_id":"slack-user-t123-u123","name":"Slack DM @Ada Lovelace","labels":{}}}"#.to_owned()
+    }
+
+    fn roles_body(count: usize) -> String {
+        let roles = (0..count)
+            .map(|_| {
+                r#"{"id":"role_infra","namespace":"default","foreign_id":"infra","name":"Infra","labels":{}}"#
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(r#"{{"data":[{roles}]}}"#)
     }
 }

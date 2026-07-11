@@ -469,6 +469,9 @@ slackbotv2:
     tag: latest
     pullPolicy: Always
   userName: centaur
+  # Secret key containing the slackbot state-store DSN. Defaults to the
+  # shared API DATABASE_URL; deployments may provide a scoped TLS policy.
+  databaseUrlSecretKey: DATABASE_URL
   assistantStatus: ""
   # Public/local MCP endpoint shown in MCP SSO setup messages. The default
   # assumes users connect through `kubectl port-forward ... 3000:8080`.

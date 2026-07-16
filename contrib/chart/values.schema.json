@@ -264,6 +264,10 @@
       "type": "object",
       "properties": {
         "runtimeClassName": { "type": "string" },
+        "deploymentStrategy": {
+          "type": "string",
+          "enum": ["RollingUpdate", "Recreate"]
+        },
         "syncInfraSecrets": { "type": "boolean" },
         "mcpPublicUrl": { "type": "string" },
         "sandboxRunningLimit": { "type": "integer", "minimum": 0 },

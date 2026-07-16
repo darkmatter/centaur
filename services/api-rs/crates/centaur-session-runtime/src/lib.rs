@@ -14,7 +14,8 @@ use std::{
 use centaur_iron_control::SessionRegistrar;
 use centaur_sandbox_core::{
     Mount, RepoCacheAccess, SandboxBackend, SandboxCapabilities as BackendSandboxCapabilities,
-    SandboxError, SandboxId, SandboxIoGuard, SandboxRead, SandboxSpec, SandboxStatus, SandboxWrite,
+    SandboxCommandOutput, SandboxError, SandboxId, SandboxIoGuard, SandboxRead, SandboxSpec,
+    SandboxStatus, SandboxWrite,
 };
 use centaur_sandbox_manager::{
     SandboxManager, SandboxReaper, SandboxReaperConfig, WarmPoolConfig, WarmPoolError,
@@ -2314,6 +2315,24 @@ impl SessionRuntime {
             );
         }
         result
+    }
+
+    pub async fn exec_in_session_sandbox(
+        &self,
+        thread_key: &ThreadKey,
+        command: &[String],
+    ) -> Result<SandboxCommandOutput, SessionRuntimeError> {
+        let session = self.store.get_session(thread_key).await?;
+        let sandbox_id = session.sandbox_id.ok_or_else(|| {
+            SessionRuntimeError::BadRequest(format!(
+                "session {thread_key} has no sandbox to inspect"
+            ))
+        })?;
+        self.sandbox_runtime
+            .manager
+            .exec(&SandboxId::new(sandbox_id), command)
+            .await
+            .map_err(SessionRuntimeError::Sandbox)
     }
 
     async fn ensure_session_sandbox(

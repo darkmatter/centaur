@@ -617,16 +617,20 @@ class Console::ThreadsControllerTest < ActionDispatch::IntegrationTest
     )
   end
 
+  # The owner-scope SQL-shape tests below stub a NON-admin: admins bypass the
+  # owner scope entirely (visible_thread_scope returns CentaurSession.all so
+  # ownerless system threads like workflow:* stay browsable).
   test "visible thread scope matches Slack threads owned by the current user's Slack OAuth record" do
+    member = users(:member_user)
     app = oauth_apps(:acme_slack)
     app.update!(client_secret: "slack-secret", labels: { "slack_team_id" => "T123" })
     create_slack_oauth_credential(
       app,
       subject: "UOWNER",
-      email: @operator.email,
+      email: member.email,
       labels: { "slack_team_id" => "T123" }
     )
-    controller = threads_controller_for(@operator)
+    controller = threads_controller_for(member)
 
     sql = controller.send(:visible_thread_scope).to_sql
 
@@ -638,16 +642,17 @@ class Console::ThreadsControllerTest < ActionDispatch::IntegrationTest
   end
 
   test "visible thread scope keeps current user's console threads without Slack OAuth" do
-    controller = threads_controller_for(@operator)
+    member = users(:member_user)
+    controller = threads_controller_for(member)
     sql = controller.send(:visible_thread_scope).to_sql
 
     assert_includes sql, "thread_key LIKE 'console:%'"
-    assert_includes sql, @operator.email
+    assert_includes sql, member.email
     refute_includes sql, "slack_user_id"
   end
 
   test "public Slack thread visibility defaults off and never expands the owner scope" do
-    controller = threads_controller_for(@operator)
+    controller = threads_controller_for(users(:member_user))
 
     with_env(
       "CENTAUR_CONSOLE_PUBLIC_SLACK_THREADS_ENABLED" => nil,
@@ -674,15 +679,16 @@ class Console::ThreadsControllerTest < ActionDispatch::IntegrationTest
   end
 
   test "visible thread scope matches Slack threads by user id when the credential has no team" do
+    member = users(:member_user)
     app = oauth_apps(:acme_slack)
     app.update!(client_secret: "slack-secret", labels: {})
     create_slack_oauth_credential(
       app,
       subject: "UOWNER",
-      email: @operator.email,
+      email: member.email,
       labels: {}
     )
-    controller = threads_controller_for(@operator)
+    controller = threads_controller_for(member)
 
     sql = controller.send(:visible_thread_scope).to_sql
 
@@ -696,14 +702,15 @@ class Console::ThreadsControllerTest < ActionDispatch::IntegrationTest
   end
 
   test "visible thread scope matches Slack threads via the SSO identity without a broker credential" do
+    member = users(:member_user)
     UserIdentity.create!(
-      user: @operator,
+      user: member,
       provider: "slack",
       subject: "USSOONLY",
-      email: @operator.email,
+      email: member.email,
       email_verified: true
     )
-    controller = threads_controller_for(@operator)
+    controller = threads_controller_for(member)
 
     sql = controller.send(:visible_thread_scope).to_sql
 
@@ -735,14 +742,15 @@ class Console::ThreadsControllerTest < ActionDispatch::IntegrationTest
   end
 
   test "sidebar thread scope matches Slack threads via the SSO identity without a broker credential" do
+    member = users(:member_user)
     UserIdentity.create!(
-      user: @operator,
+      user: member,
       provider: "slack",
       subject: "USSOONLY",
-      email: @operator.email,
+      email: member.email,
       email_verified: true
     )
-    controller = threads_controller_for(@operator)
+    controller = threads_controller_for(member)
 
     sql = controller.send(:console_sidebar_visible_thread_scope).to_sql
 
@@ -752,7 +760,7 @@ class Console::ThreadsControllerTest < ActionDispatch::IntegrationTest
   end
 
   test "sidebar includes public Slack threads only when the deploy setting is enabled" do
-    controller = threads_controller_for(@operator)
+    controller = threads_controller_for(users(:member_user))
 
     with_env("CENTAUR_CONSOLE_PUBLIC_SLACK_THREADS_ENABLED" => "true") do
       sql = controller.send(:console_sidebar_visible_thread_scope).to_sql
@@ -761,6 +769,17 @@ class Console::ThreadsControllerTest < ActionDispatch::IntegrationTest
         assert_includes sql, "slack_sync_channels"
       end
     end
+  end
+
+  test "admin thread scopes are unscoped so ownerless system threads surface" do
+    controller = threads_controller_for(@operator)
+
+    assert_equal CentaurSession.all.to_sql, controller.send(:visible_thread_scope).to_sql
+    assert_equal CentaurSession.all.to_sql,
+                 controller.send(:console_sidebar_visible_thread_scope).to_sql
+    # owned_thread_scope stays ownership-shaped even for admins (it backs
+    # reply attribution, not visibility).
+    assert_includes controller.send(:owned_thread_scope).to_sql, @operator.email
   end
 
   test "selected session resolves a directly linked thread only within the owner scope" do

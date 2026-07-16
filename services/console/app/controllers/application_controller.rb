@@ -69,6 +69,10 @@ class ApplicationController < ActionController::Base
   # permissions ("view as operator"). Self-healing: the flag is dropped if the
   # user is no longer an admin, so it can never outlive the privileges it pauses.
   def descoped?
+    # Outside a dispatched request (unit-style tests build bare controller
+    # instances) there is no session to descope through; reading `session`
+    # would raise a DelegationError on the nil @_request.
+    return false if request.nil?
     return false unless session[:descoped]
     return true if current_user&.admin?
 

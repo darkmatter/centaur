@@ -84,11 +84,20 @@ spec:
                 fi
               done
           env:
+{{- if include "centaur.derivePostgresUrls" . }}
+            # Derived per-release admin DSN (postgres.deriveDatabaseUrl): the
+            # password rides a secretKeyRef declared BEFORE the URL entry —
+            # kubelet $(VAR) expansion only sees earlier entries.
+{{ include "centaur.postgresPasswordEnv" . | indent 12 }}
+            - name: ADMIN_DATABASE_URL
+              value: {{ include "centaur.postgresDatabaseUrl" . | quote }}
+{{- else }}
             - name: ADMIN_DATABASE_URL
               valueFrom:
                 secretKeyRef:
                   name: {{ $secretEnv }}
                   key: {{ printf "%sDATABASE_URL" $prefix }}
+{{- end }}
             # Primary + Solid Cache/Queue/Cable, matching config/database.yml.
             - name: DB_NAMES
               value: {{ printf "%s %s_cache %s_queue %s_cable" $dbName $dbName $dbName $dbName | quote }}
@@ -107,6 +116,19 @@ spec:
             # SECRET_KEY_BASE, which Rails reads by its standard name). The DB
             # URL carries connection info only (no database path) so each Rails
             # connection's db name comes from the image's database.yml.
+{{- if include "centaur.derivePostgresUrls" . }}
+            # Derived per-release DB URLs (postgres.deriveDatabaseUrl): the
+            # password rides a secretKeyRef declared BEFORE the URL entries —
+            # kubelet $(VAR) expansion only sees earlier entries.
+{{ include "centaur.postgresPasswordEnv" . | indent 12 }}
+            - name: IRON_CONTROL_DATABASE_URL
+              value: {{ include "centaur.postgresHostUrl" . | quote }}
+            # Thread browsing reads api-rs session rows from its logical DB.
+            # Keep this under a Console-specific name so Rails' primary
+            # DATABASE_URL remains pointed at the console database.
+            - name: CENTAUR_CONSOLE_CENTAUR_DATABASE_URL
+              value: {{ include "centaur.postgresDatabaseUrl" . | quote }}
+{{- else }}
             - name: IRON_CONTROL_DATABASE_URL
               valueFrom:
                 secretKeyRef:
@@ -120,6 +142,7 @@ spec:
                 secretKeyRef:
                   name: {{ $secretEnv }}
                   key: {{ printf "%sDATABASE_URL" $prefix }}
+{{- end }}
             - name: CENTAUR_CONSOLE_SLACKBOTV2_USER_NAME
               value: {{ .Values.slackbotv2.userName | quote }}
             - name: CENTAUR_CONSOLE_SLACK_BOT_TOKEN
@@ -257,23 +280,17 @@ spec:
             httpGet:
               path: /up
               port: http
-            failureThreshold: 30
-            periodSeconds: 10
-            timeoutSeconds: 5
+{{ toYaml $console.startupProbe | nindent 12 }}
           readinessProbe:
             httpGet:
               path: /up
               port: http
-            failureThreshold: 6
-            periodSeconds: 10
-            timeoutSeconds: 5
+{{ toYaml $console.readinessProbe | nindent 12 }}
           livenessProbe:
             httpGet:
               path: /up
               port: http
-            failureThreshold: 6
-            periodSeconds: 10
-            timeoutSeconds: 5
+{{ toYaml $console.livenessProbe | nindent 12 }}
           securityContext:
 {{ toYaml .Values.containerSecurityContext | nindent 12 }}
             # No readOnlyRootFilesystem — Rails writes to tmp/ at runtime.

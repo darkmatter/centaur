@@ -1,0 +1,69 @@
+name: sync upstream
+
+# Keep the Darkmatter product fork close to paradigmxyz/centaur without
+# rewriting main. The workflow opens/updates a PR from `sync/upstream-main`
+# whenever upstream/main advances. Conflicts fail the run so a human can resolve
+# them explicitly in the PR branch instead of silently dropping fork changes.
+on:
+  schedule:
+    - cron: "17 10 * * 1-5"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: sync-upstream-main
+  cancel-in-progress: true
+
+jobs:
+  sync:
+    if: github.repository == 'darkmatter/centaur'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Merge upstream/main into sync branch
+        id: merge
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/paradigmxyz/centaur.git
+          git fetch upstream main
+
+          if git merge-base --is-ancestor upstream/main origin/main; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          git switch -C sync/upstream-main origin/main
+          git merge --no-edit upstream/main
+          git push --force-with-lease origin sync/upstream-main
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+          if gh pr view sync/upstream-main --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh pr edit sync/upstream-main --repo "$GITHUB_REPOSITORY" \
+              --title "sync: merge upstream main" \
+              --body "Merge latest paradigmxyz/centaur main into the Darkmatter product fork. Resolve conflicts here; do not rewrite main."
+          else
+            gh pr create --repo "$GITHUB_REPOSITORY" \
+              --base main \
+              --head sync/upstream-main \
+              --title "sync: merge upstream main" \
+              --body "Merge latest paradigmxyz/centaur main into the Darkmatter product fork. Resolve conflicts here; do not rewrite main."
+          fi
+
+      - name: Summary
+        run: |
+          if [ "${{ steps.merge.outputs.changed }}" = "true" ]; then
+            echo "Opened or updated sync/upstream-main PR."
+          else
+            echo "Already contains upstream/main."
+          fi

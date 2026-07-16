@@ -355,6 +355,115 @@ cat > "$HOME_DIR/.pi/agent/settings.json" <<EOF
 }
 EOF
 
+# ── omp (oh-my-pi) settings ──────────────────────────────────────────────────
+# Baked harness/omp/{config.yml,models.yml} land in $PI_CODING_AGENT_DIR with
+# the LiteLLM base URL substituted (OMP_LITELLM_BASE_URL, default the public
+# darkmatter gateway) so in-cluster deployments can point at a local Service.
+export PI_CODING_AGENT_DIR="${PI_CODING_AGENT_DIR:-$HOME_DIR/.omp/agent}"
+mkdir -p "$PI_CODING_AGENT_DIR"
+OMP_LITELLM_BASE_URL="${OMP_LITELLM_BASE_URL:-https://litellm.drkmttr.dev/v1}"
+for omp_cfg in config.yml models.yml; do
+    if [ -f "$HARNESS_CONFIG_DIR/omp/$omp_cfg" ]; then
+        sed "s|__OMP_LITELLM_BASE_URL__|$OMP_LITELLM_BASE_URL|g" \
+            "$HARNESS_CONFIG_DIR/omp/$omp_cfg" > "$PI_CODING_AGENT_DIR/$omp_cfg"
+    fi
+done
+
+# ── GitHub App installation token (darkmatter deployments) ──────────────────
+# When the App credentials are passed through, mint a short-lived installation
+# token at boot so the agent can clone/push and reply on GitHub — legacy
+# github-executor parity (the App key lived in the agent's trust domain there
+# too). All api.github.com traffic rides the per-sandbox egress proxy
+# (fail-closed policy, no direct 443), and the proxy pod can lag this
+# entrypoint by a few seconds — retry across that window instead of losing the
+# whole boot's GitHub access to one refused connect (verified 2026-07-09: the
+# same mint succeeds seconds later).
+#
+# Installation tokens expire after 60 minutes — fixed by GitHub, not
+# extendable. Warm-pool sandboxes idle past that hour (and any session running
+# longer) used to serve dead tokens: every GitHub call 401'd (verified
+# 2026-07-10, nixmac#514). Two changes close that hole:
+#   1. A background loop re-mints on an interval (default 50 min — hourly
+#      cadence with margin so a live token always exists) and rewrites the
+#      credential FILES below for the sandbox's whole life.
+#   2. No GITHUB_TOKEN/GH_TOKEN env export: env freezes into the exec'd
+#      harness at boot and goes stale where files can be refreshed. gh
+#      resolves the current token per invocation via the /usr/local/bin/gh
+#      wrapper reading $HOME/.centaur/github-token; git reads the refreshed
+#      credential store. Both env vars are explicitly unset so no runtime
+#      stub or stale value can shadow the fresh sources.
+# Fail-soft throughout: a failed re-mint keeps the previous token and retries
+# on a short interval; a sandbox without App creds behaves as before.
+GITHUB_TOKEN_FILE_PATH="$HOME_DIR/.centaur/github-token"
+
+mint_github_token() {
+    # 5 attempts with linear backoff; token on stdout, diagnostics to stderr.
+    local attempt token
+    for attempt in 1 2 3 4 5; do
+        if token="$(bun /usr/local/bin/mint-github-token.mjs 2>/tmp/mint-github-token.err)" \
+            && [ -n "$token" ]; then
+            printf '%s' "$token"
+            return 0
+        fi
+        sleep $((attempt * 2))
+    done
+    return 1
+}
+
+install_github_token() {
+    # Atomically publish the token file and the git credential store.
+    local token="$1" tmp
+    tmp="$(mktemp "$GITHUB_TOKEN_FILE_PATH.XXXXXX")"
+    printf '%s' "$token" > "$tmp"
+    chmod 600 "$tmp"
+    mv -f "$tmp" "$GITHUB_TOKEN_FILE_PATH"
+    # Scoped to github.com, kept out of URLs/reflog (legacy configureGit).
+    tmp="$(mktemp "$HOME_DIR/.git-credentials.XXXXXX")"
+    printf 'https://x-access-token:%s@github.com\n' "$token" > "$tmp"
+    chmod 600 "$tmp"
+    mv -f "$tmp" "$HOME_DIR/.git-credentials"
+}
+
+github_token_refresh_loop() {
+    # Re-mint before the 60-minute expiry; on failure keep the previous token
+    # (it may still be live) and retry sooner. stderr only — stdout is
+    # reserved for harness/workflow-host JSONL.
+    local interval="${GITHUB_TOKEN_REFRESH_SECONDS:-3000}" token
+    while true; do
+        sleep "$interval"
+        if token="$(mint_github_token)"; then
+            install_github_token "$token"
+            echo "github installation token re-minted" >&2
+            interval="${GITHUB_TOKEN_REFRESH_SECONDS:-3000}"
+        else
+            echo "github token re-mint failed, retrying in 300s: $(head -c 200 /tmp/mint-github-token.err 2>/dev/null)" >&2
+            interval=300
+        fi
+    done
+}
+
+if [ -n "${GITHUB_APP_ID:-}" ] && [ -n "${GITHUB_APP_PRIVATE_KEY:-}" ]; then
+    mkdir -p "$HOME_DIR/.centaur"
+    chmod 700 "$HOME_DIR/.centaur"
+    if minted_token="$(mint_github_token)"; then
+        install_github_token "$minted_token"
+        git config --global credential.helper store
+        # stdout is reserved for harness/workflow-host JSONL (see
+        # install_tool_shims.py) — a stray line here poisons the workflow-host
+        # handshake with "expected value at line 1 column 1".
+        echo "github installation token minted" >&2
+    else
+        echo "github token mint failed after 5 attempts: $(head -c 200 /tmp/mint-github-token.err 2>/dev/null)" >&2
+    fi
+    minted_token=""
+    github_token_refresh_loop &
+    # Stale/stub env must never shadow the refreshed file sources (gh prefers
+    # env over everything; see services/sandbox/gh-wrapper.sh). Scoped to the
+    # mint path: legacy deployments pass a real GITHUB_TOKEN env and no App
+    # creds — that flow (and the tail auth block) stays untouched.
+    unset GITHUB_TOKEN GH_TOKEN
+fi
+
 # ── Per-session workspace clone (no shared worktree metadata) ────────────────
 if [ "${CENTAUR_PERSISTENT_STATE:-0}" = "1" ]; then
     WORKSPACE_DIR="$STATE_DIR/workspace"
@@ -415,7 +524,25 @@ elif [ -f "$HOME_DIR/AGENTS.md" ]; then
     cp "$HOME_DIR/AGENTS.md" "$TARGET_PROMPT"
 fi
 
-if [ -f "$HOME_DIR/AGENTS_OVERLAY.md" ] && [ -f "$TARGET_PROMPT" ]; then
+# Repo-cache-backed overlay prompt (chart: overlays.sources[].promptPath),
+# rendered as ordered sandbox-side file paths under the repos mount. Later
+# overlay sources shadow earlier ones, so the last existing file wins; a
+# repo-provided prompt also shadows the legacy inline/org-repo branches below.
+_centaur_overlay_prompt_file=""
+if [ -n "${CENTAUR_OVERLAY_PROMPT_FILES:-}" ]; then
+    IFS=':' read -ra _centaur_prompt_candidates <<< "$CENTAUR_OVERLAY_PROMPT_FILES"
+    for _centaur_prompt_candidate in "${_centaur_prompt_candidates[@]}"; do
+        if [ -n "$_centaur_prompt_candidate" ] && [ -f "$_centaur_prompt_candidate" ]; then
+            _centaur_overlay_prompt_file="$_centaur_prompt_candidate"
+        fi
+    done
+    unset _centaur_prompt_candidate _centaur_prompt_candidates
+fi
+
+if [ -n "$_centaur_overlay_prompt_file" ] && [ -f "$TARGET_PROMPT" ]; then
+    printf '\n\n---\n\n' >> "$TARGET_PROMPT"
+    cat "$_centaur_overlay_prompt_file" >> "$TARGET_PROMPT"
+elif [ -f "$HOME_DIR/AGENTS_OVERLAY.md" ] && [ -f "$TARGET_PROMPT" ]; then
     printf '\n\n---\n\n' >> "$TARGET_PROMPT"
     cat "$HOME_DIR/AGENTS_OVERLAY.md" >> "$TARGET_PROMPT"
 # Repo-cache-era org prompt: with overlay images gone, point CENTAUR_OVERLAY_DIR
@@ -428,6 +555,7 @@ elif [ -n "${CENTAUR_OVERLAY_DIR:-}" ] \
     printf '\n\n---\n\n' >> "$TARGET_PROMPT"
     cat "${CENTAUR_OVERLAY_DIR}/services/sandbox/SYSTEM_PROMPT.md" >> "$TARGET_PROMPT"
 fi
+unset _centaur_overlay_prompt_file
 
 if [ "${CENTAUR_SANDBOX_OBSERVABILITY_ENABLED:-true}" = "false" ] && [ -f "$TARGET_PROMPT" ]; then
     cat >> "$TARGET_PROMPT" <<'EOF'
@@ -486,13 +614,17 @@ fi
 # Signal readiness
 touch "$HOME_DIR/.ready"
 
-# ── Background: slow auth tasks ─────────────────────────────────────────────
+# ── Background: slow auth tasks (legacy env-token path only) ─────────────────
+# GITHUB_TOKEN env survives only when the App-creds mint above did NOT run.
+# /usr/bin/gh bypasses the /usr/local/bin/gh wrapper: with no minted token
+# file the wrapper is a passthrough, but be explicit — `gh auth login` must
+# see the legacy env, not a wrapper-injected file token.
 {
     if [ -n "${GITHUB_TOKEN:-}" ]; then
         git config --global credential.helper store
         printf 'https://oauth2:%s@github.com\n' "$GITHUB_TOKEN" > "$HOME_DIR/.git-credentials"
-        echo "${GITHUB_TOKEN}" | gh auth login --with-token 2>/dev/null || true
-        gh auth setup-git 2>/dev/null || true
+        echo "${GITHUB_TOKEN}" | /usr/bin/gh auth login --with-token 2>/dev/null || true
+        /usr/bin/gh auth setup-git 2>/dev/null || true
     fi
 } &
 

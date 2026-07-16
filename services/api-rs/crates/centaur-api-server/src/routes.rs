@@ -274,7 +274,7 @@ pub fn build_router_with_app_state(state: AppState) -> Router {
         )
         .route(
             "/api/admin/slack/dm-sync/checkpoints",
-            get(list_slack_dm_sync_checkpoints),
+            get(list_slack_private_sync_checkpoints),
         )
         .route(
             "/api/admin/slack/dm-sync/batch",
@@ -1880,7 +1880,7 @@ async fn retry_slack_archive_import(
     ))
 }
 
-async fn list_slack_dm_sync_checkpoints(
+async fn list_slack_private_sync_checkpoints(
     State(state): State<AppState>,
     Query(query): Query<ListSlackDmSyncCheckpointsQuery>,
 ) -> Result<Json<Value>, ApiError> {
@@ -1888,7 +1888,7 @@ async fn list_slack_dm_sync_checkpoints(
     require_non_empty("broker_credential_id", &query.broker_credential_id)?;
     let rows = sqlx::query_as::<_, SlackDmSyncCheckpointResponse>(
         "SELECT broker_credential_id, home_team_id, conversation_id, watermark_ts \
-         FROM slack_dm_sync_checkpoints \
+         FROM slack_private_sync_checkpoints \
          WHERE broker_credential_id = $1 \
          AND ($2::text IS NULL OR home_team_id = $2) \
          ORDER BY home_team_id, conversation_id",
@@ -1920,7 +1920,7 @@ async fn ingest_slack_dm_sync_batch(
 
     for conversation in &request.conversations {
         sqlx::query(
-            "INSERT INTO slack_dm_sync_conversations (\
+            "INSERT INTO slack_private_sync_conversations (\
              home_team_id, conversation_id, conversation_type, is_archived, is_ext_shared, \
              raw_payload, last_seen_at, updated_at\
              ) VALUES ($1, $2, $3, $4, $5, $6::jsonb, NOW(), NOW()) \
@@ -1952,7 +1952,7 @@ async fn ingest_slack_dm_sync_batch(
         }
         for ((home_team_id, conversation_id), _) in conversations {
             sqlx::query(
-                "UPDATE slack_dm_sync_conversation_members \
+                "UPDATE slack_private_sync_conversation_members \
                  SET is_current_member = false, updated_at = NOW() \
                  WHERE home_team_id = $1 AND conversation_id = $2",
             )
@@ -1965,7 +1965,7 @@ async fn ingest_slack_dm_sync_batch(
 
     for member in &request.members {
         sqlx::query(
-            "INSERT INTO slack_dm_sync_conversation_members (\
+            "INSERT INTO slack_private_sync_conversation_members (\
              home_team_id, conversation_id, user_id, user_team_id, is_external, \
              is_current_member, raw_payload, last_seen_at, updated_at\
              ) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, NOW(), NOW()) \
@@ -1996,7 +1996,7 @@ async fn ingest_slack_dm_sync_batch(
             None
         };
         sqlx::query(
-            "INSERT INTO slack_dm_sync_messages (\
+            "INSERT INTO slack_private_sync_messages (\
              home_team_id, conversation_id, message_ts, occurred_at, thread_ts, \
              parent_message_ts, is_thread_root, user_id, user_team_id, bot_id, \
              message_type, message_subtype, text, permalink, reply_count, reply_users, \
@@ -2021,9 +2021,9 @@ async fn ingest_slack_dm_sync_batch(
              reply_count = EXCLUDED.reply_count, \
              reply_users = EXCLUDED.reply_users, \
              latest_reply_ts = EXCLUDED.latest_reply_ts, \
-             thread_refreshed_at = COALESCE(EXCLUDED.thread_refreshed_at, slack_dm_sync_messages.thread_refreshed_at), \
+             thread_refreshed_at = COALESCE(EXCLUDED.thread_refreshed_at, slack_private_sync_messages.thread_refreshed_at), \
              raw_payload = EXCLUDED.raw_payload, \
-             source_run_id = COALESCE(EXCLUDED.source_run_id, slack_dm_sync_messages.source_run_id), \
+             source_run_id = COALESCE(EXCLUDED.source_run_id, slack_private_sync_messages.source_run_id), \
              last_seen_at = NOW(), \
              updated_at = NOW()",
         )
@@ -2053,7 +2053,7 @@ async fn ingest_slack_dm_sync_batch(
 
     for attachment in &request.attachments {
         sqlx::query(
-            "INSERT INTO slack_dm_sync_message_attachments (\
+            "INSERT INTO slack_private_sync_message_attachments (\
              home_team_id, conversation_id, message_ts, slack_file_id, name, title, \
              mimetype, filetype, size_bytes, url_private, permalink, download_status, \
              download_error, content_sha256, raw_payload, source_run_id, last_seen_at, updated_at\
@@ -2072,7 +2072,7 @@ async fn ingest_slack_dm_sync_batch(
              download_error = EXCLUDED.download_error, \
              content_sha256 = EXCLUDED.content_sha256, \
              raw_payload = EXCLUDED.raw_payload, \
-             source_run_id = COALESCE(EXCLUDED.source_run_id, slack_dm_sync_message_attachments.source_run_id), \
+             source_run_id = COALESCE(EXCLUDED.source_run_id, slack_private_sync_message_attachments.source_run_id), \
              last_seen_at = NOW(), \
              updated_at = NOW()",
         )
@@ -2103,14 +2103,14 @@ async fn ingest_slack_dm_sync_batch(
             None
         };
         sqlx::query(
-            "INSERT INTO slack_dm_sync_checkpoints (\
+            "INSERT INTO slack_private_sync_checkpoints (\
              broker_credential_id, home_team_id, conversation_id, watermark_ts, \
              last_run_id, last_success_at, last_error, updated_at\
              ) VALUES ($1, $2, $3, $4, $5, $6, $7, NOW()) \
              ON CONFLICT (broker_credential_id, home_team_id, conversation_id) DO UPDATE SET \
              watermark_ts = EXCLUDED.watermark_ts, \
              last_run_id = EXCLUDED.last_run_id, \
-             last_success_at = COALESCE(EXCLUDED.last_success_at, slack_dm_sync_checkpoints.last_success_at), \
+             last_success_at = COALESCE(EXCLUDED.last_success_at, slack_private_sync_checkpoints.last_success_at), \
              last_error = EXCLUDED.last_error, \
              updated_at = NOW()",
         )
@@ -2699,7 +2699,7 @@ async fn upsert_slack_dm_sync_run(
         None
     };
     sqlx::query(
-        "INSERT INTO slack_dm_sync_runs (\
+        "INSERT INTO slack_private_sync_runs (\
          run_id, workflow_run_id, mode, status, broker_credential_id, source_user_id, \
          home_team_id, conversations_requested, conversations_synced, conversations_failed, \
          messages_fetched, messages_upserted, replies_fetched, replies_upserted, \
@@ -2721,7 +2721,7 @@ async fn upsert_slack_dm_sync_run(
          messages_upserted = EXCLUDED.messages_upserted, \
          replies_fetched = EXCLUDED.replies_fetched, \
          replies_upserted = EXCLUDED.replies_upserted, \
-         finished_at = COALESCE(EXCLUDED.finished_at, slack_dm_sync_runs.finished_at), \
+         finished_at = COALESCE(EXCLUDED.finished_at, slack_private_sync_runs.finished_at), \
          error_text = EXCLUDED.error_text, \
          metadata = EXCLUDED.metadata",
     )
@@ -2944,9 +2944,12 @@ fn validate_slack_dm_sync_batch(request: &SlackDmSyncBatchRequest) -> Result<(),
             "conversation.conversation_id",
             &conversation.conversation_id,
         )?;
-        if !matches!(conversation.conversation_type.as_str(), "im" | "mpim") {
+        if !matches!(
+            conversation.conversation_type.as_str(),
+            "im" | "mpim" | "private_channel"
+        ) {
             return Err(ApiError::BadRequest(
-                "conversation.conversation_type must be im or mpim".to_owned(),
+                "conversation.conversation_type must be im, mpim, or private_channel".to_owned(),
             ));
         }
         validate_json_shape("conversation.raw_payload", &conversation.raw_payload, true)?;
@@ -2981,6 +2984,42 @@ fn validate_slack_dm_sync_batch(request: &SlackDmSyncBatchRequest) -> Result<(),
         require_non_empty("checkpoint.conversation_id", &checkpoint.conversation_id)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod slack_user_sync_tests {
+    use super::*;
+
+    fn request_with_conversation_type(conversation_type: &str) -> SlackDmSyncBatchRequest {
+        SlackDmSyncBatchRequest {
+            run: None,
+            replace_memberships: false,
+            conversations: vec![SlackDmSyncConversationPayload {
+                home_team_id: "T123".to_owned(),
+                conversation_id: "G123".to_owned(),
+                conversation_type: conversation_type.to_owned(),
+                is_archived: false,
+                is_ext_shared: false,
+                raw_payload: json!({"name": "leadership"}),
+            }],
+            members: vec![],
+            messages: vec![],
+            attachments: vec![],
+            checkpoints: vec![],
+        }
+    }
+
+    #[test]
+    fn accepts_private_channel_conversations() {
+        validate_slack_dm_sync_batch(&request_with_conversation_type("private_channel")).unwrap();
+    }
+
+    #[test]
+    fn rejects_public_channel_conversations() {
+        let error = validate_slack_dm_sync_batch(&request_with_conversation_type("public_channel"))
+            .unwrap_err();
+        assert!(matches!(error, ApiError::BadRequest(_)));
+    }
 }
 
 fn validate_google_docs_sync_batch(request: &GoogleDocsSyncBatchRequest) -> Result<(), ApiError> {

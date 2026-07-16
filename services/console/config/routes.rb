@@ -47,6 +47,11 @@ Rails.application.routes.draw do
   get "console/principals/:id", to: "console#principal", as: :console_principal
   namespace :console do
     resources :threads, only: %i[index create]
+    post "threads/share", to: "threads#share", as: :thread_share
+    # Single-panel transcript refresh polled by thread_poller_controller.js
+    # while a turn is running. thread_key rides as a query param: keys carry
+    # colons and dots a path segment would mangle.
+    get "threads/panel", to: "threads#panel", as: :thread_panel
     resources :workflows, only: %i[index show] do
       member do
         post :run, action: :force_start
@@ -206,8 +211,9 @@ Rails.application.routes.draw do
       post "proxy/sync", to: "proxy_sync#create"
 
       # Called from inside sandboxes through their assigned iron-proxy. The
-      # proxy injects a short-lived sandbox entitlement JWT scoped to this path.
+      # proxy injects a short-lived sandbox entitlement JWT scoped to these paths.
       get "sandbox/permissions", to: "sandbox_permissions#show"
+      get "sandbox/oauth_apps", to: "sandbox_oauth_apps#index"
     end
   end
 

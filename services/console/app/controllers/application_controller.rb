@@ -90,7 +90,10 @@ class ApplicationController < ActionController::Base
   # before_action gate for console pages: bounce anonymous requests to the login
   # form rather than rendering the page.
   def require_login
-    redirect_to login_path unless current_user
+    return if current_user
+
+    store_return_to_for_login
+    redirect_to login_path
   end
 
   # Second gate, after require_login: a disabled user is signed out; a pending
@@ -173,6 +176,12 @@ class ApplicationController < ActionController::Base
     path
   end
 
+  def store_return_to_for_login
+    return unless request.request_method == "GET"
+
+    session[:return_to] = request.fullpath
+  end
+
   def safe_console_return_path(default: default_console_landing_path)
     raw = params[:return_to].presence || params[:next].presence
     return default if raw.blank?
@@ -198,6 +207,10 @@ class ApplicationController < ActionController::Base
       console_sidebar_console_thread_owner_sql,
       (console_sidebar_slack_thread_owner_sql(slack_owners) if slack_owners.any?)
     ].compact
+    if CentaurSession.public_slack_threads_enabled?
+      public_slack_sql = CentaurSession.public_slack_channel_sql
+      conditions << public_slack_sql if public_slack_sql
+    end
 
     return CentaurSession.where("1=0") if conditions.empty?
 
@@ -213,10 +226,13 @@ class ApplicationController < ActionController::Base
     thread_keys = console_sidebar_selected_thread_keys - threads.map(&:thread_key)
     return [] if thread_keys.empty?
 
-    # Resolve through the owner scope, not a raw find_by, so a directly linked
-    # thread only surfaces in the sidebar when the current user started it. This
-    # mirrors Console::ThreadsController#selected_session.
-    console_sidebar_visible_thread_scope.where(thread_key: thread_keys).to_a
+    visible = console_sidebar_visible_thread_scope.where(thread_key: thread_keys).to_a
+    missing_keys = thread_keys - visible.map(&:thread_key)
+    shared_keys = ThreadShare.where(thread_key: missing_keys).pluck(:thread_key)
+    shared = CentaurSession.where(thread_key: shared_keys).to_a
+    sessions_by_key = (visible + shared).index_by(&:thread_key)
+
+    thread_keys.filter_map { |thread_key| sessions_by_key[thread_key] }
   end
 
   # The thread param carries up to PANEL_LIMIT comma-separated keys when the

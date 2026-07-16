@@ -1004,12 +1004,12 @@ class Console::ThreadsControllerTest < ActionDispatch::IntegrationTest
 
     create = client.calls[0].last
     assert create[:thread_key].start_with?("console:"), "expected a console:-namespaced thread key"
-    assert_equal "claudecode", create[:harness_type]
+    assert_equal "omp", create[:harness_type]
     assert_equal "console", create[:metadata][:platform]
     assert_equal "console", create[:metadata][:source]
     assert_equal @operator.email, create[:metadata][:actor_email]
     assert_equal "@ada", create[:metadata][:github_handle]
-    assert_equal "claude-opus-4-8", create[:metadata][:model]
+    assert_equal "anthropic/claude-opus-4-8", create[:metadata][:model]
 
     append = client.calls[1].last
     assert_equal create[:thread_key], append[:thread_key]
@@ -1022,12 +1022,12 @@ class Console::ThreadsControllerTest < ActionDispatch::IntegrationTest
     execute = client.calls[2].last
     assert_equal create[:thread_key], execute[:thread_key]
     assert execute[:idempotency_key].present?
-    assert_equal "claude-opus-4-8", execute[:metadata][:model]
+    assert_equal "anthropic/claude-opus-4-8", execute[:metadata][:model]
     assert_equal "@ada", execute[:metadata][:github_handle]
     line = JSON.parse(execute[:input_lines].first)
     assert_equal "user", line["type"]
     assert_equal create[:thread_key], line["thread_key"]
-    assert_equal "claude-opus-4-8", line["model"]
+    assert_equal "anthropic/claude-opus-4-8", line["model"]
     assert_equal message[:client_message_id], line["client_user_message_id"]
     requester_context = line.dig("message", "content", 0, "text")
     assert_includes requester_context, "# Requester Context"

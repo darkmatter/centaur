@@ -12,8 +12,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use centaur_iron_control::IronControlClient;
 use centaur_sandbox_core::{
-    MountKind, ObservedSandbox, SandboxBackend, SandboxError, SandboxHandle, SandboxId, SandboxIo,
-    SandboxResult, SandboxSpec, SandboxStatus,
+    MountKind, ObservedSandbox, SandboxBackend, SandboxCommandOutput, SandboxError, SandboxHandle,
+    SandboxId, SandboxIo, SandboxResult, SandboxSpec, SandboxStatus,
 };
 use k8s_openapi::api::core::v1::{PersistentVolumeClaim, Pod};
 use kube::api::{
@@ -21,7 +21,7 @@ use kube::api::{
 };
 use kube::{Api, Client, Error};
 use serde_json::{Value, json};
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::sync::Mutex;
 use tokio::time::{Instant, sleep};
 
@@ -363,6 +363,71 @@ impl SandboxBackend for AgentSandboxBackend {
 
     async fn open_io(&self, id: &SandboxId) -> SandboxResult<SandboxIo> {
         self.attach_io(id).await
+    }
+
+    async fn exec(
+        &self,
+        id: &SandboxId,
+        command: &[String],
+    ) -> SandboxResult<SandboxCommandOutput> {
+        if command.is_empty() {
+            return Err(SandboxError::InvalidSpec(
+                "sandbox command must not be empty".to_owned(),
+            ));
+        }
+        if self.status(id).await? != SandboxStatus::Running {
+            return Err(SandboxError::NotReady(format!(
+                "agent sandbox {} is not running",
+                id.as_str()
+            )));
+        }
+
+        let params = AttachParams::default()
+            .container(self.config.container_name.clone())
+            .stdin(false)
+            .stdout(true)
+            .stderr(true)
+            .tty(false);
+        let mut process = self
+            .pods()
+            .exec(id.as_str(), command.to_vec(), &params)
+            .await
+            .map_err(|error| map_kube_error("exec sandbox command", error))?;
+        let mut stdout = process
+            .stdout()
+            .ok_or_else(|| SandboxError::io("sandbox exec stdout was not attached"))?;
+        let mut stderr = process
+            .stderr()
+            .ok_or_else(|| SandboxError::io("sandbox exec stderr was not attached"))?;
+        let status = process
+            .take_status()
+            .ok_or_else(|| SandboxError::io("sandbox exec status was not attached"))?;
+
+        let stdout_read = async {
+            let mut bytes = Vec::new();
+            stdout.read_to_end(&mut bytes).await.map(|_| bytes)
+        };
+        let stderr_read = async {
+            let mut bytes = Vec::new();
+            stderr.read_to_end(&mut bytes).await.map(|_| bytes)
+        };
+        let (stdout, stderr, status, joined) =
+            tokio::join!(stdout_read, stderr_read, status, process.join());
+        joined.map_err(|error| SandboxError::io_source("join sandbox exec", error))?;
+        let stdout =
+            stdout.map_err(|error| SandboxError::io_source("read sandbox exec stdout", error))?;
+        let stderr =
+            stderr.map_err(|error| SandboxError::io_source("read sandbox exec stderr", error))?;
+        let success = status
+            .as_ref()
+            .and_then(|status| status.status.as_deref())
+            == Some("Success");
+
+        Ok(SandboxCommandOutput {
+            stdout,
+            stderr,
+            success,
+        })
     }
 
     /// Replays the workload container's stdout from the kubelet's log files.

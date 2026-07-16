@@ -4,6 +4,13 @@ use crate::{
     ObservedSandbox, SandboxHandle, SandboxId, SandboxIo, SandboxResult, SandboxSpec, SandboxStatus,
 };
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SandboxCommandOutput {
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+    pub success: bool,
+}
+
 #[async_trait]
 /// Backend-neutral lifecycle and byte-I/O operations for one sandbox runtime.
 ///
@@ -19,6 +26,18 @@ pub trait SandboxBackend: Send + Sync {
 
     /// Open owned stdin/stdout/stderr handles for a running sandbox.
     async fn open_io(&self, id: &SandboxId) -> SandboxResult<SandboxIo>;
+
+    /// Execute one command in a running sandbox and collect its output.
+    async fn exec(
+        &self,
+        _id: &SandboxId,
+        _command: &[String],
+    ) -> SandboxResult<SandboxCommandOutput> {
+        Err(crate::SandboxError::Unsupported {
+            backend: self.name(),
+            operation: "exec",
+        })
+    }
 
     /// Read the sandbox workload's recorded stdout history since `since`.
     ///

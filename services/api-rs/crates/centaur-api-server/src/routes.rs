@@ -62,7 +62,7 @@ use crate::{
         EmitWorkflowEventRequest, EventsQuery, ExecuteSessionRequest, ExecuteSessionResponse,
         InterruptSessionExecutionRequest, InterruptSessionExecutionResponse, ListWorkflowRunsQuery,
         OnHarnessConflict, SessionContextResponse, SessionSseEvent, SlackThreadContext,
-        stream_error_sse,
+        WorkspaceDiffRequest, WorkspaceDiffResponse, stream_error_sse,
     },
 };
 
@@ -227,6 +227,10 @@ pub fn build_router_with_app_state(state: AppState) -> Router {
             post(interrupt_session_execution),
         )
         .route("/api/session/{thread_key}/events", get(stream_events))
+        .route(
+            "/api/session/{thread_key}/workspace-diff",
+            post(capture_workspace_diff),
+        )
         .route("/api/sandboxes/drain", post(drain_sandboxes))
         .merge(slack_proxy_router())
         .route("/api/workflows/schedules", get(list_workflow_schedules))
@@ -549,6 +553,114 @@ async fn execute_session(
         execution_id: execution.execution_id,
         thread_key: execution.thread_key,
         status: execution.status.to_string(),
+    }))
+}
+
+const SANDBOX_GITHUB_ROOT: &str = "/home/agent/github";
+const MAX_WORKSPACE_ARTIFACT_BYTES: usize = 10 * 1024 * 1024;
+
+fn validate_workspace_diff_request(request: &WorkspaceDiffRequest) -> Result<(), ApiError> {
+    let path = FsPath::new(&request.repo_path);
+    let relative = path.strip_prefix(SANDBOX_GITHUB_ROOT).map_err(|_| {
+        ApiError::BadRequest(format!("repo_path must be under {SANDBOX_GITHUB_ROOT}"))
+    })?;
+    if !path.is_absolute()
+        || relative.as_os_str().is_empty()
+        || relative
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err(ApiError::BadRequest(
+            "repo_path must be a normalized sandbox repository path".to_owned(),
+        ));
+    }
+    if request.base_sha.len() != 40
+        || !request
+            .base_sha
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(ApiError::BadRequest(
+            "base_sha must be a full 40-character hexadecimal commit SHA".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+async fn capture_workspace_diff(
+    State(state): State<AppState>,
+    Path(raw_thread_key): Path<String>,
+    Json(request): Json<WorkspaceDiffRequest>,
+) -> Result<Json<WorkspaceDiffResponse>, ApiError> {
+    validate_workspace_diff_request(&request)?;
+    let thread_key = ThreadKey::try_from(raw_thread_key)?;
+    let runtime = state.runtime()?;
+
+    let intent_to_add = vec![
+        "git".to_owned(),
+        "-C".to_owned(),
+        request.repo_path.clone(),
+        "add".to_owned(),
+        "-N".to_owned(),
+        "--".to_owned(),
+        ".".to_owned(),
+    ];
+    let added = runtime
+        .exec_in_session_sandbox(&thread_key, &intent_to_add)
+        .await?;
+    if !added.success {
+        return Err(ApiError::BadRequest(format!(
+            "failed to prepare workspace diff: {}",
+            String::from_utf8_lossy(&added.stderr).trim()
+        )));
+    }
+
+    let diff = vec![
+        "git".to_owned(),
+        "-C".to_owned(),
+        request.repo_path.clone(),
+        "diff".to_owned(),
+        "--binary".to_owned(),
+        "--full-index".to_owned(),
+        request.base_sha.clone(),
+        "--".to_owned(),
+        ".".to_owned(),
+    ];
+    let patch = runtime.exec_in_session_sandbox(&thread_key, &diff).await?;
+    if !patch.success {
+        return Err(ApiError::BadRequest(format!(
+            "failed to capture workspace diff: {}",
+            String::from_utf8_lossy(&patch.stderr).trim()
+        )));
+    }
+    if patch.stdout.len() > MAX_WORKSPACE_ARTIFACT_BYTES {
+        return Err(ApiError::BadRequest(format!(
+            "workspace diff exceeds {MAX_WORKSPACE_ARTIFACT_BYTES} bytes"
+        )));
+    }
+
+    let status_command = vec![
+        "git".to_owned(),
+        "-C".to_owned(),
+        request.repo_path,
+        "status".to_owned(),
+        "--porcelain=v1".to_owned(),
+        "--untracked-files=all".to_owned(),
+    ];
+    let status = runtime
+        .exec_in_session_sandbox(&thread_key, &status_command)
+        .await?;
+    if !status.success {
+        return Err(ApiError::BadRequest(format!(
+            "failed to capture workspace status: {}",
+            String::from_utf8_lossy(&status.stderr).trim()
+        )));
+    }
+
+    Ok(Json(WorkspaceDiffResponse {
+        base_sha: request.base_sha,
+        patch: String::from_utf8_lossy(&patch.stdout).into_owned(),
+        status: String::from_utf8_lossy(&status.stdout).into_owned(),
     }))
 }
 
@@ -3454,6 +3566,59 @@ mod granola_sync_tests {
     }
 }
 
+mod workspace_diff_tests {
+    use super::*;
+
+    fn request(repo_path: &str, base_sha: &str) -> WorkspaceDiffRequest {
+        WorkspaceDiffRequest {
+            repo_path: repo_path.to_owned(),
+            base_sha: base_sha.to_owned(),
+        }
+    }
+
+    #[test]
+    fn accepts_pinned_repo_under_sandbox_github_root() {
+        assert!(
+            validate_workspace_diff_request(&request(
+                "/home/agent/github/darkmatter/eval-sandbox",
+                "0123456789abcdef0123456789abcdef01234567",
+            ))
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn rejects_paths_outside_sandbox_github_root_or_with_traversal() {
+        for path in [
+            "/workspace/eval-sandbox",
+            "/home/agent/github/../../etc",
+            "home/agent/github/darkmatter/eval-sandbox",
+        ] {
+            let error = validate_workspace_diff_request(&request(
+                path,
+                "0123456789abcdef0123456789abcdef01234567",
+            ))
+            .unwrap_err();
+            assert!(matches!(error, ApiError::BadRequest(_)), "{path}: {error}");
+        }
+    }
+
+    #[test]
+    fn rejects_non_sha_base_revisions() {
+        for sha in [
+            "main",
+            "deadbeef",
+            "g123456789abcdef0123456789abcdef01234567",
+        ] {
+            let error = validate_workspace_diff_request(&request(
+                "/home/agent/github/darkmatter/eval-sandbox",
+                sha,
+            ))
+            .unwrap_err();
+            assert!(matches!(error, ApiError::BadRequest(_)), "{sha}: {error}");
+        }
+    }
+}
 #[cfg(test)]
 mod slack_archive_import_tests {
     use super::*;

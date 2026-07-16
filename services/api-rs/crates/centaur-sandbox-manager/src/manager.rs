@@ -1,8 +1,8 @@
 use std::{sync::Arc, time::Duration};
 
 use centaur_sandbox_core::{
-    DesiredSandboxState, ObservedSandbox, SandboxBackend, SandboxHandle, SandboxId, SandboxIo,
-    SandboxResult, SandboxSpec, SandboxStatus,
+    DesiredSandboxState, ObservedSandbox, SandboxBackend, SandboxCommandOutput, SandboxHandle,
+    SandboxId, SandboxIo, SandboxResult, SandboxSpec, SandboxStatus,
 };
 use centaur_telemetry::{record_sandbox_operation, record_sandbox_startup_duration};
 use tokio::time::Instant;
@@ -147,6 +147,14 @@ where
             sandbox_id = %id.as_str(),
         ))
         .await
+    }
+
+    pub async fn exec(
+        &self,
+        id: &SandboxId,
+        command: &[String],
+    ) -> SandboxResult<SandboxCommandOutput> {
+        self.backend.exec(id, command).await
     }
 
     pub async fn status(&self, id: &SandboxId) -> SandboxResult<SandboxStatus> {

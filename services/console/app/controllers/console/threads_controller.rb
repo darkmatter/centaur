@@ -641,6 +641,12 @@ class Console::ThreadsController < ApplicationController
   end
 
   def visible_thread_scope
+    # Admins see every thread, including unowned system threads (workflow:*,
+    # gh executor jobs, warm-pool smokes) that carry no owner metadata and
+    # would otherwise be invisible to every user. Non-admins remain scoped to
+    # threads they own.
+    return CentaurSession.all if acting_admin?
+
     thread_scope(include_public_slack: true)
   end
 

@@ -525,6 +525,11 @@ struct SandboxArgs {
     )]
     k8s_namespace: String,
     #[arg(
+        long = "session-sandbox-runtime-class-name",
+        env = "SESSION_SANDBOX_RUNTIME_CLASS_NAME"
+    )]
+    runtime_class_name: Option<String>,
+    #[arg(
         long = "session-sandbox-image",
         alias = "kubernetes-agent-image",
         env = "SESSION_SANDBOX_IMAGE"
@@ -1352,6 +1357,7 @@ impl TryFrom<&SandboxArgs> for AgentSandboxConfig {
     fn try_from(args: &SandboxArgs) -> Result<Self, Self::Error> {
         let mut config = AgentSandboxConfig::new(args.k8s_namespace.clone());
         config.image_pull_policy = args.agent_image_pull_policy.clone();
+        config.runtime_class_name = args.runtime_class_name.clone();
         config.image_pull_secrets = args
             .image_pull_secrets
             .iter()
@@ -1836,11 +1842,19 @@ impl IronProxyHarnessArgs {
     /// so sessions restarted onto another harness still get working
     /// credentials through the proxy.
     fn fragments(&self) -> Result<Vec<ProxyFragment>, ServerError> {
-        let mut fragments = vec![self.fragment()?];
+        let mut fragments = Vec::new();
+        // Engines with no auth-mode source (amp, omp — credentials reach the
+        // sandbox as plain env, not proxy-injected) have no infra fragment to
+        // require. An explicit KUBERNETES_IRON_PROXY_HARNESS_AUTH_MODE still
+        // forces resolution (and fails loudly on an unknown pair).
+        if self.auth_mode.is_some() || harness_auth_mode_env(&self.engine).is_some() {
+            fragments.push(self.fragment()?);
+        }
         for engine in [
             HarnessType::Codex,
             HarnessType::ClaudeCode,
             HarnessType::Amp,
+            HarnessType::Omp,
         ] {
             if engine == self.engine {
                 continue;
@@ -1924,6 +1938,7 @@ fn harness_fragment_engine_name(engine: &HarnessType) -> &'static str {
         HarnessType::Codex => "codex",
         HarnessType::Amp => "amp",
         HarnessType::ClaudeCode => "claude-code",
+        HarnessType::Omp => "omp",
     }
 }
 
@@ -1941,6 +1956,9 @@ fn harness_auth_mode_env(engine: &HarnessType) -> Option<String> {
         HarnessType::Codex => env::var("CODEX_AUTH_MODE").ok(),
         HarnessType::ClaudeCode => env::var("CLAUDE_CODE_AUTH_MODE").ok(),
         HarnessType::Amp => None,
+        // omp gets its upstream key through the plain sandbox env (LiteLLM
+        // gateway), not an iron-proxy auth fragment — the amp pattern.
+        HarnessType::Omp => None,
     }
 }
 

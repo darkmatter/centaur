@@ -842,6 +842,7 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "centaur-iron-proxy",
+ "parking_lot",
  "reqwest",
  "serde",
  "serde_json",

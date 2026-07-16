@@ -42,6 +42,19 @@ pub struct SessionContextResponse {
     pub slack: Option<SlackThreadContext>,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct WorkspaceDiffRequest {
+    pub repo_path: String,
+    pub base_sha: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct WorkspaceDiffResponse {
+    pub base_sha: String,
+    pub patch: String,
+    pub status: String,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct SlackThreadContext {
     pub channel_id: String,

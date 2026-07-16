@@ -19,6 +19,7 @@ enum Harness {
     ClaudeCode,
     Amp,
     Codex,
+    Omp,
 }
 
 impl Harness {
@@ -27,6 +28,7 @@ impl Harness {
             Self::ClaudeCode => "claude-code",
             Self::Amp => "amp",
             Self::Codex => "codex",
+            Self::Omp => "omp",
         }
     }
 
@@ -35,6 +37,7 @@ impl Harness {
             Self::ClaudeCode => &["claude-code", "--mode", "jsonrpc"],
             Self::Amp => &["amp", "--mode", "jsonrpc"],
             Self::Codex => &["codex", "--mode", "jsonrpc"],
+            Self::Omp => &["omp", "--mode", "jsonrpc"],
         }
     }
 
@@ -43,6 +46,7 @@ impl Harness {
             Self::ClaudeCode => &["claude-code"],
             Self::Amp => &["amp"],
             Self::Codex => &["codex"],
+            Self::Omp => &["omp"],
         }
     }
 
@@ -51,6 +55,7 @@ impl Harness {
             Self::ClaudeCode => Some("CENTAUR_CLAUDE_APP_BRIDGE_COMMAND"),
             Self::Amp => Some("CENTAUR_AMP_APP_BRIDGE_COMMAND"),
             Self::Codex => None,
+            Self::Omp => Some("CENTAUR_OMP_APP_BRIDGE_COMMAND"),
         }
     }
 
@@ -66,6 +71,7 @@ impl Harness {
                 let model = std::env::var("AMP_MODE").unwrap_or_else(|_| "deep".to_string());
                 json!({ "model": model })
             }
+            Self::Omp => json!({}),
             Self::Codex => {
                 let mut params = json!({
                     "approvalPolicy": "never",
@@ -81,6 +87,32 @@ impl Harness {
             }
         }
     }
+}
+
+#[test]
+fn fake_omp_assistant_error_fails_the_app_server_turn() {
+    let fake_omp = concat!(
+        "printf '%s\\n' ",
+        "'{\"type\":\"session\",\"version\":3,\"id\":\"omp-session\"}' ",
+        "'{\"type\":\"agent_start\"}' ",
+        "'{\"type\":\"turn_start\"}' ",
+        "'{\"type\":\"message_end\",\"message\":{\"role\":\"assistant\",\"content\":[],\"provider\":\"litellm\",\"model\":\"glm-5.2-fp8\",\"stopReason\":\"error\",\"errorStatus\":401,\"errorMessage\":\"401 LiteLLM Virtual Key expected\"}}' ",
+        "'{\"type\":\"turn_end\"}' ",
+        "'{\"type\":\"agent_end\",\"messages\":[]}'"
+    );
+
+    let run = run_bridge_turn(BridgeTurnConfig {
+        harness: Harness::Omp,
+        command_override: Some(fake_omp.to_string()),
+        prompt: "say hello".to_string(),
+        timeout: Duration::from_secs(10),
+    });
+
+    assert_eq!(run.turn.terminal_status.as_deref(), Some("failed"));
+    assert_eq!(
+        run.turn.terminal_error.as_deref(),
+        Some("401 LiteLLM Virtual Key expected")
+    );
 }
 
 #[test]
@@ -1273,6 +1305,7 @@ impl BridgeProcess {
         for env_key in [
             "CENTAUR_CLAUDE_APP_BRIDGE_COMMAND",
             "CENTAUR_AMP_APP_BRIDGE_COMMAND",
+            "CENTAUR_OMP_APP_BRIDGE_COMMAND",
             "CODEX_MODEL",
             "CODEX_MODEL_PROVIDER",
             "OPENROUTER_MODEL",
@@ -1930,7 +1963,9 @@ fn run_native_anthropic(harness: Harness, prompt: &str, timeout: Duration) -> Na
             ]);
             command
         }
-        Harness::Codex => panic!("native anthropic runner does not support Codex"),
+        Harness::Codex | Harness::Omp => {
+            panic!("native anthropic runner does not support {harness:?}")
+        }
     };
     command
         .stdin(Stdio::piped())

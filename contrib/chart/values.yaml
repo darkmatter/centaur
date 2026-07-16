@@ -360,6 +360,8 @@ agentSandbox:
 apiRs:
   enabled: true
   replicaCount: 1
+  # Recreate prevents concurrent migrations on disposable single-writer DBs.
+  deploymentStrategy: RollingUpdate
   runtimeClassName: ""
   image:
     repository: centaur-api-rs

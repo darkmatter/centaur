@@ -182,6 +182,8 @@ metadata:
 {{ include "centaur.componentLabels" (dict "root" . "component" "api-rs") | nindent 4 }}
 spec:
   replicas: {{ .Values.apiRs.replicaCount }}
+  strategy:
+    type: {{ .Values.apiRs.deploymentStrategy }}
   selector:
     matchLabels:
 {{ include "centaur.componentSelectorLabels" (dict "root" . "component" "api-rs") | nindent 6 }}

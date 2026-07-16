@@ -48,11 +48,27 @@ pub struct WorkspaceDiffRequest {
     pub base_sha: String,
 }
 
+/// SHA-256 attestation of the omp config layers live at capture time,
+/// gathered by trusted exec inside the sandbox. `global` is
+/// /home/agent/.omp/agent/config.yml (installed at boot, overlay-owned when
+/// CENTAUR_OVERLAY_OMP_DIR is set); `project_*` are /home/agent/.omp/
+/// config.yml and settings.json — omp's project layer at its spawn cwd,
+/// which OUTRANKS the global file and is agent-writable. A value of
+/// "absent" means the file did not exist.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct HarnessConfigAttestation {
+    pub global_config_sha256: String,
+    pub project_config_sha256: String,
+    pub project_settings_sha256: String,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct WorkspaceDiffResponse {
     pub base_sha: String,
     pub patch: String,
     pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub harness_config: Option<HarnessConfigAttestation>,
 }
 
 #[derive(Clone, Debug, Serialize)]

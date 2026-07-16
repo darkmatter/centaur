@@ -60,9 +60,10 @@ use crate::{
     types::{
         AppendMessagesRequest, AppendMessagesResponse, CreateSessionRequest, CreateSessionResponse,
         EmitWorkflowEventRequest, EventsQuery, ExecuteSessionRequest, ExecuteSessionResponse,
-        InterruptSessionExecutionRequest, InterruptSessionExecutionResponse, ListWorkflowRunsQuery,
-        OnHarnessConflict, SessionContextResponse, SessionSseEvent, SlackThreadContext,
-        WorkspaceDiffRequest, WorkspaceDiffResponse, stream_error_sse,
+        HarnessConfigAttestation, InterruptSessionExecutionRequest,
+        InterruptSessionExecutionResponse, ListWorkflowRunsQuery, OnHarnessConflict,
+        SessionContextResponse, SessionSseEvent, SlackThreadContext, WorkspaceDiffRequest,
+        WorkspaceDiffResponse, stream_error_sse,
     },
 };
 
@@ -664,10 +665,40 @@ async fn capture_workspace_diff(
         )));
     }
 
+    // Attest the harness config that was live at capture time. The overlay
+    // installs the global omp config at boot, but omp's project settings
+    // layer (<cwd>/.omp, cwd = /home/agent) OUTRANKS it and the workspace is
+    // agent-writable — so record hashes from trusted exec rather than trusting
+    // static lock/overlay consistency. Absent files hash as "absent".
+    let attest_command = vec![
+        "sh".to_owned(),
+        "-c".to_owned(),
+        "for f in /home/agent/.omp/agent/config.yml /home/agent/.omp/config.yml \
+             /home/agent/.omp/settings.json; do \
+           if [ -f \"$f\" ]; then printf '%s ' \"$(sha256sum \"$f\" | cut -d' ' -f1)\"; \
+           else printf 'absent '; fi; \
+         done"
+            .to_owned(),
+    ];
+    let attest = runtime
+        .exec_in_session_sandbox(&thread_key, &attest_command)
+        .await?;
+    let mut hashes = String::from_utf8_lossy(&attest.stdout)
+        .split_whitespace()
+        .map(str::to_owned)
+        .collect::<Vec<_>>()
+        .into_iter();
+    let harness_config = attest.success.then(|| HarnessConfigAttestation {
+        global_config_sha256: hashes.next().unwrap_or_else(|| "absent".to_owned()),
+        project_config_sha256: hashes.next().unwrap_or_else(|| "absent".to_owned()),
+        project_settings_sha256: hashes.next().unwrap_or_else(|| "absent".to_owned()),
+    });
+
     Ok(Json(WorkspaceDiffResponse {
         base_sha: request.base_sha,
         patch: String::from_utf8_lossy(&patch.stdout).into_owned(),
         status: String::from_utf8_lossy(&status.stdout).into_owned(),
+        harness_config,
     }))
 }
 

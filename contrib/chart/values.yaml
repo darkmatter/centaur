@@ -379,6 +379,8 @@ apiRs:
   mcpPublicUrl: ""
   runMigrations: true
   sandboxBackend: agent-k8s
+  # Empty preserves operator-managed principal labels; eval instances may use "all".
+  sandboxDefaultRepoCacheAccess: ""
   sandboxWorkload: codex-app-server
   sandboxReadyTimeoutSecs: 90
   sandboxWarmPoolSize: 3

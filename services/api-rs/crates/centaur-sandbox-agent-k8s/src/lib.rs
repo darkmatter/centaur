@@ -418,10 +418,8 @@ impl SandboxBackend for AgentSandboxBackend {
             stdout.map_err(|error| SandboxError::io_source("read sandbox exec stdout", error))?;
         let stderr =
             stderr.map_err(|error| SandboxError::io_source("read sandbox exec stderr", error))?;
-        let success = status
-            .as_ref()
-            .and_then(|status| status.status.as_deref())
-            == Some("Success");
+        let success =
+            status.as_ref().and_then(|status| status.status.as_deref()) == Some("Success");
 
         Ok(SandboxCommandOutput {
             stdout,

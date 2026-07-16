@@ -59,6 +59,7 @@ pub struct SessionRegistrar {
     client: IronControlClient,
     namespace: String,
     assign_role_ids: Vec<String>,
+    default_labels: BTreeMap<String, String>,
 }
 
 impl SessionRegistrar {
@@ -73,7 +74,13 @@ impl SessionRegistrar {
             client,
             namespace: namespace.into(),
             assign_role_ids,
+            default_labels: BTreeMap::new(),
         }
+    }
+
+    pub fn with_default_labels(mut self, labels: BTreeMap<String, String>) -> Self {
+        self.default_labels = labels;
+        self
     }
 
     /// Upsert the principal for ``thread_key`` using the session metadata the
@@ -113,6 +120,12 @@ impl SessionRegistrar {
             let mut labels = existing.labels;
             labels.extend(input.labels);
             input.labels = labels;
+        }
+        for (key, value) in &self.default_labels {
+            input
+                .labels
+                .entry(key.clone())
+                .or_insert_with(|| value.clone());
         }
         let slack_permission = slack_permission_for_thread(thread_key, &input.labels);
         let should_upsert_slack_permission = !exists
@@ -317,6 +330,20 @@ mod tests {
             &mut channel_labels,
         );
         assert_eq!(channel_labels.get("slack_email"), None);
+    }
+
+    #[test]
+    fn registrar_carries_default_principal_labels() {
+        let labels = BTreeMap::from([("centaur.sandbox_repo_cache".to_owned(), "all".to_owned())]);
+        let registrar = SessionRegistrar::new(
+            IronControlClient::new("http://localhost", "test-key"),
+            "default",
+            Vec::new(),
+        )
+        .with_default_labels(labels.clone());
+
+        assert_eq!(registrar.default_labels, labels);
+    }
     }
 
     #[tokio::test]

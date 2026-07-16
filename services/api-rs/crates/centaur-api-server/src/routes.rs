@@ -3605,6 +3605,7 @@ mod granola_sync_tests {
     }
 }
 
+#[cfg(test)]
 mod workspace_diff_tests {
     use super::*;
 

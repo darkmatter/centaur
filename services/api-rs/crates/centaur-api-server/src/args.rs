@@ -655,6 +655,12 @@ struct SandboxArgs {
     )]
     iron_control_sync_infra_secrets: bool,
     #[arg(
+        long = "session-sandbox-default-repo-cache-access",
+        env = "SESSION_SANDBOX_DEFAULT_REPO_CACHE_ACCESS",
+        default_value = ""
+    )]
+    default_repo_cache_access: String,
+    #[arg(
         long = "workflow-host-sandbox",
         env = "WORKFLOW_HOST_SANDBOX",
         default_value_t = true
@@ -727,8 +733,20 @@ impl SandboxArgs {
         for role_id in &role_ids {
             client.assign_role(&workflow_host.id, role_id).await?;
         }
+        let access = self.default_repo_cache_access.trim().to_ascii_lowercase();
+        if !access.is_empty() && !matches!(access.as_str(), "none" | "public" | "all") {
+            return Err(ServerError::UnsupportedConfig(format!(
+                "SESSION_SANDBOX_DEFAULT_REPO_CACHE_ACCESS must be none, public, all, or empty; got {access:?}"
+            )));
+        }
+        let default_labels = (!access.is_empty())
+            .then(|| BTreeMap::from([("centaur.sandbox_repo_cache".to_owned(), access)]));
+        let mut registrar = SessionRegistrar::new(client, namespace, role_ids);
+        if let Some(labels) = default_labels {
+            registrar = registrar.with_default_labels(labels);
+        }
         Ok(Some(IronControlRuntime {
-            registrar: SessionRegistrar::new(client, namespace, role_ids),
+            registrar,
             warm_pool_bootstrap_principal: bootstrap.id,
             workflow_host_principal: workflow_host.id,
         }))

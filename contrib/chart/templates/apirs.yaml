@@ -178,6 +178,10 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: {{ $apiRsName }}
+{{- if eq .Values.apiRs.deploymentStrategy "Recreate" }}
+  annotations:
+    argocd.argoproj.io/sync-options: Replace=true
+{{- end }}
   labels:
 {{ include "centaur.componentLabels" (dict "root" . "component" "api-rs") | nindent 4 }}
 spec:

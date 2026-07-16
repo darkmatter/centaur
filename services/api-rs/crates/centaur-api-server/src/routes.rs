@@ -557,13 +557,20 @@ async fn execute_session(
 }
 
 const SANDBOX_GITHUB_ROOT: &str = "/home/agent/github";
+/// Writable eval checkouts; `/home/agent/github` is the read-only repo-cache mirror.
+const SANDBOX_WORKSPACE_EVAL_ROOT: &str = "/home/agent/workspace/eval";
 const MAX_WORKSPACE_ARTIFACT_BYTES: usize = 10 * 1024 * 1024;
 
 fn validate_workspace_diff_request(request: &WorkspaceDiffRequest) -> Result<(), ApiError> {
     let path = FsPath::new(&request.repo_path);
-    let relative = path.strip_prefix(SANDBOX_GITHUB_ROOT).map_err(|_| {
-        ApiError::BadRequest(format!("repo_path must be under {SANDBOX_GITHUB_ROOT}"))
-    })?;
+    let relative = path
+        .strip_prefix(SANDBOX_GITHUB_ROOT)
+        .or_else(|_| path.strip_prefix(SANDBOX_WORKSPACE_EVAL_ROOT))
+        .map_err(|_| {
+            ApiError::BadRequest(format!(
+                "repo_path must be under {SANDBOX_GITHUB_ROOT} or {SANDBOX_WORKSPACE_EVAL_ROOT}"
+            ))
+        })?;
     if !path.is_absolute()
         || relative.as_os_str().is_empty()
         || relative
@@ -3621,6 +3628,17 @@ mod workspace_diff_tests {
         assert!(
             validate_workspace_diff_request(&request(
                 "/home/agent/github/darkmatter/eval-sandbox",
+                "0123456789abcdef0123456789abcdef01234567",
+            ))
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn accepts_pinned_repo_under_writable_eval_root() {
+        assert!(
+            validate_workspace_diff_request(&request(
+                "/home/agent/workspace/eval/darkmatter/eval-sandbox",
                 "0123456789abcdef0123456789abcdef01234567",
             ))
             .is_ok()

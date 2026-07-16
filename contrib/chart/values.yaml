@@ -179,6 +179,18 @@ console:
     # host.
     host: ""
     tls: []
+  startupProbe:
+    failureThreshold: 30
+    periodSeconds: 10
+    timeoutSeconds: 5
+  readinessProbe:
+    failureThreshold: 6
+    periodSeconds: 10
+    timeoutSeconds: 5
+  livenessProbe:
+    failureThreshold: 6
+    periodSeconds: 10
+    timeoutSeconds: 5
   resources: {}
   # Solid Queue worker (`bin/jobs`) that runs the console's background jobs —
   # most importantly the broker-credential OAuth refresh loop that mints and
@@ -222,6 +234,13 @@ overlay:
 # runtime. Set a subdir to "" to explicitly disable that surface for a source.
 # Repo visibility defaults to private; set visibility: public only for repos
 # safe to expose to principals with sandbox_repo_cache=public.
+#
+# promptPath (no default) names a repo-relative markdown file (conventionally
+# SYSTEM_PROMPT.md) appended to every sandbox's system prompt from the repos
+# mount (/home/agent/github/<repo>/<promptPath>, via CENTAUR_OVERLAY_PROMPT_FILES).
+# When several sources set promptPath the last existing file wins, and a
+# repo-provided prompt shadows the legacy inline overlay.systemPrompt value.
+# Files missing at runtime are skipped like the other surfaces.
 overlays:
   sources: []
   # - repo: paradigmxyz/centaur
@@ -230,6 +249,7 @@ overlays:
   # - repo: your-org/centaur-overlay
   #   ref: main
   #   visibility: private
+  #   promptPath: SYSTEM_PROMPT.md
   # - repo: your-org/workflows-only
   #   ref: main
   #   visibility: private
@@ -254,12 +274,13 @@ sandbox:
   #                  subscription token (proxy injects the brokered credential).
   codexAuthMode: api_key
   claudeCodeAuthMode: api_key
-  # The deployment's default harness: codex | amp | claudecode. Decides what
-  # warm sandboxes boot (SESSION_SANDBOX_HARNESS) and which harness auth
-  # fragment is required at startup (the other harnesses' fragments are
-  # registered too when available, so per-session --claude/--amp/--codex
-  # overrides keep working credentials). Per-session sandboxes always run
-  # their session's harness via container args; the sandbox image CMD only
+  # The deployment's default harness: codex | amp | claudecode | omp. Decides
+  # what warm sandboxes boot (SESSION_SANDBOX_HARNESS) and which harness auth
+  # fragment is required at startup (engines with no auth-mode source — amp,
+  # omp — require none; the other harnesses' fragments are registered too when
+  # available, so per-session --claude/--amp/--codex/--omp overrides keep
+  # working credentials). Per-session sandboxes always run their session's
+  # harness via container args; the sandbox image CMD only
   # matters for containers started outside api-rs.
   harnessEngine: codex
   # Copied into every sandbox pod. CLAUDE_MODEL / CODEX_MODEL set here (the
@@ -345,6 +366,9 @@ agentSandbox:
 apiRs:
   enabled: true
   replicaCount: 1
+  # Recreate prevents concurrent migrations on disposable single-writer DBs.
+  deploymentStrategy: RollingUpdate
+  runtimeClassName: ""
   image:
     repository: centaur-api-rs
     tag: latest
@@ -469,6 +493,9 @@ slackbotv2:
     tag: latest
     pullPolicy: Always
   userName: centaur
+  # Secret key containing the slackbot state-store DSN. Defaults to the
+  # shared API DATABASE_URL; deployments may provide a scoped TLS policy.
+  databaseUrlSecretKey: DATABASE_URL
   assistantStatus: ""
   # Public/local MCP endpoint shown in MCP SSO setup messages. The default
   # assumes users connect through `kubectl port-forward ... 3000:8080`.
@@ -601,6 +628,14 @@ teamsbot:
 
 postgres:
   enabled: true
+  # Derive per-release DB connection URLs from postgres.auth.* and the
+  # release-prefixed Postgres Service name instead of reading the shared infra
+  # Secret's DATABASE_URL / IRON_CONTROL_DATABASE_URL keys. Required when
+  # several releases share a namespace and each must dial its own bundled
+  # Postgres. The password stays in postgres.auth.existingSecretName/Key: it
+  # reaches containers via a secretKeyRef and kubelet $(VAR) expansion, never
+  # the rendered manifest. Only effective when postgres.enabled is true.
+  deriveDatabaseUrl: false
   image:
     repository: paradedb/paradedb
     tag: 0.23.0-pg16

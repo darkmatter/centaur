@@ -16,6 +16,7 @@
 {{- $sandboxWorkflowDirList := list -}}
 {{- $skillDirs := list -}}
 {{- $publicSkillDirs := list -}}
+{{- $sandboxPromptFileList := list -}}
 {{- range $source := $overlaySources -}}
 {{- $repo := get $source "repo" | default "" -}}
 {{- $visibility := get $source "visibility" | default "private" -}}
@@ -38,6 +39,9 @@
 {{- if eq $visibility "public" -}}
 {{- $publicSkillDirs = append $publicSkillDirs $skillDir -}}
 {{- end -}}
+{{- end -}}
+{{- with (get $source "promptPath") -}}
+{{- $sandboxPromptFileList = append $sandboxPromptFileList (printf "/home/agent/github/%s/%s" $repo .) -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}
@@ -174,10 +178,19 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: {{ $apiRsName }}
+{{- if eq .Values.apiRs.deploymentStrategy "Recreate" }}
+  annotations:
+    argocd.argoproj.io/sync-options: Replace=true
+{{- end }}
   labels:
 {{ include "centaur.componentLabels" (dict "root" . "component" "api-rs") | nindent 4 }}
 spec:
   replicas: {{ .Values.apiRs.replicaCount }}
+  strategy:
+    type: {{ .Values.apiRs.deploymentStrategy }}
+{{- if eq .Values.apiRs.deploymentStrategy "Recreate" }}
+    rollingUpdate: null
+{{- end }}
   selector:
     matchLabels:
 {{ include "centaur.componentSelectorLabels" (dict "root" . "component" "api-rs") | nindent 6 }}
@@ -196,6 +209,9 @@ spec:
       terminationGracePeriodSeconds: {{ .Values.apiRs.terminationGracePeriodSeconds }}
       automountServiceAccountToken: true
       serviceAccountName: {{ $apiRsName }}
+{{- if .Values.apiRs.runtimeClassName }}
+      runtimeClassName: {{ .Values.apiRs.runtimeClassName | quote }}
+{{- end }}
       {{- with .Values.global.imagePullSecrets }}
       imagePullSecrets:
 {{ toYaml . | nindent 8 }}
@@ -205,11 +221,21 @@ spec:
           image: {{ printf "%s:%s" .Values.apiRs.image.repository .Values.apiRs.image.tag | quote }}
           imagePullPolicy: {{ .Values.apiRs.image.pullPolicy }}
           env:
+{{- if include "centaur.derivePostgresUrls" . }}
+            # Derived per-release DB URL (postgres.deriveDatabaseUrl): the
+            # password rides a secretKeyRef declared BEFORE DATABASE_URL —
+            # kubelet $(VAR) expansion only sees earlier entries — and this
+            # explicit entry shadows the envFrom-injected DATABASE_URL key.
+{{ include "centaur.postgresPasswordEnv" . | indent 12 }}
+            - name: DATABASE_URL
+              value: {{ include "centaur.postgresDatabaseUrl" . | quote }}
+{{- else }}
             - name: DATABASE_URL
               valueFrom:
                 secretKeyRef:
                   name: {{ include "centaur.secretEnvName" . }}
                   key: {{ printf "%sDATABASE_URL" .Values.secretManager.envPrefix }}
+{{- end }}
             - name: CENTAUR_JWT_SIGNING_SECRET
               valueFrom:
                 secretKeyRef:
@@ -316,6 +342,10 @@ spec:
 {{- end }}
             - name: SESSION_SANDBOX_K8S_NAMESPACE
               value: {{ .Release.Namespace | quote }}
+{{- if .Values.sandbox.runtimeClassName }}
+            - name: SESSION_SANDBOX_RUNTIME_CLASS_NAME
+              value: {{ .Values.sandbox.runtimeClassName | quote }}
+{{- end }}
             - name: SESSION_SANDBOX_IMAGE
               value: {{ printf "%s:%s" .Values.sandbox.image.repository .Values.sandbox.image.tag | quote }}
             - name: SESSION_SANDBOX_IMAGE_PULL_POLICY
@@ -388,6 +418,9 @@ spec:
 {{- end }}
 {{- if and .Values.repoCache.enabled (gt (len $publicSkillDirs) 0) }}
 {{- $sandboxEnvList = append $sandboxEnvList (dict "name" "CENTAUR_PUBLIC_SKILL_DIRS" "value" (join ":" $publicSkillDirs)) }}
+{{- end }}
+{{- if and .Values.repoCache.enabled (gt (len $sandboxPromptFileList) 0) }}
+{{- $sandboxEnvList = append $sandboxEnvList (dict "name" "CENTAUR_OVERLAY_PROMPT_FILES" "value" (join ":" $sandboxPromptFileList)) }}
 {{- end }}
 {{- range $k, $v := .Values.sandbox.extraEnv }}
 {{- $sandboxEnvList = append $sandboxEnvList (dict "name" $k "value" ($v | toString)) }}

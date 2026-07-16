@@ -263,6 +263,11 @@
     "apiRs": {
       "type": "object",
       "properties": {
+        "runtimeClassName": { "type": "string" },
+        "deploymentStrategy": {
+          "type": "string",
+          "enum": ["RollingUpdate", "Recreate"]
+        },
         "syncInfraSecrets": { "type": "boolean" },
         "mcpPublicUrl": { "type": "string" },
         "sandboxRunningLimit": { "type": "integer", "minimum": 0 },
@@ -359,6 +364,7 @@
       "type": "object",
       "properties": {
         "mcpPublicUrl": { "type": "string" },
+        "databaseUrlSecretKey": { "type": "string", "minLength": 1 },
         "metrics": {
           "type": "object",
           "properties": {
@@ -379,6 +385,7 @@
     "postgres": {
       "type": "object",
       "properties": {
+        "deriveDatabaseUrl": { "type": "boolean" },
         "persistence": {
           "type": "object",
           "properties": {

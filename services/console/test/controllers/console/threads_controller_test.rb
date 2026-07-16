@@ -815,7 +815,7 @@ class Console::ThreadsControllerTest < ActionDispatch::IntegrationTest
       # The model picker is a custom menu (account-dropdown style) posting
       # through a hidden field, not a native select.
       assert_select "input[type=hidden][name=model]", count: 1
-      assert_select "[data-console-model-option][data-value=?]", "amp"
+      assert_select "[data-console-model-option][data-value=?]", "glm-5.2"
       assert_select "select", count: 0
     end
     # Submitting replaces the centered empty state with a full-height,
@@ -1064,20 +1064,18 @@ class Console::ThreadsControllerTest < ActionDispatch::IntegrationTest
     refute_includes requester_context, "Prompted by: Goksu Toprak"
   end
 
-  test "picking Amp starts an amp chat and sends no model" do
+  test "the default pick starts an omp chat on the gateway model" do
     client = RecordingApiClient.new
     with_composer(client: client) do
-      post console_threads_url, params: { prompt: "Reply with PONG.", model: "amp" }
+      post console_threads_url, params: { prompt: "Reply with PONG." }
     end
 
     create = client.calls[0].last
-    assert_equal "amp", create[:harness_type]
-    assert_not create[:metadata].key?(:model)
+    assert_equal "omp", create[:harness_type]
+    assert_equal "litellm/glm-5.2-fp8", create[:metadata][:model]
 
-    execute = client.calls[2].last
-    assert_not execute[:metadata].key?(:model)
-    line = JSON.parse(execute[:input_lines].first)
-    assert_not line.key?("model")
+    line = JSON.parse(client.calls[2].last[:input_lines].first)
+    assert_equal "litellm/glm-5.2-fp8", line["model"]
   end
 
   test "starting a chat with an unknown model is rejected" do
@@ -1091,18 +1089,18 @@ class Console::ThreadsControllerTest < ActionDispatch::IntegrationTest
     assert_match(/Unknown model/, flash[:alert])
   end
 
-  test "a gpt model pick starts a codex chat" do
+  test "a gpt pick starts an omp chat on the provider-prefixed ref" do
     client = RecordingApiClient.new
     with_composer(client: client) do
       post console_threads_url, params: { prompt: "Reply with PONG.", model: "gpt-5.5" }
     end
 
     create = client.calls[0].last
-    assert_equal "codex", create[:harness_type]
-    assert_equal "gpt-5.5", create[:metadata][:model]
+    assert_equal "omp", create[:harness_type]
+    assert_equal "openai-codex/gpt-5.5", create[:metadata][:model]
   end
 
-  test "a codex chat carries the picked reasoning effort" do
+  test "a picked reasoning effort rides the model ref as an omp suffix" do
     client = RecordingApiClient.new
     with_composer(client: client) do
       post console_threads_url,
@@ -1110,26 +1108,25 @@ class Console::ThreadsControllerTest < ActionDispatch::IntegrationTest
     end
 
     execute = client.calls[2].last
-    assert_equal "max", execute[:metadata][:reasoning]
+    assert_equal "openai-codex/gpt-5.6-sol:max", execute[:metadata][:model]
+    assert_not execute[:metadata].key?(:reasoning)
     line = JSON.parse(execute[:input_lines].first)
-    assert_equal "max", line["reasoning"]
+    assert_equal "openai-codex/gpt-5.6-sol:max", line["model"]
+    assert_not line.key?("reasoning")
   end
 
-  test "an effort the model does not offer is dropped" do
+  test "an effort the model does not offer is dropped from the ref" do
     client = RecordingApiClient.new
     with_composer(client: client) do
-      # max is 5.6-only; claude models take no effort at all.
+      # max is 5.6-only; claude entries expose no efforts at all.
       post console_threads_url,
            params: { prompt: "Reply with PONG.", model: "gpt-5.5", effort: "max" }
       post console_threads_url,
            params: { prompt: "Reply with PONG.", model: "claude-opus-4-8", effort: "high" }
     end
 
-    [ 2, 5 ].each do |index|
-      execute = client.calls[index].last
-      assert_not execute[:metadata].key?(:reasoning)
-      assert_not JSON.parse(execute[:input_lines].first).key?("reasoning")
-    end
+    assert_equal "openai-codex/gpt-5.5", client.calls[2].last[:metadata][:model]
+    assert_equal "anthropic/claude-opus-4-8", client.calls[5].last[:metadata][:model]
   end
 
   test "a blank prompt asks for a message" do

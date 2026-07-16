@@ -84,14 +84,14 @@ class Console::ThreadsController < ApplicationController
   # Pseudo thread key that opens a new-chat composer pane in the split view.
   NEW_PANE_KEY = "new".freeze
 
-  # The composer's model selector, in display order. Each entry pins the
-  # harness the choice runs on (wire values match api-rs's HarnessType enum,
-  # serde lowercase); the model ids are the ones the bots' --model flags
-  # expand to (services/slackbotv2/src/overrides.ts). Amp appears as a plain
-  # entry with no model: it picks its own model per turn. `efforts` are the
-  # per-turn reasoning efforts the harness accepts for the model (codex only —
-  # harness-server discards `reasoning` for claude/amp; enum per
-  # crates/harness-server/src/codex.rs, `max` being 5.6-specific).
+  # The composer's model selector, in display order. Every choice runs on the
+  # omp harness — the deployment standard (sandbox.harnessEngine, every
+  # workflow, slackbotv2) — and the pick rides omp's `--model` flag as a
+  # provider-prefixed model ref (harness/omp/config.yml modelRoles shape:
+  # litellm/..., anthropic/..., openai-codex/...), overriding the in-image
+  # default. `efforts` are reasoning efforts appended to the model ref as a
+  # `:effort` suffix (omp's native form, e.g. openai-codex/gpt-5.6-sol:xhigh);
+  # enum per crates/harness-server/src/codex.rs, `max` being 5.6-specific.
   ComposerAgent = Struct.new(:value, :label, :harness, :model, :efforts, keyword_init: true)
   CODEX_EFFORTS = [
     %w[minimal Minimal],
@@ -100,25 +100,25 @@ class Console::ThreadsController < ApplicationController
     %w[high High],
     [ "xhigh", "Extra High" ]
   ].freeze
-  # First entry doubles as the default pick (unless the deploy's default-model
-  # resolution for its harness names another listed model).
+  # First entry doubles as the default pick: the self-hosted gateway model the
+  # deployment runs everywhere else (modelRoles.default).
   COMPOSER_AGENTS = [
+    ComposerAgent.new(value: "glm-5.2", label: "GLM-5.2",
+                      harness: "omp", model: "litellm/glm-5.2-fp8", efforts: []),
     ComposerAgent.new(value: "gpt-5.6-sol", label: "GPT-5.6 Sol",
-                      harness: "codex", model: "gpt-5.6-sol",
+                      harness: "omp", model: "openai-codex/gpt-5.6-sol",
                       efforts: CODEX_EFFORTS + [ %w[max Max] ]),
     ComposerAgent.new(value: "gpt-5.5", label: "GPT-5.5",
-                      harness: "codex", model: "gpt-5.5",
+                      harness: "omp", model: "openai-codex/gpt-5.5",
                       efforts: CODEX_EFFORTS),
     ComposerAgent.new(value: "claude-opus-4-8", label: "Claude Opus 4.8",
-                      harness: "claudecode", model: "claude-opus-4-8", efforts: []),
+                      harness: "omp", model: "anthropic/claude-opus-4-8", efforts: []),
     ComposerAgent.new(value: "claude-sonnet-4-6", label: "Claude Sonnet 4.6",
-                      harness: "claudecode", model: "claude-sonnet-4-6", efforts: []),
+                      harness: "omp", model: "anthropic/claude-sonnet-4-6", efforts: []),
     ComposerAgent.new(value: "claude-haiku-4-5", label: "Claude Haiku 4.5",
-                      harness: "claudecode", model: "claude-haiku-4-5", efforts: []),
+                      harness: "omp", model: "anthropic/claude-haiku-4-5", efforts: []),
     ComposerAgent.new(value: "claude-fable-5", label: "Claude Fable 5",
-                      harness: "claudecode", model: "claude-fable-5", efforts: []),
-    ComposerAgent.new(value: "amp", label: "Amp",
-                      harness: "amp", model: nil, efforts: [])
+                      harness: "omp", model: "anthropic/claude-fable-5", efforts: [])
   ].freeze
 
   helper_method :thread_title,
@@ -303,6 +303,14 @@ class Console::ThreadsController < ApplicationController
     agent.efforts.map(&:first).include?(effort) ? effort : nil
   end
 
+  # The omp model ref for this pick: reasoning effort rides the ref as omp's
+  # native `:effort` suffix (openai-codex/gpt-5.6-sol:max), not a separate
+  # wire field.
+  def composer_model_ref(agent)
+    effort = composer_effort_param(agent)
+    effort.present? ? "#{agent.model}:#{effort}" : agent.model
+  end
+
   def composer_agent_for(raw)
     value = raw.to_s.strip
     value = composer_default_agent_value if value.blank?
@@ -318,12 +326,13 @@ class Console::ThreadsController < ApplicationController
     end
 
     thread_key = "console:#{SecureRandom.uuid}"
+    model_ref = composer_model_ref(agent)
     api_client.create_session(
       thread_key: thread_key,
       harness_type: agent.harness,
-      metadata: console_actor_metadata.merge(agent.model.present? ? { model: agent.model } : {})
+      metadata: console_actor_metadata.merge(model_ref.present? ? { model: model_ref } : {})
     )
-    send_prompt(thread_key, prompt, model: agent.model, effort: composer_effort_param(agent))
+    send_prompt(thread_key, prompt, model: model_ref)
     # A new-chat pane in a split view swaps the sentinel for the created
     # thread so the other panes stay open.
     open_keys = params[:open_threads].to_s.split(",").map(&:strip).reject(&:blank?)
@@ -356,7 +365,7 @@ class Console::ThreadsController < ApplicationController
   # Append persists the turn in conversation history; execute runs it. The
   # shared client_message_id lets api-rs dedupe the copy of the message the
   # harness echoes back.
-  def send_prompt(thread_key, prompt, model: nil, effort: nil)
+  def send_prompt(thread_key, prompt, model: nil)
     message_id = SecureRandom.uuid
 
     api_client.append_session_messages(
@@ -373,7 +382,6 @@ class Console::ThreadsController < ApplicationController
 
     execute_metadata = console_actor_metadata.merge(action: "execute")
     execute_metadata[:model] = model if model.present?
-    execute_metadata[:reasoning] = effort if effort.present?
     api_client.execute_session(
       thread_key: thread_key,
       idempotency_key: SecureRandom.uuid,
@@ -381,18 +389,16 @@ class Console::ThreadsController < ApplicationController
       input_lines: [
         composer_input_line(
           thread_key, prompt,
-          model: model, effort: effort, client_message_id: message_id
+          model: model, client_message_id: message_id
         )
       ]
     )
   end
 
   # One blocks-protocol user line, the shape harness-server parses from
-  # execute's input_lines. `model` is honored by every harness; omitted (e.g.
-  # for Amp) the harness runs its own default. `reasoning` is the per-turn
-  # codex effort; other harnesses discard it, and validation upstream only
-  # accepts it for codex models anyway.
-  def composer_input_line(thread_key, prompt, model:, effort:, client_message_id:)
+  # execute's input_lines. `model` is honored by every harness; omitted, the
+  # harness runs its own default (for omp: harness/omp/config.yml modelRoles).
+  def composer_input_line(thread_key, prompt, model:, client_message_id:)
     line = {
       type: "user",
       thread_key: thread_key,
@@ -407,7 +413,6 @@ class Console::ThreadsController < ApplicationController
       }
     }
     line[:model] = model if model.present?
-    line[:reasoning] = effort if effort.present?
     line.to_json
   end
 
@@ -1369,6 +1374,7 @@ class Console::ThreadsController < ApplicationController
 
   def thread_harness_label(session)
     case session.harness_type.to_s
+    when "omp" then "omp"
     when "codex" then "Codex"
     when "claudecode" then "Claude Code"
     when "amp" then "Amp"

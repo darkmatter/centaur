@@ -760,14 +760,17 @@ class Console::ThreadsControllerTest < ActionDispatch::IntegrationTest
   end
 
   test "sidebar includes public Slack threads only when the deploy setting is enabled" do
+    # Without the synchronized channel catalog the scope deliberately omits
+    # the public-slack clause; skip instead of passing assertion-free (a
+    # zero-assertion run fails minitest, seed-dependently).
+    skip_unless_slack_channel_table
+
     controller = threads_controller_for(users(:member_user))
 
     with_env("CENTAUR_CONSOLE_PUBLIC_SLACK_THREADS_ENABLED" => "true") do
       sql = controller.send(:console_sidebar_visible_thread_scope).to_sql
 
-      if slack_channel_privacy_catalog_available?
-        assert_includes sql, "slack_sync_channels"
-      end
+      assert_includes sql, "slack_sync_channels"
     end
   end
 
@@ -815,7 +818,7 @@ class Console::ThreadsControllerTest < ActionDispatch::IntegrationTest
       # The model picker is a custom menu (account-dropdown style) posting
       # through a hidden field, not a native select.
       assert_select "input[type=hidden][name=model]", count: 1
-      assert_select "[data-console-model-option][data-value=?]", "amp"
+      assert_select "[data-console-model-option][data-value=?]", "glm-5.2"
       assert_select "select", count: 0
     end
     # Submitting replaces the centered empty state with a full-height,
@@ -1001,12 +1004,12 @@ class Console::ThreadsControllerTest < ActionDispatch::IntegrationTest
 
     create = client.calls[0].last
     assert create[:thread_key].start_with?("console:"), "expected a console:-namespaced thread key"
-    assert_equal "claudecode", create[:harness_type]
+    assert_equal "omp", create[:harness_type]
     assert_equal "console", create[:metadata][:platform]
     assert_equal "console", create[:metadata][:source]
     assert_equal @operator.email, create[:metadata][:actor_email]
     assert_equal "@ada", create[:metadata][:github_handle]
-    assert_equal "claude-opus-4-8", create[:metadata][:model]
+    assert_equal "anthropic/claude-opus-4-8", create[:metadata][:model]
 
     append = client.calls[1].last
     assert_equal create[:thread_key], append[:thread_key]
@@ -1019,12 +1022,12 @@ class Console::ThreadsControllerTest < ActionDispatch::IntegrationTest
     execute = client.calls[2].last
     assert_equal create[:thread_key], execute[:thread_key]
     assert execute[:idempotency_key].present?
-    assert_equal "claude-opus-4-8", execute[:metadata][:model]
+    assert_equal "anthropic/claude-opus-4-8", execute[:metadata][:model]
     assert_equal "@ada", execute[:metadata][:github_handle]
     line = JSON.parse(execute[:input_lines].first)
     assert_equal "user", line["type"]
     assert_equal create[:thread_key], line["thread_key"]
-    assert_equal "claude-opus-4-8", line["model"]
+    assert_equal "anthropic/claude-opus-4-8", line["model"]
     assert_equal message[:client_message_id], line["client_user_message_id"]
     requester_context = line.dig("message", "content", 0, "text")
     assert_includes requester_context, "# Requester Context"
@@ -1064,20 +1067,18 @@ class Console::ThreadsControllerTest < ActionDispatch::IntegrationTest
     refute_includes requester_context, "Prompted by: Goksu Toprak"
   end
 
-  test "picking Amp starts an amp chat and sends no model" do
+  test "the default pick starts an omp chat on the gateway model" do
     client = RecordingApiClient.new
     with_composer(client: client) do
-      post console_threads_url, params: { prompt: "Reply with PONG.", model: "amp" }
+      post console_threads_url, params: { prompt: "Reply with PONG." }
     end
 
     create = client.calls[0].last
-    assert_equal "amp", create[:harness_type]
-    assert_not create[:metadata].key?(:model)
+    assert_equal "omp", create[:harness_type]
+    assert_equal "litellm/glm-5.2-fp8", create[:metadata][:model]
 
-    execute = client.calls[2].last
-    assert_not execute[:metadata].key?(:model)
-    line = JSON.parse(execute[:input_lines].first)
-    assert_not line.key?("model")
+    line = JSON.parse(client.calls[2].last[:input_lines].first)
+    assert_equal "litellm/glm-5.2-fp8", line["model"]
   end
 
   test "starting a chat with an unknown model is rejected" do
@@ -1091,18 +1092,18 @@ class Console::ThreadsControllerTest < ActionDispatch::IntegrationTest
     assert_match(/Unknown model/, flash[:alert])
   end
 
-  test "a gpt model pick starts a codex chat" do
+  test "a gpt pick starts an omp chat on the provider-prefixed ref" do
     client = RecordingApiClient.new
     with_composer(client: client) do
       post console_threads_url, params: { prompt: "Reply with PONG.", model: "gpt-5.5" }
     end
 
     create = client.calls[0].last
-    assert_equal "codex", create[:harness_type]
-    assert_equal "gpt-5.5", create[:metadata][:model]
+    assert_equal "omp", create[:harness_type]
+    assert_equal "openai-codex/gpt-5.5", create[:metadata][:model]
   end
 
-  test "a codex chat carries the picked reasoning effort" do
+  test "a picked reasoning effort rides the model ref as an omp suffix" do
     client = RecordingApiClient.new
     with_composer(client: client) do
       post console_threads_url,
@@ -1110,26 +1111,25 @@ class Console::ThreadsControllerTest < ActionDispatch::IntegrationTest
     end
 
     execute = client.calls[2].last
-    assert_equal "max", execute[:metadata][:reasoning]
+    assert_equal "openai-codex/gpt-5.6-sol:max", execute[:metadata][:model]
+    assert_not execute[:metadata].key?(:reasoning)
     line = JSON.parse(execute[:input_lines].first)
-    assert_equal "max", line["reasoning"]
+    assert_equal "openai-codex/gpt-5.6-sol:max", line["model"]
+    assert_not line.key?("reasoning")
   end
 
-  test "an effort the model does not offer is dropped" do
+  test "an effort the model does not offer is dropped from the ref" do
     client = RecordingApiClient.new
     with_composer(client: client) do
-      # max is 5.6-only; claude models take no effort at all.
+      # max is 5.6-only; claude entries expose no efforts at all.
       post console_threads_url,
            params: { prompt: "Reply with PONG.", model: "gpt-5.5", effort: "max" }
       post console_threads_url,
            params: { prompt: "Reply with PONG.", model: "claude-opus-4-8", effort: "high" }
     end
 
-    [ 2, 5 ].each do |index|
-      execute = client.calls[index].last
-      assert_not execute[:metadata].key?(:reasoning)
-      assert_not JSON.parse(execute[:input_lines].first).key?("reasoning")
-    end
+    assert_equal "openai-codex/gpt-5.5", client.calls[2].last[:metadata][:model]
+    assert_equal "anthropic/claude-opus-4-8", client.calls[5].last[:metadata][:model]
   end
 
   test "a blank prompt asks for a message" do

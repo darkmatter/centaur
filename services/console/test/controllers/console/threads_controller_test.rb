@@ -61,8 +61,11 @@ class Console::ThreadsControllerTest < ActionDispatch::IntegrationTest
     assert_redirected_to console_threads_path(thread: thread_key)
   end
 
-  test "direct selected thread renders chat not found when the current user did not start it" do
+  test "direct selected thread renders chat not found when a non-admin did not start it" do
     skip_unless_session_table
+
+    delete logout_url
+    post login_url, params: { email: users(:member_user).email, password: "password123456" }
 
     thread_key = "slack:C0DIRECT:#{SecureRandom.hex(6)}"
     insert_slack_session(
@@ -71,9 +74,10 @@ class Console::ThreadsControllerTest < ActionDispatch::IntegrationTest
       slack_user_name: "someone-else"
     )
 
-    # @operator has no Slack OAuth credential matching U_OTHER, so this thread is
-    # outside their owner scope. A direct ?thread= link must render a 404 chat
-    # not found state instead of surfacing it or falling back to another chat.
+    # member_user has no Slack OAuth credential matching U_OTHER, so this
+    # thread is outside their owner scope. A direct ?thread= link must render
+    # a 404 chat not found state instead of surfacing it or falling back to
+    # another chat. (Admins bypass the owner scope — covered below.)
     get console_threads_url(thread: thread_key)
 
     assert_response :not_found
@@ -86,6 +90,37 @@ class Console::ThreadsControllerTest < ActionDispatch::IntegrationTest
     assert_select ".console-thread-list a.console-thread-link-active[href=?]",
                   console_threads_path(thread: thread_key),
                   count: 0
+  end
+
+  test "an admin sees unowned threads, including ownerless workflow threads" do
+    skip_unless_session_table
+
+    workflow_key = "workflow:ci-fixer:scan"
+    insert_session(workflow_key, { source: "ci_fixer", stage: "scan" }.to_json)
+    slack_key = "slack:C0DIRECT:#{SecureRandom.hex(6)}"
+    insert_slack_session(slack_key, slack_user_id: "U_OTHER", slack_user_name: "someone-else")
+
+    # workflow:* threads carry no owner metadata, so without the admin bypass
+    # they are invisible to every user; another user's Slack thread is
+    # likewise outside the admin's own scope.
+    get console_threads_url(thread: workflow_key)
+    assert_response :ok
+
+    get console_threads_url(thread: slack_key)
+    assert_response :ok
+  end
+
+  test "a non-admin cannot see ownerless workflow threads" do
+    skip_unless_session_table
+
+    delete logout_url
+    post login_url, params: { email: users(:member_user).email, password: "password123456" }
+
+    workflow_key = "workflow:ci-fixer:fix"
+    insert_session(workflow_key, { source: "ci_fixer", stage: "fix" }.to_json)
+
+    get console_threads_url(thread: workflow_key)
+    assert_response :not_found
   end
 
   test "direct link to a nonexistent thread renders chat not found" do

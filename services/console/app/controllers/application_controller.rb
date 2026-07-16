@@ -202,6 +202,10 @@ class ApplicationController < ActionController::Base
   end
 
   def console_sidebar_visible_thread_scope
+    # Mirrors Console::ThreadsController#visible_thread_scope: admins see all
+    # threads, including unowned system threads (workflow:*, executor jobs).
+    return CentaurSession.all if acting_admin?
+
     slack_owners = console_sidebar_slack_thread_owners_for_current_user
     conditions = [
       console_sidebar_console_thread_owner_sql,

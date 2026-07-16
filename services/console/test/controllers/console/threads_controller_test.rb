@@ -760,14 +760,17 @@ class Console::ThreadsControllerTest < ActionDispatch::IntegrationTest
   end
 
   test "sidebar includes public Slack threads only when the deploy setting is enabled" do
+    # Without the synchronized channel catalog the scope deliberately omits
+    # the public-slack clause; skip instead of passing assertion-free (a
+    # zero-assertion run fails minitest, seed-dependently).
+    skip_unless_slack_channel_table
+
     controller = threads_controller_for(users(:member_user))
 
     with_env("CENTAUR_CONSOLE_PUBLIC_SLACK_THREADS_ENABLED" => "true") do
       sql = controller.send(:console_sidebar_visible_thread_scope).to_sql
 
-      if slack_channel_privacy_catalog_available?
-        assert_includes sql, "slack_sync_channels"
-      end
+      assert_includes sql, "slack_sync_channels"
     end
   end
 

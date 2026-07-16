@@ -51,6 +51,12 @@ spec:
             - containerPort: 5432
               name: postgres
               protocol: TCP
+          startupProbe:
+            failureThreshold: 60
+            periodSeconds: 2
+            tcpSocket:
+              port: 5432
+            timeoutSeconds: 1
           readinessProbe:
             failureThreshold: 3
             periodSeconds: 10

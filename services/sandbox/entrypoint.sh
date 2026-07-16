@@ -359,13 +359,21 @@ EOF
 # Baked harness/omp/{config.yml,models.yml} land in $PI_CODING_AGENT_DIR with
 # the LiteLLM base URL substituted (OMP_LITELLM_BASE_URL, default the public
 # darkmatter gateway) so in-cluster deployments can point at a local Service.
+# When CENTAUR_OVERLAY_OMP_DIR names a directory (an overlay checkout, e.g.
+# /home/agent/github/darkmatter/centaur-overlay/harness/omp), files there win
+# over the baked copies per file — the overlay owns agent behavior, including
+# model-role routing, and evals must exercise the candidate's config.
 export PI_CODING_AGENT_DIR="${PI_CODING_AGENT_DIR:-$HOME_DIR/.omp/agent}"
 mkdir -p "$PI_CODING_AGENT_DIR"
 OMP_LITELLM_BASE_URL="${OMP_LITELLM_BASE_URL:-https://litellm.drkmttr.dev/v1}"
 for omp_cfg in config.yml models.yml; do
-    if [ -f "$HARNESS_CONFIG_DIR/omp/$omp_cfg" ]; then
+    src="$HARNESS_CONFIG_DIR/omp/$omp_cfg"
+    if [ -n "${CENTAUR_OVERLAY_OMP_DIR:-}" ] && [ -f "$CENTAUR_OVERLAY_OMP_DIR/$omp_cfg" ]; then
+        src="$CENTAUR_OVERLAY_OMP_DIR/$omp_cfg"
+    fi
+    if [ -f "$src" ]; then
         sed "s|__OMP_LITELLM_BASE_URL__|$OMP_LITELLM_BASE_URL|g" \
-            "$HARNESS_CONFIG_DIR/omp/$omp_cfg" > "$PI_CODING_AGENT_DIR/$omp_cfg"
+            "$src" > "$PI_CODING_AGENT_DIR/$omp_cfg"
     fi
 done
 

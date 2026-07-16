@@ -344,7 +344,6 @@ mod tests {
 
         assert_eq!(registrar.default_labels, labels);
     }
-    }
 
     #[tokio::test]
     async fn register_session_seeds_roles_for_new_principal() {

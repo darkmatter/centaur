@@ -669,30 +669,30 @@ async fn capture_workspace_diff(
     // installs the global omp config at boot, but omp's project settings
     // layer (<cwd>/.omp, cwd = /home/agent) OUTRANKS it and the workspace is
     // agent-writable — so record hashes from trusted exec rather than trusting
-    // static lock/overlay consistency. Absent files hash as "absent".
+    // static lock/overlay consistency. Output is keyed (`name=value`), never
+    // positional: an empty substitution (file readable-bit races, sha256sum
+    // failure) must not shift later fields onto earlier names. Absent files
+    // report "absent"; hash failures report "error".
     let attest_command = vec![
         "sh".to_owned(),
         "-c".to_owned(),
-        "for f in /home/agent/.omp/agent/config.yml /home/agent/.omp/config.yml \
-             /home/agent/.omp/settings.json; do \
-           if [ -f \"$f\" ]; then printf '%s ' \"$(sha256sum \"$f\" | cut -d' ' -f1)\"; \
-           else printf 'absent '; fi; \
-         done"
+        "attest() { \
+           if [ -f \"$2\" ]; then \
+             h=$(sha256sum \"$2\" 2>/dev/null | cut -d' ' -f1); \
+             [ -n \"$h\" ] || h=error; \
+           else h=absent; fi; \
+           printf '%s=%s\\n' \"$1\" \"$h\"; \
+         }; \
+         attest global /home/agent/.omp/agent/config.yml; \
+         attest project_config /home/agent/.omp/config.yml; \
+         attest project_settings /home/agent/.omp/settings.json"
             .to_owned(),
     ];
     let attest = runtime
         .exec_in_session_sandbox(&thread_key, &attest_command)
         .await?;
-    let mut hashes = String::from_utf8_lossy(&attest.stdout)
-        .split_whitespace()
-        .map(str::to_owned)
-        .collect::<Vec<_>>()
-        .into_iter();
-    let harness_config = attest.success.then(|| HarnessConfigAttestation {
-        global_config_sha256: hashes.next().unwrap_or_else(|| "absent".to_owned()),
-        project_config_sha256: hashes.next().unwrap_or_else(|| "absent".to_owned()),
-        project_settings_sha256: hashes.next().unwrap_or_else(|| "absent".to_owned()),
-    });
+    let harness_config =
+        parse_harness_config_attestation(&String::from_utf8_lossy(&attest.stdout), attest.success);
 
     Ok(Json(WorkspaceDiffResponse {
         base_sha: request.base_sha,
@@ -700,6 +700,32 @@ async fn capture_workspace_diff(
         status: String::from_utf8_lossy(&status.stdout).into_owned(),
         harness_config,
     }))
+}
+
+/// Parse the keyed attest output. Any missing or empty field reads as
+/// "error" — never silently absent — so a truncated or shifted exec output
+/// can only make the suite's integrity gate MORE suspicious, not less.
+fn parse_harness_config_attestation(
+    stdout: &str,
+    success: bool,
+) -> Option<HarnessConfigAttestation> {
+    if !success {
+        return None;
+    }
+    let keyed = |key: &str| -> String {
+        stdout
+            .lines()
+            .find_map(|line| line.strip_prefix(&format!("{key}=")))
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("error")
+            .to_owned()
+    };
+    Some(HarnessConfigAttestation {
+        global_config_sha256: keyed("global"),
+        project_config_sha256: keyed("project_config"),
+        project_settings_sha256: keyed("project_settings"),
+    })
 }
 
 async fn interrupt_session_execution(
@@ -3690,6 +3716,28 @@ mod workspace_diff_tests {
             .unwrap_err();
             assert!(matches!(error, ApiError::BadRequest(_)), "{path}: {error}");
         }
+    }
+
+    #[test]
+    fn attestation_parses_keyed_fields_and_never_shifts() {
+        let parsed = parse_harness_config_attestation(
+            "global=abc123\nproject_config=absent\nproject_settings=absent\n",
+            true,
+        )
+        .unwrap();
+        assert_eq!(parsed.global_config_sha256, "abc123");
+        assert_eq!(parsed.project_config_sha256, "absent");
+        assert_eq!(parsed.project_settings_sha256, "absent");
+
+        // An empty value or a missing line reads as "error" — a degraded
+        // exec must make the integrity gate more suspicious, never less.
+        let degraded =
+            parse_harness_config_attestation("global=\nproject_settings=absent\n", true).unwrap();
+        assert_eq!(degraded.global_config_sha256, "error");
+        assert_eq!(degraded.project_config_sha256, "error");
+        assert_eq!(degraded.project_settings_sha256, "absent");
+
+        assert!(parse_harness_config_attestation("global=abc\n", false).is_none());
     }
 
     #[test]

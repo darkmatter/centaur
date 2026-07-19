@@ -17,6 +17,10 @@ providers:
     models:
       - id: glm-5.2-fp8
         name: GLM 5.2 fp8 (darkmatter gateway)
+        # The vLLM deployment exposes native GLM tool calls through its glm47
+        # parser. Without this override, LiteLLM discovery marks the model as
+        # tool-less and omp auto-selects its less reliable in-band GLM dialect.
+        supportsTools: true
         reasoning: true
         contextWindow: 1048576
         maxTokens: 131072

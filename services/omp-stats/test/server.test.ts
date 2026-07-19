@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 
 import { loadConfig } from "../src/config.ts";
 import { createHandler } from "../src/server.ts";
+import { createSource, syncOnce } from "../src/sync.ts";
 import { sessionJsonl, testConfig } from "./fixtures.ts";
 import { writeCorpusTar } from "./fixtures.ts";
 
@@ -100,17 +101,26 @@ describe("createHandler /export/:key", () => {
     expect(res.status).toBe(404);
   });
 
+  test("returns 400 for a malformed encoded key", async () => {
+    const cfg = testConfig();
+    const handler = createHandler(cfg, { upstream: "http://127.0.0.1:1" });
+    const res = await handler(new Request("http://localhost/export/T%ZZ"));
+    expect(res.status).toBe(400);
+  });
+
   test("serves rendered transcript HTML for a known corpus", async () => {
     const cfg = testConfig();
     const SESSION_ID = "019f0000-0000-7000-8000-00000000000c";
     const jsonlName = `2026-01-01T00-00-00-000Z_${SESSION_ID}.jsonl`;
-    await writeCorpusTar(cfg.transcriptsDir!, "k1", { files: { [jsonlName]: sessionJsonl(SESSION_ID) } });
+    await writeCorpusTar(cfg.transcriptsDir!, "T%3A1234", {
+      files: { [jsonlName]: sessionJsonl(SESSION_ID) },
+    });
 
-    const { syncOnce } = await import("../src/sync.ts");
-    await syncOnce(cfg, (await import("../src/sync.ts")).createSource(cfg)!, { notify: false });
+    await syncOnce(cfg, createSource(cfg)!, { notify: false });
 
     const handler = createHandler(cfg, { upstream: "http://127.0.0.1:1" });
-    const res = await handler(new Request("http://localhost/export/k1"));
+    // api-rs/Axum decodes the `%3A` path escape before forwarding to this app.
+    const res = await handler(new Request("http://localhost/export/T:1234"));
     expect(res.status).toBe(200);
     expect(res.headers.get("content-type")).toContain("text/html");
     expect((await res.text()).toLowerCase()).toContain("<!doctype html>");

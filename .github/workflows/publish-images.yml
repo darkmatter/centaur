@@ -53,7 +53,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        service: [api-rs, slackbotv2, linearbot, discordbot, githubbot, teamsbot, agent, iron-proxy, console]
+        service: [api-rs, slackbotv2, linearbot, discordbot, githubbot, teamsbot, agent, iron-proxy, console, omp-stats]
         platform: ${{ github.event_name == 'push' && fromJSON('["linux/amd64", "linux/arm64"]') || fromJSON('["linux/amd64"]') }}
         include:
           - service: api-rs
@@ -100,6 +100,11 @@ jobs:
             image: centaur-console
             context: services/console
             dockerfile: services/console/Dockerfile
+            target: ""
+          - service: omp-stats
+            image: centaur-omp-stats
+            context: services/omp-stats
+            dockerfile: services/omp-stats/Dockerfile
             target: ""
 
     steps:
@@ -181,6 +186,7 @@ jobs:
           - image: centaur-agent
           - image: centaur-iron-proxy
           - image: centaur-console
+          - image: centaur-omp-stats
           - image: centaur-discordbot
           - image: centaur-githubbot
           - image: centaur-teamsbot

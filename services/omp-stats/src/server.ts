@@ -1,5 +1,6 @@
 import type { Config } from "./config.ts";
 import { renderExport } from "./export.ts";
+import { decodeThreadKey, encodeThreadKey } from "./encoding.ts";
 
 // Hop-by-hop headers must not be forwarded in either direction (RFC 9110
 // §7.6.1). `host` is recomputed by fetch; `accept-encoding` is dropped so the
@@ -83,7 +84,6 @@ async function proxyToStats(req: Request, url: URL, upstream: string): Promise<R
   }
   return new Response(res.body, { status: res.status, headers });
 }
-
 /** Build the wrapper's fetch handler; `upstream` overrides target for tests. */
 export function createHandler(
   cfg: Config,
@@ -97,7 +97,16 @@ export function createHandler(
     }
     const exportMatch = /^\/export\/([^/]+)$/.exec(url.pathname);
     if (req.method === "GET" && exportMatch) {
-      const result = await renderExport(cfg, exportMatch[1]!);
+      // Axum decodes percent escapes in `/apps/:name/*path` before forwarding.
+      // Canonicalize both decoded (`T:1234`) and encoded (`T%3A1234`) forms to
+      // the object-storage directory spelling used by transcript sync.
+      let threadKey: string;
+      try {
+        threadKey = encodeThreadKey(decodeThreadKey(exportMatch[1]!));
+      } catch {
+        return new Response("invalid thread key\n", { status: 400 });
+      }
+      const result = await renderExport(cfg, threadKey);
       switch (result.kind) {
         case "ok":
           return new Response(Bun.file(result.htmlPath), {

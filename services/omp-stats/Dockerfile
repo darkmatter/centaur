@@ -7,20 +7,16 @@
 FROM oven/bun:1.3.14-slim AS base
 
 ARG OMP_VERSION=16.3.5
-# omp's npm bin shim is a `#!/usr/bin/env bun` script, so bun must be on PATH
-# before omp can be verified. The base image ships bun; the version pin below
-# only guards against drift if the base is rebased.
-ARG BUN_VERSION=bun-v1.3.14
+ENV BUN_INSTALL=/opt/bun-global
+ENV PATH="${BUN_INSTALL}/bin:${PATH}"
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends tar ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
 
-# omp ships its own bundled runtime; install it globally the same way the
-# sandbox image does (npm -g @oh-my-pi/pi-coding-agent). Verification runs
-# after bun is already on PATH from the base image.
-RUN npm install -g --prefer-online --force \
-      "@oh-my-pi/pi-coding-agent@${OMP_VERSION}" \
+# omp ships its own bundled runtime. Keep the global package and executable
+# outside /root so the non-root runtime user can execute it.
+RUN bun install --global "@oh-my-pi/pi-coding-agent@${OMP_VERSION}" \
     && omp --version | grep -F "${OMP_VERSION}"
 
 # Non-root user; the app never needs root and the PVC is owned by this uid.
@@ -29,7 +25,7 @@ USER app
 WORKDIR /home/app
 
 # App code. COPY --chown keeps the uid right without a chown layer.
-COPY --chown=1001:1001 package.json bun.lockb ./
+COPY --chown=1001:1001 package.json bun.lock ./
 COPY --chown=1001:1001 src/ src/
 
 RUN bun install --prod --frozen-lockfile

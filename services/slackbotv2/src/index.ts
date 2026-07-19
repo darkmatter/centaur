@@ -558,6 +558,7 @@ export async function handleCollabCommand(
     })
     return true
 }
+}
 export async function handleExportCommand(
   thread: Thread<SlackbotV2ThreadState>,
   message: ChatMessage,

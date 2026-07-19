@@ -1,10 +1,7 @@
-import { createSlackbotV2, type SlackbotV2Options } from './index'
-import { parseChannelDefaults } from './channel-defaults'
+import { createSlackbotV2 } from './index'
+import { buildSlackbotV2Options } from './options'
 
 const port = numberEnv('PORT', 3002)
-const apiUrl = stringEnv('CENTAUR_API_URL', 'http://127.0.0.1:8080')
-const botToken = requiredEnv('SLACK_BOT_TOKEN')
-const signingSecret = requiredEnv('SLACK_SIGNING_SECRET')
 
 // Default to info: the chat adapter logs entire raw Slack webhook bodies at
 // debug, and JSON-serializing those multi-hundred-KB payloads on the hot path
@@ -25,42 +22,7 @@ const consoleLogger = {
   child: () => consoleLogger
 }
 
-const options: SlackbotV2Options = {
-  apiUrl,
-  apiKey: optionalEnv('SLACKBOT_API_KEY'),
-  assistantStatus: optionalEnv('SLACKBOTV2_ASSISTANT_STATUS'),
-  activitySummaryStatusEnabled: booleanEnv('SLACKBOTV2_ACTIVITY_SUMMARY_STATUS_ENABLED', false),
-  botToken,
-  botUserId: optionalEnv('SLACK_BOT_USER_ID'),
-  channelDefaults: parseChannelDefaults(optionalEnv('SLACKBOTV2_CHANNEL_DEFAULTS'), reason =>
-    consoleLogger.warn('slackbotv2 SLACKBOTV2_CHANNEL_DEFAULTS', { reason })
-  ),
-  consolePublicUrl: optionalEnv('CENTAUR_CONSOLE_PUBLIC_URL'),
-  defaultHarnessType: optionalEnv('SLACKBOTV2_DEFAULT_HARNESS'),
-  // Same env vars deployers use to override the sandbox harness model
-  // (sandbox.extraEnv); the chart mirrors them here so displayed defaults
-  // track the deployment instead of the baked harness config.
-  harnessDefaultModels: {
-    ...(optionalEnv('CLAUDE_MODEL') ? { claudecode: optionalEnv('CLAUDE_MODEL')! } : {}),
-    ...(optionalEnv('CODEX_MODEL') ? { codex: optionalEnv('CODEX_MODEL')! } : {})
-  },
-  idleTimeoutMs: optionalNumberEnv('SESSION_IDLE_TIMEOUT_MS'),
-  maxDurationMs: optionalNumberEnv('SESSION_MAX_DURATION_MS'),
-  postgresUrl:
-    optionalEnv('SLACKBOTV2_DATABASE_URL') ??
-    optionalEnv('DATABASE_URL') ??
-    optionalEnv('POSTGRES_URL'),
-  renderRecoveryMaxObligationAgeMs: optionalNumberEnv(
-    'SLACKBOTV2_RENDER_RECOVERY_MAX_OBLIGATION_AGE_MS'
-  ),
-  sessionApiTimeoutMs: optionalNumberEnv('SLACKBOTV2_SESSION_API_TIMEOUT_MS'),
-  signingSecret,
-  slackApiUrl: optionalEnv('SLACK_API_URL'),
-  slackApiTimeoutMs: optionalNumberEnv('SLACKBOTV2_SLACK_API_TIMEOUT_MS'),
-  stateKeyPrefix: optionalEnv('SLACKBOTV2_STATE_KEY_PREFIX'),
-  userName: stringEnv('SLACKBOTV2_USER_NAME', 'centaur'),
-  logger: consoleLogger
-}
+const options = buildSlackbotV2Options(process.env, consoleLogger)
 
 const { app } = createSlackbotV2(options)
 const server = Bun.serve({
@@ -76,7 +38,7 @@ console.log(
     service: 'slackbotv2',
     activity_summary_status_enabled: options.activitySummaryStatusEnabled,
     port: server.port,
-    api_url: apiUrl
+    api_url: options.apiUrl
   })
 )
 
@@ -85,33 +47,9 @@ function optionalEnv(name: string): string | undefined {
   return value ? value : undefined
 }
 
-function requiredEnv(name: string): string {
-  const value = optionalEnv(name)
-  if (!value) {
-    throw new Error(`${name} is required`)
-  }
-  return value
-}
-
-function stringEnv(name: string, fallback: string): string {
-  return optionalEnv(name) ?? fallback
-}
-
 function numberEnv(name: string, fallback: number): number {
-  return optionalNumberEnv(name) ?? fallback
-}
-
-function booleanEnv(name: string, fallback: boolean): boolean {
   const value = optionalEnv(name)
   if (!value) return fallback
-  if (['1', 'true', 'yes', 'on'].includes(value.toLowerCase())) return true
-  if (['0', 'false', 'no', 'off'].includes(value.toLowerCase())) return false
-  throw new Error(`${name} must be a boolean`)
-}
-
-function optionalNumberEnv(name: string): number | undefined {
-  const value = optionalEnv(name)
-  if (!value) return undefined
   const parsed = Number.parseInt(value, 10)
   if (!Number.isFinite(parsed) || parsed <= 0) {
     throw new Error(`${name} must be a positive integer`)

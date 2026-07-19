@@ -985,7 +985,9 @@ fn resumed_thread_state<H: HarnessServer>(
             .clone()
             .unwrap_or_else(|| harness.default_model_provider().to_string()),
         service_tier: params.service_tier.clone().flatten(),
-        harness_session_id: Some(params.thread_id.clone()),
+        harness_session_id: harness
+            .resume_session_id(&params.thread_id)
+            .or_else(|| Some(params.thread_id.clone())),
         completed_turns: Vec::new(),
         process: None,
         thread_started_sent: false,
@@ -1277,6 +1279,9 @@ fn run_harness_turn<H: HarnessServer, W: Write>(
                     }
                     append_usage_span_output(&normalized, &mut usage_span_output);
                     if let Some(session_id) = normalized.session_id() {
+                        if state.harness_session_id.as_deref() != Some(session_id) {
+                            harness.record_session_id(&state.id, session_id);
+                        }
                         last_session_id = Some(session_id.to_string());
                         state.harness_session_id = Some(session_id.to_string());
                     }

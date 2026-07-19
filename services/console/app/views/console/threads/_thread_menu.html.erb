@@ -1,3 +1,17 @@
+<% if omp_stats_app_enabled? %>
+  <%# Deep link into the omp-stats app's transcript export, via the app-plane
+      proxy. The thread key is percent-encoded by hand (not via a route
+      helper) because it can carry path-significant bytes; the proxy forwards
+      the encoded form to the app untouched. %>
+  <a href="/console/apps/omp-stats/export/<%= ERB::Util.url_encode(session.thread_key) %>"
+     target="_blank"
+     rel="noopener"
+     class="console-thread-share-trigger"
+     aria-label="Export HTML"
+     title="Export HTML">
+    <%= console_icon("arrow-down-tray", classes: "size-4") %>
+  </a>
+<% end %>
 <div class="console-thread-share-wrap"
      data-controller="thread-share"
      data-thread-share-url-value="<%= console_threads_url(thread: session.thread_key) %>">

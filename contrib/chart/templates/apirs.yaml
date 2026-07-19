@@ -500,6 +500,25 @@ spec:
               value: {{ .Values.toolServer.githubToken.secretKey | quote }}
 {{- end }}
 {{- end }}
+{{- if .Values.apps }}
+{{- $appsRegistry := list }}
+{{- range $app := .Values.apps }}
+{{- $appServiceName := include "centaur.componentName" (dict "root" $ "component" (printf "app-%s" $app.name)) }}
+{{- $appsRegistry = append $appsRegistry (dict "name" $app.name "url" (printf "http://%s:80" $appServiceName)) }}
+{{- end }}
+            # Static app-plane registry for the /apps/{name}/* proxy: app name
+            # -> in-cluster Service URL (see templates/apps.yaml). Chart config
+            # until the DB-backed registry lands.
+            - name: CENTAUR_APPS_JSON
+              value: {{ toJson $appsRegistry | quote }}
+{{- end }}
+{{- if .Values.apiRs.transcripts.bucket }}
+            # omp transcript corpus sync target; an unset bucket disables sync.
+            - name: CENTAUR_TRANSCRIPTS_BUCKET
+              value: {{ .Values.apiRs.transcripts.bucket | quote }}
+            - name: CENTAUR_TRANSCRIPTS_PREFIX
+              value: {{ .Values.apiRs.transcripts.prefix | default "transcripts" | quote }}
+{{- end }}
 {{- range $name, $value := .Values.apiRs.extraEnv }}
 {{- if ne $name "SESSION_SANDBOX_PASSTHROUGH_ENV" }}
             - name: {{ $name }}

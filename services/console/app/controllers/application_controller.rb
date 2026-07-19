@@ -10,7 +10,7 @@ class ApplicationController < ActionController::Base
   rescue_from ActiveRecord::RecordNotFound, with: :render_not_found
 
   helper_method :current_user, :acting_admin?, :descoped?, :password_login_enabled?
-  helper_method :public_base_url, :oauth_callback_redirect_uri
+  helper_method :public_base_url, :oauth_callback_redirect_uri, :omp_stats_app_enabled?
 
   # The public origin the console is reached at. Derived from the request by
   # default; CENTAUR_CONSOLE_PUBLIC_URL overrides it for deployments behind
@@ -82,6 +82,14 @@ class ApplicationController < ActionController::Base
 
   def password_login_enabled?
     ConsoleAuth.password_login_enabled?
+  end
+
+  # Whether the omp-stats app links (the Usage nav entry and the per-thread
+  # transcript export) are shown. The app is optional infrastructure behind
+  # the app-plane proxy, so the links default off; deployments that run it
+  # set CENTAUR_CONSOLE_OMP_STATS_ENABLED=true.
+  def omp_stats_app_enabled?
+    ActiveModel::Type::Boolean.new.cast(ConsoleEnv.fetch("OMP_STATS_ENABLED", false))
   end
 
   # The permission check console gates use instead of current_user.admin?: a

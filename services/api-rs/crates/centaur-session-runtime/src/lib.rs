@@ -3,6 +3,7 @@ mod title_generator;
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
+    env,
     future::Future,
     sync::{
         Arc,
@@ -11,6 +12,12 @@ use std::{
     time::{Duration, SystemTime},
 };
 
+use aws_config::BehaviorVersion;
+use aws_sdk_s3::{
+    Client as S3Client,
+    config::{Builder as S3ConfigBuilder, Region},
+    primitives::ByteStream,
+};
 use centaur_iron_control::SessionRegistrar;
 use centaur_sandbox_core::{
     Mount, RepoCacheAccess, SandboxBackend, SandboxCapabilities as BackendSandboxCapabilities,
@@ -484,7 +491,6 @@ struct ToolHostResponse {
 }
 
 /// Shared handles threaded through background session tasks (stdout pump,
-/// terminal-output recording, max-duration failure, idle pause).
 #[derive(Clone)]
 struct RuntimeContext {
     store: PgSessionStore,
@@ -6973,6 +6979,12 @@ async fn record_terminal_output(
             (execution, "failed")
         }
     };
+    spawn_transcript_archive(
+        ctx.clone(),
+        thread_key.clone(),
+        execution_id.to_owned(),
+        sandbox_id.to_owned(),
+    );
     ctx.execution_spans.lock().await.remove(execution_id);
     ctx.session_ownership_generations.remove(execution_id);
     // A one-shot session ownership lease (OMP only) is released now that the
@@ -7016,6 +7028,224 @@ async fn record_terminal_output(
         );
     }
     Ok(())
+}
+
+const TRANSCRIPTS_BUCKET_ENV: &str = "CENTAUR_TRANSCRIPTS_BUCKET";
+const TRANSCRIPTS_PREFIX_ENV: &str = "CENTAUR_TRANSCRIPTS_PREFIX";
+const TRANSCRIPTS_DEFAULT_PREFIX: &str = "transcripts";
+/// Per-thread corpus tarball cap; oversized corpora are skipped, not truncated.
+const TRANSCRIPT_ARCHIVE_MAX_BYTES: usize = 256 * 1024 * 1024;
+const SESSION_TRANSCRIPT_ARCHIVED_EVENT: &str = "session.transcript_archived";
+
+struct TranscriptArchiveConfig {
+    bucket: String,
+    prefix: String,
+    region: Option<String>,
+    endpoint: Option<String>,
+}
+
+impl TranscriptArchiveConfig {
+    /// `None` when no transcripts bucket is configured (archival disabled).
+    /// Region/endpoint reuse the S3 configuration surface already used for
+    /// archive imports so one object-store setup covers both.
+    fn from_env() -> Option<Self> {
+        let bucket = env::var(TRANSCRIPTS_BUCKET_ENV).ok()?.trim().to_owned();
+        if bucket.is_empty() {
+            return None;
+        }
+        let prefix = env::var(TRANSCRIPTS_PREFIX_ENV)
+            .ok()
+            .map(|value| value.trim_matches('/').to_owned())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| TRANSCRIPTS_DEFAULT_PREFIX.to_owned());
+        Some(Self {
+            bucket,
+            prefix,
+            region: transcript_non_empty_env("SLACK_ARCHIVE_UPLOAD_REGION"),
+            endpoint: transcript_non_empty_env("SLACK_ARCHIVE_UPLOAD_ENDPOINT"),
+        })
+    }
+}
+
+fn transcript_non_empty_env(name: &str) -> Option<String> {
+    env::var(name)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+/// Percent-encodes a thread key into a single S3 key segment: bytes in
+/// `[A-Za-z0-9._~-]` pass through, everything else becomes `%XX` (uppercase).
+/// Consumers decode with plain percent-decoding, so this must stay in lockstep
+/// with the app-plane contract.
+fn encode_thread_key_segment(thread_key: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut encoded = String::with_capacity(thread_key.len());
+    for byte in thread_key.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'.' | b'_' | b'~' | b'-' => {
+                encoded.push(byte as char);
+            }
+            _ => {
+                encoded.push('%');
+                encoded.push(HEX[usize::from(byte >> 4)] as char);
+                encoded.push(HEX[usize::from(byte & 0x0f)] as char);
+            }
+        }
+    }
+    encoded
+}
+
+fn bounded_archive_pipeline(producer: &str, max_bytes: usize) -> String {
+    format!(
+        "set -o pipefail; {{ {producer}; }} | head -c {cap}",
+        cap = max_bytes + 1
+    )
+}
+
+fn omp_transcript_archive_command(max_bytes: usize) -> [String; 3] {
+    let producer =
+        "tar -C \"${OMP_SESSION_DIR:-$HOME/.omp-harness-sessions}\" -czf - . 2>/dev/null";
+    [
+        "bash".to_owned(),
+        "-lc".to_owned(),
+        bounded_archive_pipeline(producer, max_bytes),
+    ]
+}
+
+/// Best-effort omp transcript archival at execution end. Detached so it can
+/// never affect execution outcome or latency; every failure is warn-only.
+fn spawn_transcript_archive(
+    ctx: RuntimeContext,
+    thread_key: ThreadKey,
+    execution_id: String,
+    sandbox_id: String,
+) {
+    let Some(config) = TranscriptArchiveConfig::from_env() else {
+        return;
+    };
+    tokio::spawn(async move {
+        if let Err(error) =
+            archive_omp_transcripts(&ctx, &thread_key, &execution_id, &sandbox_id, &config).await
+        {
+            warn!(
+                component = COMPONENT_SESSION_RUNTIME,
+                event = "session_transcript_archive_failed",
+                thread_key = %thread_key,
+                execution_id,
+                sandbox_id,
+                error,
+                "failed to archive omp transcript corpus"
+            );
+        }
+    });
+}
+
+async fn archive_omp_transcripts(
+    ctx: &RuntimeContext,
+    thread_key: &ThreadKey,
+    execution_id: &str,
+    sandbox_id: &str,
+    config: &TranscriptArchiveConfig,
+) -> Result<(), String> {
+    let session = ctx
+        .store
+        .get_session(thread_key)
+        .await
+        .map_err(|error| format!("failed to load session: {error}"))?;
+    if session.harness_type != HarnessType::Omp {
+        return Ok(());
+    }
+    // Same env fallback as the harness launcher: OMP_SESSION_DIR when the
+    // sandbox persists sessions, else the harness default directory.
+    //
+    // head terminates tar after MAX+1 bytes. The oversized branch must run
+    // before the status check because pipefail reports tar's expected SIGPIPE
+    // as a failure; shorter output still requires a successful tar status.
+    let command = omp_transcript_archive_command(TRANSCRIPT_ARCHIVE_MAX_BYTES);
+    let output = ctx
+        .manager
+        .exec(&SandboxId::new(sandbox_id), &command)
+        .await
+        .map_err(|error| format!("sandbox exec failed: {error}"))?;
+    // MAX+1 distinguishes an archive exactly at the limit from an oversized
+    // one; the latter is skipped cleanly rather than uploaded truncated.
+    if output.stdout.len() > TRANSCRIPT_ARCHIVE_MAX_BYTES {
+        debug!(
+            component = COMPONENT_SESSION_RUNTIME,
+            event = "session_transcript_archive_oversized",
+            thread_key = %thread_key,
+            execution_id,
+            sandbox_id,
+            "omp transcript corpus exceeded the {} byte cap; skipping archive",
+            TRANSCRIPT_ARCHIVE_MAX_BYTES
+        );
+        return Ok(());
+    }
+    if !output.success {
+        return Err(format!(
+            "corpus tar exited unsuccessfully: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    if output.stdout.is_empty() {
+        debug!(
+            component = COMPONENT_SESSION_RUNTIME,
+            event = "session_transcript_archive_empty",
+            thread_key = %thread_key,
+            execution_id,
+            sandbox_id,
+            "omp session directory produced no corpus; skipping archive"
+        );
+        return Ok(());
+    }
+    let object_key = format!(
+        "{}/{}/corpus.tar.gz",
+        config.prefix,
+        encode_thread_key_segment(thread_key.as_str())
+    );
+    let size_bytes = output.stdout.len();
+    let client = transcript_s3_client(config).await;
+    client
+        .put_object()
+        .bucket(&config.bucket)
+        .key(&object_key)
+        .content_type("application/gzip")
+        .body(ByteStream::from(output.stdout))
+        .send()
+        .await
+        .map_err(|error| format!("s3 put failed: {error}"))?;
+    ctx.store
+        .append_event(
+            thread_key,
+            Some(execution_id),
+            SESSION_TRANSCRIPT_ARCHIVED_EVENT,
+            json!({
+                "execution_id": execution_id,
+                "thread_key": thread_key.as_str(),
+                "object_key": object_key,
+                "size_bytes": size_bytes,
+            }),
+        )
+        .await
+        .map_err(|error| format!("failed to record archive event: {error}"))?;
+    Ok(())
+}
+
+async fn transcript_s3_client(config: &TranscriptArchiveConfig) -> S3Client {
+    let mut loader = aws_config::defaults(BehaviorVersion::latest());
+    if let Some(region) = &config.region {
+        loader = loader.region(Region::new(region.clone()));
+    }
+    if let Some(endpoint) = &config.endpoint {
+        loader = loader.endpoint_url(endpoint);
+    }
+    let shared_config = loader.load().await;
+    let mut builder = S3ConfigBuilder::from(&shared_config);
+    if config.endpoint.is_some() {
+        builder = builder.force_path_style(true);
+    }
+    S3Client::from_conf(builder.build())
 }
 
 fn spawn_max_duration_failure(
@@ -9506,6 +9736,112 @@ mod tests {
     use centaur_session_core::SessionStatus;
     use serde_json::json;
     use time::OffsetDateTime;
+
+    #[test]
+    fn transcript_thread_key_encoding_matches_contract() {
+        assert_eq!(
+            encode_thread_key_segment("slack:T1:C2:123.456"),
+            "slack%3AT1%3AC2%3A123.456"
+        );
+    }
+
+    #[test]
+    fn transcript_thread_key_encoding_keeps_unreserved_bytes() {
+        assert_eq!(encode_thread_key_segment("AZaz09._~-"), "AZaz09._~-");
+    }
+
+    #[test]
+    fn transcript_thread_key_encoding_uses_uppercase_percent_hex() {
+        assert_eq!(encode_thread_key_segment("a b/c%"), "a%20b%2Fc%25");
+        assert_eq!(encode_thread_key_segment("é"), "%C3%A9");
+        assert_eq!(encode_thread_key_segment(""), "");
+    }
+
+    #[test]
+    fn omp_transcript_archive_command_caps_oversized_output_at_max_plus_one() {
+        let max_bytes = 1024;
+        let root = std::env::temp_dir().join(format!(
+            "centaur-omp-archive-{}-{}",
+            std::process::id(),
+            OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+
+        // Deterministic, incompressible-enough payload: the gzip stream is
+        // larger than max_bytes, so the command must emit exactly MAX+1.
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let payload = (0..64 * 1024)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state as u8
+            })
+            .collect::<Vec<_>>();
+        std::fs::write(root.join("corpus.jsonl"), payload).unwrap();
+
+        let command = omp_transcript_archive_command(max_bytes);
+        let output = std::process::Command::new(&command[0])
+            .args(&command[1..])
+            .env("OMP_SESSION_DIR", &root)
+            .output()
+            .unwrap();
+        assert_eq!(output.stdout.len(), max_bytes + 1);
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn bounded_archive_pipeline_terminates_oversized_producer_early() {
+        let max_bytes = 1024;
+        let root = std::env::temp_dir().join(format!(
+            "centaur-bounded-producer-{}-{}",
+            std::process::id(),
+            OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let completed = root.join("producer-completed");
+        let command = [
+            "bash".to_owned(),
+            "-lc".to_owned(),
+            bounded_archive_pipeline(
+                "dd if=/dev/zero bs=1024 count=65536 2>/dev/null && : > \"$PRODUCER_COMPLETED\"",
+                max_bytes,
+            ),
+        ];
+
+        let output = std::process::Command::new(&command[0])
+            .args(&command[1..])
+            .env("PRODUCER_COMPLETED", &completed)
+            .output()
+            .unwrap();
+
+        assert_eq!(output.stdout.len(), max_bytes + 1);
+        assert!(
+            !completed.exists(),
+            "producer consumed all input instead of stopping after MAX+1 bytes"
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn omp_transcript_archive_command_preserves_tar_failure() {
+        let max_bytes = 1024;
+        let missing = std::env::temp_dir().join(format!(
+            "centaur-omp-archive-missing-{}-{}",
+            std::process::id(),
+            OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        let command = omp_transcript_archive_command(max_bytes);
+        let output = std::process::Command::new(&command[0])
+            .args(&command[1..])
+            .env("OMP_SESSION_DIR", missing)
+            .output()
+            .unwrap();
+
+        assert!(!output.status.success());
+    }
 
     #[test]
     fn sandbox_repo_cache_label_controls_access() {

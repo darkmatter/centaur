@@ -66,6 +66,11 @@ jobs:
       - name: Install yq
         uses: mikefarah/yq@5a7e72a743649b1b3a47d1a1d8214f3453173c51 # v4
 
+      - name: Run chart regression tests
+        run: |
+          bash contrib/chart/test-app-pod-security-context.sh
+          bash contrib/chart/test-slackbot-database-secret-key.sh
+
       - name: Validate chart version bump
         run: |
           set -e

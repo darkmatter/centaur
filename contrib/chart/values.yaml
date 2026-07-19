@@ -506,6 +506,11 @@ apps: []
 #   image: centaur-omp-stats:latest
 #   imagePullPolicy: Always
 #   port: 8080
+#   # Optional pod-level security context. Persistent images that run
+#   # non-root commonly need fsGroup so the mounted volume is writable.
+#   podSecurityContext:
+#     fsGroup: 1001
+#     fsGroupChangePolicy: OnRootMismatch
 #   # Extra container env, verbatim (name/value or valueFrom entries).
 #   env: []
 #   persistence:

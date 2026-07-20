@@ -1,0 +1,21 @@
+{
+  "name": "centaur-collab-relay",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Native OMP collab relay + web client image — serves the upstream collab-web WebSocket relay and static browser client over one port.",
+  "scripts": {
+    "dev": "bun --hot --watch src/server.ts",
+    "start": "bun src/server.ts",
+    "test": "bun test test",
+    "check:types": "bun tsgo --project tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@oh-my-pi/pi-wire": "17.0.5"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.3.13",
+    "@typescript/native-preview": "^7.0.0-dev.20260512.1",
+    "typescript": "^6.0.3"
+  }
+}

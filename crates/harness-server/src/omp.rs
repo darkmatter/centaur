@@ -403,7 +403,7 @@ fn normalized_stop_reason(reason: &str) -> String {
     .to_string()
 }
 
-fn omp_session_dir() -> PathBuf {
+pub(crate) fn omp_session_dir() -> PathBuf {
     env::var_os("OMP_SESSION_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| {

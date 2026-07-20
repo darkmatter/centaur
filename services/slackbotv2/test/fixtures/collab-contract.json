@@ -1,0 +1,128 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Centaur native OMP collaboration room control contract",
+  "description": "Canonical contract shared between the Slack ingress (slackbotv2) and the api-rs room lifecycle implementation (centaur-3w2.6). The resident OMP host (centaur-3w2.5) uses camelCase at the RPC boundary and normalizes to this snake_case API shape.",
+  "routes": {
+    "start": {
+      "method": "POST",
+      "path": "/api/session/{thread_key}/collab/start",
+      "auth": "authorization: Bearer ${SLACKBOT_API_KEY}",
+      "content_type": "application/json",
+      "request": {
+        "type": "object",
+        "properties": {
+          "relay_url": { "type": "string", "optional": true },
+          "display_name": { "type": "string", "optional": true }
+        },
+        "additionalProperties": false
+      },
+      "response": {
+        "type": "object",
+        "required": ["ok", "thread_key", "room"],
+        "properties": {
+          "ok": { "type": "boolean", "const": true },
+          "thread_key": { "type": "string" },
+          "room": { "$ref": "#/roomState" }
+        }
+      },
+      "idempotent": true,
+      "idempotent_note": "If already active, returns existing room without re-creating"
+    },
+    "status": {
+      "method": "GET",
+      "path": "/api/session/{thread_key}/collab/status",
+      "auth": "authorization: Bearer ${SLACKBOT_API_KEY}",
+      "request": null,
+      "response": {
+        "type": "object",
+        "required": ["ok", "thread_key", "room"],
+        "properties": {
+          "ok": { "type": "boolean", "const": true },
+          "thread_key": { "type": "string" },
+          "room": {
+            "oneOf": [
+              { "$ref": "#/roomState" },
+              { "type": "null" }
+            ]
+          }
+        }
+      },
+      "null_room_note": "room is null when no live room — ingress posts 'No active collaboration room.'"
+    },
+    "stop": {
+      "method": "POST",
+      "path": "/api/session/{thread_key}/collab/stop",
+      "auth": "authorization: Bearer ${SLACKBOT_API_KEY}",
+      "content_type": "application/json",
+      "request": {
+        "type": "object",
+        "properties": {
+          "reason": { "type": "string", "optional": true }
+        },
+        "additionalProperties": false
+      },
+      "response": {
+        "type": "object",
+        "required": ["ok", "thread_key", "stopped"],
+        "properties": {
+          "ok": { "type": "boolean", "const": true },
+          "thread_key": { "type": "string" },
+          "stopped": { "type": "boolean" }
+        }
+      },
+      "idempotent": true,
+      "idempotent_note": "stopped=false means there was no room to stop (idempotent success)"
+    }
+  },
+  "roomState": {
+    "type": "object",
+    "required": ["active", "participants"],
+    "properties": {
+      "active": { "type": "boolean" },
+      "join_url": { "type": "string", "optional": true, "description": "Full omp join-capable tailnet URL from the resident host. Ingress forwards verbatim — never synthesizes the relay prefix." },
+      "view_url": { "type": "string", "optional": true },
+      "web_url": { "type": "string", "optional": true },
+      "participants": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "required": ["name", "role"],
+          "properties": {
+            "name": { "type": "string" },
+            "role": { "type": "string", "enum": ["host", "guest"] },
+            "read_only": { "type": "boolean", "optional": true }
+          }
+        }
+      }
+    }
+  },
+  "errors": {
+    "409": {
+      "description": "Ownership conflict — a resident host holds the session and blocks start",
+      "body": { "ok": false, "error": "string" }
+    },
+    "400": {
+      "description": "Terminal/archived session",
+      "body": { "ok": false, "error": "string" }
+    },
+    "standard": "Standard ApiError JSON for other failures"
+  },
+  "ingress_rules": {
+    "join_command": "omp join '<join_url>'",
+    "posix_escaping": "Embedded single quotes in join_url replaced with the four-character sequence '\\'' (close quote, backslash-escaped quote, reopen quote)",
+    "no_synthesis": "Ingress never spawns OMP or synthesizes the tailnet relay prefix — join_url comes verbatim from the resident host",
+    "no_raw_control_url": "No raw full-control URL or browser link is posted — only the omp join command",
+    "no_agent_turn": "Stop, status, and failures all short-circuit before normal agent execution",
+    "exactly_one_command": "Start posts exactly one copyable shell command"
+  },
+  "sample_output": {
+    "start_normal": "omp join 'https://relay.tailnet.test/r/room-abc.aGVsbG8='",
+    "start_with_embedded_quotes": "omp join 'https://relay.test/r/x'\\''y'\\''z'",
+    "status_active": "omp join 'https://relay.tailnet.test/r/room-abc.aGVsbG8='",
+    "status_inactive": "No active collaboration room.",
+    "stop_closed": "Collaboration room closed.",
+    "stop_idempotent": "No active collaboration room to close.",
+    "malformed": "Unknown /collab arguments: `frobnicate`. Usage: `/collab` (start), `/collab status`, or `/collab stop`.",
+    "failure": "Collaboration command failed: ..."
+  }
+}

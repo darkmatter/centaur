@@ -361,7 +361,7 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
   return { app, chat }
 }
 
-async function handleSlackMessageHandoff(
+export async function handleSlackMessageHandoff(
   thread: Thread<SlackbotV2ThreadState>,
   message: ChatMessage,
   input: {
@@ -488,6 +488,10 @@ export async function handleCollabCommand(
     subcommand: parsed.subcommand,
     trigger
   })
+  // Clear any initial "Thinking…" status set by the handoff before this
+  // command was recognised. Like the stop command, /collab short-circuits
+  // without an agent turn — leaving the thinking indicator up would hang.
+  await setAssistantStatus(thread, '', options, trace)
   try {
     if (hasMalformedCollabArgs(parsed)) {
       await thread.post(

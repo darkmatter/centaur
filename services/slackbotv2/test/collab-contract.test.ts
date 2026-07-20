@@ -102,18 +102,18 @@ const STOP_OK: SlackbotV2StopCollabResponse = {
 
 describe('collab contract fixture — route paths', () => {
   test('start route matches contract', () => {
-    expect(contract.routes.start.method).toBe('POST')
-    expect(contract.routes.start.path).toBe('/api/session/{thread_key}/collab/start')
+    expect(contract.routes.start!.method).toBe('POST')
+    expect(contract.routes.start!.path).toBe('/api/session/{thread_key}/collab/start')
   })
 
   test('status route matches contract', () => {
-    expect(contract.routes.status.method).toBe('GET')
-    expect(contract.routes.status.path).toBe('/api/session/{thread_key}/collab/status')
+    expect(contract.routes.status!.method).toBe('GET')
+    expect(contract.routes.status!.path).toBe('/api/session/{thread_key}/collab/status')
   })
 
   test('stop route matches contract', () => {
-    expect(contract.routes.stop.method).toBe('POST')
-    expect(contract.routes.stop.path).toBe('/api/session/{thread_key}/collab/stop')
+    expect(contract.routes.stop!.method).toBe('POST')
+    expect(contract.routes.stop!.path).toBe('/api/session/{thread_key}/collab/stop')
   })
 })
 
@@ -133,7 +133,7 @@ describe('collab contract — room state fields are snake_case', () => {
     }
     expect(participant.items.properties).toHaveProperty('name')
     expect(participant.items.properties).toHaveProperty('role')
-    expect(participant.items.properties.role.enum).toEqual(['host', 'guest'])
+    expect(participant.items.properties.role!.enum).toEqual(['host', 'guest'])
   })
 
   test('TS type SlackbotV2CollabRoomState matches fixture fields', () => {
@@ -161,21 +161,21 @@ describe('collab contract — room state fields are snake_case', () => {
 
 describe('collab contract — response shapes', () => {
   test('start response has ok, thread_key, room (non-null)', () => {
-    const props = contract.routes.start.response.properties
+    const props = contract.routes.start!.response.properties
     expect(props).toHaveProperty('ok')
     expect(props).toHaveProperty('thread_key')
     expect(props).toHaveProperty('room')
   })
 
   test('status response has ok, thread_key, room (nullable)', () => {
-    const props = contract.routes.status.response.properties
+    const props = contract.routes.status!.response.properties
     expect(props).toHaveProperty('ok')
     expect(props).toHaveProperty('thread_key')
     expect(props).toHaveProperty('room')
   })
 
   test('stop response has ok, thread_key, stopped', () => {
-    const props = contract.routes.stop.response.properties
+    const props = contract.routes.stop!.response.properties
     expect(props).toHaveProperty('ok')
     expect(props).toHaveProperty('thread_key')
     expect(props).toHaveProperty('stopped')
@@ -220,7 +220,7 @@ describe('collab contract — ingress rules', () => {
     const rendered = renderCollabJoinCommand(JOIN_URL)
     expect(rendered).toBe(`omp join '${JOIN_URL}'`)
     // Matches the contract's sample output for start_normal.
-    expect(rendered).toBe(contract.sample_output.start_normal)
+    expect(rendered).toBe(contract.sample_output.start_normal!)
   })
 
   test('posix_escaping rule matches the four-char sequence', () => {
@@ -229,7 +229,7 @@ describe('collab contract — ingress rules', () => {
     expect(posixSingleQuoteEscape("a'b")).toBe("a'\\''b")
     // Sample output with embedded quotes.
     const rendered = renderCollabJoinCommand("https://relay.test/r/x'y'z")
-    expect(rendered).toBe(contract.sample_output.start_with_embedded_quotes)
+    expect(rendered).toBe(contract.sample_output.start_with_embedded_quotes!)
   })
 
   test('no_synthesis rule is stated', () => {

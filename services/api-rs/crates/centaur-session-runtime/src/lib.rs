@@ -27,8 +27,8 @@ use centaur_session_core::{
     SessionMessageInput, ThreadKey,
 };
 use centaur_session_sqlx::{
-    PgSessionStore, SandboxCapacityCandidate, SessionEventListener, SessionStoreError,
-    default_metadata,
+    PgSessionStore, SandboxCapacityCandidate, SessionEventListener, SessionOwnerMode,
+    SessionStoreError, default_metadata,
 };
 use centaur_telemetry::{
     export_thread_trace_root_span, record_sandbox_warm_pool_claim,
@@ -86,6 +86,7 @@ type SandboxSpecFactory = Arc<
 >;
 type SessionInputSink = FramedWrite<SandboxWrite, LinesCodec>;
 type ExecutionSpanRegistry = Arc<Mutex<HashMap<String, Span>>>;
+type SessionOwnershipGenerationRegistry = Arc<DashMap<String, i64>>;
 type SessionPipeMap = Arc<DashMap<String, SessionPipe>>;
 type SessionPipeOpenLocks = Arc<DashMap<String, Arc<Mutex<()>>>>;
 type ToolHostCallLocks = Arc<DashMap<String, Arc<Mutex<()>>>>;
@@ -102,6 +103,7 @@ pub struct SessionRuntime {
     sandbox_pipe_open_locks: SessionPipeOpenLocks,
     tool_host_call_locks: ToolHostCallLocks,
     execution_spans: ExecutionSpanRegistry,
+    session_ownership_generations: SessionOwnershipGenerationRegistry,
     iron_control: Option<SessionRegistrar>,
     warm_pool: Option<Arc<WarmPoolManager>>,
     personas: Option<Arc<PersonaRegistry>>,
@@ -405,6 +407,7 @@ struct RuntimeContext {
     manager: Arc<SandboxManager>,
     sandbox_pipes: SessionPipeMap,
     execution_spans: ExecutionSpanRegistry,
+    session_ownership_generations: SessionOwnershipGenerationRegistry,
     stdout_owner_id: String,
 }
 
@@ -796,6 +799,7 @@ impl SessionRuntime {
             sandbox_runtime,
             sandbox_pipes: Arc::new(DashMap::new()),
             sandbox_pipe_open_locks: Arc::new(DashMap::new()),
+            session_ownership_generations: Arc::new(DashMap::new()),
             tool_host_call_locks: Arc::new(DashMap::new()),
             execution_spans: Arc::new(Mutex::new(HashMap::new())),
             iron_control: None,
@@ -915,6 +919,7 @@ impl SessionRuntime {
             manager: self.sandbox_runtime.manager.clone(),
             sandbox_pipes: self.sandbox_pipes.clone(),
             execution_spans: self.execution_spans.clone(),
+            session_ownership_generations: self.session_ownership_generations.clone(),
             stdout_owner_id: self.stdout_owner_id.clone(),
         }
     }
@@ -1196,6 +1201,36 @@ impl SessionRuntime {
             spawn_stdout_owner_renewer(self.context(), execution_id.to_owned());
         }
         Ok(claimed)
+    }
+
+    /// Acquires a one-shot session ownership lease for an OMP session before a
+    /// normal execution starts. A resident collaboration host holding the
+    /// session blocks this acquisition; the caller surfaces the conflict.
+    /// Non-OMP harnesses are unaffected — they skip the boundary entirely.
+    async fn acquire_oneshot_session_ownership(
+        &self,
+        thread_key: &ThreadKey,
+        harness_type: &HarnessType,
+    ) -> Result<Option<i64>, SessionRuntimeError> {
+        if !matches!(harness_type, HarnessType::Omp) {
+            return Ok(None);
+        }
+        let ownership = self
+            .store
+            .acquire_session_ownership(thread_key, &self.stdout_owner_id, SessionOwnerMode::Oneshot)
+            .await?;
+        if !ownership.acquired {
+            let mode = match ownership.mode {
+                SessionOwnerMode::Resident => "resident",
+                SessionOwnerMode::Oneshot => "oneshot",
+            };
+            return Err(SessionRuntimeError::SessionOwned {
+                thread_key: thread_key.as_str().to_owned(),
+                owner_id: ownership.owner_id,
+                mode,
+            });
+        }
+        Ok(Some(ownership.generation))
     }
 
     /// Attach an iron-control registrar so each new session upserts its
@@ -1841,13 +1876,38 @@ impl SessionRuntime {
             validate_input_lines(&input_lines)?;
             let (idle_timeout, max_duration) = duration_options(idle_timeout_ms, max_duration_ms)?;
 
+            // Resolve an exact idempotent retry before ownership acquisition.
+            // This lets a caller attach to its existing execution while a
+            // resident owner holds the session, without creating a competing
+            // one-shot execution.
+            if let Some(idempotency_key) = idempotency_key.as_deref()
+                && let Some(existing) = self
+                    .store
+                    .execution_for_idempotency_key(thread_key, idempotency_key)
+                    .await?
+            {
+                span.record("centaur.execution_id", existing.execution_id.as_str());
+                span.record("execution_id", existing.execution_id.as_str());
+                return Ok(existing);
+            }
+
+            // For OMP sessions, acquire a one-shot session ownership lease
+            // before creating the execution. A resident collaboration host
+            // holding the session blocks this acquisition; the caller surfaces
+            // the conflict. Non-OMP harnesses skip the boundary entirely.
+            let ownership_generation = self
+                .acquire_oneshot_session_ownership(thread_key, &session.harness_type)
+                .await?;
+            let mut execution_metadata =
+                execution_metadata(metadata, idle_timeout_ms, max_duration_ms);
+            if let Some(generation) = ownership_generation
+                && let Value::Object(object) = &mut execution_metadata
+            {
+                object.insert("_session_owner_generation".to_owned(), json!(generation));
+            }
             let execution = self
                 .store
-                .create_execution(
-                    thread_key,
-                    idempotency_key.as_deref(),
-                    execution_metadata(metadata, idle_timeout_ms, max_duration_ms),
-                )
+                .create_execution(thread_key, idempotency_key.as_deref(), execution_metadata)
                 .await?;
             span.record(
                 "centaur.execution_id",
@@ -1863,6 +1923,10 @@ impl SessionRuntime {
                     status = %execution.execution.status,
                     "returning existing execution"
                 );
+                let _ = self
+                    .store
+                    .release_session_ownership(thread_key, &self.stdout_owner_id)
+                    .await;
                 return Ok(execution.execution);
             }
             let claim = self
@@ -1885,7 +1949,15 @@ impl SessionRuntime {
                     status = %execution.status,
                     "execution was already claimed or terminal"
                 );
+                let _ = self
+                    .store
+                    .release_session_ownership(thread_key, &self.stdout_owner_id)
+                    .await;
                 return Ok(execution);
+            }
+            if let Some(generation) = ownership_generation {
+                self.session_ownership_generations
+                    .insert(execution.execution_id.clone(), generation);
             }
             if let Err(error) = self.claim_stdout_owner(&execution.execution_id).await {
                 self.record_execution_failure(thread_key, &execution.execution_id, &error)
@@ -2021,6 +2093,15 @@ impl SessionRuntime {
                 %error,
                 "session execution failed"
             );
+            // Release any one-shot session ownership lease acquired for this
+            // attempt (OMP only). The record_execution_failure path inside the
+            // async block already releases for executions that reached the
+            // stdout-owner stage; this covers the create_execution failure
+            // path where no execution row exists to fail.
+            let _ = self
+                .store
+                .release_session_ownership(thread_key, &self.stdout_owner_id)
+                .await;
         }
         result
     }
@@ -2032,6 +2113,7 @@ impl SessionRuntime {
         error: &SessionRuntimeError,
     ) {
         self.execution_spans.lock().await.remove(execution_id);
+        self.session_ownership_generations.remove(execution_id);
         let error_message = error.to_string();
         let execution = match self
             .store
@@ -2067,6 +2149,12 @@ impl SessionRuntime {
             Some(runtime_error_failure_class(error)),
         )
         .await;
+        // Release the one-shot session ownership lease (OMP only) so a resident
+        // host can reclaim the session after a failed execution.
+        let _ = self
+            .store
+            .release_session_ownership(thread_key, &self.stdout_owner_id)
+            .await;
     }
 
     async fn forward_messages_to_active_execution(
@@ -3180,6 +3268,30 @@ impl SessionRuntime {
             .await;
             return Ok(OrphanAdoption::Failed);
         }
+
+        // A live resident session owner holds the session: the resident
+        // collaboration host owns the sandbox and stdout pump. Adoption must
+        // not claim stdout against a resident-owned OMP session, or it would
+        // race the resident host. Defer the row so a later scan can revisit
+        // it once the resident releases or its lease expires.
+        if let Some(owner) = self.store.active_session_ownership(thread_key).await?
+            && matches!(owner.mode, SessionOwnerMode::Resident)
+        {
+            if record_deferral {
+                self.record_adoption_deferral(execution).await;
+            } else {
+                debug!(
+                    component = COMPONENT_SESSION_RUNTIME,
+                    event = "execution_adoption_deferred",
+                    thread_key = %thread_key,
+                    execution_id,
+                    sandbox_id,
+                    owner_id = %owner.owner_id,
+                    "resident session owner holds the session; deferring adoption"
+                );
+            }
+            return Ok(OrphanAdoption::Deferred);
+        }
         if !self.claim_expired_stdout_owner(execution_id).await? {
             // Deferrals repeat on every periodic scan while another control
             // plane pumps the execution; only the first observation is worth
@@ -3342,6 +3454,44 @@ impl SessionRuntime {
         // this point would otherwise claim a lease that outlives the
         // process, stranding it until the lease TTL expires.
         self.shutting_down.store(true, Ordering::SeqCst);
+
+        // Release this control plane's session ownership leases immediately so
+        // a resident host or a later one-shot can reclaim sessions without
+        // waiting out the ownership lease TTL. This runs unconditionally —
+        // even when there are no in-flight stdout-owner executions — because a
+        // one-shot session ownership lease may outlive the execution it gated.
+        match tokio::time::timeout(
+            EXECUTION_HANDOFF_DB_TIMEOUT,
+            self.store
+                .release_session_ownership_for_owner(&self.stdout_owner_id),
+        )
+        .await
+        {
+            Ok(Ok(count)) if count > 0 => {
+                info!(
+                    component = COMPONENT_SESSION_RUNTIME,
+                    event = "session_ownership_handoff_released",
+                    count,
+                    "released session ownership leases at shutdown for reacquisition by a peer"
+                );
+            }
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => {
+                warn!(
+                    component = COMPONENT_SESSION_RUNTIME,
+                    event = "session_ownership_handoff_release_failed",
+                    %error,
+                    "failed to release session ownership leases at shutdown"
+                );
+            }
+            Err(_) => {
+                warn!(
+                    component = COMPONENT_SESSION_RUNTIME,
+                    event = "session_ownership_handoff_release_timeout",
+                    "timed out releasing session ownership leases; peers must wait for lease expiry"
+                );
+            }
+        }
         let deadline = Instant::now()
             .checked_add(timeout)
             .unwrap_or_else(|| Instant::now() + Duration::from_secs(3600));
@@ -5175,6 +5325,15 @@ async fn record_terminal_output(
         }
     };
     ctx.execution_spans.lock().await.remove(execution_id);
+    ctx.session_ownership_generations.remove(execution_id);
+    // A one-shot session ownership lease (OMP only) is released now that the
+    // execution has reached a terminal state, letting a resident host or a
+    // later one-shot reclaim the session. Non-OMP sessions have no row and
+    // this is a no-op.
+    let _ = ctx
+        .store
+        .release_session_ownership(thread_key, &ctx.stdout_owner_id)
+        .await;
     if let Err(error) = ctx
         .store
         .touch_sandbox_activity(thread_key, sandbox_id)
@@ -5277,6 +5436,7 @@ async fn record_max_duration_failure(
         return Ok(());
     };
     ctx.execution_spans.lock().await.remove(execution_id);
+    ctx.session_ownership_generations.remove(execution_id);
     if let Err(error) = ctx.store.touch_session_sandbox_activity(thread_key).await {
         warn!(
             component = COMPONENT_SESSION_RUNTIME,
@@ -5309,6 +5469,10 @@ async fn record_max_duration_failure(
         Some("timeout"),
     )
     .await;
+    let _ = ctx
+        .store
+        .release_session_ownership(thread_key, &ctx.stdout_owner_id)
+        .await;
     if let Some(idle_timeout) = idle_timeout.or_else(|| idle_timeout_from_execution(&execution))
         && let Some(sandbox_id) = ctx.store.get_session(thread_key).await?.sandbox_id
     {
@@ -5702,6 +5866,7 @@ fn runtime_error_failure_class(error: &SessionRuntimeError) -> &'static str {
         SessionRuntimeError::IronControl(_) => "iron_control",
         SessionRuntimeError::WarmPool(_) => "warm_pool",
         SessionRuntimeError::CapacityExceeded { .. } => "capacity",
+        SessionRuntimeError::SessionOwned { .. } => "session_owned",
     }
 }
 
@@ -6602,6 +6767,14 @@ pub enum SessionRuntimeError {
         max_running: usize,
         running: usize,
         operation: &'static str,
+    },
+    #[error(
+        "session {thread_key} is owned by another control plane (owner={owner_id}, mode={mode})"
+    )]
+    SessionOwned {
+        thread_key: String,
+        owner_id: String,
+        mode: &'static str,
     },
 }
 
@@ -9620,5 +9793,279 @@ mod adoption_tests {
             .fail_execution_if_active(&execution_id, "test cleanup")
             .await
             .expect("terminalize execution");
+    }
+
+    // ---- session exclusive ownership runtime integration (centaur-3w2.2) ----
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn omp_oneshot_execution_rejected_when_resident_holds_session() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _guard = TEST_LOCK.lock().await;
+        let thread_key =
+            ThreadKey::parse(format!("test:omp-resident-block-{}", Uuid::new_v4())).unwrap();
+        store
+            .create_or_get_session(&thread_key, &HarnessType::Omp, None, json!({}))
+            .await
+            .expect("create session");
+
+        // Simulate a resident collaboration host holding the session.
+        let ownership = store
+            .acquire_session_ownership(&thread_key, "resident-host", SessionOwnerMode::Resident)
+            .await
+            .expect("resident acquires");
+        assert!(ownership.acquired);
+
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        let runtime = runtime_with(&store, backend);
+
+        // A one-shot execution cannot start against the resident-owned session.
+        let error = runtime
+            .execute_session(
+                &thread_key,
+                ExecuteSessionInput {
+                    idempotency_key: None,
+                    metadata: None,
+                    input_lines: vec![json!({"type":"user","message":"hi"}).to_string()],
+                    idle_timeout_ms: None,
+                    max_duration_ms: None,
+                },
+            )
+            .await
+            .expect_err("one-shot must be rejected");
+        assert!(
+            matches!(error, SessionRuntimeError::SessionOwned { .. }),
+            "expected SessionOwned, got {error:?}"
+        );
+
+        // Releasing the resident lease lets the one-shot through the ownership
+        // boundary (it then fails at sandbox ensure on the mock, but the
+        // ownership acquire itself must no longer be the blocker).
+        assert!(
+            store
+                .release_session_ownership(&thread_key, "resident-host")
+                .await
+                .expect("release"),
+            "resident releases"
+        );
+        let error2 = runtime
+            .execute_session(
+                &thread_key,
+                ExecuteSessionInput {
+                    idempotency_key: None,
+                    metadata: None,
+                    input_lines: vec![json!({"type":"user","message":"hi"}).to_string()],
+                    idle_timeout_ms: None,
+                    max_duration_ms: None,
+                },
+            )
+            .await
+            .expect_err("sandbox ensure fails on mock, but ownership acquire passes");
+        assert!(
+            !matches!(error2, SessionRuntimeError::SessionOwned { .. }),
+            "must not be SessionOwned after release, got {error2:?}"
+        );
+
+        // Cleanup: terminalize any execution the second attempt may have created.
+        if let Ok(Some(execution)) = store.active_execution_for_thread(&thread_key).await {
+            let _ = store
+                .fail_execution_if_active(&execution.execution_id, "test cleanup")
+                .await;
+        }
+        let _ = store
+            .release_session_ownership(&thread_key, "api-rs-runtime")
+            .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn non_omp_harnesses_skip_session_ownership_boundary() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _guard = TEST_LOCK.lock().await;
+        let thread_key = ThreadKey::parse(format!("test:non-omp-skip-{}", Uuid::new_v4())).unwrap();
+        store
+            .create_or_get_session(&thread_key, &HarnessType::Codex, None, json!({}))
+            .await
+            .expect("create session");
+
+        // Even if a session ownership row exists for a non-OMP session, the
+        // runtime's one-shot acquire helper skips non-OMP harnesses.
+        store
+            .acquire_session_ownership(&thread_key, "resident-host", SessionOwnerMode::Resident)
+            .await
+            .expect("seed ownership row");
+
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        let runtime = runtime_with(&store, backend);
+
+        // The one-shot acquire helper is a no-op for Codex sessions.
+        runtime
+            .acquire_oneshot_session_ownership(&thread_key, &HarnessType::Codex)
+            .await
+            .expect("non-OMP harness skips ownership boundary");
+
+        // The resident's lease is still intact — the non-OMP path did not
+        // touch it.
+        assert!(
+            store
+                .session_ownership_fence_matches(&thread_key, 1)
+                .await
+                .expect("fence check"),
+            "non-OMP acquire must not steal the resident's lease"
+        );
+
+        // Cleanup.
+        let _ = store
+            .release_session_ownership(&thread_key, "resident-host")
+            .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn omp_idempotent_retry_resolves_before_resident_ownership_gate() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _guard = TEST_LOCK.lock().await;
+        let thread_key =
+            ThreadKey::parse(format!("test:omp-idempotent-retry-{}", Uuid::new_v4())).unwrap();
+        store
+            .create_or_get_session(&thread_key, &HarnessType::Omp, None, json!({}))
+            .await
+            .expect("create session");
+        let existing = store
+            .create_execution(&thread_key, Some("retry-key"), json!({}))
+            .await
+            .expect("create execution")
+            .execution;
+        store
+            .mark_execution_running(&existing.execution_id)
+            .await
+            .expect("mark existing running");
+        store
+            .acquire_session_ownership(&thread_key, "resident-host", SessionOwnerMode::Resident)
+            .await
+            .expect("resident acquires");
+
+        let runtime = runtime_with(
+            &store,
+            Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new())),
+        );
+        let result = runtime
+            .execute_session(
+                &thread_key,
+                ExecuteSessionInput {
+                    idempotency_key: Some("retry-key".to_owned()),
+                    metadata: None,
+                    input_lines: vec![json!({"type":"user","message":"retry"}).to_string()],
+                    idle_timeout_ms: None,
+                    max_duration_ms: None,
+                },
+            )
+            .await
+            .expect("idempotent retry resolves before ownership gate");
+        assert_eq!(result.execution_id, existing.execution_id);
+        assert_eq!(result.status, ExecutionStatus::Running);
+
+        let _ = store
+            .fail_execution_if_active(&existing.execution_id, "test cleanup")
+            .await;
+        let _ = store
+            .release_session_ownership(&thread_key, "resident-host")
+            .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn adoption_defers_when_resident_session_owner_is_live() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _guard = TEST_LOCK.lock().await;
+        let thread_key =
+            ThreadKey::parse(format!("test:omp-adopt-defer-{}", Uuid::new_v4())).unwrap();
+        store
+            .create_or_get_session(&thread_key, &HarnessType::Omp, None, json!({}))
+            .await
+            .expect("create session");
+        store
+            .update_sandbox_assignment(&thread_key, "sbx-adopt", &default_capabilities())
+            .await
+            .expect("assign sandbox");
+        let execution_id = store
+            .create_execution(&thread_key, None, json!({}))
+            .await
+            .expect("create execution")
+            .execution
+            .execution_id;
+        store
+            .mark_execution_running(&execution_id)
+            .await
+            .expect("mark running");
+        backdate_execution(&store, &execution_id, 200.0).await;
+
+        // A resident owner holds the session — adoption must not claim stdout
+        // or pump against the resident host.
+        store
+            .acquire_session_ownership(&thread_key, "resident-host", SessionOwnerMode::Resident)
+            .await
+            .expect("resident acquires");
+
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        let runtime = runtime_with(&store, backend);
+        runtime.adopt_orphaned_executions().await;
+        wait_for_event(&store, &thread_key, "session.execution_adoption_deferred").await;
+
+        // The execution must not be terminalized — the resident still owns it.
+        let all = events(&store, &thread_key).await;
+        assert!(
+            all.iter()
+                .all(|event| event.event_type != "session.execution_completed"),
+            "resident-owned execution must not be terminalized by adoption"
+        );
+
+        // Cleanup.
+        let _ = store
+            .fail_execution_if_active(&execution_id, "test cleanup")
+            .await;
+        let _ = store
+            .release_session_ownership(&thread_key, "resident-host")
+            .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn handoff_owned_executions_releases_session_ownership() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _guard = TEST_LOCK.lock().await;
+        let thread_key = ThreadKey::parse(format!("test:omp-handoff-{}", Uuid::new_v4())).unwrap();
+        store
+            .create_or_get_session(&thread_key, &HarnessType::Omp, None, json!({}))
+            .await
+            .expect("create session");
+
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        let runtime = runtime_with(&store, backend);
+
+        // Simulate this control plane holding a one-shot session ownership lease.
+        let acquired = runtime
+            .acquire_oneshot_session_ownership(&thread_key, &HarnessType::Omp)
+            .await
+            .expect("acquire one-shot ownership");
+        assert!(acquired.is_some());
+
+        // Handoff releases every session ownership lease held by this owner.
+        runtime.handoff_owned_executions(Duration::ZERO).await;
+
+        // The lease must be gone — a peer can reclaim the session immediately.
+        let owner = store
+            .active_session_ownership(&thread_key)
+            .await
+            .expect("lookup");
+        assert!(
+            owner.is_none(),
+            "session ownership must be released at handoff"
+        );
     }
 }

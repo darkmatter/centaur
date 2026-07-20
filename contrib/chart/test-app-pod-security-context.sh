@@ -31,3 +31,10 @@ printf '%s\n' "$rendered" | yq -e '
   .spec.template.spec.securityContext.fsGroup == 1001 and
   .spec.template.spec.securityContext.fsGroupChangePolicy == "OnRootMismatch"
 ' >/dev/null
+
+printf '%s\n' "$rendered" | yq -e '
+  select(.kind == "NetworkPolicy" and .metadata.name == "test-centaur-api-rs-egress") |
+  .spec.egress[] |
+  select(.to[].podSelector.matchLabels."app.kubernetes.io/component" == "app-omp-stats") |
+  select(.ports[].protocol == "TCP" and .ports[].port == 8080)
+' >/dev/null

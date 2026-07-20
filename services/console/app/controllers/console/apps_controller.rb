@@ -1,8 +1,8 @@
 # Reverse proxy for app-plane workloads: /console/apps/:name/* relays the
 # request to api-rs' /apps/{name}/* route. The console session cookie is the
-# human auth gate (require_login/require_active_account from
-# ApplicationController); the upstream hop authenticates with the console's
-# internal API credential instead, so inbound cookies and Authorization
+# human auth gate; transcript exports additionally use the Threads surface's
+# owner/public/admin visibility contract. The upstream hop authenticates with
+# the console's internal API credential, so inbound cookies and Authorization
 # headers never leave this process. Only status, body, and content type are
 # relayed back -- hop-by-hop headers are dropped by construction.
 class Console::AppsController < ApplicationController
@@ -19,7 +19,8 @@ class Console::AppsController < ApplicationController
 
   def proxy
     path = upstream_path
-    return head :not_found unless params[:name].to_s.match?(APP_NAME_PATTERN) && path
+    return head :not_found unless params[:name].to_s.match?(APP_NAME_PATTERN)
+    return head :not_found unless app_path_authorized?(params[:name], params[:path].to_s)
 
     upstream = api_client.proxy_app(
       method: request.request_method,
@@ -39,18 +40,23 @@ class Console::AppsController < ApplicationController
 
   private
 
-  # The remainder of the request path after /console/apps/<name>/, taken from
-  # request.path rather than params[:path]: the router URL-decodes glob params,
-  # and re-forwarding the decoded form would corrupt path segments that
-  # legitimately carry encoded bytes (the transcript export path embeds a
-  # percent-encoded thread key). Traversal segments yield nil (a 404) -- the
-  # upstream route is a proxy, not a filesystem, and a legitimate app path
-  # never contains them.
-  def upstream_path
-    raw = request.path.sub(%r{\A/console/apps/[^/]+/?}, "")
-    return nil if raw.split("/").include?("..")
+  def app_path_authorized?(name, decoded_path)
+    return false if decoded_path.include?("\\")
+    return false if decoded_path.split("/").any? { |segment| segment == "." || segment == ".." }
 
-    raw
+    export_path = decoded_path == "export" || decoded_path.start_with?("export/")
+    return true unless name == "omp-stats" && export_path
+
+    match = decoded_path.match(%r{\Aexport/([^/]+)/?\z})
+    match && console_thread_readable?(match[1])
+  end
+
+  # Preserve the raw path when forwarding so percent-encoded thread keys keep
+  # their exact byte representation. Authorization and traversal checks use the
+  # router-decoded params[:path] separately; using this raw value for either
+  # would let encoded path syntax bypass those checks.
+  def upstream_path
+    request.path.sub(%r{\A/console/apps/[^/]+/?}, "")
   end
 
   def api_client

@@ -56,6 +56,58 @@ class Console::AppsControllerTest < ActionDispatch::IntegrationTest
     assert_nil call[:body]
   end
 
+  test "denies an OMP transcript export when the current user does not own the thread" do
+    delete logout_url
+    member = users(:member_user)
+    post login_url, params: { email: member.email, password: "password123456" }
+    checked_thread_keys = []
+    Console::AppsController.define_method(:console_thread_readable?) do |thread_key|
+      checked_thread_keys << thread_key
+      false
+    end
+
+    get "/console/apps/omp-stats/export/slack%3AC123%3A1700.42"
+
+    assert_response :not_found
+    assert_equal [ "slack:C123:1700.42" ], checked_thread_keys
+    assert_empty @client.calls
+  ensure
+    Console::AppsController.send(:remove_method, :console_thread_readable?)
+  end
+
+  test "denies a percent-encoded OMP export prefix for a non-owner" do
+    delete logout_url
+    member = users(:member_user)
+    post login_url, params: { email: member.email, password: "password123456" }
+    checked_thread_keys = []
+    Console::AppsController.define_method(:console_thread_readable?) do |thread_key|
+      checked_thread_keys << thread_key
+      false
+    end
+
+    get "/console/apps/omp-stats/%65xport/slack%3AC123%3A1700.42"
+
+    assert_response :not_found
+    assert_equal [ "slack:C123:1700.42" ], checked_thread_keys
+    assert_empty @client.calls
+  ensure
+    Console::AppsController.send(:remove_method, :console_thread_readable?)
+  end
+
+  test "rejects percent-encoded traversal segments before proxying" do
+    get "/console/apps/omp-stats/api/%2e%2e/stats"
+
+    assert_response :not_found
+    assert_empty @client.calls
+  end
+
+  test "rejects percent-encoded backslashes before URL normalization" do
+    get "/console/apps/omp-stats/foo%5C..%5Cexport%5Cslack%3AC123%3A1700.42"
+
+    assert_response :not_found
+    assert_empty @client.calls
+  end
+
   test "forwards method body and content type" do
     post "/console/apps/omp-stats/api/query",
          params: '{"q":1}',

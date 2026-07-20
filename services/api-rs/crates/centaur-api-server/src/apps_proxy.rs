@@ -45,6 +45,7 @@ pub(crate) fn apps_proxy_router() -> Router<AppState> {
 fn apps_proxy_router_with_registry(registry: AppsRegistry) -> Router<AppState> {
     Router::new()
         .route("/apps/{name}", any(proxy_app_root))
+        .route("/apps/{name}/", any(proxy_app_root))
         .route("/apps/{name}/{*path}", any(proxy_app_path))
         .layer(Extension(registry))
 }
@@ -315,6 +316,26 @@ mod tests {
         assert_eq!(body["method"], "GET");
         assert_eq!(body["path"], "/");
         assert_eq!(body["query"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn forwards_app_root_with_trailing_slash() {
+        let addr = spawn_stub_upstream().await;
+        let app = proxy_router(format!("http://{addr}"));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/apps/omp-stats/")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(body["path"], "/");
     }
 
     #[tokio::test]

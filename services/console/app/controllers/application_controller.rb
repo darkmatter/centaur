@@ -233,6 +233,17 @@ class ApplicationController < ActionController::Base
     CentaurSession.where(conditions.map { |condition| "(#{condition})" }.join(" OR "))
   end
 
+  # The single-thread form of the same visibility contract used by the Threads
+  # page and its sidebar. Explicit shares remain readable outside the owner
+  # scope; all other keys fail closed.
+  def console_thread_readable?(thread_key)
+    return false if thread_key.blank?
+
+    return true if acting_admin?
+    console_sidebar_visible_thread_scope.exists?(thread_key: thread_key) ||
+      ThreadShare.exists?(thread_key: thread_key)
+  end
+
   def console_sidebar_threads_with_direct_selection(threads)
     selected = console_sidebar_direct_selected_threads(threads)
     selected.any? ? [ *selected, *threads ] : threads

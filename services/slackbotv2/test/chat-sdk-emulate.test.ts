@@ -24,6 +24,7 @@ import {
 } from '../src/index'
 import { clearRequesterIdentityCacheForTests } from '../src/session-api'
 import { slackbotMetrics } from '../src/metrics'
+import { createOpenAiMessageOverridesStrategy } from '../src/message-overrides-strategy'
 import claudeSettings from '../../../harness/claude/settings.json'
 
 const BOT_TOKEN = 'xoxb-slackbotv2-emulate'
@@ -580,6 +581,106 @@ describe('slackbotv2', () => {
         model: 'claude-fable-5'
       })
     )
+  })
+
+  it('opts one Slack thread into nanocodex without changing the configured default', async () => {
+    const sharedState = createMemoryState()
+    await sharedState.connect()
+    let strategyRequestCount = 0
+    bot = createTestBot({
+      defaultHarnessType: 'claudecode',
+      messageOverridesStrategy: createOpenAiMessageOverridesStrategy({
+        apiKey: 'test-key',
+        fetch: (async () => {
+          strategyRequestCount += 1
+          return Response.json({
+            output: [
+              {
+                content: [
+                  {
+                    text: JSON.stringify({
+                      harness: null,
+                      model: null,
+                      provider: null,
+                      reasoning: null
+                    })
+                  }
+                ]
+              }
+            ]
+          })
+        }) as unknown as typeof fetch,
+        model: 'gpt-5.4-nano'
+      }),
+      state: sharedState
+    })
+
+    const sendMention = async (parentTs: string, text: string, eventId: string) => {
+      const mention = await postUserMessage(`<@${BOT_USER_ID}> ${text}`, parentTs)
+      const waits: Promise<unknown>[] = []
+      const response = await bot.app.request(
+        '/api/webhooks/slack',
+        signedSlackEvent({
+          event_id: eventId,
+          event: {
+            type: 'app_mention',
+            user: USER_ID,
+            channel: CHANNEL_ID,
+            team: TEAM_ID,
+            ts: mention.ts,
+            thread_ts: parentTs,
+            text: `<@${BOT_USER_ID}> ${text}`
+          }
+        }),
+        {},
+        waitUntilContext(waits)
+      )
+      expect(response.status).toBe(200)
+      await Promise.all(waits)
+    }
+
+    const nanocodexParent = await postUserMessage('Nanocodex thread context.')
+    await sendMention(
+      nanocodexParent.ts,
+      '--nanocodex start with the native harness',
+      'Ev-slackbotv2-nanocodex-opt-in'
+    )
+    await sendMention(
+      nanocodexParent.ts,
+      'continue without another flag',
+      'Ev-slackbotv2-nanocodex-sticky'
+    )
+
+    const defaultParent = await postUserMessage('Default harness thread context.')
+    await sendMention(
+      defaultParent.ts,
+      'use the configured default',
+      'Ev-slackbotv2-default-after-nanocodex'
+    )
+
+    expect(codexApi.creates.map(create => create.body.harness_type)).toEqual([
+      'nanocodex',
+      'nanocodex',
+      'claudecode'
+    ])
+    expect(codexApi.creates[0]!.body.on_harness_conflict).toBe('restart')
+    expect(codexApi.creates[2]!.body.on_harness_conflict).toBeUndefined()
+    // The explicit flag bypasses the deployed LLM strategy. Only the two
+    // unflagged messages consult it.
+    expect(strategyRequestCount).toBe(2)
+    expect(JSON.stringify(codexApi.executes[0]!.body)).not.toContain('--nanocodex')
+    expect(JSON.stringify(codexApi.executes[0]!.body)).toContain(
+      'start with the native harness'
+    )
+
+    const nanocodexState = await sharedState.get<Record<string, unknown>>(
+      `thread-state:${threadKey(nanocodexParent.ts)}`
+    )
+    const defaultState = await sharedState.get<Record<string, unknown>>(
+      `thread-state:${threadKey(defaultParent.ts)}`
+    )
+    expect(nanocodexState?.harnessType).toBe('nanocodex')
+    expect(defaultState?.harnessType).toBeUndefined()
   })
 
   it('appends an Open-session-in-Console context block to the first assistant message only', async () => {

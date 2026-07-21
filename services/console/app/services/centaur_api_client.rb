@@ -9,24 +9,12 @@ class CentaurApiClient
 
   DEFAULT_TIMEOUT_SECONDS = 20
 
-  # App-plane proxy timeouts: connecting to api-rs should be near-instant, but
-  # apps may render on demand (transcript export shells out), so reads get a
-  # generous ceiling independent of the JSON helpers' single timeout.
-  PROXY_OPEN_TIMEOUT_SECONDS = 5
-  PROXY_READ_TIMEOUT_SECONDS = 60
-
-  ProxyResponse = Struct.new(:status, :content_type, :body, keyword_init: true)
-
   attr_reader :base_url
 
-  def initialize(base_url: nil, api_key: nil, app_proxy_api_key: nil, http: nil, net_http_factory: nil, timeout: DEFAULT_TIMEOUT_SECONDS)
+  def initialize(base_url: nil, api_key: nil, http: nil, timeout: DEFAULT_TIMEOUT_SECONDS)
     @base_url = (base_url.presence || ConsoleEnv["CENTAUR_API_URL"].presence || "http://localhost:8080").delete_suffix("/")
     @api_key = api_key.presence || ConsoleEnv["CENTAUR_API_KEY"].presence
-    @app_proxy_api_key = app_proxy_api_key.presence ||
-      ConsoleEnv["APP_PROXY_API_KEY"].presence ||
-      @api_key
     @http = http || method(:net_http_request)
-    @net_http_factory = net_http_factory || ->(host, port) { Net::HTTP.new(host, port) }
     @timeout = timeout
   end
 
@@ -128,41 +116,6 @@ class CentaurApiClient
     payload[:input] = input unless input.nil?
 
     post("/api/workflows/runs", payload)
-  end
-
-  # Raw pass-through to the api-rs app plane (ANY /apps/{name}/*). Unlike the
-  # JSON helpers above, the upstream response is relayed verbatim -- status,
-  # body, and content type -- because apps serve HTML pages and assets, not
-  # API JSON; non-2xx statuses are part of that relay, so only transport
-  # failures raise Error. `path` and `query` must arrive still
-  # percent-encoded: they are spliced into the URL untouched so encoded bytes
-  # in app paths (e.g. a thread key) survive the hop. Callers pass no headers;
-  # the only credential on the request is the console's configured app-proxy
-  # API key, so inbound cookies/authorization are guaranteed to stay out.
-  def proxy_app(method:, name:, path: "", query: nil, body: nil, content_type: nil)
-    target = +"#{@base_url}/apps/#{escape_path(name)}/#{path}"
-    target << "?#{query}" if query.present?
-    uri = URI.parse(target)
-
-    request = Net::HTTPGenericRequest.new(method.to_s.upcase, true, true, uri)
-    request["Authorization"] = "Bearer #{@app_proxy_api_key}" if @app_proxy_api_key.present?
-    if body
-      request["Content-Type"] = content_type.presence || "application/octet-stream"
-      request.body = body
-    end
-
-    http = @net_http_factory.call(uri.host, uri.port)
-    http.use_ssl = uri.scheme == "https"
-    http.open_timeout = PROXY_OPEN_TIMEOUT_SECONDS
-    http.read_timeout = PROXY_READ_TIMEOUT_SECONDS
-    response = http.request(request)
-    ProxyResponse.new(
-      status: response.code.to_i,
-      content_type: response["Content-Type"],
-      body: response.body.to_s
-    )
-  rescue Timeout::Error, SystemCallError, SocketError, IOError, OpenSSL::SSL::SSLError, Net::HTTPBadResponse => e
-    raise Error, "App proxy request failed: #{e.class}: #{e.message}"
   end
 
   private

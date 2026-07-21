@@ -120,16 +120,6 @@ Rails.application.routes.draw do
            to: "etls#delete_slack_archive_import",
            as: :delete_slack_archive_import
   end
-  # App-plane reverse proxy: relays /console/apps/:name/* to api-rs'
-  # /apps/{name}/* route behind the console session gate. format: false because
-  # app asset paths contain dots (e.g. .js/.css) that Rails would otherwise
-  # strip into a :format segment.
-  match "console/apps/:name/*path",
-        to: "console/apps#proxy",
-        via: :all,
-        as: :console_app_proxy,
-        format: false
-  get "console/apps/:name", to: "console/apps#proxy", defaults: { path: "" }
   # Create/edit forms for OAuth apps. Declared before the show route so
   # /console/oauth_apps/new wins over the generic `:id` match. Named
   # `*_oauth_app_form*` so the form helpers don't collide with the read

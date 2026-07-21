@@ -55,8 +55,8 @@ import {
 import { resolveChannelDefault } from './channel-defaults'
 import { extractMessageOverrides } from './overrides'
 import { isAllowedSlackMessage, isAllowedSlackWebhookBody } from './slack-events'
-import { exportLinkForThread, isSlackExportCommand } from './export-command'
 import { isSlackStopCommand } from './stop-command'
+import { exportLinkForThread, isSlackExportCommand } from './export-command'
 import { hasMalformedCollabArgs, parseCollabCommand, renderCollabJoinCommand } from './collab-command'
 import type {
   ForwardSessionInput,
@@ -557,34 +557,21 @@ export async function handleCollabCommand(
       trigger
     })
     return true
+  }
 }
-}
+
 export async function handleExportCommand(
   thread: Thread<SlackbotV2ThreadState>,
   message: ChatMessage,
   options: SlackbotV2Options,
   trigger: string
 ): Promise<boolean> {
-  if (!isSlackExportCommand(message)) return false
-  // Without a configured Console public URL (CENTAUR_CONSOLE_PUBLIC_URL, the
-  // same origin used for the "Open chat in Console" context link) there is no
-  // link to hand back, so the message flows through to the agent instead of
-  // dead-ending.
-  if (!options.consolePublicUrl) return false
+  if (!isSlackExportCommand(message) || !options.ompViewerUrl) return false
   const trace = createHandoffTrace(thread, message, 'append')
-  traceLog(options, 'slackbotv2_export_command_started', trace, { trigger })
   await setAssistantStatus(thread, '', options, trace)
-  try {
-    await thread.post(`Transcript export: ${exportLinkForThread(options.consolePublicUrl, thread.id)}`)
-    traceLog(options, 'slackbotv2_export_command_complete', trace, { trigger })
-    return true
-  } catch (error) {
-    traceWarn(options, 'slackbotv2_export_command_failed', trace, {
-      error: errorMessage(error),
-      trigger
-    })
-    throw error
-  }
+  await thread.post(`Transcript export: ${exportLinkForThread(options.ompViewerUrl, thread.id)}`)
+  traceLog(options, 'slackbotv2_export_command_complete', trace, { trigger })
+  return true
 }
 
 async function subscribeSlackThreadForHandoff(

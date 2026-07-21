@@ -16,33 +16,6 @@ class CentaurApiClientTest < ActiveSupport::TestCase
     end
   end
 
-  class StubProxyHTTP
-    attr_accessor :use_ssl, :open_timeout, :read_timeout
-    attr_reader :captured_request
-
-    def request(request)
-      @captured_request = request
-      Struct.new(:code, :body) do
-        def [](name) = name == "Content-Type" ? "text/html" : nil
-      end.new("200", "<html>ok</html>")
-    end
-  end
-
-  test "authenticates app proxy requests with the dedicated API key" do
-    http = StubProxyHTTP.new
-    client = CentaurApiClient.new(
-      base_url: "http://api.internal:8080",
-      app_proxy_api_key: "app-proxy-secret",
-      net_http_factory: ->(_host, _port) { http }
-    )
-
-    response = client.proxy_app(method: "GET", name: "omp-stats", path: "export/thread")
-
-    assert_equal 200, response.status
-    assert_equal "Bearer app-proxy-secret", http.captured_request["Authorization"]
-    assert_nil http.captured_request["Cookie"]
-  end
-
   test "lists Slack archive imports with query params" do
     http = StubHTTP.new(status: 200, body: { imports: [] }.to_json)
     client = CentaurApiClient.new(base_url: "http://api.internal:8080", http: http)

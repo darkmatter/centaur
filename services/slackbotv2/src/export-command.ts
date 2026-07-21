@@ -25,12 +25,7 @@ export function isSlackExportCommand(message: { text: string }): boolean {
   return EXPORT_COMMAND_PATTERN.test(withoutMentions)
 }
 
-/**
- * Console deep link for a thread's transcript export. The trailing-slash trim
- * keeps a configured base like `https://console.example.com/` from producing
- * a `//console` path; the thread key is percent-encoded because Slack thread
- * ids contain `:` and `.` separators.
- */
-export function exportLinkForThread(consolePublicUrl: string, threadId: string): string {
-  return `${consolePublicUrl.replace(/\/$/, '')}/console/apps/omp-stats/export/${encodeURIComponent(threadId)}`
+/** Direct tailnet viewer link for a thread transcript. */
+export function exportLinkForThread(viewerUrl: string, threadId: string): string {
+  return `${viewerUrl.replace(/\/$/, '')}/export/${encodeURIComponent(threadId)}`
 }

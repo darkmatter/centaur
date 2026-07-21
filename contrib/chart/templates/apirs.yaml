@@ -449,13 +449,6 @@ spec:
                   name: {{ include "centaur.secretEnvName" . }}
                   key: {{ printf "%sIRON_CONTROL_INITIAL_API_KEY" .Values.secretManager.envPrefix }}
 {{- end }}
-{{- if gt (len .Values.apps) 0 }}
-            - name: CENTAUR_APP_PROXY_API_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "centaur.secretEnvName" . }}
-                  key: {{ printf "%sIRON_CONTROL_INITIAL_API_KEY" .Values.secretManager.envPrefix }}
-{{- end }}
 {{- if and .Values.toolServer.enabled (not .Values.toolServer.repo) (eq (len $toolSources) 0) }}
 {{- fail "toolServer.repo (owner/name) must be set when toolServer.enabled=true" }}
 {{- end }}
@@ -507,20 +500,7 @@ spec:
               value: {{ .Values.toolServer.githubToken.secretKey | quote }}
 {{- end }}
 {{- end }}
-{{- if .Values.apps }}
-{{- $appsRegistry := list }}
-{{- range $app := .Values.apps }}
-{{- $appServiceName := include "centaur.componentName" (dict "root" $ "component" (printf "app-%s" $app.name)) }}
-{{- $appsRegistry = append $appsRegistry (dict "name" $app.name "url" (printf "http://%s:80" $appServiceName)) }}
-{{- end }}
-            # Static app-plane registry for the /apps/{name}/* proxy: app name
-            # -> in-cluster Service URL (see templates/apps.yaml). Chart config
-            # until the DB-backed registry lands.
-            - name: CENTAUR_APPS_JSON
-              value: {{ toJson $appsRegistry | quote }}
-{{- end }}
 {{- if .Values.apiRs.transcripts.bucket }}
-            # omp transcript corpus sync target; an unset bucket disables sync.
             - name: CENTAUR_TRANSCRIPTS_BUCKET
               value: {{ .Values.apiRs.transcripts.bucket | quote }}
             - name: CENTAUR_TRANSCRIPTS_PREFIX

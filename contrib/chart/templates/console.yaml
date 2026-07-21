@@ -267,18 +267,15 @@ spec:
               value: "1"
             - name: RAILS_SERVE_STATIC_FILES
               value: "1"
+{{- if .Values.ompViewerUrl }}
+            - name: CENTAUR_OMP_VIEWER_URL
+              value: {{ .Values.ompViewerUrl | quote }}
+{{- end }}
 {{- if .Values.apiRs.enabled }}
             - name: CENTAUR_API_URL
               value: {{ printf "http://%s:%v" $apiRsName .Values.apiRs.port | quote }}
             - name: CENTAUR_CONSOLE_CENTAUR_API_URL
               value: {{ printf "http://%s:%v" $apiRsName .Values.apiRs.port | quote }}
-{{- if gt (len .Values.apps) 0 }}
-            - name: CENTAUR_CONSOLE_APP_PROXY_API_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: {{ $secretEnv }}
-                  key: {{ printf "%sIRON_CONTROL_INITIAL_API_KEY" $prefix }}
-{{- end }}
 {{- end }}
           ports:
             - containerPort: {{ $console.service.httpPort }}

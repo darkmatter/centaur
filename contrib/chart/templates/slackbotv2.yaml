@@ -99,6 +99,10 @@ spec:
             - name: SLACKBOTV2_CHANNEL_DEFAULTS
               value: {{ .Values.slackbotv2.channelDefaults | toJson | quote }}
 {{- end }}
+{{- if .Values.ompViewerUrl }}
+            - name: CENTAUR_OMP_VIEWER_URL
+              value: {{ .Values.ompViewerUrl | quote }}
+{{- end }}
 {{- range $name := tuple "CLAUDE_MODEL" "CODEX_MODEL" }}
 {{- if and (hasKey $.Values.sandbox.extraEnv $name) (not (hasKey $.Values.slackbotv2.extraEnv $name)) }}
             # Mirror the deployer's harness default-model override

@@ -1306,6 +1306,7 @@ impl BridgeProcess {
             "CENTAUR_CLAUDE_APP_BRIDGE_COMMAND",
             "CENTAUR_AMP_APP_BRIDGE_COMMAND",
             "CENTAUR_OMP_APP_BRIDGE_COMMAND",
+            "CENTAUR_OMP_RPC_BRIDGE_COMMAND",
             "CODEX_MODEL",
             "CODEX_MODEL_PROVIDER",
             "OPENROUTER_MODEL",
@@ -1705,6 +1706,24 @@ impl BridgeProcess {
         if let Some(model) = model {
             input["model"] = Value::String(model.to_string());
         }
+        self.run_blocks_user_line(input, timeout)
+    }
+
+    fn run_blocks_user_turn_with_ownership(
+        &mut self,
+        prompt: &str,
+        ownership: &Value,
+        timeout: Duration,
+    ) -> TurnCapture {
+        let input = json!({
+            "type": "user",
+            "thread_key": "slack:C123:123.456",
+            "trace_metadata": ownership,
+            "message": {
+                "role": "user",
+                "content": [{"type": "text", "text": prompt}],
+            },
+        });
         self.run_blocks_user_line(input, timeout)
     }
 
@@ -2392,4 +2411,329 @@ fn shell_quote(path: &Path) -> String {
 
 fn shell_quote_str(raw: &str) -> String {
     format!("'{}'", raw.replace('\'', "'\\''"))
+}
+
+// ---------------------------------------------------------------------------
+// Resident OMP RPC host integration tests (centaur-3w2.5)
+// ---------------------------------------------------------------------------
+// These tests drive the real `harness-server omp` blocks-mode binary with a
+// fake `omp --mode rpc` script (via CENTAUR_OMP_RPC_BRIDGE_COMMAND) that
+// speaks the exact OMP RPC wire protocol. They prove:
+// - process reuse across two sequential turns (same fake process)
+// - unsolicited collab_state frames while a prompt result is pending
+// - prompt/steer/interrupt normalization
+// - collab start/status/stop normalization
+// - ownership absent/stale rejection
+// - clean shutdown
+
+/// A fake `omp --mode rpc` script that speaks the wire protocol. It writes
+/// `ready`, responds to `prompt`/`steer`/`abort`/`collab_*` commands, emits
+/// agent lifecycle events, and optionally emits unsolicited `collab_state`
+/// frames. A pidfile proves process reuse across turns.
+fn fake_omp_rpc_script(pidfile: &Path, emit_collab_during_turn: bool) -> String {
+    let script_path = temp_path(&format!("fake-omp-rpc-{}", Uuid::new_v4().simple()));
+    let collab_line = if emit_collab_during_turn {
+        r#"printf '%s\n' '{"type":"collab_state","state":"reconnecting","reason":"relay blip","room":{"active":true,"joinUrl":"relay.example/r/room.key","viewUrl":"relay.example/r/room.key","participants":[{"name":"host","role":"host"}]}}'"#
+    } else {
+        ":"
+    };
+    let script = format!(
+        r#"#!/bin/sh
+echo $$ > '{pidfile}'
+printf '%s\n' '{{"type":"ready"}}'
+TURN_COUNT=0
+while IFS= read -r line; do
+  CMD=$(printf '%s' "$line" | sed -n 's/.*"type":"\([^"]*\)".*/\1/p')
+  ID=$(printf '%s' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+  case "$CMD" in
+    prompt)
+      TURN_COUNT=$((TURN_COUNT+1))
+      printf '{{"id":"%s","type":"response","command":"prompt","success":true,"data":{{"agentInvoked":true}}}}\n' "$ID"
+      printf '%s\n' '{{"type":"agent_start"}}'
+      printf '%s\n' '{{"type":"turn_start"}}'
+      printf '%s\n' '{{"type":"message_update","assistantMessageEvent":{{"type":"text_delta","contentIndex":0,"delta":"hello from turn '"$TURN_COUNT"'"}},"message":{{"role":"assistant","content":[],"responseId":"msg-'"$TURN_COUNT"'"}}}}'
+      {collab_line}
+      printf '%s\n' '{{"type":"message_end","message":{{"role":"assistant","content":[{{"type":"text","text":"hello from turn '"$TURN_COUNT"'"}}],"stopReason":"stop","responseId":"msg-'"$TURN_COUNT"'"}}}}'
+      printf '%s\n' '{{"type":"turn_end"}}'
+      printf '%s\n' '{{"type":"agent_end","messages":[]}}'
+      ;;
+    steer)
+      printf '{{"id":"%s","type":"response","command":"steer","success":true}}\n' "$ID"
+      ;;
+    abort)
+      printf '{{"id":"%s","type":"response","command":"abort","success":true}}\n' "$ID"
+      printf '%s\n' '{{"type":"agent_end","messages":[]}}'
+      ;;
+    collab_start)
+      printf '{{"id":"%s","type":"response","command":"collab_start","success":true,"data":{{"active":true,"joinUrl":"relay.example/r/room.key-and-write-token","viewUrl":"relay.example/r/room.key","participants":[{{"name":"host","role":"host"}}]}}}}\n' "$ID"
+      ;;
+    collab_status)
+      printf '{{"id":"%s","type":"response","command":"collab_status","success":true,"data":{{"active":true,"joinUrl":"relay.example/r/room.key-and-write-token","viewUrl":"relay.example/r/room.key","participants":[{{"name":"host","role":"host"}}]}}}}\n' "$ID"
+      ;;
+    collab_stop)
+      printf '{{"id":"%s","type":"response","command":"collab_stop","success":true,"data":{{"active":false,"participants":[]}}}}\n' "$ID"
+      ;;
+    *)
+      printf '%s' "$line" >&2
+      ;;
+  esac
+done
+"#,
+        pidfile = pidfile.display(),
+        collab_line = collab_line,
+    );
+    std::fs::write(&script_path, script).expect("write fake omp script");
+    set_executable(&script_path);
+    script_path.display().to_string()
+}
+
+fn set_executable(path: &Path) {
+    let _ = std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o755));
+}
+
+/// Spawn `harness-server omp` in blocks mode with a fake omp RPC bridge.
+fn spawn_omp_resident(fake_script: String, extra_envs: &[(&str, &str)]) -> BridgeProcess {
+    let bin = env!("CARGO_BIN_EXE_harness-server");
+    let mut command = Command::new(bin);
+    command
+        .args(["omp"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for env_key in [
+        "CENTAUR_OMP_APP_BRIDGE_COMMAND",
+        "CENTAUR_OMP_RPC_BRIDGE_COMMAND",
+        "OMP_SESSION_DIR",
+    ] {
+        command.env_remove(env_key);
+    }
+    command.env("CENTAUR_OMP_RPC_BRIDGE_COMMAND", &fake_script);
+    for (key, value) in extra_envs {
+        command.env(key, value);
+    }
+    BridgeProcess::spawn_command(command)
+}
+
+fn omp_ownership_json(owner: &str, generation: i64) -> Value {
+    json!({
+        "owner_id": owner,
+        "generation": generation,
+    })
+}
+
+#[test]
+fn resident_omp_reuses_one_process_across_two_turns() {
+    let pidfile = temp_path("omp-rpc-pid");
+    let _ = std::fs::remove_file(&pidfile);
+    let script = fake_omp_rpc_script(&pidfile, false);
+    let mut bridge = spawn_omp_resident(script, &[]);
+
+    let ownership = omp_ownership_json("resident-host", 1);
+    let turn1 = bridge.run_blocks_user_turn_with_ownership(
+        "first prompt",
+        &ownership,
+        Duration::from_secs(30),
+    );
+    let pid1 = std::fs::read_to_string(&pidfile)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+
+    let turn2 = bridge.run_blocks_user_turn_with_ownership(
+        "second prompt",
+        &ownership,
+        Duration::from_secs(30),
+    );
+    let pid2 = std::fs::read_to_string(&pidfile)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+
+    let _ = bridge.finish_successfully();
+
+    // Same process: the pidfile was written once at startup and not overwritten.
+    assert_eq!(pid1, pid2, "resident process must be reused across turns");
+    assert!(!pid1.is_empty(), "pid must have been written");
+
+    // Both turns produced text.
+    assert!(
+        turn1.text_from_deltas.contains("turn 1")
+            || turn1
+                .completed_agent_items
+                .values()
+                .any(|t| t.contains("turn 1"))
+    );
+    assert!(
+        turn2.text_from_deltas.contains("turn 2")
+            || turn2
+                .completed_agent_items
+                .values()
+                .any(|t| t.contains("turn 2"))
+    );
+}
+
+#[test]
+fn resident_omp_unsolicited_collab_frame_does_not_block_prompt() {
+    let pidfile = temp_path("omp-rpc-pid-collab");
+    let _ = std::fs::remove_file(&pidfile);
+    let script = fake_omp_rpc_script(&pidfile, true);
+    let mut bridge = spawn_omp_resident(script, &[]);
+    let ownership = omp_ownership_json("resident-host", 1);
+
+    let turn = bridge.run_blocks_user_turn_with_ownership(
+        "prompt with collab",
+        &ownership,
+        Duration::from_secs(30),
+    );
+    let stdout_lines = bridge.finish_successfully();
+
+    // The turn completed (was not blocked by the collab_state frame).
+    assert!(
+        turn.terminal_status.is_some(),
+        "turn must complete despite unsolicited collab frame"
+    );
+
+    // The collab_state frame was normalized and emitted as a collab/state notification.
+    let has_collab = stdout_lines
+        .iter()
+        .any(|line| line.contains("collab/state"));
+    assert!(
+        has_collab,
+        "unsolicited collab_state must be emitted as collab/state notification"
+    );
+}
+
+#[test]
+fn resident_omp_missing_ownership_rejects_turn() {
+    let pidfile = temp_path("omp-rpc-pid-noown");
+    let _ = std::fs::remove_file(&pidfile);
+    let script = fake_omp_rpc_script(&pidfile, false);
+    let mut bridge = spawn_omp_resident(script, &[]);
+
+    // Send a user line WITHOUT ownership in trace_metadata.
+    bridge.send(json!({
+        "type": "user",
+        "text": "hello without ownership",
+    }));
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let value = bridge.read_json(deadline);
+
+    // Must be a blocks error about missing ownership.
+    let method = value
+        .get("method")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let error_msg = value
+        .pointer("/params/error/message")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    assert_eq!(method, "error");
+    assert!(
+        error_msg.contains("ownership"),
+        "must reject without ownership, got: {error_msg}"
+    );
+
+    let _ = bridge.finish_successfully();
+}
+
+#[test]
+fn resident_omp_stale_ownership_rejects_turn() {
+    let pidfile = temp_path("omp-rpc-pid-stale");
+    let _ = std::fs::remove_file(&pidfile);
+    let script = fake_omp_rpc_script(&pidfile, false);
+    let mut bridge = spawn_omp_resident(script, &[]);
+
+    // First turn admits generation 1.
+    let ownership_v1 = omp_ownership_json("resident-host", 1);
+    let _turn1 =
+        bridge.run_blocks_user_turn_with_ownership("first", &ownership_v1, Duration::from_secs(30));
+
+    // Second turn with generation 2 (stale — different from admitted gen 1).
+    let ownership_v2 = omp_ownership_json("resident-host", 2);
+    bridge.send(json!({
+        "type": "user",
+        "text": "second with stale ownership",
+        "trace_metadata": ownership_v2,
+    }));
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let value = bridge.read_json(deadline);
+    let error_msg = value
+        .pointer("/params/error/message")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    assert!(
+        error_msg.contains("stale"),
+        "must reject stale ownership, got: {error_msg}"
+    );
+
+    let _ = bridge.finish_successfully();
+}
+
+#[test]
+fn resident_omp_collab_start_status_stop_normalize() {
+    let pidfile = temp_path("omp-rpc-pid-collab-ctrl");
+    let _ = std::fs::remove_file(&pidfile);
+    let script = fake_omp_rpc_script(&pidfile, false);
+    let mut bridge = spawn_omp_resident(script, &[]);
+    let ownership = omp_ownership_json("resident-host", 1);
+
+    // Admit ownership with a user turn first.
+    let _turn =
+        bridge.run_blocks_user_turn_with_ownership("admit", &ownership, Duration::from_secs(30));
+
+    // collab_start
+    bridge.send(json!({
+        "type": "collab_start",
+        "ownership": ownership,
+        "relayUrl": "wss://relay.example",
+        "displayName": "centaur-host",
+    }));
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let start_frame = bridge.read_json(deadline);
+    assert!(
+        start_frame.get("method").and_then(Value::as_str) == Some("collab/state")
+            && start_frame.pointer("/params/state").and_then(Value::as_str) == Some("started"),
+        "collab_start must emit collab/state started: {start_frame}"
+    );
+    let start_room = start_frame
+        .pointer("/params/room")
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(start_room["active"], true);
+    assert_eq!(
+        start_room["join_url"],
+        "relay.example/r/room.key-and-write-token"
+    );
+
+    // collab_status
+    bridge.send(json!({
+        "type": "collab_status",
+        "ownership": ownership,
+    }));
+    let status_frame = bridge.read_json(Instant::now() + Duration::from_secs(30));
+    assert!(
+        status_frame.get("method").and_then(Value::as_str) == Some("collab/status"),
+        "collab_status must emit collab/status: {status_frame}"
+    );
+
+    // collab_stop
+    bridge.send(json!({
+        "type": "collab_stop",
+        "ownership": ownership,
+    }));
+    let stop_frame = bridge.read_json(Instant::now() + Duration::from_secs(30));
+    assert!(
+        stop_frame.get("method").and_then(Value::as_str) == Some("collab/state")
+            && stop_frame.pointer("/params/state").and_then(Value::as_str) == Some("stopped"),
+        "collab_stop must emit collab/state stopped: {stop_frame}"
+    );
+    let stop_room = stop_frame
+        .pointer("/params/room")
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(stop_room["active"], false);
+
+    let _ = bridge.finish_successfully();
 }

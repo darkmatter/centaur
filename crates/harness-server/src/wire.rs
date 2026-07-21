@@ -4,7 +4,10 @@ use serde_json::Value;
 use crate::Result;
 
 pub fn is_known_untyped_server_notification(method: &str) -> bool {
-    matches!(method, "remoteControl/status/changed" | "collab/state")
+    matches!(
+        method,
+        "remoteControl/status/changed" | "collab/state" | "collab/status"
+    )
 }
 
 pub fn notification_to_jsonrpc(notification: &ServerNotification) -> Result<JSONRPCNotification> {

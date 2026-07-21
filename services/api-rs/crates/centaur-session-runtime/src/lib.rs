@@ -6339,12 +6339,14 @@ fn input_line_with_session_context(
             .entry("trace_metadata")
             .or_insert_with(|| Value::Object(serde_json::Map::new()));
         if let Value::Object(metadata) = entry {
-            metadata
-                .entry("owner_id")
-                .or_insert_with(|| Value::String(owner_id.clone()));
-            metadata
-                .entry("generation")
-                .or_insert_with(|| Value::Number(serde_json::Number::from(generation)));
+            // Overwrite (not or_insert) so a client-supplied owner_id or
+            // generation in trace_metadata is replaced by the trusted
+            // api-rs-injected value. A malicious client cannot survive this.
+            metadata.insert("owner_id".to_owned(), Value::String(owner_id.clone()));
+            metadata.insert(
+                "generation".to_owned(),
+                Value::Number(serde_json::Number::from(generation)),
+            );
         }
     }
     merge_session_context(map, session_context_for_thread(thread_key));
@@ -8003,6 +8005,32 @@ mod tests {
             assert!(m.get("owner_id").is_none());
             assert!(m.get("generation").is_none());
         }
+    }
+
+    #[test]
+    fn input_line_overwrites_client_supplied_ownership_with_trusted_values() {
+        // Regression: a malicious client may supply owner_id/generation in
+        // trace_metadata. The api-rs injection MUST overwrite them, not
+        // preserve them. or_insert_with would let the client values survive;
+        // insert replaces them.
+        let thread_key = ThreadKey::parse("chat:C123:1780000000.000000").unwrap();
+        let trace = SessionTraceContext::new(&thread_key, None)
+            .with_ownership("api-rs-trusted", 42);
+
+        // Client supplies malicious ownership in trace_metadata.
+        let line = input_line_with_session_context(
+            &thread_key,
+            &trace,
+            r#"{"type":"user","trace_metadata":{"owner_id":"malicious-client","generation":999}}"#,
+        );
+        let value: Value = serde_json::from_str(&line).unwrap();
+
+        // Trusted values overwrite the malicious ones.
+        assert_eq!(value["trace_metadata"]["owner_id"], "api-rs-trusted");
+        assert_eq!(value["trace_metadata"]["generation"], 42);
+        // Malicious values must NOT survive.
+        assert_ne!(value["trace_metadata"]["owner_id"], "malicious-client");
+        assert_ne!(value["trace_metadata"]["generation"], 999);
     }
 
     #[test]

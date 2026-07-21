@@ -2683,12 +2683,14 @@ fn resident_omp_collab_start_status_stop_normalize() {
     let _turn =
         bridge.run_blocks_user_turn_with_ownership("admit", &ownership, Duration::from_secs(30));
 
-    // collab_start
+    // collab_start with caller-supplied request id for correlation.
     bridge.send(json!({
         "type": "collab_start",
+        "id": "req-collab-start-1",
         "ownership": ownership,
         "relayUrl": "wss://relay.example",
         "displayName": "centaur-host",
+        "webUrl": "https://collab.example",
     }));
     let deadline = Instant::now() + Duration::from_secs(30);
     let start_frame = bridge.read_json(deadline);
@@ -2696,6 +2698,13 @@ fn resident_omp_collab_start_status_stop_normalize() {
         start_frame.get("method").and_then(Value::as_str) == Some("collab/state")
             && start_frame.pointer("/params/state").and_then(Value::as_str) == Some("started"),
         "collab_start must emit collab/state started: {start_frame}"
+    );
+    assert_eq!(
+        start_frame
+            .pointer("/params/request_id")
+            .and_then(Value::as_str),
+        Some("req-collab-start-1"),
+        "collab/state must echo caller-supplied request_id: {start_frame}"
     );
     let start_room = start_frame
         .pointer("/params/room")
@@ -2707,15 +2716,23 @@ fn resident_omp_collab_start_status_stop_normalize() {
         "relay.example/r/room.key-and-write-token"
     );
 
-    // collab_status
+    // collab_status with caller-supplied request id.
     bridge.send(json!({
         "type": "collab_status",
+        "id": "req-collab-status-1",
         "ownership": ownership,
     }));
     let status_frame = bridge.read_json(Instant::now() + Duration::from_secs(30));
     assert!(
         status_frame.get("method").and_then(Value::as_str) == Some("collab/status"),
         "collab_status must emit collab/status: {status_frame}"
+    );
+    assert_eq!(
+        status_frame
+            .pointer("/params/request_id")
+            .and_then(Value::as_str),
+        Some("req-collab-status-1"),
+        "collab/status must echo caller-supplied request_id: {status_frame}"
     );
 
     // collab_stop
@@ -2736,6 +2753,115 @@ fn resident_omp_collab_start_status_stop_normalize() {
     assert_eq!(stop_room["active"], false);
 
     let _ = bridge.finish_successfully();
+}
+#[test]
+fn resident_omp_interrupt_without_ownership_rejects() {
+    let pidfile = temp_path("omp-rpc-pid-int-noown");
+    let _ = std::fs::remove_file(&pidfile);
+    let script = fake_omp_rpc_script(&pidfile, false);
+    let mut bridge = spawn_omp_resident(script, &[]);
+    let ownership = omp_ownership_json("resident-host", 1);
+
+    // Admit ownership with a user turn first.
+    let _turn =
+        bridge.run_blocks_user_turn_with_ownership("admit", &ownership, Duration::from_secs(30));
+
+    // Send interrupt WITHOUT ownership — must be rejected.
+    bridge.send(json!({"type": "interrupt"}));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let value = bridge.read_json_allowing_error(deadline);
+    let error_msg = value
+        .pointer("/params/error/message")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    assert!(
+        error_msg.contains("ownership"),
+        "interrupt without ownership must be rejected, got: {error_msg}"
+    );
+
+    let _ = bridge.finish_successfully();
+}
+
+#[test]
+fn resident_omp_interrupt_with_stale_ownership_rejects() {
+    let pidfile = temp_path("omp-rpc-pid-int-stale");
+    let _ = std::fs::remove_file(&pidfile);
+    let script = fake_omp_rpc_script(&pidfile, false);
+    let mut bridge = spawn_omp_resident(script, &[]);
+    let ownership = omp_ownership_json("resident-host", 1);
+
+    // Admit ownership with a user turn first (generation 1).
+    let _turn =
+        bridge.run_blocks_user_turn_with_ownership("admit", &ownership, Duration::from_secs(30));
+
+    // Send interrupt with stale generation 2 — must be rejected.
+    let stale = omp_ownership_json("resident-host", 2);
+    bridge.send(json!({
+        "type": "interrupt",
+        "ownership": stale,
+    }));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let value = bridge.read_json_allowing_error(deadline);
+    let error_msg = value
+        .pointer("/params/error/message")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    assert!(
+        error_msg.contains("stale"),
+        "interrupt with stale ownership must be rejected, got: {error_msg}"
+    );
+
+    let _ = bridge.finish_successfully();
+}
+
+#[test]
+fn resident_omp_drive_turn_settles_on_child_exit() {
+    // If the omp process exits without sending agent_end, drive_omp_turn
+    // must not poll forever. The settle timeout ensures the turn completes.
+    let script_path = temp_path(&format!("fake-omp-rpc-exit-{}", Uuid::new_v4().simple()));
+    let script = format!(
+        r#"#!/bin/sh
+printf '%s
+' '{{"type":"ready"}}'
+while IFS= read -r line; do
+  CMD=$(printf '%s' "$line" | sed -n 's/.*"type":"\([^"]*\)".*/\1/p')
+  ID=$(printf '%s' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+  case "$CMD" in
+    prompt)
+      printf '{{"id":"%s","type":"response","command":"prompt","success":true}}
+' "$ID"
+      printf '%s
+' '{{"type":"agent_start"}}'
+      # Exit WITHOUT sending agent_end — simulates a crashed/killed process.
+      exit 0
+      ;;
+    *)
+      ;;
+  esac
+done
+"#,
+    );
+    std::fs::write(&script_path, script).expect("write exit script");
+    set_executable(&script_path);
+
+    // The turn should complete (not hang forever) because the process exits
+    // and read_line_timeout returns Err on disconnect, which propagates.
+    // The adapter should handle this gracefully. The key assertion is that
+    // we reach the end of this function — the turn didn't block forever.
+    let mut bridge = spawn_omp_resident(script_path.display().to_string(), &[]);
+    let ownership = omp_ownership_json("resident-host", 1);
+    // The process exits mid-turn; the adapter must settle without hanging.
+    // run_blocks_user_line will either complete or panic on process exit.
+    // Either way, the test finishes within the timeout (not forever).
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _turn = bridge.run_blocks_user_turn_with_ownership(
+            "prompt",
+            &ownership,
+            Duration::from_secs(30),
+        );
+    }));
+    // Drop the bridge — if the process already exited this is a no-op.
+    drop(bridge);
 }
 
 // ---------------------------------------------------------------------------

@@ -372,6 +372,7 @@ pub fn collab_start_command(
     id: &str,
     relay_url: Option<&str>,
     display_name: Option<&str>,
+    web_url: Option<&str>,
 ) -> Value {
     let mut cmd = json!({ "id": id, "type": "collab_start" });
     if let Some(relay) = relay_url {
@@ -379,6 +380,9 @@ pub fn collab_start_command(
     }
     if let Some(name) = display_name {
         cmd["displayName"] = Value::String(name.to_owned());
+    }
+    if let Some(web) = web_url {
+        cmd["webUrl"] = Value::String(web.to_owned());
     }
     cmd
 }
@@ -461,14 +465,27 @@ pub fn room_state_to_api(room: &OmpCollabRoomState) -> Value {
 #[derive(Debug)]
 pub enum OmpBlocksControl {
     CollabStart {
+        /// Optional caller-supplied request id for correlation. When present
+        /// the adapter uses it as the omp RPC request id and echoes it as
+        /// `request_id` on the normalized collab/state notification.
+        request_id: Option<String>,
         relay_url: Option<String>,
         display_name: Option<String>,
+        web_url: Option<String>,
         ownership: OmpRpcOwnership,
     },
     CollabStatus {
+        request_id: Option<String>,
         ownership: OmpRpcOwnership,
     },
     CollabStop {
+        request_id: Option<String>,
+        ownership: OmpRpcOwnership,
+    },
+    /// Interrupt the active turn. Carries ownership so the adapter can fence
+    /// stale/missing owners before sending abort to the resident process.
+    Interrupt {
+        request_id: Option<String>,
         ownership: OmpRpcOwnership,
     },
 }
@@ -498,8 +515,15 @@ pub fn parse_omp_control_line(line: &str) -> Result<Option<OmpBlocksControl>> {
         .ok_or_else(|| HarnessServerError::InvalidBlocksInput {
             message: "missing ownership (owner_id + generation)".to_string(),
         })?;
+    let request_id = value
+        .get("id")
+        .or_else(|| value.get("request_id"))
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
     match kind {
         "collab_start" => Ok(Some(OmpBlocksControl::CollabStart {
+            request_id,
             relay_url: value
                 .get("relayUrl")
                 .or_else(|| value.get("relay_url"))
@@ -510,10 +534,25 @@ pub fn parse_omp_control_line(line: &str) -> Result<Option<OmpBlocksControl>> {
                 .or_else(|| value.get("display_name"))
                 .and_then(Value::as_str)
                 .map(str::to_owned),
+            web_url: value
+                .get("webUrl")
+                .or_else(|| value.get("web_url"))
+                .and_then(Value::as_str)
+                .map(str::to_owned),
             ownership,
         })),
-        "collab_status" => Ok(Some(OmpBlocksControl::CollabStatus { ownership })),
-        "collab_stop" => Ok(Some(OmpBlocksControl::CollabStop { ownership })),
+        "collab_status" => Ok(Some(OmpBlocksControl::CollabStatus {
+            request_id,
+            ownership,
+        })),
+        "collab_stop" => Ok(Some(OmpBlocksControl::CollabStop {
+            request_id,
+            ownership,
+        })),
+        "interrupt" => Ok(Some(OmpBlocksControl::Interrupt {
+            request_id,
+            ownership,
+        })),
         _ => Ok(None),
     }
 }
@@ -701,18 +740,41 @@ pub fn run_omp_blocks_server() -> Result<()> {
                 turn_active.store(false, Ordering::SeqCst);
             }
             OmpBlocksInput::Command(BlocksCommand::Interrupt) => {
-                // Abort the active turn: send `abort` to the resident process.
-                // The turn driver's drain loop will see agent_end (or process
-                // exit) and complete the turn.
+                // Interrupt without ownership: reject if ownership has been
+                // admitted (the process exists and a stale owner must not
+                // abort it). If no process exists, there is nothing to abort.
+                if admitted_ownership.is_some() {
+                    write_blocks_error(
+                        &mut stdout,
+                        &thread_id,
+                        "interrupt",
+                        "missing ownership: interrupt requires owner_id + generation",
+                    )?;
+                    continue;
+                }
                 if let Some(child) = child.as_mut() {
                     let id = child.next_request_id();
                     child.send_command(&abort_command(&id))?;
                 }
             }
+            OmpBlocksInput::Control(OmpBlocksControl::Interrupt {
+                request_id,
+                ownership,
+            }) => {
+                if !check_ownership(&admitted_ownership, &ownership, &mut stdout, &thread_id) {
+                    continue;
+                }
+                if let Some(child) = child.as_mut() {
+                    let id = resolve_request_id(child, request_id);
+                    child.send_command(&abort_command(&id))?;
+                }
+            }
             OmpBlocksInput::Command(BlocksCommand::AttachmentChunk) => {}
             OmpBlocksInput::Control(OmpBlocksControl::CollabStart {
+                request_id,
                 relay_url,
                 display_name,
+                web_url,
                 ownership,
             }) => {
                 if !check_ownership(&admitted_ownership, &ownership, &mut stdout, &thread_id) {
@@ -723,18 +785,22 @@ pub fn run_omp_blocks_server() -> Result<()> {
                     drain_ready(child.as_mut().unwrap())?;
                 }
                 let child = child.as_mut().unwrap();
-                let id = child.next_request_id();
+                let id = resolve_request_id(child, request_id);
                 child.send_command(&collab_start_command(
                     &id,
                     relay_url.as_deref(),
                     display_name.as_deref(),
+                    web_url.as_deref(),
                 ))?;
                 let room = drive_collab_command(child, &id, "collab_start", &mut stdout)?;
                 if let Some(room) = room {
-                    emit_collab_state(&mut stdout, "started", None, &room)?;
+                    emit_collab_state(&mut stdout, "started", None, &room, Some(&id))?;
                 }
             }
-            OmpBlocksInput::Control(OmpBlocksControl::CollabStatus { ownership }) => {
+            OmpBlocksInput::Control(OmpBlocksControl::CollabStatus {
+                request_id,
+                ownership,
+            }) => {
                 if !check_ownership(&admitted_ownership, &ownership, &mut stdout, &thread_id) {
                     continue;
                 }
@@ -747,7 +813,7 @@ pub fn run_omp_blocks_server() -> Result<()> {
                     )?;
                     continue;
                 };
-                let id = child.next_request_id();
+                let id = resolve_request_id(child, request_id);
                 child.send_command(&collab_status_command(&id))?;
                 let room = drive_collab_command(child, &id, "collab_status", &mut stdout)?;
                 if let Some(room) = room {
@@ -755,11 +821,20 @@ pub fn run_omp_blocks_server() -> Result<()> {
                     let api_room = room_state_to_api(&parsed);
                     write_value(
                         &mut stdout,
-                        &serde_json::json!({"method":"collab/status","params":{"room":api_room}}),
+                        &serde_json::json!({
+                            "method": "collab/status",
+                            "params": {
+                                "room": api_room,
+                                "request_id": id,
+                            },
+                        }),
                     )?;
                 }
             }
-            OmpBlocksInput::Control(OmpBlocksControl::CollabStop { ownership }) => {
+            OmpBlocksInput::Control(OmpBlocksControl::CollabStop {
+                request_id,
+                ownership,
+            }) => {
                 if !check_ownership(&admitted_ownership, &ownership, &mut stdout, &thread_id) {
                     continue;
                 }
@@ -772,11 +847,11 @@ pub fn run_omp_blocks_server() -> Result<()> {
                     )?;
                     continue;
                 };
-                let id = child.next_request_id();
+                let id = resolve_request_id(child, request_id);
                 child.send_command(&collab_stop_command(&id))?;
                 let room = drive_collab_command(child, &id, "collab_stop", &mut stdout)?;
                 if let Some(room) = room {
-                    emit_collab_state(&mut stdout, "stopped", None, &room)?;
+                    emit_collab_state(&mut stdout, "stopped", None, &room, Some(&id))?;
                 }
             }
         }
@@ -791,6 +866,11 @@ pub fn run_omp_blocks_server() -> Result<()> {
 
 /// Check ownership against the admitted fence. Returns `false` (and writes a
 /// blocks error) when stale or missing.
+/// Prefer a caller-supplied request id; otherwise allocate from the child.
+fn resolve_request_id(child: &mut OmpRpcChild, supplied: Option<String>) -> String {
+    supplied.unwrap_or_else(|| child.next_request_id())
+}
+
 fn check_ownership(
     admitted: &Option<OmpRpcOwnership>,
     incoming: &OmpRpcOwnership,
@@ -917,10 +997,17 @@ fn emit_collab_state(
     state: &str,
     reason: Option<&str>,
     room: &Value,
+    request_id: Option<&str>,
 ) -> Result<()> {
     let parsed = parse_room_state(room)?;
     let api_room = room_state_to_api(&parsed);
-    write_value(stdout, &collab_state_wire_value(state, reason, &api_room))
+    let mut value = collab_state_wire_value(state, reason, &api_room);
+    if let Some(request_id) = request_id
+        && let Some(params) = value.get_mut("params")
+    {
+        params["request_id"] = Value::String(request_id.to_owned());
+    }
+    write_value(stdout, &value)
 }
 
 fn ownership_from_trace(trace_context: &crate::otel::TraceContext) -> Option<OmpRpcOwnership> {
@@ -959,10 +1046,28 @@ fn drive_omp_turn(
     use crate::traits::{HarnessServer, NormalizedEvent};
 
     let mut terminal = false;
+    // Bounded settle: if no frame is received within this duration after the
+    // last activity, the turn is assumed complete (agent_end was dropped or
+    // the process exited). This prevents an infinite poll if the RPC process
+    // drops the terminal agent_end frame.
+    let settle_timeout = Duration::from_secs(120);
+    let mut last_activity = std::time::Instant::now();
     while !terminal {
         let line = match child.read_line_timeout(Duration::from_millis(50))? {
-            Some(line) => line,
-            None => continue,
+            Some(line) => {
+                last_activity = std::time::Instant::now();
+                line
+            }
+            None => {
+                // Timeout: if we've been idle past the settle window, finish
+                // the turn. The child may have exited (read_line_timeout
+                // returns Err on disconnect, handled by the ? above).
+                if last_activity.elapsed() > settle_timeout {
+                    eprintln!("omp rpc: turn settle timeout reached, finishing turn");
+                    break;
+                }
+                continue;
+            }
         };
         let frame = OmpRpcFrame::parse_json_line(&line)?;
         match frame {
@@ -1332,10 +1437,16 @@ mod tests {
 
     #[test]
     fn collab_commands_build() {
-        let start = collab_start_command("c1", Some("wss://relay"), Some("host"));
+        let start = collab_start_command(
+            "c1",
+            Some("wss://relay"),
+            Some("host"),
+            Some("https://collab.example"),
+        );
         assert_eq!(start["type"], "collab_start");
         assert_eq!(start["relayUrl"], "wss://relay");
         assert_eq!(start["displayName"], "host");
+        assert_eq!(start["webUrl"], "https://collab.example");
 
         let status = collab_status_command("c2");
         assert_eq!(status["type"], "collab_status");

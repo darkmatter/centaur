@@ -99,6 +99,50 @@ export type SlackbotV2InterruptSessionResponse = {
   thread_key: string
 }
 
+export type SlackbotV2CollabParticipant = {
+  name: string
+  read_only?: boolean
+  role: 'guest' | 'host'
+}
+
+/** Native OMP room state, relayed from the resident host via api-rs. */
+export type SlackbotV2CollabRoomState = {
+  active: boolean
+  join_url?: string
+  participants: SlackbotV2CollabParticipant[]
+  view_url?: string
+  web_url?: string
+  web_view_url?: string
+}
+
+export type SlackbotV2StartCollabRequest = {
+  display_name?: string
+  relay_url?: string
+  web_url?: string
+}
+
+export type SlackbotV2StartCollabResponse = {
+  ok: boolean
+  room: SlackbotV2CollabRoomState | null
+  thread_key: string
+}
+
+export type SlackbotV2StatusCollabResponse = {
+  ok: boolean
+  room: SlackbotV2CollabRoomState | null
+  thread_key: string
+}
+
+export type SlackbotV2StopCollabRequest = {
+  reason?: string
+}
+
+export type SlackbotV2StopCollabResponse = {
+  ok: boolean
+  stopped: boolean
+  thread_key: string
+}
+
 export type SlackbotV2Fetch = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>
 
 export type SlackbotV2Options = {

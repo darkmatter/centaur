@@ -2485,6 +2485,11 @@ while IFS= read -r line; do
     set_session_name)
       printf '{{"id":"%s","type":"response","command":"set_session_name","success":true}}\n' "$ID"
       ;;
+    get_state)
+      # Return the released shape: sessionId + sessionFile.
+      SESSION_ID="sess-$(cat '{pidfile}' 2>/dev/null || echo unknown)"
+      printf '{{"id":"%s","type":"response","command":"get_state","success":true,"data":{{"sessionId":"%s","sessionFile":"/tmp/%s.jsonl","sessionName":"test","isStreaming":false,"isCompacting":false,"steeringMode":"all","followUpMode":"all","interruptMode":"immediate","autoCompactionEnabled":true,"messageCount":0,"queuedMessageCount":0,"todoPhases":[],"thinkingLevel":"off"}}}}\n' "$ID" "$SESSION_ID" "$SESSION_ID"
+      ;;
     *)
       printf '%s' "$line" >&2
       ;;
@@ -3027,22 +3032,69 @@ fn resident_omp_real_binary_collab_status_and_ownership_fence() {
 }
 
 #[test]
-fn resident_omp_session_name_resumes_across_respawn() {
-    // L2: with CENTAUR_OMP_SESSION_NAME set, a second resident process sees
-    // the prior session marker (proves resume identity continuity).
-    let pidfile = temp_path("omp-rpc-pid-resume");
-    let _ = std::fs::remove_file(&pidfile);
-    let _ = std::fs::remove_file(format!("{}.session", pidfile.display()));
-    let _ = std::fs::remove_file(format!("{}.resumed", pidfile.display()));
-    let script = fake_omp_rpc_script(&pidfile, false);
-    let session_name = "centaur-thread-resume-test";
+fn resident_omp_session_id_resumes_across_respawn() {
+    // Fix (1): prove that get_state persists the actual session id and a
+    // second spawn passes --resume <id> via OMP_BIN (not bridge override).
+    // The fake executable records its argv and returns the session id from
+    // get_state based on its PID.
+    let session_dir = temp_path("omp-session-dir");
+    let _ = std::fs::create_dir_all(&session_dir);
+    let marker = session_dir.join(".resident_session_id");
+    let _ = std::fs::remove_file(&marker);
+    let argv_log = temp_path("omp-argv-log");
+    let _ = std::fs::remove_file(&argv_log);
 
+    // Fake omp binary: records argv, speaks the wire protocol.
+    let fake_bin = temp_path(&format!("fake-omp-bin-{}", Uuid::new_v4().simple()));
+    let script = format!(
+        r#"#!/bin/sh
+# Record argv for resume proof.
+printf '%s\n' "$*" >> '{argv_log}'
+# Write a stable PID-based session id.
+echo $$ > '{session_dir}/.pid'
+printf '%s\n' '{{"type":"ready"}}'
+while IFS= read -r line; do
+  CMD=$(printf '%s' "$line" | sed -n 's/.*"type":"\([^"]*\)".*/\1/p')
+  ID=$(printf '%s' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+  case "$CMD" in
+    get_state)
+      SID="sess-$$"
+      printf '{{"id":"%s","type":"response","command":"get_state","success":true,"data":{{"sessionId":"%s","sessionFile":"/tmp/%s.jsonl","sessionName":"test","isStreaming":false,"isCompacting":false,"steeringMode":"all","followUpMode":"all","interruptMode":"immediate","autoCompactionEnabled":true,"messageCount":0,"queuedMessageCount":0,"todoPhases":[],"thinkingLevel":"off"}}}}\n' "$ID" "$SID" "$SID"
+      ;;
+    prompt)
+      printf '{{"id":"%s","type":"response","command":"prompt","success":true,"data":{{"agentInvoked":true}}}}\n' "$ID"
+      printf '%s\n' '{{"type":"agent_start"}}'
+      printf '%s\n' '{{"type":"message_update","assistantMessageEvent":{{"type":"text_delta","contentIndex":0,"delta":"hi"}},"message":{{"role":"assistant","content":[],"responseId":"msg-1"}}}}'
+      printf '%s\n' '{{"type":"message_end","message":{{"role":"assistant","content":[{{"type":"text","text":"hi"}}],"stopReason":"stop","responseId":"msg-1"}}}}'
+      printf '%s\n' '{{"type":"agent_end","messages":[]}}'
+      ;;
+    *)
+      ;;
+  esac
+done
+"#,
+        argv_log = argv_log.display(),
+        session_dir = session_dir.display(),
+    );
+    std::fs::write(&fake_bin, script).expect("write fake bin");
+    set_executable(&fake_bin);
+
+    let ownership = omp_ownership_json("resident-host", 1);
+
+    // First lifetime: spawn with OMP_BIN, no bridge override.
     {
-        let mut bridge = spawn_omp_resident(
-            script.clone(),
-            &[("CENTAUR_OMP_SESSION_NAME", session_name)],
-        );
-        let ownership = omp_ownership_json("resident-host", 1);
+        let bin = env!("CARGO_BIN_EXE_harness-server");
+        let mut command = Command::new(bin);
+        command
+            .args(["omp"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .env_remove("CENTAUR_OMP_RPC_BRIDGE_COMMAND")
+            .env_remove("CENTAUR_OMP_APP_BRIDGE_COMMAND")
+            .env("OMP_BIN", &fake_bin)
+            .env("OMP_SESSION_DIR", &session_dir);
+        let mut bridge = BridgeProcess::spawn_command(command);
         let _turn = bridge.run_blocks_user_turn_with_ownership(
             "first lifetime",
             &ownership,
@@ -3051,15 +3103,27 @@ fn resident_omp_session_name_resumes_across_respawn() {
         let _ = bridge.finish_successfully();
     }
 
-    let marker = std::fs::read_to_string(format!("{}.session", pidfile.display()))
-        .unwrap_or_default()
-        .trim()
-        .to_string();
-    assert_eq!(marker, session_name, "first lifetime must pin session name");
+    // The marker must contain a session id from get_state.
+    let persisted = std::fs::read_to_string(&marker).unwrap_or_default();
+    assert!(
+        !persisted.trim().is_empty() && persisted.starts_with("sess-"),
+        "first lifetime must persist session id, got: {persisted:?}"
+    );
 
+    // Second lifetime: same OMP_BIN + session dir; must pass --resume <id>.
     {
-        let mut bridge = spawn_omp_resident(script, &[("CENTAUR_OMP_SESSION_NAME", session_name)]);
-        let ownership = omp_ownership_json("resident-host", 1);
+        let bin = env!("CARGO_BIN_EXE_harness-server");
+        let mut command = Command::new(bin);
+        command
+            .args(["omp"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .env_remove("CENTAUR_OMP_RPC_BRIDGE_COMMAND")
+            .env_remove("CENTAUR_OMP_APP_BRIDGE_COMMAND")
+            .env("OMP_BIN", &fake_bin)
+            .env("OMP_SESSION_DIR", &session_dir);
+        let mut bridge = BridgeProcess::spawn_command(command);
         let _turn = bridge.run_blocks_user_turn_with_ownership(
             "second lifetime",
             &ownership,
@@ -3068,12 +3132,379 @@ fn resident_omp_session_name_resumes_across_respawn() {
         let _ = bridge.finish_successfully();
     }
 
-    let resumed = std::fs::read_to_string(format!("{}.resumed", pidfile.display()))
-        .unwrap_or_default()
-        .trim()
-        .to_string();
-    assert_eq!(
-        resumed, session_name,
-        "respawn must resume the prior session identity"
+    // The argv log must show --resume <persisted-id> on the second spawn.
+    let argv_log_content = std::fs::read_to_string(&argv_log).unwrap_or_default();
+    let resume_flag = format!("--resume {}", persisted.trim());
+    assert!(
+        argv_log_content.contains(&resume_flag),
+        "second spawn must pass {resume_flag}, argv log: {argv_log_content}"
     );
+}
+
+#[test]
+fn resident_omp_active_interrupt_and_steer_ownership() {
+    // Fixes 2-3: active interrupt/steer exact-check ownership;
+    // stale/missing surface errors; valid interrupt finishes interrupted.
+    // Steer message is recorded to a temp file for exact assertion.
+    let pidfile = temp_path("omp-rpc-pid-active-ctrl");
+    let steer_log = temp_path("omp-rpc-steer-log");
+    let _ = std::fs::remove_file(&pidfile);
+    let _ = std::fs::remove_file(&steer_log);
+    let script_path = temp_path(&format!("fake-omp-hold-{}", Uuid::new_v4().simple()));
+    let script = format!(
+        r#"#!/bin/sh
+echo $$ > '{pidfile}'
+printf '%s\n' '{{"type":"ready"}}'
+while IFS= read -r line; do
+  CMD=$(printf '%s' "$line" | sed -n 's/.*"type":"\([^"]*\)".*/\1/p')
+  ID=$(printf '%s' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+  MSG=$(printf '%s' "$line" | sed -n 's/.*"message":"\([^"]*\)".*/\1/p')
+  case "$CMD" in
+    get_state)
+      printf '{{"id":"%s","type":"response","command":"get_state","success":true,"data":{{"sessionId":"sess-hold","sessionFile":"/tmp/sess-hold.jsonl","sessionName":"t","isStreaming":false,"isCompacting":false,"steeringMode":"all","followUpMode":"all","interruptMode":"immediate","autoCompactionEnabled":true,"messageCount":0,"queuedMessageCount":0,"todoPhases":[],"thinkingLevel":"off"}}}}\n' "$ID"
+      ;;
+    prompt)
+      printf '{{"id":"%s","type":"response","command":"prompt","success":true,"data":{{"agentInvoked":true}}}}\n' "$ID"
+      printf '%s\n' '{{"type":"agent_start"}}'
+      printf '%s\n' '{{"type":"message_update","assistantMessageEvent":{{"type":"text_delta","contentIndex":0,"delta":"working"}},"message":{{"role":"assistant","content":[],"responseId":"msg-1"}}}}'
+      # Hold open until abort.
+      ;;
+    steer)
+      printf '%s\n' "$MSG" > '{steer_log}'
+      printf '{{"id":"%s","type":"response","command":"steer","success":true}}\n' "$ID"
+      ;;
+    abort)
+      printf '{{"id":"%s","type":"response","command":"abort","success":true}}\n' "$ID"
+      printf '%s\n' '{{"type":"agent_end","messages":[]}}'
+      ;;
+    *)
+      ;;
+  esac
+done
+"#,
+        pidfile = pidfile.display(),
+        steer_log = steer_log.display(),
+    );
+    std::fs::write(&script_path, &script).expect("write hold script");
+    set_executable(&script_path);
+
+    let mut bridge = spawn_omp_resident(script_path.display().to_string(), &[]);
+    let ownership = omp_ownership_json("resident-host", 1);
+    let stale = omp_ownership_json("resident-host", 99);
+
+    bridge.send(json!({
+        "type": "user",
+        "thread_key": "slack:C123:123.456",
+        "trace_metadata": ownership,
+        "message": {
+            "role": "user",
+            "content": [{"type": "text", "text": "long running"}],
+        },
+    }));
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut saw_delta = false;
+    while Instant::now() < deadline && !saw_delta {
+        let v = bridge.read_json(deadline);
+        if v.get("method").and_then(Value::as_str) == Some("item/agentMessage/delta") {
+            saw_delta = true;
+        }
+    }
+    assert!(
+        saw_delta,
+        "turn must start streaming before concurrent controls"
+    );
+
+    // Stale interrupt during active turn → error.
+    bridge.send(json!({
+        "type": "interrupt",
+        "trace_metadata": stale,
+    }));
+    let err = bridge.read_json_allowing_error(Instant::now() + Duration::from_secs(5));
+    let msg = err
+        .pointer("/params/error/message")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    assert!(
+        msg.contains("stale") || msg.contains("ownership"),
+        "stale interrupt must error: {msg}"
+    );
+
+    // Valid steer during active turn.
+    bridge.send(json!({
+        "type": "user",
+        "thread_key": "slack:C123:123.456",
+        "trace_metadata": {
+            "owner_id": "resident-host",
+            "generation": 1,
+            "action": "steer_active_execution",
+        },
+        "message": {
+            "role": "user",
+            "content": [{"type": "text", "text": "also include risks"}],
+        },
+    }));
+    // Wait for steer to be processed (poll the log file).
+    let steer_deadline = Instant::now() + Duration::from_secs(5);
+    let mut steer_msg = String::new();
+    while Instant::now() < steer_deadline {
+        if let Ok(s) = std::fs::read_to_string(&steer_log) {
+            if !s.trim().is_empty() {
+                steer_msg = s.trim().to_string();
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(
+        steer_msg, "also include risks",
+        "active steer must send exact message text, got: {steer_msg:?}"
+    );
+
+    // Valid interrupt → abort + interrupted status.
+    bridge.send(json!({
+        "type": "interrupt",
+        "trace_metadata": ownership,
+    }));
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut interrupted = false;
+    while Instant::now() < deadline {
+        let v = bridge.read_json_allowing_error(deadline);
+        if v.get("method").and_then(Value::as_str) == Some("turn/completed") {
+            let status = v.pointer("/params/turn/status").and_then(Value::as_str);
+            if status == Some("interrupted") {
+                interrupted = true;
+                break;
+            }
+        }
+    }
+    assert!(
+        interrupted,
+        "valid interrupt must finish turn as interrupted"
+    );
+
+    let _ = bridge.finish_successfully();
+}
+
+#[test]
+fn resident_omp_fifo_pending_after_turn() {
+    // Fix 4: items queued mid-turn must be processed FIFO after it ends.
+    // Hold-open turn, enqueue collab_status then a second user prompt during
+    // the hold, then abort; assert collab/status appears before turn 2 text.
+    let pidfile = temp_path("omp-rpc-pid-fifo");
+    let _ = std::fs::remove_file(&pidfile);
+    let script_path = temp_path(&format!("fake-omp-fifo-{}", Uuid::new_v4().simple()));
+    let script = format!(
+        r#"#!/bin/sh
+echo $$ > '{pidfile}'
+printf '%s\n' '{{"type":"ready"}}'
+TURN=0
+while IFS= read -r line; do
+  CMD=$(printf '%s' "$line" | sed -n 's/.*"type":"\([^"]*\)".*/\1/p')
+  ID=$(printf '%s' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+  case "$CMD" in
+    get_state)
+      printf '{{"id":"%s","type":"response","command":"get_state","success":true,"data":{{"sessionId":"sess-fifo","sessionFile":"/tmp/s.jsonl","sessionName":"t","isStreaming":false,"isCompacting":false,"steeringMode":"all","followUpMode":"all","interruptMode":"immediate","autoCompactionEnabled":true,"messageCount":0,"queuedMessageCount":0,"todoPhases":[],"thinkingLevel":"off"}}}}\n' "$ID"
+      ;;
+    prompt)
+      TURN=$((TURN+1))
+      if [ "$TURN" = "1" ]; then
+        printf '{{"id":"%s","type":"response","command":"prompt","success":true,"data":{{"agentInvoked":true}}}}\n' "$ID"
+        printf '%s\n' '{{"type":"agent_start"}}'
+        printf '%s\n' '{{"type":"message_update","assistantMessageEvent":{{"type":"text_delta","contentIndex":0,"delta":"hold"}},"message":{{"role":"assistant","content":[],"responseId":"msg-1"}}}}'
+        # Hold open until abort.
+      else
+        printf '{{"id":"%s","type":"response","command":"prompt","success":true,"data":{{"agentInvoked":true}}}}\n' "$ID"
+        printf '%s\n' '{{"type":"agent_start"}}'
+        printf '%s\n' '{{"type":"message_update","assistantMessageEvent":{{"type":"text_delta","contentIndex":0,"delta":"second-turn-text"}},"message":{{"role":"assistant","content":[],"responseId":"msg-2"}}}}'
+        printf '%s\n' '{{"type":"message_end","message":{{"role":"assistant","content":[{{"type":"text","text":"second-turn-text"}}],"stopReason":"stop","responseId":"msg-2"}}}}'
+        printf '%s\n' '{{"type":"agent_end","messages":[]}}'
+      fi
+      ;;
+    collab_status)
+      printf '{{"id":"%s","type":"response","command":"collab_status","success":true,"data":{{"active":false,"participants":[]}}}}\n' "$ID"
+      ;;
+    abort)
+      printf '{{"id":"%s","type":"response","command":"abort","success":true}}\n' "$ID"
+      printf '%s\n' '{{"type":"agent_end","messages":[]}}'
+      ;;
+    *)
+      ;;
+  esac
+done
+"#,
+        pidfile = pidfile.display(),
+    );
+    std::fs::write(&script_path, &script).expect("write fifo script");
+    set_executable(&script_path);
+
+    let mut bridge = spawn_omp_resident(script_path.display().to_string(), &[]);
+    let ownership = omp_ownership_json("resident-host", 1);
+
+    // Start hold-open turn.
+    bridge.send(json!({
+        "type": "user",
+        "thread_key": "slack:C123:123.456",
+        "trace_metadata": ownership,
+        "message": {
+            "role": "user",
+            "content": [{"type": "text", "text": "hold open"}],
+        },
+    }));
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut saw_delta = false;
+    while Instant::now() < deadline && !saw_delta {
+        let v = bridge.read_json(deadline);
+        if v.get("method").and_then(Value::as_str) == Some("item/agentMessage/delta") {
+            saw_delta = true;
+        }
+    }
+    assert!(saw_delta, "hold-open turn must start");
+
+    // Enqueue two distinguishable items mid-turn: collab_status then user prompt.
+    bridge.send(json!({
+        "type": "collab_status",
+        "id": "fifo-status",
+        "trace_metadata": ownership,
+    }));
+    bridge.send(json!({
+        "type": "user",
+        "thread_key": "slack:C123:123.456",
+        "trace_metadata": ownership,
+        "message": {
+            "role": "user",
+            "content": [{"type": "text", "text": "second prompt"}],
+        },
+    }));
+
+    // Abort the hold-open turn.
+    bridge.send(json!({
+        "type": "interrupt",
+        "trace_metadata": ownership,
+    }));
+
+    // Collect methods in order after abort.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut methods = Vec::new();
+    let mut saw_second_text = false;
+    while Instant::now() < deadline {
+        let v = bridge.read_json_allowing_error(deadline);
+        let method = v
+            .get("method")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        methods.push(method.clone());
+        if method == "item/agentMessage/delta" {
+            let delta = v
+                .pointer("/params/delta")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if delta.contains("second-turn-text") {
+                saw_second_text = true;
+                break;
+            }
+        }
+        // Safety: stop after enough frames.
+        if methods.len() > 40 {
+            break;
+        }
+    }
+
+    let status_idx = methods.iter().position(|m| m == "collab/status");
+    assert!(
+        status_idx.is_some(),
+        "collab/status must appear after hold turn, methods={methods:?}"
+    );
+    assert!(
+        saw_second_text,
+        "second turn text must appear after hold turn, methods={methods:?}"
+    );
+    // collab/status must appear before the second turn's delta.
+    // Find the last collab/status and first second-turn-related delta.
+    let first_status = status_idx.unwrap();
+    // second turn starts after interrupt completes; collab/status should be before it.
+    // We check that collab/status appears somewhere before we saw second-turn-text.
+    assert!(
+        first_status < methods.len() - 1,
+        "FIFO: collab/status (idx {first_status}) must precede second turn, methods={methods:?}"
+    );
+
+    let _ = bridge.finish_successfully();
+}
+
+#[test]
+fn resident_omp_failed_prompt_preserves_error_message() {
+    // Fix 8: correlated prompt failure must carry the actual error text.
+    let pidfile = temp_path("omp-rpc-pid-fail");
+    let _ = std::fs::remove_file(&pidfile);
+    let script_path = temp_path(&format!("fake-omp-fail-{}", Uuid::new_v4().simple()));
+    let script = format!(
+        r#"#!/bin/sh
+echo $$ > '{pidfile}'
+printf '%s\n' '{{"type":"ready"}}'
+while IFS= read -r line; do
+  CMD=$(printf '%s' "$line" | sed -n 's/.*"type":"\([^"]*\)".*/\1/p')
+  ID=$(printf '%s' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+  case "$CMD" in
+    get_state)
+      printf '{{"id":"%s","type":"response","command":"get_state","success":true,"data":{{"sessionId":"sess-fail","sessionFile":"/tmp/s.jsonl","sessionName":"t","isStreaming":false,"isCompacting":false,"steeringMode":"all","followUpMode":"all","interruptMode":"immediate","autoCompactionEnabled":true,"messageCount":0,"queuedMessageCount":0,"todoPhases":[],"thinkingLevel":"off"}}}}\n' "$ID"
+      ;;
+    prompt)
+      printf '{{"id":"%s","type":"response","command":"prompt","success":false,"error":"Model not found: provider/model"}}\n' "$ID"
+      ;;
+    *)
+      ;;
+  esac
+done
+"#,
+        pidfile = pidfile.display(),
+    );
+    std::fs::write(&script_path, &script).expect("write fail script");
+    set_executable(&script_path);
+
+    let mut bridge = spawn_omp_resident(script_path.display().to_string(), &[]);
+    let ownership = omp_ownership_json("resident-host", 1);
+
+    bridge.send(json!({
+        "type": "user",
+        "thread_key": "slack:C123:123.456",
+        "trace_metadata": ownership,
+        "message": {
+            "role": "user",
+            "content": [{"type": "text", "text": "hello"}],
+        },
+    }));
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut saw_actual_error = false;
+    let mut saw_failed_turn = false;
+    while Instant::now() < deadline {
+        let v = bridge.read_json_allowing_error(deadline);
+        let method = v.get("method").and_then(Value::as_str).unwrap_or_default();
+        if method == "error" {
+            let msg = v
+                .pointer("/params/error/message")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if msg.contains("Model not found") {
+                saw_actual_error = true;
+            }
+        }
+        if method == "turn/completed" {
+            let status = v.pointer("/params/turn/status").and_then(Value::as_str);
+            if status == Some("failed") {
+                saw_failed_turn = true;
+                break;
+            }
+        }
+    }
+    assert!(
+        saw_actual_error,
+        "must preserve actual prompt error message"
+    );
+    assert!(saw_failed_turn, "failed prompt must finish as failed");
+
+    let _ = bridge.finish_successfully();
 }

@@ -367,15 +367,14 @@ fn omp_rpc_command() -> ProcessCommand {
         "--session-dir",
         &crate::omp::omp_session_dir().display().to_string(),
     ]);
-    // Stable session path/id so a respawn after resident death resumes the
-    // prior JSONL instead of creating a new anonymous session. api-rs should
-    // set CENTAUR_OMP_SESSION_PATH to the actual session JSONL path (obtained
-    // from the first spawn's session_info_update event). The value is passed
-    // as --resume <path>, which the release resolves by JSONL filename prefix.
-    if let Ok(path) = env::var("CENTAUR_OMP_SESSION_PATH")
-        && !path.is_empty()
+    // Resume prior session: read the actual session id written by the first
+    // spawn's get_state response. The release resolves --resume by JSONL
+    // filename prefix matching.
+    let session_marker = crate::omp::omp_session_dir().join(".resident_session_id");
+    if let Ok(id) = std::fs::read_to_string(&session_marker)
+        && !id.trim().is_empty()
     {
-        command.args(["--resume", &path]);
+        command.args(["--resume", id.trim()]);
     }
     if let Ok(model) = env::var("OMP_MODEL")
         && !model.is_empty()
@@ -390,15 +389,15 @@ fn omp_rpc_command() -> ProcessCommand {
 /// id and name that the release assigned, so a respawn can resume the prior
 /// session by its JSONL path rather than a display name the release cannot
 /// resolve. Frames are forwarded through the normalizer if possible.
-/// After `ready`, send `get_state` to obtain the authoritative session id
-/// and file path. Persist the id so a respawn can resume the prior JSONL.
-/// The release binary emits `session_info_update` only on title change, not
-/// at startup — `get_state` is the only authoritative source.
+/// After `ready`, send `get_state` to obtain the authoritative session id.
+/// Returns `Err` if the response is missing, empty, failed, or times out.
+/// The id is persisted to `$OMP_SESSION_DIR/.resident_session_id` so a respawn
+/// can resume the prior JSONL.
 fn query_and_persist_session_state(
     child: &mut OmpRpcChild,
     event_normalizer: &mut crate::omp::OmpEventNormalizer,
     stdout: &mut impl Write,
-) -> Result<()> {
+) -> Result<String> {
     let id = child.next_request_id();
     child.send_command(&json!({ "id": id, "type": "get_state" }))?;
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -413,17 +412,34 @@ fn query_and_persist_session_state(
                 command,
                 success,
                 data,
-                ..
-            } if resp_id.as_deref() == Some(id.as_str()) && command == "get_state" && success => {
-                if let Some(d) = data
-                    && let Some(sid) = d.get("sessionId").and_then(Value::as_str)
-                {
-                    eprintln!("omp rpc: resident session id={sid}");
-                    if let Ok(dir) = env::var("OMP_SESSION_DIR") {
-                        let _ = std::fs::write(format!("{dir}/.resident_session_id"), sid);
-                    }
+                error,
+            } if resp_id.as_deref() == Some(id.as_str()) && command == "get_state" => {
+                if !success {
+                    return Err(HarnessServerError::InvalidBlocksInput {
+                        message: format!("get_state failed: {}", error.unwrap_or_default()),
+                    });
                 }
-                return Ok(());
+                let Some(d) = data else {
+                    return Err(HarnessServerError::InvalidBlocksInput {
+                        message: "get_state returned no data".to_string(),
+                    });
+                };
+                let Some(sid) = d.get("sessionId").and_then(Value::as_str) else {
+                    return Err(HarnessServerError::InvalidBlocksInput {
+                        message: "get_state missing sessionId".to_string(),
+                    });
+                };
+                if sid.is_empty() {
+                    return Err(HarnessServerError::InvalidBlocksInput {
+                        message: "get_state returned empty sessionId".to_string(),
+                    });
+                }
+                eprintln!("omp rpc: resident session id={sid}");
+                let dir = crate::omp::omp_session_dir();
+                std::fs::create_dir_all(&dir)?;
+                let marker = dir.join(".resident_session_id");
+                std::fs::write(&marker, sid)?;
+                return Ok(sid.to_owned());
             }
             OmpRpcFrame::Response { .. } => {}
             OmpRpcFrame::Event(event) => {
@@ -448,7 +464,9 @@ fn query_and_persist_session_state(
             _ => {}
         }
     }
-    Ok(())
+    Err(HarnessServerError::InvalidBlocksInput {
+        message: "get_state timed out".to_string(),
+    })
 }
 
 /// Build a `prompt` command. During active streaming, `streaming_behavior`
@@ -771,7 +789,18 @@ pub fn run_omp_blocks_server() -> Result<()> {
     let thread_id = format!("omp-{}", uuid::Uuid::new_v4().simple());
     let mut harness_session_id: Option<String> = None;
 
-    while let Ok(input) = input_rx.recv() {
+    let mut respawn_child = false;
+    let mut outer_pending: std::collections::VecDeque<OmpBlocksInput> =
+        std::collections::VecDeque::new();
+    loop {
+        let input = if let Some(pending) = outer_pending.pop_front() {
+            pending
+        } else {
+            match input_rx.recv() {
+                Ok(input) => input,
+                Err(_) => break,
+            }
+        };
         match input {
             OmpBlocksInput::Command(BlocksCommand::User {
                 input,
@@ -780,6 +809,10 @@ pub fn run_omp_blocks_server() -> Result<()> {
                 trace_context,
                 ..
             }) => {
+                // Set turn_active at actual dispatch so concurrent
+                // interrupt/steer gates work for pending Users that start
+                // after a prior turn cleared the flag.
+                turn_active.store(true, Ordering::SeqCst);
                 // Admission: require ownership on first turn. The ownership
                 // is carried in trace_metadata. A stale or missing fence
                 // rejects.
@@ -861,7 +894,7 @@ pub fn run_omp_blocks_server() -> Result<()> {
                     write_value(&mut stdout, &notification_to_wire_value(&notification)?)?;
                 }
 
-                drive_omp_turn(
+                let drive_result = drive_omp_turn(
                     child,
                     &mut event_normalizer,
                     &mut normalizer,
@@ -875,6 +908,20 @@ pub fn run_omp_blocks_server() -> Result<()> {
                 )?;
 
                 turn_active.store(false, Ordering::SeqCst);
+
+                // #4: requeue pending items from the turn driver into the
+                // outer VecDeque for FIFO processing before the next recv.
+                for input in drive_result.pending {
+                    outer_pending.push_back(input);
+                }
+
+                // #6: if the child is not reusable, drop it so the next
+                // turn spawns a fresh process.
+                if !drive_result.child_reusable {
+                    // Signal outer scope to respawn. The inner 'child' is
+                    // a &mut reference; we kill via Drop by setting a flag.
+                    respawn_child = true;
+                }
             }
             OmpBlocksInput::Command(BlocksCommand::Interrupt) => {
                 // Interrupt without ownership: reject if ownership has been
@@ -1003,6 +1050,14 @@ pub fn run_omp_blocks_server() -> Result<()> {
                     emit_collab_state(&mut stdout, "stopped", None, &room, Some(&id))?;
                 }
             }
+        }
+
+        // Handle child respawn after a non-reusable turn.
+        if respawn_child {
+            if let Some(old_child) = child.take() {
+                let _ = old_child.wait();
+            }
+            respawn_child = false;
         }
     }
 
@@ -1196,6 +1251,14 @@ fn drain_ready(child: &mut OmpRpcChild) -> Result<()> {
     }
 }
 
+/// Result of driving an OMP turn. `pending` items are returned to the outer
+/// loop for FIFO processing. `child_reusable` is false when the child process
+/// is in an unrecoverable state (e.g. timeout abort without clean drain).
+struct TurnDriveResult {
+    pending: std::collections::VecDeque<OmpBlocksInput>,
+    child_reusable: bool,
+}
+
 fn drive_omp_turn(
     child: &mut OmpRpcChild,
     event_normalizer: &mut crate::omp::OmpEventNormalizer,
@@ -1207,39 +1270,118 @@ fn drive_omp_turn(
     thread_id: &str,
     active_rx: &mpsc::Receiver<OmpBlocksInput>,
     admitted_ownership: &Option<OmpRpcOwnership>,
-) -> Result<()> {
+) -> Result<TurnDriveResult> {
     use crate::omp::OmpHarness;
     use crate::traits::{HarnessServer, NormalizedEvent};
 
+    let mut pending = std::collections::VecDeque::new();
     let mut terminal = false;
     let mut failed = false;
     let mut aborted = false;
-    // Settle window: arm only after a terminal assistant stop (message_end
-    // with stopReason=stop). If agent_end is dropped, the settle window
-    // fires shortly after. A separate absolute max-duration guards against
-    // a totally silent turn (provider/tool taking very long).
+    let mut child_reusable = true;
+    let mut prompt_error: Option<String> = None;
+    // Settle window: arm only after a terminal assistant stop.
     let mut settle_deadline: Option<std::time::Instant> = None;
     let absolute_deadline = std::time::Instant::now() + Duration::from_secs(300);
-    let mut requeued: Vec<OmpBlocksInput> = Vec::new();
+
     while !terminal {
-        // Check for concurrent steer/interrupt from the stdin thread.
-        // Drain all pending inputs without blocking; preserve unmatched.
+        // #5: check deadlines unconditionally, regardless of frame flow.
+        let now = std::time::Instant::now();
+        if now >= absolute_deadline {
+            eprintln!("omp rpc: absolute turn timeout, terminating");
+            let abort_id = child.next_request_id();
+            child.send_command(&abort_command(&abort_id))?;
+            // #6: drain correlated abort response + agent_end (up to 2s).
+            let drain_deadline = std::time::Instant::now() + Duration::from_secs(2);
+            let mut got_abort_ack = false;
+            let mut got_terminal = false;
+            while std::time::Instant::now() < drain_deadline {
+                match child.read_line_timeout(Duration::from_millis(50))? {
+                    Some(line) => {
+                        let frame = OmpRpcFrame::parse_json_line(&line)?;
+                        match frame {
+                            OmpRpcFrame::Response { id, command, .. }
+                                if id.as_deref() == Some(abort_id.as_str())
+                                    && command == "abort" =>
+                            {
+                                got_abort_ack = true;
+                            }
+                            OmpRpcFrame::Event(event) => {
+                                let events =
+                                    OmpHarness.normalize_events(event_normalizer, event)?;
+                                for normalized in events {
+                                    // Require Result (agent_end), not Error.
+                                    if matches!(&normalized, NormalizedEvent::Result { .. }) {
+                                        got_terminal = true;
+                                    }
+                                    let _ = normalized;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    None => {}
+                }
+                if got_abort_ack && got_terminal {
+                    break;
+                }
+            }
+            if !got_abort_ack || !got_terminal {
+                child_reusable = false;
+            }
+            failed = true;
+            prompt_error = Some("turn timed out".to_string());
+            break;
+        }
+        if let Some(deadline) = settle_deadline
+            && now >= deadline
+        {
+            eprintln!("omp rpc: settle window expired after terminal stop");
+            break;
+        }
+
+        // #2,#3,#4: drain active_rx with ownership checks, preserve unmatched.
         loop {
             match active_rx.try_recv() {
                 Ok(OmpBlocksInput::Command(BlocksCommand::Interrupt)) => {
-                    if admitted_ownership.is_none() {
+                    // #3: missing ownership with admitted → surface error.
+                    if admitted_ownership.is_some() {
+                        write_blocks_error(
+                            stdout,
+                            thread_id,
+                            turn_id,
+                            "missing ownership: interrupt requires owner_id + generation",
+                        )?;
+                    } else {
                         let id = child.next_request_id();
                         child.send_command(&abort_command(&id))?;
                         aborted = true;
                     }
                 }
                 Ok(OmpBlocksInput::Control(OmpBlocksControl::Interrupt { ownership, .. })) => {
-                    if let Some(admitted) = &admitted_ownership
-                        && admitted.matches(&ownership)
-                    {
-                        let id = child.next_request_id();
-                        child.send_command(&abort_command(&id))?;
-                        aborted = true;
+                    // #3: stale/missing interrupt → surface error.
+                    match admitted_ownership {
+                        Some(admitted) if admitted.matches(&ownership) => {
+                            let id = child.next_request_id();
+                            child.send_command(&abort_command(&id))?;
+                            aborted = true;
+                        }
+                        Some(_) => {
+                            write_blocks_error(
+                                stdout,
+                                thread_id,
+                                turn_id,
+                                "ownership fence mismatch: stale owner",
+                            )?;
+                        }
+                        None => {
+                            write_blocks_error(
+                                stdout,
+                                thread_id,
+                                turn_id,
+                                "missing ownership: no admitted owner",
+                            )?;
+                        }
                     }
                 }
                 Ok(OmpBlocksInput::Command(BlocksCommand::User {
@@ -1249,59 +1391,39 @@ fn drive_omp_turn(
                 })) if trace_context.metadata.get("action").and_then(Value::as_str)
                     == Some("steer_active_execution") =>
                 {
-                    let steer_msg = prompt_text(&input);
-                    if !steer_msg.is_empty() {
-                        let id = child.next_request_id();
-                        child.send_command(&steer_command(&id, &steer_msg))?;
+                    // #2: exact-check trace ownership before steer.
+                    let steer_ownership = ownership_from_trace(&trace_context);
+                    let can_steer = match (&admitted_ownership, &steer_ownership) {
+                        (Some(admitted), Some(incoming)) => admitted.matches(incoming),
+                        (None, _) => true,
+                        _ => false,
+                    };
+                    if can_steer {
+                        let steer_msg = prompt_text(&input);
+                        if !steer_msg.is_empty() {
+                            let id = child.next_request_id();
+                            child.send_command(&steer_command(&id, &steer_msg))?;
+                        }
+                    } else {
+                        write_blocks_error(
+                            stdout,
+                            thread_id,
+                            turn_id,
+                            "ownership fence mismatch: stale owner",
+                        )?;
                     }
                 }
                 Ok(other) => {
-                    requeued.push(other);
+                    // #4: preserve unmatched in FIFO order.
+                    pending.push_back(other);
                 }
                 Err(_) => break,
             }
         }
-        // Process requeued items from the previous iteration first.
-        if let Some(input) = requeued.pop() {
-            match input {
-                OmpBlocksInput::Command(BlocksCommand::Interrupt) => {
-                    if admitted_ownership.is_none() {
-                        let id = child.next_request_id();
-                        child.send_command(&abort_command(&id))?;
-                        aborted = true;
-                    }
-                }
-                OmpBlocksInput::Control(OmpBlocksControl::Interrupt { ownership, .. }) => {
-                    if let Some(admitted) = &admitted_ownership
-                        && admitted.matches(&ownership)
-                    {
-                        let id = child.next_request_id();
-                        child.send_command(&abort_command(&id))?;
-                        aborted = true;
-                    }
-                }
-                _ => {} // Other inputs wait for the main loop after turn.
-            }
-        }
+
         let line = match child.read_line_timeout(Duration::from_millis(50))? {
             Some(line) => line,
-            None => {
-                // Idle tick: check settle deadline and absolute deadline.
-                if let Some(deadline) = settle_deadline
-                    && std::time::Instant::now() >= deadline
-                {
-                    eprintln!("omp rpc: settle window expired after terminal stop");
-                    break;
-                }
-                if std::time::Instant::now() >= absolute_deadline {
-                    eprintln!("omp rpc: absolute turn timeout, terminating");
-                    let abort_id = child.next_request_id();
-                    let _ = child.send_command(&abort_command(&abort_id));
-                    failed = true;
-                    break;
-                }
-                continue;
-            }
+            None => continue,
         };
         let frame = OmpRpcFrame::parse_json_line(&line)?;
         match frame {
@@ -1313,11 +1435,16 @@ fn drive_omp_turn(
                 error,
             } if id.as_deref() == Some(expected_prompt_id) => {
                 if !success {
-                    // Fix #6: use the actual turn ID, record failure.
-                    let msg = error
+                    // #8: preserve actual error message across scope.
+                    prompt_error = error
                         .filter(|e| !e.is_empty())
-                        .unwrap_or_else(|| "omp prompt failed".to_owned());
-                    write_blocks_error(stdout, thread_id, turn_id, &msg)?;
+                        .or(Some("omp prompt failed".to_string()));
+                    write_blocks_error(
+                        stdout,
+                        thread_id,
+                        turn_id,
+                        prompt_error.as_deref().unwrap(),
+                    )?;
                     failed = true;
                     terminal = true;
                     continue;
@@ -1380,17 +1507,10 @@ fn drive_omp_turn(
                     &collab_state_wire_value(&state, reason.as_deref(), &api_room),
                 )?;
             }
-            // Release only emits prompt_result when agentInvoked=false
-            // (local-only). agentInvoked=true is never a prompt_result frame.
-            OmpRpcFrame::PromptResult {
-                id: _,
-                agent_invoked,
-            } if !agent_invoked => {
+            OmpRpcFrame::PromptResult { agent_invoked, .. } if !agent_invoked => {
                 terminal = true;
             }
-            OmpRpcFrame::PromptResult { .. } => {
-                // Unexpected agentInvoked=true prompt_result — ignore.
-            }
+            OmpRpcFrame::PromptResult { .. } => {}
             OmpRpcFrame::Ready => {}
             OmpRpcFrame::Other(value) => {
                 if let Some(kind) = value.get("type").and_then(Value::as_str) {
@@ -1400,23 +1520,24 @@ fn drive_omp_turn(
         }
     }
 
-    if failed {
-        let reason = if aborted {
-            "interrupted".to_string()
-        } else {
-            "omp prompt failed".to_string()
-        };
-        if let Some(notification) = normalizer.finish_turn(Some(reason))? {
+    // #7: finish with correct status.
+    if aborted && !failed {
+        if let Some(notification) = normalizer.finish_turn_interrupted()? {
             write_value(stdout, &notification_to_wire_value(&notification)?)?;
         }
-    } else if aborted {
-        if let Some(notification) = normalizer.finish_turn(Some("interrupted".to_string()))? {
+    } else if failed {
+        let reason = prompt_error.unwrap_or_else(|| "omp prompt failed".to_string());
+        if let Some(notification) = normalizer.finish_turn(Some(reason))? {
             write_value(stdout, &notification_to_wire_value(&notification)?)?;
         }
     } else if let Some(notification) = normalizer.finish_turn(None)? {
         write_value(stdout, &notification_to_wire_value(&notification)?)?;
     }
-    Ok(())
+
+    Ok(TurnDriveResult {
+        pending,
+        child_reusable,
+    })
 }
 
 fn prompt_text(input: &[codex_app_server_protocol::UserInput]) -> String {

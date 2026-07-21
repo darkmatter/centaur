@@ -689,7 +689,13 @@ enum OmpBlocksInput {
     Command(BlocksCommand),
     Control(OmpBlocksControl),
     /// A control line that failed to parse (e.g. missing ownership).
-    Error(String),
+    /// Carries the error message, optional request id, and command kind
+    /// so the error frame can be correlated by the api-rs dispatcher.
+    ParseError {
+        message: String,
+        request_id: Option<String>,
+        command: String,
+    },
 }
 
 /// The resident OMP blocks server. One `omp --mode rpc` process per owned
@@ -740,12 +746,29 @@ pub fn run_omp_blocks_server() -> Result<()> {
                     }
                     Ok(None) => {}
                     Err(error) => {
-                        // A control line that failed to parse (e.g. missing
-                        // ownership) — surface as a blocks error so the
-                        // caller sees the rejection rather than hanging.
+                        // Surface parse errors (e.g. missing ownership)
+                        // with request_id and command kind for correlation.
+                        let (kind, rid) = match serde_json::from_str::<Value>(trimmed) {
+                            Ok(v) => (
+                                v.get("type")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("input")
+                                    .to_owned(),
+                                v.get("id")
+                                    .or_else(|| v.get("request_id"))
+                                    .and_then(Value::as_str)
+                                    .filter(|s| !s.is_empty())
+                                    .map(str::to_owned),
+                            ),
+                            Err(_) => ("input".to_string(), None),
+                        };
                         eprintln!("invalid OMP control input: {error}");
                         if input_tx
-                            .send(OmpBlocksInput::Error(error.to_string()))
+                            .send(OmpBlocksInput::ParseError {
+                                message: error.to_string(),
+                                request_id: rid,
+                                command: kind,
+                            })
                             .is_err()
                         {
                             break;
@@ -945,7 +968,14 @@ pub fn run_omp_blocks_server() -> Result<()> {
                 request_id,
                 ownership,
             }) => {
-                if !check_ownership(&mut admitted_ownership, &ownership, &mut stdout, &thread_id) {
+                if !check_ownership_with_request_id(
+                    &mut admitted_ownership,
+                    &ownership,
+                    &mut stdout,
+                    &thread_id,
+                    request_id.as_deref(),
+                    "interrupt",
+                ) {
                     continue;
                 }
                 if let Some(child) = child.as_mut() {
@@ -954,8 +984,18 @@ pub fn run_omp_blocks_server() -> Result<()> {
                 }
             }
             OmpBlocksInput::Command(BlocksCommand::AttachmentChunk) => {}
-            OmpBlocksInput::Error(message) => {
-                write_blocks_error(&mut stdout, &thread_id, "input", &message)?;
+            OmpBlocksInput::ParseError {
+                message,
+                request_id,
+                command,
+            } => {
+                write_blocks_error_with_request_id(
+                    &mut stdout,
+                    &thread_id,
+                    &command,
+                    &message,
+                    request_id.as_deref(),
+                )?;
             }
             OmpBlocksInput::Control(OmpBlocksControl::CollabStart {
                 request_id,
@@ -964,7 +1004,14 @@ pub fn run_omp_blocks_server() -> Result<()> {
                 web_url,
                 ownership,
             }) => {
-                if !check_ownership(&mut admitted_ownership, &ownership, &mut stdout, &thread_id) {
+                if !check_ownership_with_request_id(
+                    &mut admitted_ownership,
+                    &ownership,
+                    &mut stdout,
+                    &thread_id,
+                    request_id.as_deref(),
+                    "collab_start",
+                ) {
                     continue;
                 }
                 if child.is_none() {
@@ -994,15 +1041,23 @@ pub fn run_omp_blocks_server() -> Result<()> {
                 request_id,
                 ownership,
             }) => {
-                if !check_ownership(&mut admitted_ownership, &ownership, &mut stdout, &thread_id) {
+                if !check_ownership_with_request_id(
+                    &mut admitted_ownership,
+                    &ownership,
+                    &mut stdout,
+                    &thread_id,
+                    request_id.as_deref(),
+                    "collab_status",
+                ) {
                     continue;
                 }
                 let Some(child) = child.as_mut() else {
-                    write_blocks_error(
+                    write_blocks_error_with_request_id(
                         &mut stdout,
                         &thread_id,
                         "collab_status",
                         "no resident process",
+                        request_id.as_deref(),
                     )?;
                     continue;
                 };
@@ -1030,15 +1085,23 @@ pub fn run_omp_blocks_server() -> Result<()> {
                 request_id,
                 ownership,
             }) => {
-                if !check_ownership(&mut admitted_ownership, &ownership, &mut stdout, &thread_id) {
+                if !check_ownership_with_request_id(
+                    &mut admitted_ownership,
+                    &ownership,
+                    &mut stdout,
+                    &thread_id,
+                    request_id.as_deref(),
+                    "collab_stop",
+                ) {
                     continue;
                 }
                 let Some(child) = child.as_mut() else {
-                    write_blocks_error(
+                    write_blocks_error_with_request_id(
                         &mut stdout,
                         &thread_id,
                         "collab_stop",
                         "no resident process",
+                        request_id.as_deref(),
                     )?;
                     continue;
                 };
@@ -1075,30 +1138,39 @@ fn resolve_request_id(child: &mut OmpRpcChild, supplied: Option<String>) -> Stri
     supplied.unwrap_or_else(|| child.next_request_id())
 }
 
+#[allow(dead_code)]
 fn check_ownership(
     admitted: &mut Option<OmpRpcOwnership>,
     incoming: &OmpRpcOwnership,
     stdout: &mut impl Write,
     thread_id: &str,
 ) -> bool {
+    check_ownership_with_request_id(admitted, incoming, stdout, thread_id, None, "collab")
+}
+
+fn check_ownership_with_request_id(
+    admitted: &mut Option<OmpRpcOwnership>,
+    incoming: &OmpRpcOwnership,
+    stdout: &mut impl Write,
+    thread_id: &str,
+    request_id: Option<&str>,
+    command: &str,
+) -> bool {
     match admitted {
         Some(admitted) => {
             if !admitted.matches(incoming) {
-                let _ = write_blocks_error(
+                let _ = write_blocks_error_with_request_id(
                     stdout,
                     thread_id,
-                    "collab",
+                    command,
                     "ownership fence mismatch: stale owner",
+                    request_id,
                 );
                 return false;
             }
             true
         }
         None => {
-            // No ownership has been admitted yet. Pin the first trusted
-            // control ownership so subsequent controls and user turns are
-            // fenced against it. Rejecting would prevent lifecycle-only
-            // traffic before a user turn (the real-wire collab_start path).
             *admitted = Some(incoming.clone());
             true
         }
@@ -1133,7 +1205,13 @@ fn drive_collab_command(
                 if !success {
                     let cmd = resp_command.as_str();
                     let msg = error.unwrap_or_else(|| format!("{cmd} failed"));
-                    write_blocks_error(stdout, thread_id, cmd, &msg)?;
+                    write_blocks_error_with_request_id(
+                        stdout,
+                        thread_id,
+                        cmd,
+                        &msg,
+                        Some(expected_id),
+                    )?;
                     return Ok(None);
                 }
                 return Ok(data);
@@ -1181,7 +1259,13 @@ fn drive_omp_steer_response(
             } if id.as_deref() == Some(expected_id) => {
                 if !success {
                     let msg = error.unwrap_or_else(|| "steer failed".to_owned());
-                    write_blocks_error(stdout, thread_id, "steer", &msg)?;
+                    write_blocks_error_with_request_id(
+                        stdout,
+                        thread_id,
+                        "steer",
+                        &msg,
+                        Some(expected_id),
+                    )?;
                 }
                 return Ok(());
             }
@@ -1555,16 +1639,30 @@ fn write_blocks_error(
     turn_id: &str,
     message: &str,
 ) -> Result<()> {
+    write_blocks_error_with_request_id(stdout, thread_id, turn_id, message, None)
+}
+
+fn write_blocks_error_with_request_id(
+    stdout: &mut impl Write,
+    thread_id: &str,
+    turn_id: &str,
+    message: &str,
+    request_id: Option<&str>,
+) -> Result<()> {
+    let mut params = serde_json::json!({
+        "error": { "message": message, "codexErrorInfo": null, "additionalDetails": null },
+        "willRetry": false,
+        "threadId": thread_id,
+        "turnId": turn_id,
+    });
+    if let Some(rid) = request_id {
+        params["request_id"] = Value::String(rid.to_owned());
+    }
     write_value(
         stdout,
         &serde_json::json!({
             "method": "error",
-            "params": {
-                "error": { "message": message, "codexErrorInfo": null, "additionalDetails": null },
-                "willRetry": false,
-                "threadId": thread_id,
-                "turnId": turn_id,
-            },
+            "params": params,
         }),
     )
 }

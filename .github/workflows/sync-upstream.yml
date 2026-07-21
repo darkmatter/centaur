@@ -84,25 +84,20 @@ jobs:
           EOF
           )
 
-          # Ensure the upstream-sync label exists before creating/updating the
-          # PR. The overlay workflow's resume detection finds merged sync PRs
-          # by --head sync/upstream-main, but the label is a second signal and
-          # must never be missing — an unlabeled PR would strand resume.
-          gh label create "upstream-sync" --repo "$GITHUB_REPOSITORY" \
-            --description "Upstream sync merge PR" 2>/dev/null || true
-
+          # The overlay workflow finds merged sync PRs by --head
+          # sync/upstream-main (always works) — no label needed. The PR body
+          # carries a <!-- centaur:upstream-sync --> marker as a secondary
+          # signal. Label creation requires issues:write which the token lacks;
+          # dropping it avoids the dependency.
           if gh pr view sync/upstream-main --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh pr edit sync/upstream-main --repo "$GITHUB_REPOSITORY" \
               --title "sync: merge upstream main" \
               --body "$BODY"
-            gh pr edit sync/upstream-main --repo "$GITHUB_REPOSITORY" \
-              --add-label "upstream-sync"
           else
             gh pr create --repo "$GITHUB_REPOSITORY" \
               --base main \
               --head sync/upstream-main \
               --title "sync: merge upstream main" \
-              --label "upstream-sync" \
               --body "$BODY"
           fi
 

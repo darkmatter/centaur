@@ -329,6 +329,8 @@ pub struct CollabRoomState {
     pub view_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub web_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub web_view_url: Option<String>,
     #[serde(default)]
     pub participants: Vec<CollabParticipant>,
 }
@@ -339,6 +341,8 @@ pub struct CollabStartInput {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub relay_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub web_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
 }
 
@@ -348,13 +352,12 @@ pub struct CollabStopInput {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
 }
-
-/// Outcome of a collab room control operation.
 #[derive(Clone, Debug, Serialize)]
 pub struct CollabRoomOutcome {
     pub ok: bool,
     pub thread_key: ThreadKey,
     pub room: Option<CollabRoomState>,
+    pub stopped: bool,
 }
 
 #[cfg(test)]

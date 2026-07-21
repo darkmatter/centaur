@@ -124,6 +124,7 @@ pub struct InterruptSessionExecutionResponse {
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct StartCollabRoomRequest {
     pub relay_url: Option<String>,
+    pub web_url: Option<String>,
     pub display_name: Option<String>,
 }
 

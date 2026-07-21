@@ -90,6 +90,7 @@ type ExecutionSpanRegistry = Arc<Mutex<HashMap<String, Span>>>;
 type SessionOwnershipGenerationRegistry = Arc<DashMap<String, i64>>;
 type SessionPipeMap = Arc<DashMap<String, SessionPipe>>;
 type SessionPipeOpenLocks = Arc<DashMap<String, Arc<Mutex<()>>>>;
+type CollabLifecycleLocks = Arc<DashMap<ThreadKey, Arc<Mutex<()>>>>;
 type ToolHostCallLocks = Arc<DashMap<String, Arc<Mutex<()>>>>;
 type SessionTitleThreadSet = Arc<DashSet<ThreadKey>>;
 type SessionTitleGenerator = Arc<
@@ -143,6 +144,9 @@ pub struct SessionRuntime {
     /// renews the session ownership lease. Removal on stop/loss/termination
     /// releases the keepalive and permits normal idle cleanup.
     collab_rooms: CollabRoomRegistry,
+    /// Serializes start, status, stop, loss, and shutdown cleanup per
+    /// session so route responses and keepalive teardown are atomic.
+    collab_lifecycle_locks: CollabLifecycleLocks,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -840,6 +844,7 @@ impl SessionRuntime {
             stdout_owner_id: format!("api-rs-{}", uuid::Uuid::new_v4().simple()),
             shutting_down: Arc::new(AtomicBool::new(false)),
             collab_rooms: Arc::new(DashMap::new()),
+            collab_lifecycle_locks: Arc::new(DashMap::new()),
         }
     }
 
@@ -952,6 +957,12 @@ impl SessionRuntime {
             stdout_owner_id: self.stdout_owner_id.clone(),
             collab_rooms: self.collab_rooms.clone(),
         }
+    }
+    fn collab_lifecycle_lock(&self, thread_key: &ThreadKey) -> Arc<Mutex<()>> {
+        self.collab_lifecycle_locks
+            .entry(thread_key.clone())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
     }
 
     pub async fn run_tool_host_call(
@@ -2378,18 +2389,25 @@ impl SessionRuntime {
             &thread_trace_parent_span_id(thread_key),
         );
         async {
+            if self.shutting_down.load(Ordering::SeqCst) {
+                return Err(SessionRuntimeError::BadRequest(
+                    "session runtime is shutting down".to_owned(),
+                ));
+            }
+            let lifecycle_lock = self.collab_lifecycle_lock(thread_key);
+            let _lifecycle_guard = lifecycle_lock.lock().await;
+            if self.shutting_down.load(Ordering::SeqCst) {
+                return Err(SessionRuntimeError::BadRequest(
+                    "session runtime is shutting down".to_owned(),
+                ));
+            }
             ensure_thread_trace_root_span(thread_key);
             let session = self.store.get_session(thread_key).await?;
-
-            // Collaboration rooms are OMP-only. Other harness types lack the
-            // resident RPC host that owns the room.
             if session.harness_type != HarnessType::Omp {
                 return Err(SessionRuntimeError::CollabNotSupported {
                     harness_type: session.harness_type.to_string(),
                 });
             }
-
-            // Terminal sessions cannot start or join rooms.
             if matches!(
                 session.status,
                 SessionStatus::Failed | SessionStatus::Archived
@@ -2400,27 +2418,59 @@ impl SessionRuntime {
                 });
             }
 
-            // If a room is already active for this session, return it
-            // without re-creating or re-acquiring. The existing keepalive
-            // task continues to hold the lease.
-            if let Some(handle) = self.collab_rooms.get(thread_key).as_deref() {
-                let state = handle.state.clone();
-                info!(
-                    component = COMPONENT_SESSION_RUNTIME,
-                    event = "collab_room_start_reused",
-                    thread_key = %thread_key,
-                    "collaboration room already active"
-                );
-                return Ok(CollabRoomOutcome {
-                    ok: true,
-                    thread_key: thread_key.clone(),
-                    room: Some(state),
-                });
+            if let Some(handle) = self.collab_rooms.get(thread_key).as_deref().cloned() {
+                if session.sandbox_id.is_none() {
+                    return Ok(CollabRoomOutcome {
+                        ok: true,
+                        thread_key: thread_key.clone(),
+                        room: Some(handle.state),
+                        stopped: false,
+                    });
+                }
+                let status_request_id = collab_request_id();
+                let status_anchor = self.store.latest_event_id(thread_key).await?;
+                if self
+                    .send_collab_control_line(
+                        thread_key,
+                        &handle.owner_id,
+                        handle.generation,
+                        &status_request_id,
+                        "collab_status",
+                        None,
+                        None,
+                        None,
+                    )
+                    .await
+                    .is_ok()
+                    && let Ok(room) = wait_for_collab_status(
+                        &self.store,
+                        thread_key,
+                        status_anchor,
+                        handle.generation,
+                        &status_request_id,
+                    )
+                    .await
+                    && room.active
+                    && let Some(current) = self.collab_rooms.get(thread_key).as_deref().cloned()
+                    && current.owner_id == handle.owner_id
+                    && current.generation == handle.generation
+                {
+                    return Ok(CollabRoomOutcome {
+                        ok: true,
+                        thread_key: thread_key.clone(),
+                        room: Some(room),
+                        stopped: false,
+                    });
+                }
+                self.cleanup_collab_room_local(
+                    thread_key,
+                    &handle,
+                    "session.collab_room_lost",
+                    "stale_room",
+                )
+                .await?;
             }
 
-            // Acquire a resident session ownership lease. A one-shot
-            // execution or another resident host holding the session
-            // blocks this acquisition; the caller surfaces the conflict.
             let ownership = self
                 .store
                 .acquire_session_ownership(
@@ -2441,78 +2491,127 @@ impl SessionRuntime {
                 });
             }
 
-            // Touch sandbox activity so the sandbox is not suspended while
-            // the room is being set up.
-            let _ = self.store.touch_session_sandbox_activity(thread_key).await;
-
-            let baseline_event_id = self
+            if !self
                 .store
-                .list_events_after(thread_key, 0, None, 1000)
+                .touch_session_sandbox_activity(thread_key)
                 .await?
-                .into_iter()
-                .map(|event| event.event_id)
-                .max()
-                .unwrap_or(0);
+            {
+                let _ = self
+                    .store
+                    .release_session_ownership(thread_key, &self.stdout_owner_id)
+                    .await;
+                return Err(SessionRuntimeError::BadRequest(
+                    "session has no live sandbox for collaboration".to_owned(),
+                ));
+            }
+            let baseline_event_id = self.store.latest_event_id(thread_key).await?;
+            let request_id = collab_request_id();
             let keepalive = Arc::new(AtomicBool::new(true));
             let initial_state = CollabRoomState {
                 active: true,
                 join_url: None,
                 view_url: None,
                 web_url: None,
+                web_view_url: None,
                 participants: Vec::new(),
             };
-            let handle = CollabRoomHandle {
-                owner_id: self.stdout_owner_id.clone(),
-                generation: ownership.generation,
-                state: initial_state.clone(),
-                keepalive: keepalive.clone(),
-            };
-            self.collab_rooms.insert(thread_key.clone(), handle);
+            self.collab_rooms.insert(
+                thread_key.clone(),
+                CollabRoomHandle {
+                    owner_id: self.stdout_owner_id.clone(),
+                    generation: ownership.generation,
+                    state: initial_state,
+                    keepalive: keepalive.clone(),
+                },
+            );
+            spawn_collab_keepalive(
+                self.clone(),
+                thread_key.clone(),
+                self.stdout_owner_id.clone(),
+                ownership.generation,
+                keepalive,
+            );
 
-            // Spawn the keepalive renewal task. It periodically renews the
-            // session ownership lease and touches sandbox activity. If the
-            // renewal fails (ownership lost to another owner/process/relay
-            // loss), the keepalive flag flips to false and the room is
-            // removed.
-            let ctx = self.context();
-            let tk = thread_key.clone();
-            let owner_id = self.stdout_owner_id.clone();
-            let generation = ownership.generation;
-            spawn_collab_keepalive(ctx, tk, owner_id, generation, keepalive);
-
-            // Record a durable lifecycle event, fenced by the ownership
-            // generation so a stale owner cannot publish after takeover.
-            if let Err(error) = self
+            let send_result = self
                 .send_collab_control_line(
                     thread_key,
                     &self.stdout_owner_id,
                     ownership.generation,
+                    &request_id,
                     "collab_start",
                     input.relay_url.as_deref(),
+                    input.web_url.as_deref(),
                     input.display_name.as_deref(),
                 )
-                .await
-            {
+                .await;
+            if let Err(error) = send_result {
                 let _ = self
-                    .lose_collab_room(thread_key, "collab_start_send_failed")
+                    .attempt_collab_stop(thread_key, &self.stdout_owner_id, ownership.generation)
                     .await;
+                if let Some(handle) = self.collab_rooms.get(thread_key).as_deref().cloned() {
+                    self.cleanup_collab_room_local(
+                        thread_key,
+                        &handle,
+                        "session.collab_room_lost",
+                        "collab_start_send_failed",
+                    )
+                    .await?;
+                }
                 return Err(error);
             }
-            let room_state =
-                match wait_for_collab_started(&self.store, thread_key, baseline_event_id).await {
-                    Ok(state) => state,
-                    Err(error) => {
-                        let _ = self
-                            .lose_collab_room(thread_key, "collab_start_timeout")
-                            .await;
-                        return Err(error);
-                    }
-                };
-            if let Some(mut entry) = self.collab_rooms.get_mut(thread_key) {
-                entry.state = room_state.clone();
-            }
 
-            if let Err(error) = self
+            let room_state = match wait_for_collab_started(
+                &self.store,
+                thread_key,
+                baseline_event_id,
+                ownership.generation,
+                &request_id,
+            )
+            .await
+            {
+                Ok(state) => state,
+                Err(error) => {
+                    let _ = self
+                        .attempt_collab_stop(
+                            thread_key,
+                            &self.stdout_owner_id,
+                            ownership.generation,
+                        )
+                        .await;
+                    if let Some(handle) = self.collab_rooms.get(thread_key).as_deref().cloned() {
+                        self.cleanup_collab_room_local(
+                            thread_key,
+                            &handle,
+                            "session.collab_room_lost",
+                            "collab_start_failed",
+                        )
+                        .await?;
+                    }
+                    return Err(error);
+                }
+            };
+            let Some(mut handle) = self.collab_rooms.get(thread_key).as_deref().cloned() else {
+                let _ = self
+                    .attempt_collab_stop(thread_key, &self.stdout_owner_id, ownership.generation)
+                    .await;
+                return Err(SessionRuntimeError::CollabRoomLost {
+                    thread_key: thread_key.as_str().to_owned(),
+                    reason: "collab room disappeared during start".to_owned(),
+                });
+            };
+            if handle.owner_id != self.stdout_owner_id || handle.generation != ownership.generation
+            {
+                let _ = self
+                    .attempt_collab_stop(thread_key, &self.stdout_owner_id, ownership.generation)
+                    .await;
+                return Err(SessionRuntimeError::CollabRoomLost {
+                    thread_key: thread_key.as_str().to_owned(),
+                    reason: "collab room ownership changed during start".to_owned(),
+                });
+            }
+            handle.state = room_state.clone();
+            self.collab_rooms.insert(thread_key.clone(), handle);
+            let persisted = self
                 .store
                 .append_unscoped_event_if_session_owner(
                     thread_key,
@@ -2524,31 +2623,34 @@ impl SessionRuntime {
                         "thread_key": thread_key.as_str(),
                         "owner_id": self.stdout_owner_id,
                         "generation": ownership.generation,
+                        "request_id": request_id,
                         "room": room_state.clone(),
                     }),
                 )
-                .await
-            {
-                warn!(
-                    component = COMPONENT_SESSION_RUNTIME,
-                    event = "collab_room_start_event_failed",
-                    thread_key = %thread_key,
-                    %error,
-                    "failed to record collab_room_started event"
-                );
+                .await?;
+            if persisted.is_none() {
+                if let Some(handle) = self.collab_rooms.get(thread_key).as_deref().cloned() {
+                    let _ = self
+                        .attempt_collab_stop(thread_key, &handle.owner_id, handle.generation)
+                        .await;
+                    self.cleanup_collab_room_local(
+                        thread_key,
+                        &handle,
+                        "session.collab_room_lost",
+                        "collab_start_fenced",
+                    )
+                    .await?;
+                }
+                return Err(SessionRuntimeError::CollabRoomLost {
+                    thread_key: thread_key.as_str().to_owned(),
+                    reason: "collab start lost ownership fence".to_owned(),
+                });
             }
-
-            info!(
-                component = COMPONENT_SESSION_RUNTIME,
-                event = "collab_room_start_completed",
-                thread_key = %thread_key,
-                generation = ownership.generation,
-                "collaboration room started"
-            );
             Ok(CollabRoomOutcome {
                 ok: true,
                 thread_key: thread_key.clone(),
                 room: Some(room_state),
+                stopped: false,
             })
         }
         .instrument(span)
@@ -2567,26 +2669,41 @@ impl SessionRuntime {
             ok: true,
             thread_key: thread_key.clone(),
             room,
+            stopped: false,
         }
     }
+
+    pub fn has_active_collab_room(&self, thread_key: &ThreadKey) -> bool {
+        self.collab_rooms.contains_key(thread_key)
+    }
+    #[allow(clippy::too_many_arguments)]
     async fn send_collab_control_line(
         &self,
         thread_key: &ThreadKey,
         owner_id: &str,
         generation: i64,
+        request_id: &str,
         command: &str,
         relay_url: Option<&str>,
+        web_url: Option<&str>,
         display_name: Option<&str>,
     ) -> Result<(), SessionRuntimeError> {
         let session = self.store.get_session(thread_key).await?;
         let sandbox_id = session.sandbox_id.ok_or_else(|| {
             SessionRuntimeError::BadRequest(
-                "session has no assigned sandbox; run an OMP turn before starting collaboration"
-                    .to_owned(),
+                "session has no assigned sandbox for collaboration lifecycle control".to_owned(),
             )
         })?;
         let pipe = self.ensure_session_pipe(thread_key, &sandbox_id).await?;
-        let frame = collab_control_frame(command, owner_id, generation, relay_url, display_name);
+        let frame = collab_control_frame(
+            request_id,
+            command,
+            owner_id,
+            generation,
+            relay_url,
+            web_url,
+            display_name,
+        );
         write_input_lines(
             &pipe,
             &[frame.to_string()],
@@ -2595,6 +2712,77 @@ impl SessionRuntime {
             Some(&sandbox_id),
         )
         .await
+    }
+    async fn attempt_collab_stop(
+        &self,
+        thread_key: &ThreadKey,
+        owner_id: &str,
+        generation: i64,
+    ) -> Result<(), SessionRuntimeError> {
+        let request_id = collab_request_id();
+        let baseline = self.store.latest_event_id(thread_key).await?;
+        self.send_collab_control_line(
+            thread_key,
+            owner_id,
+            generation,
+            &request_id,
+            "collab_stop",
+            None,
+            None,
+            None,
+        )
+        .await?;
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            wait_for_collab_stopped(&self.store, thread_key, baseline, generation, &request_id),
+        )
+        .await
+        .map_err(|_| SessionRuntimeError::CollabRoomLost {
+            thread_key: thread_key.as_str().to_owned(),
+            reason: "collab_stop response timed out".to_owned(),
+        })??;
+        Ok(())
+    }
+
+    async fn cleanup_collab_room_local(
+        &self,
+        thread_key: &ThreadKey,
+        handle: &CollabRoomHandle,
+        event_type: &str,
+        reason: &str,
+    ) -> Result<(), SessionRuntimeError> {
+        handle.keepalive.store(false, Ordering::SeqCst);
+        let persisted = self
+            .store
+            .append_unscoped_event_if_session_owner(
+                thread_key,
+                &handle.owner_id,
+                handle.generation,
+                PgSessionStore::SESSION_OWNERSHIP_LEASE,
+                event_type,
+                json!({
+                    "thread_key": thread_key.as_str(),
+                    "reason": reason,
+                    "owner_id": handle.owner_id,
+                    "generation": handle.generation,
+                }),
+            )
+            .await?;
+        self.collab_rooms.remove(thread_key);
+        let released = self
+            .store
+            .release_session_ownership(thread_key, &handle.owner_id)
+            .await?;
+        if persisted.is_none() || !released {
+            return Err(SessionRuntimeError::CollabRoomLost {
+                thread_key: thread_key.as_str().to_owned(),
+                reason: format!(
+                    "fenced collaboration cleanup for {event_type} (persisted={}, released={released})",
+                    persisted.is_some()
+                ),
+            });
+        }
+        Ok(())
     }
 
     /// Stops the collaboration room for a session, releasing the keepalive
@@ -2619,57 +2807,73 @@ impl SessionRuntime {
             &thread_trace_parent_span_id(thread_key),
         );
         async {
-            ensure_thread_trace_root_span(thread_key);
+            let lifecycle_lock = self.collab_lifecycle_lock(thread_key);
+            let _lifecycle_guard = lifecycle_lock.lock().await;
             let Some(handle) = self.collab_rooms.get(thread_key).as_deref().cloned() else {
-                // No active room — idempotent success.
                 return Ok(CollabRoomOutcome {
                     ok: true,
                     thread_key: thread_key.clone(),
                     room: None,
+                    stopped: false,
                 });
             };
-
-            // Signal the keepalive task to stop renewing.
-            handle.keepalive.store(false, Ordering::SeqCst);
-
-            // Remove the in-memory room so idle suspension can proceed.
-            self.collab_rooms.remove(thread_key);
-
-            // Release the session ownership lease iff we still hold it.
-            // Record the terminal event before releasing the lease: the
-            // fenced append must observe the still-live generation.
-            let _ = self
+            let request_id = collab_request_id();
+            let baseline_event_id = self.store.latest_event_id(thread_key).await?;
+            let has_sandbox = self
                 .store
-                .append_unscoped_event_if_session_owner(
+                .get_session(thread_key)
+                .await?
+                .sandbox_id
+                .is_some();
+            let control_error = if has_sandbox {
+                self.send_collab_control_line(
                     thread_key,
                     &handle.owner_id,
                     handle.generation,
-                    PgSessionStore::SESSION_OWNERSHIP_LEASE,
+                    &request_id,
+                    "collab_stop",
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .err()
+            } else {
+                None
+            };
+            let wait_error = if control_error.is_none() && has_sandbox {
+                wait_for_collab_stopped(
+                    &self.store,
+                    thread_key,
+                    baseline_event_id,
+                    handle.generation,
+                    &request_id,
+                )
+                .await
+                .err()
+            } else {
+                None
+            };
+            let error = control_error.or(wait_error);
+            let reason = input.reason.as_deref().unwrap_or("explicit_stop");
+            let cleanup = self
+                .cleanup_collab_room_local(
+                    thread_key,
+                    &handle,
                     "session.collab_room_stopped",
-                    json!({
-                        "thread_key": thread_key.as_str(),
-                        "reason": input.reason.as_deref().unwrap_or("explicit_stop"),
-                    }),
+                    reason,
                 )
                 .await;
-
-            // Release the session ownership lease iff we still hold it.
-            let released = self
-                .store
-                .release_session_ownership(thread_key, &handle.owner_id)
-                .await?;
-
-            info!(
-                component = COMPONENT_SESSION_RUNTIME,
-                event = "collab_room_stop_completed",
-                thread_key = %thread_key,
-                released_ownership = released,
-                "collaboration room stopped"
-            );
+            if let Some(error) = error {
+                let _ = cleanup;
+                return Err(error);
+            }
+            cleanup?;
             Ok(CollabRoomOutcome {
                 ok: true,
                 thread_key: thread_key.clone(),
                 room: None,
+                stopped: true,
             })
         }
         .instrument(span)
@@ -2714,6 +2918,8 @@ impl SessionRuntime {
                 "session.collab_room_state",
                 json!({
                     "thread_key": thread_key.as_str(),
+                    "owner_id": owner_id,
+                    "generation": generation,
                     "state": state,
                 }),
             )
@@ -2731,37 +2937,26 @@ impl SessionRuntime {
         thread_key: &ThreadKey,
         reason: &str,
     ) -> Result<(), SessionRuntimeError> {
+        let lifecycle_lock = self.collab_lifecycle_lock(thread_key);
+        let _lifecycle_guard = lifecycle_lock.lock().await;
         let Some(handle) = self.collab_rooms.get(thread_key).as_deref().cloned() else {
             return Ok(());
         };
-        // The `DashMap::Ref` guard is dropped at the semicolon above so no
-        // shard lock is held across the awaited lifecycle writes below.
-        handle.keepalive.store(false, Ordering::SeqCst);
-        // Record loss while the owner generation is still live; stale
-        // owners cannot publish lifecycle writes after takeover.
-        let _ = self
-            .store
-            .append_unscoped_event_if_session_owner(
-                thread_key,
-                &handle.owner_id,
-                handle.generation,
-                PgSessionStore::SESSION_OWNERSHIP_LEASE,
-                "session.collab_room_lost",
-                json!({
-                    "thread_key": thread_key.as_str(),
-                    "reason": reason,
-                    "owner_id": handle.owner_id,
-                    "generation": handle.generation,
-                }),
-            )
-            .await;
-        self.collab_rooms.remove(thread_key);
-        // Release the lease so a new resident can recover transcript
-        // state and create a fresh room/capability.
-        let _ = self
-            .store
-            .release_session_ownership(thread_key, &handle.owner_id)
-            .await;
+        if let Err(error) = self
+            .attempt_collab_stop(thread_key, &handle.owner_id, handle.generation)
+            .await
+        {
+            warn!(
+                component = COMPONENT_SESSION_RUNTIME,
+                event = "collab_stop_on_loss_failed",
+                thread_key = %thread_key,
+                reason = reason,
+                %error,
+                "resident stop failed while recording collaboration loss"
+            );
+        }
+        self.cleanup_collab_room_local(thread_key, &handle, "session.collab_room_lost", reason)
+            .await?;
         info!(
             component = COMPONENT_SESSION_RUNTIME,
             event = "collab_room_lost_recorded",
@@ -2770,11 +2965,6 @@ impl SessionRuntime {
             "collaboration room lost"
         );
         Ok(())
-    }
-
-    /// Returns true when a collaboration room is active for the session.
-    pub fn has_active_collab_room(&self, thread_key: &ThreadKey) -> bool {
-        self.collab_rooms.contains_key(thread_key)
     }
 
     async fn wait_for_active_steering_pipe(
@@ -3940,12 +4130,25 @@ impl SessionRuntime {
         // this point would otherwise claim a lease that outlives the
         // process, stranding it until the lease TTL expires.
         self.shutting_down.store(true, Ordering::SeqCst);
-        // Invalidate all active collab room keepalives and clear the
-        // in-memory registry. The ownership release below frees the
-        // session_owners rows; the keepalive tasks observe their flag
-        // flip and exit without further renewal attempts.
-        for entry in self.collab_rooms.iter() {
-            entry.keepalive.store(false, Ordering::SeqCst);
+        // Stop every resident room remotely before dropping local state. Take
+        // owned snapshots so no DashMap guard is held across awaits.
+        let rooms = self
+            .collab_rooms
+            .iter()
+            .map(|entry| (entry.key().clone(), entry.value().clone()))
+            .collect::<Vec<_>>();
+        for (thread_key, handle) in rooms {
+            let _ = self
+                .attempt_collab_stop(&thread_key, &handle.owner_id, handle.generation)
+                .await;
+            let _ = self
+                .cleanup_collab_room_local(
+                    &thread_key,
+                    &handle,
+                    "session.collab_room_lost",
+                    "runtime_shutdown",
+                )
+                .await;
         }
         self.collab_rooms.clear();
 
@@ -6014,7 +6217,7 @@ fn spawn_idle_pause(
 /// The keepalive interval is shorter than the ownership lease so renewal
 /// happens well before expiry.
 fn spawn_collab_keepalive(
-    ctx: RuntimeContext,
+    runtime: SessionRuntime,
     thread_key: ThreadKey,
     owner_id: String,
     generation: i64,
@@ -6031,53 +6234,35 @@ fn spawn_collab_keepalive(
             if !keepalive.load(Ordering::SeqCst) {
                 return;
             }
-            let renewed = ctx
+            let renewed = runtime
                 .store
-                .renew_session_ownership(&thread_key, &owner_id)
+                .renew_session_ownership_if_session_owner(&thread_key, &owner_id, generation)
                 .await;
-            match renewed {
-                Ok(true) => {
-                    let _ = ctx.store.touch_session_sandbox_activity(&thread_key).await;
-                }
-                Ok(false) => {
-                    warn!(
-                        component = COMPONENT_SESSION_RUNTIME,
-                        event = "collab_keepalive_renewal_lost",
-                        thread_key = %thread_key,
-                        generation,
-                        "session ownership lease no longer held; removing collab room"
-                    );
-                    keepalive.store(false, Ordering::SeqCst);
-                    ctx.collab_rooms.remove(&thread_key);
-                    let _ = ctx
-                        .store
-                        .append_event(
-                            &thread_key,
-                            None,
-                            "session.collab_room_lost",
-                            json!({
-                                "thread_key": thread_key.as_str(),
-                                "reason": "ownership_lease_expired",
-                                "owner_id": owner_id,
-                                "generation": generation,
-                            }),
-                        )
-                        .await;
-                    return;
-                }
-                Err(error) => {
-                    warn!(
-                        component = COMPONENT_SESSION_RUNTIME,
-                        event = "collab_keepalive_renewal_failed",
-                        thread_key = %thread_key,
-                        %error,
-                        "failed to renew session ownership lease for collab room"
-                    );
-                    // A transient store error does not immediately remove the
-                    // room; the next tick retries. The lease will eventually
-                    // expire if the store stays unreachable, at which point
-                    // renewal returns false and the room is lost.
-                }
+            let lost_reason = match renewed {
+                Ok(true) => match runtime
+                    .store
+                    .touch_session_sandbox_activity(&thread_key)
+                    .await
+                {
+                    Ok(true) => None,
+                    Ok(false) => Some("sandbox_activity_touch_lost"),
+                    Err(_) => Some("keepalive_store_failure"),
+                },
+                Ok(false) => Some("ownership_lease_expired"),
+                Err(_) => Some("keepalive_store_failure"),
+            };
+            if let Some(reason) = lost_reason {
+                warn!(
+                    component = COMPONENT_SESSION_RUNTIME,
+                    event = "collab_keepalive_lost",
+                    thread_key = %thread_key,
+                    generation,
+                    reason,
+                    "keepalive renewal or sandbox activity touch failed"
+                );
+                keepalive.store(false, Ordering::SeqCst);
+                let _ = runtime.lose_collab_room(&thread_key, reason).await;
+                return;
             }
         }
     });
@@ -7020,14 +7205,21 @@ fn interrupt_input_line(thread_key: &ThreadKey, reason: &str) -> String {
     .expect("interrupt input line serializes")
 }
 
+fn collab_request_id() -> String {
+    format!("collab-{}", Uuid::new_v4().simple())
+}
+
 fn collab_control_frame(
+    request_id: &str,
     command: &str,
     owner_id: &str,
     generation: i64,
     relay_url: Option<&str>,
+    web_url: Option<&str>,
     display_name: Option<&str>,
 ) -> Value {
     let mut frame = json!({
+        "id": request_id,
         "type": command,
         "ownership": {
             "owner_id": owner_id,
@@ -7037,16 +7229,38 @@ fn collab_control_frame(
     if let Some(relay_url) = relay_url {
         frame["relayUrl"] = Value::String(relay_url.to_owned());
     }
+    if let Some(web_url) = web_url {
+        frame["webUrl"] = Value::String(web_url.to_owned());
+    }
     if let Some(display_name) = display_name {
         frame["displayName"] = Value::String(display_name.to_owned());
     }
     frame
 }
 
-async fn wait_for_collab_started(
+fn collab_event_matches(
+    event: &SessionEvent,
+    after_event_id: i64,
+    generation: i64,
+    request_id: &str,
+) -> bool {
+    event.event_id > after_event_id
+        && event.payload.get("generation").and_then(Value::as_i64) == Some(generation)
+        && event
+            .payload
+            .get("request_id")
+            .and_then(Value::as_str)
+            .is_none_or(|id| id == request_id)
+}
+
+async fn wait_for_collab_event(
     store: &PgSessionStore,
     thread_key: &ThreadKey,
     after_event_id: i64,
+    generation: i64,
+    request_id: &str,
+    expected_state: &str,
+    expected_event_type: &str,
 ) -> Result<CollabRoomState, SessionRuntimeError> {
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
@@ -7054,112 +7268,175 @@ async fn wait_for_collab_started(
             .list_events_after(thread_key, after_event_id, None, 128)
             .await?;
         for event in events {
-            if event.event_type != "session.collab_room_state"
-                || event.payload.get("state").and_then(Value::as_str) != Some("started")
+            if !collab_event_matches(&event, after_event_id, generation, request_id) {
+                continue;
+            }
+            if event.event_type == "session.collab_room_error" {
+                let message = event
+                    .payload
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("resident collaboration command failed");
+                return Err(SessionRuntimeError::BadRequest(message.to_owned()));
+            }
+            if event.event_type != expected_event_type
+                || event.payload.get("state").and_then(Value::as_str) != Some(expected_state)
             {
                 continue;
             }
-            if let Some(room) = event.payload.get("room") {
-                return serde_json::from_value(room.clone()).map_err(|error| {
-                    SessionRuntimeError::BadRequest(format!(
-                        "resident collaboration response contained invalid room state: {error}"
-                    ))
-                });
-            }
+            let Some(room) = event.payload.get("room") else {
+                return Err(SessionRuntimeError::BadRequest(
+                    "resident collaboration response omitted room state".to_owned(),
+                ));
+            };
+            return serde_json::from_value(room.clone()).map_err(|error| {
+                SessionRuntimeError::BadRequest(format!(
+                    "resident collaboration response contained invalid room state: {error}"
+                ))
+            });
         }
         if Instant::now() >= deadline {
             return Err(SessionRuntimeError::CollabRoomLost {
                 thread_key: thread_key.as_str().to_owned(),
-                reason: "resident OMP did not emit collab/state started".to_owned(),
+                reason: format!("resident OMP did not emit collab/state {expected_state}"),
             });
         }
         sleep(Duration::from_millis(25)).await;
     }
 }
 
-/// Handles the canonical blocks-mode collaboration lifecycle frame:
-/// `{"method":"collab/state","params":{"state":...,"reason":...,"room":...}}`.
-/// These frames are independent of normal execution stdout and therefore
-/// must be processed before stdout-owner routing.
+async fn wait_for_collab_started(
+    store: &PgSessionStore,
+    thread_key: &ThreadKey,
+    after_event_id: i64,
+    generation: i64,
+    request_id: &str,
+) -> Result<CollabRoomState, SessionRuntimeError> {
+    wait_for_collab_event(
+        store,
+        thread_key,
+        after_event_id,
+        generation,
+        request_id,
+        "started",
+        "session.collab_room_state",
+    )
+    .await
+}
+
+async fn wait_for_collab_stopped(
+    store: &PgSessionStore,
+    thread_key: &ThreadKey,
+    after_event_id: i64,
+    generation: i64,
+    request_id: &str,
+) -> Result<CollabRoomState, SessionRuntimeError> {
+    wait_for_collab_event(
+        store,
+        thread_key,
+        after_event_id,
+        generation,
+        request_id,
+        "stopped",
+        "session.collab_room_state",
+    )
+    .await
+}
+
+async fn wait_for_collab_status(
+    store: &PgSessionStore,
+    thread_key: &ThreadKey,
+    after_event_id: i64,
+    generation: i64,
+    request_id: &str,
+) -> Result<CollabRoomState, SessionRuntimeError> {
+    wait_for_collab_event(
+        store,
+        thread_key,
+        after_event_id,
+        generation,
+        request_id,
+        "status",
+        "session.collab_room_status",
+    )
+    .await
+}
+
+/// Handles normalized resident lifecycle and status notifications before
+/// normal execution stdout routing. Lifecycle-only rooms have no execution
+/// id, so dropping these lines would lose the control-plane response.
 async fn process_collab_state_line(
     ctx: &RuntimeContext,
     thread_key: &ThreadKey,
     value: &Value,
 ) -> Result<bool, SessionRuntimeError> {
-    let is_method_frame = value.get("method").and_then(Value::as_str) == Some("collab/state");
-    let is_collab_state_frame = value.get("type").and_then(Value::as_str) == Some("collab_state");
-    let is_start_response = value.get("type").and_then(Value::as_str) == Some("response")
-        && value.get("command").and_then(Value::as_str) == Some("collab_start");
-    if !is_method_frame && !is_collab_state_frame && !is_start_response {
+    let method = value.get("method").and_then(Value::as_str);
+    let is_collab_state = method == Some("collab/state")
+        || value.get("type").and_then(Value::as_str) == Some("collab_state");
+    let is_collab_status = method == Some("collab/status");
+    let is_error = method == Some("error");
+    if !is_collab_state && !is_collab_status && !is_error {
         return Ok(false);
     }
-    let params = if is_method_frame {
-        value.get("params").cloned().unwrap_or_default()
-    } else if is_start_response {
-        json!({
-            "state": if value.get("success").and_then(Value::as_bool).unwrap_or(false) {
-                "started"
-            } else {
-                "failed"
-            },
-            "reason": value.get("error"),
-            "room": value.get("data").and_then(|data| data.get("room")).or_else(|| value.get("data")),
-        })
-    } else {
-        value.clone()
-    };
-    let state_name = params
-        .get("state")
+    let params = value
+        .get("params")
+        .cloned()
+        .unwrap_or_else(|| value.clone());
+    let request_id = params
+        .get("request_id")
+        .or_else(|| params.get("requestId"))
         .and_then(Value::as_str)
-        .unwrap_or("failed");
-    let Some(room_value) = params.get("room") else {
-        warn!(
-            component = COMPONENT_SESSION_RUNTIME,
-            event = "collab_state_missing_room",
-            thread_key = %thread_key,
-            state = state_name,
-            "ignoring malformed collaboration lifecycle frame"
-        );
-        return Ok(true);
-    };
-    let room: CollabRoomState = match serde_json::from_value(room_value.clone()) {
-        Ok(room) => room,
-        Err(error) => {
-            warn!(
-                component = COMPONENT_SESSION_RUNTIME,
-                event = "collab_state_invalid_room",
-                thread_key = %thread_key,
-                %error,
-                "ignoring malformed collaboration room state"
-            );
-            return Ok(true);
-        }
-    };
+        .map(str::to_owned);
     let Some(handle) = ctx.collab_rooms.get(thread_key).as_deref().cloned() else {
-        // A frame from a dead process or stale capability must not recreate
-        // an in-memory room or revive its keepalive.
-        warn!(
-            component = COMPONENT_SESSION_RUNTIME,
-            event = "collab_state_without_active_room",
-            thread_key = %thread_key,
-            state = state_name,
-            "ignoring collaboration state for inactive room"
-        );
         return Ok(true);
     };
-    let event_type = match state_name {
-        "started" => "session.collab_room_state",
-        "stopped" | "failed" | "reconnecting" => "session.collab_room_lost",
-        _ => "session.collab_room_state",
+    if is_error {
+        let error = params
+            .get("error")
+            .and_then(|error| error.get("message").or(Some(error)))
+            .and_then(Value::as_str)
+            .unwrap_or("resident collaboration command failed");
+        let _ = ctx
+            .store
+            .append_unscoped_event_if_session_owner(
+                thread_key,
+                &handle.owner_id,
+                handle.generation,
+                PgSessionStore::SESSION_OWNERSHIP_LEASE,
+                "session.collab_room_error",
+                json!({
+                    "thread_key": thread_key.as_str(),
+                    "request_id": request_id,
+                    "generation": handle.generation,
+                    "error": error,
+                }),
+            )
+            .await?;
+        return Ok(true);
+    }
+    let state_name = if is_collab_status {
+        "status"
+    } else {
+        params
+            .get("state")
+            .and_then(Value::as_str)
+            .unwrap_or("failed")
     };
-    let event_payload = json!({
-        "thread_key": thread_key.as_str(),
-        "state": state_name,
-        "reason": params.get("reason"),
-        "room": room.clone(),
-        "owner_id": handle.owner_id.clone(),
-        "generation": handle.generation,
-    });
+    let Some(room_value) = params.get("room") else {
+        return Ok(true);
+    };
+    let room: CollabRoomState = serde_json::from_value(room_value.clone()).map_err(|error| {
+        SessionRuntimeError::BadRequest(format!(
+            "resident collaboration response contained invalid room state: {error}"
+        ))
+    })?;
+    let event_type = if is_collab_status {
+        "session.collab_room_status"
+    } else if state_name == "started" || state_name == "stopped" {
+        "session.collab_room_state"
+    } else {
+        "session.collab_room_lost"
+    };
     let persisted = ctx
         .store
         .append_unscoped_event_if_session_owner(
@@ -7168,32 +7445,39 @@ async fn process_collab_state_line(
             handle.generation,
             PgSessionStore::SESSION_OWNERSHIP_LEASE,
             event_type,
-            event_payload,
+            json!({
+                "thread_key": thread_key.as_str(),
+                "state": state_name,
+                "reason": params.get("reason"),
+                "request_id": request_id,
+                "room": room.clone(),
+                "owner_id": handle.owner_id,
+                "generation": handle.generation,
+            }),
         )
         .await?;
     if persisted.is_none() {
-        // Fencing rejection means another owner took over. Do not let this
-        // stale frame keep the sandbox alive.
         handle.keepalive.store(false, Ordering::SeqCst);
         ctx.collab_rooms.remove(thread_key);
         return Ok(true);
     }
-    match state_name {
-        "started" => {
-            let mut updated = handle;
-            updated.state = room;
+    let mut updated = handle.clone();
+    updated.state = room;
+    if state_name == "started" || is_collab_status {
+        ctx.collab_rooms.insert(thread_key.clone(), updated);
+    } else {
+        // A request-correlated stop is finalized by stop_collab_room after
+        // its waiter observes this event. Unsolicited terminal loss removes
+        // the room only after its loss event has been durably appended.
+        if request_id.is_some() && state_name == "stopped" {
             ctx.collab_rooms.insert(thread_key.clone(), updated);
-            let _ = ctx.store.touch_session_sandbox_activity(thread_key).await;
-        }
-        "stopped" | "failed" | "reconnecting" => {
+        } else {
             handle.keepalive.store(false, Ordering::SeqCst);
             ctx.collab_rooms.remove(thread_key);
-            let _ = ctx
-                .store
+            ctx.store
                 .release_session_ownership(thread_key, &handle.owner_id)
-                .await;
+                .await?;
         }
-        _ => {}
     }
     Ok(true)
 }
@@ -8305,10 +8589,12 @@ mod tests {
     #[test]
     fn collab_start_frame_uses_native_wire_contract() {
         let frame = collab_control_frame(
+            "req-1",
             "collab_start",
             "resident-1",
             7,
             Some("https://relay.example/join"),
+            Some("https://relay.example/web"),
             Some("Demo"),
         );
         assert_eq!(frame["type"], "collab_start");
@@ -8334,6 +8620,7 @@ mod tests {
                     join_url: Some("https://relay.example/old".to_owned()),
                     view_url: None,
                     web_url: None,
+                    web_view_url: None,
                     participants: Vec::new(),
                 },
                 keepalive: keepalive.clone(),
@@ -11044,6 +11331,7 @@ mod adoption_tests {
             join_url: Some(old_url.clone()),
             view_url: None,
             web_url: None,
+            web_view_url: None,
             participants: Vec::new(),
         };
         let runtime = runtime_with(
@@ -11173,6 +11461,7 @@ mod adoption_tests {
             join_url: Some("https://relay.example/join#cap".to_owned()),
             view_url: Some("https://relay.example/view".to_owned()),
             web_url: Some("https://relay.example/web".to_owned()),
+            web_view_url: None,
             participants: vec![
                 centaur_session_core::CollabParticipant {
                     name: "demo".to_owned(),
@@ -11216,6 +11505,7 @@ mod adoption_tests {
             join_url: Some("https://relay.example/join#cap-v2".to_owned()),
             view_url: None,
             web_url: None,
+            web_view_url: None,
             participants: Vec::new(),
         };
         assert!(
@@ -11272,6 +11562,7 @@ mod adoption_tests {
             join_url: Some("https://relay.example/already-active".to_owned()),
             view_url: None,
             web_url: None,
+            web_view_url: None,
             participants: Vec::new(),
         };
         runtime.collab_rooms.insert(
@@ -11499,6 +11790,7 @@ mod adoption_tests {
                     join_url: Some("https://relay.example/dead-url".to_owned()),
                     view_url: None,
                     web_url: None,
+                    web_view_url: None,
                     participants: Vec::new(),
                 },
                 keepalive: keepalive.clone(),

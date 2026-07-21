@@ -776,6 +776,7 @@ async fn start_collab_room(
             &thread_key,
             &CollabStartInput {
                 relay_url: request.relay_url,
+                web_url: request.web_url,
                 display_name: request.display_name,
             },
         )
@@ -806,7 +807,6 @@ async fn stop_collab_room(
     Json(request): Json<StopCollabRoomRequest>,
 ) -> Result<Json<StopCollabRoomResponse>, ApiError> {
     let thread_key = ThreadKey::try_from(raw_thread_key)?;
-    let had_room = state.runtime()?.has_active_collab_room(&thread_key);
     let outcome = state
         .runtime()?
         .stop_collab_room(
@@ -819,7 +819,7 @@ async fn stop_collab_room(
     Ok(Json(StopCollabRoomResponse {
         ok: outcome.ok,
         thread_key: outcome.thread_key,
-        stopped: had_room,
+        stopped: outcome.stopped,
     }))
 }
 

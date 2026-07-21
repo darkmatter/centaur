@@ -1157,6 +1157,21 @@ impl PgSessionStore {
         row.try_into().map(Some)
     }
 
+    /// Returns the true latest event id for a session without applying a page
+    /// limit. Lifecycle request anchors must use this rather than taking the
+    /// maximum of a bounded ascending page, which can point at an old event
+    /// once a session has more than one page of history.
+    pub async fn latest_event_id(&self, thread_key: &ThreadKey) -> Result<i64, SessionStoreError> {
+        sqlx::query_scalar::<_, Option<i64>>(
+            "select max(event_id) from session_events where thread_key = $1",
+        )
+        .bind(thread_key.as_str())
+        .fetch_one(&self.pool)
+        .await
+        .map(|latest| latest.unwrap_or(0))
+        .map_err(Into::into)
+    }
+
     pub async fn list_events_after(
         &self,
         thread_key: &ThreadKey,
@@ -1892,11 +1907,41 @@ impl PgSessionStore {
             r#"
             update session_owners
             set lease_expires_at = $3, updated_at = now()
-            where thread_key = $1 and owner_id = $2
+            where thread_key = $1
+              and owner_id = $2
+              and lease_expires_at > now()
             "#,
         )
         .bind(thread_key.as_str())
         .bind(owner_id)
+        .bind(expires_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+    /// Renews a resident lease only when both the owner generation and the
+    /// unexpired lease still match. An expired process cannot resurrect its
+    /// ownership by renewing after the fact.
+    pub async fn renew_session_ownership_if_session_owner(
+        &self,
+        thread_key: &ThreadKey,
+        owner_id: &str,
+        generation: i64,
+    ) -> Result<bool, SessionStoreError> {
+        let expires_at = stdout_lease_expires_at(Self::SESSION_OWNERSHIP_LEASE);
+        let result = sqlx::query(
+            r#"
+            update session_owners
+            set lease_expires_at = $4, updated_at = now()
+            where thread_key = $1
+              and owner_id = $2
+              and generation = $3
+              and lease_expires_at > now()
+            "#,
+        )
+        .bind(thread_key.as_str())
+        .bind(owner_id)
+        .bind(generation)
         .bind(expires_at)
         .execute(&self.pool)
         .await?;

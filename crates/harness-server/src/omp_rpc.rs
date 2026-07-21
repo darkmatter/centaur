@@ -12,6 +12,18 @@
 //! (`owner_id` + `generation`) and the adapter carries it for the process
 //! lifetime. A stale or missing ownership fence rejects every command and
 //! prevents durable frame publication. See `OmpRpcOwnership`.
+//!
+//! # Process lifetime vs session resume
+//! Process reuse is within one resident host lifetime (one `OmpRpcChild`).
+//! Across resident lifetimes (child death / re-acquire), set
+//! `CENTAUR_OMP_SESSION_NAME` so respawn passes `--resume <name>` and the
+//! prior JSONL session is continued instead of starting an anonymous one.
+//!
+//! # Ownership lease recovery
+//! This adapter does not release the DB ownership row — api-rs owns the
+//! lease (acquire/release around executions). If api-rs crashes without
+//! releasing, recovery is the DB row's lease-expiry timeout. See
+//! `acquire_oneshot_session_ownership` / `release_session_ownership`.
 
 use std::env;
 use std::io::{self, BufRead, Write};
@@ -34,6 +46,10 @@ use crate::{HarnessServerError, Result};
 /// The resident session ownership fence. Admission requires both fields; a
 /// stale generation (one that no longer matches the current owner) or a
 /// missing owner rejects every command and prevents durable frame publication.
+///
+/// Lease recovery: the fence is process-local. Durable ownership lives in
+/// api-rs's DB row; if the API process dies without release, the lease
+/// expires on its timeout and a new owner can re-acquire.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OmpRpcOwnership {
     pub owner_id: String,
@@ -78,6 +94,7 @@ pub enum OmpRpcFrame {
     /// A prompt that was accepted immediately but later resolves as local-only
     /// (no agent turn). `agent_invoked == false` is a completion signal.
     PromptResult {
+        #[allow(dead_code)]
         id: Option<String>,
         agent_invoked: bool,
     },
@@ -311,11 +328,22 @@ impl OmpRpcChild {
     /// shutdown after stdin is closed.
     pub fn wait(mut self) -> Result<std::process::ExitStatus> {
         // Closing stdin tells the RPC server to drain pending side-channel
-        // requests and exit cleanly (code 0).
+        // requests and exit cleanly (code 0). Bounded: if the child ignores
+        // stdin EOF, kill after the timeout rather than hang forever.
         if let Some(mut stdin) = self.stdin.take() {
             let _ = stdin.flush();
         }
-        self.child.wait().map_err(Into::into)
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            match self.child.try_wait()? {
+                Some(status) => return Ok(status),
+                None if std::time::Instant::now() >= deadline => {
+                    let _ = self.child.kill();
+                    return self.child.wait().map_err(Into::into);
+                }
+                None => thread::sleep(Duration::from_millis(50)),
+            }
+        }
     }
 }
 
@@ -339,12 +367,61 @@ fn omp_rpc_command() -> ProcessCommand {
         "--session-dir",
         &crate::omp::omp_session_dir().display().to_string(),
     ]);
+    // Stable session name so a respawn after resident death resumes the prior
+    // JSONL instead of creating a new anonymous session. api-rs should set
+    // CENTAUR_OMP_SESSION_NAME to a thread-stable value (e.g. thread_key hash).
+    if let Ok(name) = env::var("CENTAUR_OMP_SESSION_NAME")
+        && !name.is_empty()
+    {
+        command.args(["--resume", &name]);
+    }
     if let Ok(model) = env::var("OMP_MODEL")
         && !model.is_empty()
     {
         command.args(["--model", &model]);
     }
     command
+}
+
+/// After ready, pin the session name when CENTAUR_OMP_SESSION_NAME is set so
+/// the first create and subsequent resumes share one JSONL identity.
+fn pin_session_name(child: &mut OmpRpcChild) -> Result<()> {
+    let Ok(name) = env::var("CENTAUR_OMP_SESSION_NAME") else {
+        return Ok(());
+    };
+    if name.is_empty() {
+        return Ok(());
+    }
+    let id = child.next_request_id();
+    child.send_command(&json!({
+        "id": id,
+        "type": "set_session_name",
+        "name": name,
+    }))?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        let Some(line) = child.read_line_timeout(Duration::from_millis(100))? else {
+            continue;
+        };
+        let frame = OmpRpcFrame::parse_json_line(&line)?;
+        if let OmpRpcFrame::Response {
+            id: resp_id,
+            success,
+            error,
+            ..
+        } = frame
+            && resp_id.as_deref() == Some(id.as_str())
+        {
+            if !success {
+                eprintln!(
+                    "omp rpc: set_session_name failed: {}",
+                    error.unwrap_or_else(|| "unknown".to_owned())
+                );
+            }
+            return Ok(());
+        }
+    }
+    Ok(())
 }
 
 /// Build a `prompt` command. During active streaming, `streaming_behavior`
@@ -570,6 +647,11 @@ enum OmpBlocksInput {
 /// session/agent/collaboration lifecycle frames while ordinary commands are
 /// correlated by id. Requires current resident ownership on admission and
 /// fences stale/missing ownership.
+///
+/// Ownership lease recovery: this process does not touch the DB ownership
+/// row. api-rs acquires/releases the lease around executions; if api-rs dies
+/// without release, the DB lease-expiry timeout is the recovery path. On
+/// clean stdin EOF this server waits (bounded) for the child then exits.
 pub fn run_omp_blocks_server() -> Result<()> {
     use crate::omp::OmpEventNormalizer;
     use crate::server::{BlocksState, parse_blocks_line_with_state};
@@ -688,6 +770,7 @@ pub fn run_omp_blocks_server() -> Result<()> {
                 if child.is_none() {
                     child = Some(OmpRpcChild::spawn()?);
                     drain_ready(child.as_mut().unwrap())?;
+                    pin_session_name(child.as_mut().unwrap())?;
                 }
                 let child = child.as_mut().unwrap();
 
@@ -705,7 +788,7 @@ pub fn run_omp_blocks_server() -> Result<()> {
                     // No turn lifecycle — the active turn continues.
                     let id = child.next_request_id();
                     child.send_command(&steer_command(&id, &message))?;
-                    drive_omp_steer_response(child, &id, &mut stdout)?;
+                    drive_omp_steer_response(child, &id, &mut stdout, &thread_id)?;
                     turn_active.store(false, Ordering::SeqCst);
                     continue;
                 }
@@ -735,6 +818,8 @@ pub fn run_omp_blocks_server() -> Result<()> {
                     &mut normalizer,
                     &mut stdout,
                     &mut harness_session_id,
+                    &id,
+                    &thread_id,
                 )?;
 
                 turn_active.store(false, Ordering::SeqCst);
@@ -783,6 +868,7 @@ pub fn run_omp_blocks_server() -> Result<()> {
                 if child.is_none() {
                     child = Some(OmpRpcChild::spawn()?);
                     drain_ready(child.as_mut().unwrap())?;
+                    pin_session_name(child.as_mut().unwrap())?;
                 }
                 let child = child.as_mut().unwrap();
                 let id = resolve_request_id(child, request_id);
@@ -792,7 +878,8 @@ pub fn run_omp_blocks_server() -> Result<()> {
                     display_name.as_deref(),
                     web_url.as_deref(),
                 ))?;
-                let room = drive_collab_command(child, &id, "collab_start", &mut stdout)?;
+                let room =
+                    drive_collab_command(child, &id, "collab_start", &mut stdout, &thread_id)?;
                 if let Some(room) = room {
                     emit_collab_state(&mut stdout, "started", None, &room, Some(&id))?;
                 }
@@ -815,20 +902,22 @@ pub fn run_omp_blocks_server() -> Result<()> {
                 };
                 let id = resolve_request_id(child, request_id);
                 child.send_command(&collab_status_command(&id))?;
-                let room = drive_collab_command(child, &id, "collab_status", &mut stdout)?;
+                let room =
+                    drive_collab_command(child, &id, "collab_status", &mut stdout, &thread_id)?;
                 if let Some(room) = room {
+                    // Snapshot shape: same room contract as collab/state, plus
+                    // state derived from room.active and request_id for wait
+                    // correlation. Distinct method (collab/status) so api-rs
+                    // can tell a query snapshot from a lifecycle event.
                     let parsed = parse_room_state(&room)?;
                     let api_room = room_state_to_api(&parsed);
-                    write_value(
-                        &mut stdout,
-                        &serde_json::json!({
-                            "method": "collab/status",
-                            "params": {
-                                "room": api_room,
-                                "request_id": id,
-                            },
-                        }),
-                    )?;
+                    let state = if parsed.active { "started" } else { "stopped" };
+                    let mut value = collab_state_wire_value(state, None, &api_room);
+                    value["method"] = Value::String("collab/status".to_owned());
+                    if let Some(params) = value.get_mut("params") {
+                        params["request_id"] = Value::String(id.clone());
+                    }
+                    write_value(&mut stdout, &value)?;
                 }
             }
             OmpBlocksInput::Control(OmpBlocksControl::CollabStop {
@@ -849,7 +938,8 @@ pub fn run_omp_blocks_server() -> Result<()> {
                 };
                 let id = resolve_request_id(child, request_id);
                 child.send_command(&collab_stop_command(&id))?;
-                let room = drive_collab_command(child, &id, "collab_stop", &mut stdout)?;
+                let room =
+                    drive_collab_command(child, &id, "collab_stop", &mut stdout, &thread_id)?;
                 if let Some(room) = room {
                     emit_collab_state(&mut stdout, "stopped", None, &room, Some(&id))?;
                 }
@@ -899,6 +989,7 @@ fn drive_collab_command(
     expected_id: &str,
     _command: &str,
     stdout: &mut impl Write,
+    thread_id: &str,
 ) -> Result<Option<Value>> {
     loop {
         let line = match child.read_line_timeout(Duration::from_secs(30))? {
@@ -918,7 +1009,7 @@ fn drive_collab_command(
                 if !success {
                     let cmd = resp_command.as_str();
                     let msg = error.unwrap_or_else(|| format!("{cmd} failed"));
-                    write_blocks_error(stdout, "", cmd, &msg)?;
+                    write_blocks_error(stdout, thread_id, cmd, &msg)?;
                     return Ok(None);
                 }
                 return Ok(data);
@@ -952,6 +1043,7 @@ fn drive_omp_steer_response(
     child: &mut OmpRpcChild,
     expected_id: &str,
     stdout: &mut impl Write,
+    thread_id: &str,
 ) -> Result<()> {
     loop {
         let line = match child.read_line_timeout(Duration::from_secs(30))? {
@@ -965,7 +1057,7 @@ fn drive_omp_steer_response(
             } if id.as_deref() == Some(expected_id) => {
                 if !success {
                     let msg = error.unwrap_or_else(|| "steer failed".to_owned());
-                    write_blocks_error(stdout, "", "steer", &msg)?;
+                    write_blocks_error(stdout, thread_id, "steer", &msg)?;
                 }
                 return Ok(());
             }
@@ -1041,6 +1133,8 @@ fn drive_omp_turn(
     normalizer: &mut CodexTurnNormalizer,
     stdout: &mut impl Write,
     harness_session_id: &mut Option<String>,
+    expected_prompt_id: &str,
+    thread_id: &str,
 ) -> Result<()> {
     use crate::omp::OmpHarness;
     use crate::traits::{HarnessServer, NormalizedEvent};
@@ -1071,7 +1165,35 @@ fn drive_omp_turn(
         };
         let frame = OmpRpcFrame::parse_json_line(&line)?;
         match frame {
+            OmpRpcFrame::Response {
+                id,
+                command: _,
+                success,
+                data,
+                error,
+            } if id.as_deref() == Some(expected_prompt_id) => {
+                // Correlate the outstanding prompt response by id.
+                // Release contract: agent turns emit response with
+                // data.agentInvoked=true then agent events; local-only
+                // prompts emit response with agentInvoked=false (and often
+                // a follow-up prompt_result). Never hang on a failed prompt.
+                if !success {
+                    let msg = error.unwrap_or_else(|| "omp prompt failed".to_owned());
+                    write_blocks_error(stdout, thread_id, "turn", &msg)?;
+                    terminal = true;
+                    continue;
+                }
+                let agent_invoked = data
+                    .as_ref()
+                    .and_then(|d| d.get("agentInvoked").and_then(Value::as_bool))
+                    .unwrap_or(true);
+                if !agent_invoked {
+                    // Local-only: no agent_end will arrive.
+                    terminal = true;
+                }
+            }
             OmpRpcFrame::Response { success, error, .. } => {
+                // Uncorrelated response (e.g. concurrent abort ack).
                 if !success {
                     let msg = error.unwrap_or_else(|| "omp command failed".to_owned());
                     eprintln!("omp rpc command failed: {msg}");
@@ -1115,12 +1237,16 @@ fn drive_omp_turn(
                     &collab_state_wire_value(&state, reason.as_deref(), &api_room),
                 )?;
             }
-            OmpRpcFrame::PromptResult { id, agent_invoked } if !agent_invoked => {
-                let _ = id;
+            // Release only emits prompt_result when agentInvoked=false
+            // (local-only). agentInvoked=true is never a prompt_result frame.
+            OmpRpcFrame::PromptResult {
+                id: _,
+                agent_invoked,
+            } if !agent_invoked => {
                 terminal = true;
             }
-            OmpRpcFrame::PromptResult { id, .. } => {
-                let _ = id;
+            OmpRpcFrame::PromptResult { .. } => {
+                // Unexpected agentInvoked=true prompt_result — ignore.
             }
             OmpRpcFrame::Ready => {}
             OmpRpcFrame::Other(value) => {

@@ -2440,6 +2440,13 @@ fn fake_omp_rpc_script(pidfile: &Path, emit_collab_during_turn: bool) -> String 
     let script = format!(
         r#"#!/bin/sh
 echo $$ > '{pidfile}'
+# Session resume markers for L2 restart/resume proof.
+if [ -n "$CENTAUR_OMP_SESSION_NAME" ]; then
+  echo "$CENTAUR_OMP_SESSION_NAME" > '{pidfile}.session'
+fi
+if [ -f '{pidfile}.session' ]; then
+  cat '{pidfile}.session' > '{pidfile}.resumed'
+fi
 printf '%s\n' '{{"type":"ready"}}'
 TURN_COUNT=0
 while IFS= read -r line; do
@@ -2465,13 +2472,18 @@ while IFS= read -r line; do
       printf '%s\n' '{{"type":"agent_end","messages":[]}}'
       ;;
     collab_start)
-      printf '{{"id":"%s","type":"response","command":"collab_start","success":true,"data":{{"active":true,"joinUrl":"relay.example/r/room.key-and-write-token","viewUrl":"relay.example/r/room.key","participants":[{{"name":"host","role":"host"}}]}}}}\n' "$ID"
+      printf '%s\n' '{{"type":"collab_state","state":"started","room":{{"active":true,"joinUrl":"relay.example/r/room.key-and-write-token","viewUrl":"relay.example/r/room.key","webUrl":"https://collab.example/#join","webViewUrl":"https://collab.example/#view","participants":[{{"name":"host","role":"host"}}]}}}}'
+      printf '{{"id":"%s","type":"response","command":"collab_start","success":true,"data":{{"active":true,"joinUrl":"relay.example/r/room.key-and-write-token","viewUrl":"relay.example/r/room.key","webUrl":"https://collab.example/#join","webViewUrl":"https://collab.example/#view","participants":[{{"name":"host","role":"host"}}]}}}}\n' "$ID"
       ;;
     collab_status)
-      printf '{{"id":"%s","type":"response","command":"collab_status","success":true,"data":{{"active":true,"joinUrl":"relay.example/r/room.key-and-write-token","viewUrl":"relay.example/r/room.key","participants":[{{"name":"host","role":"host"}}]}}}}\n' "$ID"
+      printf '{{"id":"%s","type":"response","command":"collab_status","success":true,"data":{{"active":true,"joinUrl":"relay.example/r/room.key-and-write-token","viewUrl":"relay.example/r/room.key","webUrl":"https://collab.example/#join","webViewUrl":"https://collab.example/#view","participants":[{{"name":"host","role":"host"}}]}}}}\n' "$ID"
       ;;
     collab_stop)
+      printf '%s\n' '{{"type":"collab_state","state":"stopped","room":{{"active":false,"participants":[]}}}}'
       printf '{{"id":"%s","type":"response","command":"collab_stop","success":true,"data":{{"active":false,"participants":[]}}}}\n' "$ID"
+      ;;
+    set_session_name)
+      printf '{{"id":"%s","type":"response","command":"set_session_name","success":true}}\n' "$ID"
       ;;
     *)
       printf '%s' "$line" >&2
@@ -2693,18 +2705,22 @@ fn resident_omp_collab_start_status_stop_normalize() {
         "webUrl": "https://collab.example",
     }));
     let deadline = Instant::now() + Duration::from_secs(30);
-    let start_frame = bridge.read_json(deadline);
+    // Release order: unsolicited collab_state may arrive before the correlated emit.
+    let mut start_frame = Value::Null;
+    while Instant::now() < deadline {
+        let frame = bridge.read_json(deadline);
+        if frame.get("method").and_then(Value::as_str) == Some("collab/state")
+            && frame.pointer("/params/state").and_then(Value::as_str) == Some("started")
+            && frame.pointer("/params/request_id").and_then(Value::as_str)
+                == Some("req-collab-start-1")
+        {
+            start_frame = frame;
+            break;
+        }
+    }
     assert!(
-        start_frame.get("method").and_then(Value::as_str) == Some("collab/state")
-            && start_frame.pointer("/params/state").and_then(Value::as_str) == Some("started"),
-        "collab_start must emit collab/state started: {start_frame}"
-    );
-    assert_eq!(
-        start_frame
-            .pointer("/params/request_id")
-            .and_then(Value::as_str),
-        Some("req-collab-start-1"),
-        "collab/state must echo caller-supplied request_id: {start_frame}"
+        start_frame.get("method").and_then(Value::as_str) == Some("collab/state"),
+        "collab_start must emit correlated collab/state started: {start_frame}"
     );
     let start_room = start_frame
         .pointer("/params/room")
@@ -2735,15 +2751,34 @@ fn resident_omp_collab_start_status_stop_normalize() {
         "collab/status must echo caller-supplied request_id: {status_frame}"
     );
 
+    assert!(
+        matches!(
+            status_frame
+                .pointer("/params/state")
+                .and_then(Value::as_str),
+            Some("started") | Some("stopped")
+        ),
+        "collab/status must include state derived from room.active: {status_frame}"
+    );
+
     // collab_stop
     bridge.send(json!({
         "type": "collab_stop",
         "ownership": ownership,
     }));
-    let stop_frame = bridge.read_json(Instant::now() + Duration::from_secs(30));
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut stop_frame = Value::Null;
+    while Instant::now() < deadline {
+        let frame = bridge.read_json(deadline);
+        if frame.get("method").and_then(Value::as_str) == Some("collab/state")
+            && frame.pointer("/params/state").and_then(Value::as_str) == Some("stopped")
+        {
+            stop_frame = frame;
+            break;
+        }
+    }
     assert!(
-        stop_frame.get("method").and_then(Value::as_str) == Some("collab/state")
-            && stop_frame.pointer("/params/state").and_then(Value::as_str) == Some("stopped"),
+        stop_frame.get("method").and_then(Value::as_str) == Some("collab/state"),
         "collab_stop must emit collab/state stopped: {stop_frame}"
     );
     let stop_room = stop_frame
@@ -2883,54 +2918,137 @@ fn resident_omp_real_binary_collab_status_and_ownership_fence() {
     let mut bridge = spawn_omp_resident(wrapper.to_string(), &[]);
     let ownership = omp_ownership_json("resident-host", 1);
 
-    // Admit ownership with a user turn. The real binary needs a model; use
-    // --no-session so no session state persists. The prompt may fail without
-    // an API key, but the process spawns and the ready frame drains.
-    // Send collab_status (no model needed) to prove the real binary responds.
+    // collab_start against real binary with no relay: expect collab/state failed
+    // with a reason, and/or a blocks error from the failed response.
     bridge.send(json!({
         "type": "collab_start",
+        "id": "real-start-1",
         "ownership": ownership,
         "relayUrl": "wss://relay.example",
         "displayName": "centaur-host",
     }));
 
     let deadline = Instant::now() + Duration::from_secs(30);
-    // The real binary will emit a collab_state frame (likely "failed" since
-    // there's no relay) and a response frame.
-    let mut got_collab_state = false;
-    let mut got_response = false;
-    loop {
-        let now = Instant::now();
-        if now >= deadline {
-            break;
-        }
-        let value = bridge.read_json_allowing_error(now + Duration::from_secs(5));
+    let mut got_failed_state = false;
+    let mut got_error = false;
+    let mut failed_reason = None::<String>;
+    while Instant::now() < deadline {
+        let value = bridge.read_json_allowing_error(Instant::now() + Duration::from_secs(5));
         let method = value
             .get("method")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        if method == "collab/state" {
-            got_collab_state = true;
+        if method == "collab/state"
+            && value.pointer("/params/state").and_then(Value::as_str) == Some("failed")
+        {
+            got_failed_state = true;
+            failed_reason = value
+                .pointer("/params/reason")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            break;
         }
-        // The response frame comes through as a JSON-RPC notification with
-        // method "collab/state" (normalized from the response) or an error.
         if method == "error" {
-            // collab_start fails without a relay — that's expected. The key
-            // proof is that the real binary responded and the adapter
-            // normalized the frames.
-            got_response = true;
-        }
-        if got_collab_state && got_response {
+            got_error = true;
             break;
         }
     }
-
-    // The real binary must have emitted at least a collab_state frame
-    // (even if "failed") proving the wire protocol is spoken end-to-end.
     assert!(
-        got_collab_state || got_response,
-        "real binary must respond to collab_start with collab_state or error"
+        got_failed_state || got_error,
+        "real binary collab_start must produce collab/state failed or error"
+    );
+    if got_failed_state {
+        assert!(
+            failed_reason.as_ref().is_some_and(|r| !r.is_empty()),
+            "collab/state failed must carry a non-empty reason"
+        );
+        // Drain the correlated failure error frame that follows collab_state.
+        if !got_error {
+            let err = bridge.read_json_allowing_error(Instant::now() + Duration::from_secs(5));
+            assert_eq!(
+                err.get("method").and_then(Value::as_str),
+                Some("error"),
+                "failed collab_start should also emit blocks error: {err}"
+            );
+        }
+    }
+
+    // collab_status snapshot against real binary.
+    bridge.send(json!({
+        "type": "collab_status",
+        "id": "real-status-1",
+        "ownership": ownership,
+    }));
+    let status = bridge.read_json(Instant::now() + Duration::from_secs(15));
+    assert_eq!(
+        status.get("method").and_then(Value::as_str),
+        Some("collab/status"),
+        "collab_status must emit collab/status: {status}"
+    );
+    assert_eq!(
+        status.pointer("/params/request_id").and_then(Value::as_str),
+        Some("real-status-1")
+    );
+    assert_eq!(status.pointer("/params/room/active"), Some(&json!(false)));
+    assert!(
+        matches!(
+            status.pointer("/params/state").and_then(Value::as_str),
+            Some("stopped") | Some("started")
+        ),
+        "collab/status must include state: {status}"
     );
 
     let _ = bridge.finish_successfully();
+}
+
+#[test]
+fn resident_omp_session_name_resumes_across_respawn() {
+    // L2: with CENTAUR_OMP_SESSION_NAME set, a second resident process sees
+    // the prior session marker (proves resume identity continuity).
+    let pidfile = temp_path("omp-rpc-pid-resume");
+    let _ = std::fs::remove_file(&pidfile);
+    let _ = std::fs::remove_file(format!("{}.session", pidfile.display()));
+    let _ = std::fs::remove_file(format!("{}.resumed", pidfile.display()));
+    let script = fake_omp_rpc_script(&pidfile, false);
+    let session_name = "centaur-thread-resume-test";
+
+    {
+        let mut bridge = spawn_omp_resident(
+            script.clone(),
+            &[("CENTAUR_OMP_SESSION_NAME", session_name)],
+        );
+        let ownership = omp_ownership_json("resident-host", 1);
+        let _turn = bridge.run_blocks_user_turn_with_ownership(
+            "first lifetime",
+            &ownership,
+            Duration::from_secs(30),
+        );
+        let _ = bridge.finish_successfully();
+    }
+
+    let marker = std::fs::read_to_string(format!("{}.session", pidfile.display()))
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    assert_eq!(marker, session_name, "first lifetime must pin session name");
+
+    {
+        let mut bridge = spawn_omp_resident(script, &[("CENTAUR_OMP_SESSION_NAME", session_name)]);
+        let ownership = omp_ownership_json("resident-host", 1);
+        let _turn = bridge.run_blocks_user_turn_with_ownership(
+            "second lifetime",
+            &ownership,
+            Duration::from_secs(30),
+        );
+        let _ = bridge.finish_successfully();
+    }
+
+    let resumed = std::fs::read_to_string(format!("{}.resumed", pidfile.display()))
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    assert_eq!(
+        resumed, session_name,
+        "respawn must resume the prior session identity"
+    );
 }

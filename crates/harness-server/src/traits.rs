@@ -144,6 +144,15 @@ pub enum NormalizedEvent {
     Error {
         message: String,
     },
+    /// Unsolicited collaboration lifecycle frame from a resident OMP RPC
+    /// host (`collab_state`). Carries the lifecycle state
+    /// (`started`/`reconnecting`/`stopped`/`failed`), optional reason, and
+    /// the room JSON (already in the api-rs snake_case contract).
+    CollabState {
+        state: String,
+        reason: Option<String>,
+        room: serde_json::Value,
+    },
     Ignored,
 }
 

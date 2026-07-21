@@ -2043,6 +2043,14 @@ impl SessionRuntime {
             };
 
             let trace = SessionTraceContext::new(thread_key, Some(&execution_trace_span));
+            // Inject the trusted ownership fence (acquired above) so the
+            // harness-server resident OMP host can fence stale/missing
+            // ownership. Only OMP sessions have a generation; non-OMP skip.
+            let trace = if let Some(generation) = ownership_generation {
+                trace.with_ownership(&self.stdout_owner_id, generation)
+            } else {
+                trace
+            };
             let input_lines = input_lines_with_session_context(thread_key, &trace, &input_lines);
             if let Err(error) = write_input_lines(
                 &pipe,
@@ -2187,6 +2195,17 @@ impl SessionRuntime {
             .get(&execution.execution_id)
             .cloned();
         let trace = SessionTraceContext::new(thread_key, execution_span.as_ref());
+        // Inject the trusted ownership fence from the active execution's
+        // generation so the harness-server can fence steering commands.
+        let trace = if let Some(generation) = self
+            .session_ownership_generations
+            .get(&execution.execution_id)
+            .map(|g| *g.value())
+        {
+            trace.with_ownership(&self.stdout_owner_id, generation)
+        } else {
+            trace
+        };
         let input_lines = input_lines_with_session_context(thread_key, &trace, &input_lines);
 
         let pipe = match self
@@ -2253,6 +2272,17 @@ impl SessionRuntime {
             .get(&execution.execution_id)
             .cloned();
         let trace = SessionTraceContext::new(thread_key, execution_span.as_ref());
+        // Inject the trusted ownership fence from the active execution's
+        // generation so the harness-server can fence interrupt commands.
+        let trace = if let Some(generation) = self
+            .session_ownership_generations
+            .get(&execution.execution_id)
+            .map(|g| *g.value())
+        {
+            trace.with_ownership(&self.stdout_owner_id, generation)
+        } else {
+            trace
+        };
         let input_lines = input_lines_with_session_context(
             thread_key,
             &trace,
@@ -6211,6 +6241,11 @@ struct SessionTraceContext {
     /// W3C traceparent of the current execution span, when the OpenTelemetry
     /// layer is active. Lets harness spans join the execution's trace.
     traceparent: Option<String>,
+    /// Trusted session ownership fence injected by api-rs (never client-
+    /// asserted). The harness-server resident OMP host fences every command
+    /// on this ownership; a stale or missing fence is rejected.
+    owner_id: Option<String>,
+    generation: Option<i64>,
 }
 
 impl SessionTraceContext {
@@ -6218,7 +6253,18 @@ impl SessionTraceContext {
         Self {
             trace_id: thread_trace_id(thread_key),
             traceparent: execution_span.and_then(centaur_telemetry::traceparent_for_span),
+            owner_id: None,
+            generation: None,
         }
+    }
+
+    /// Attach the trusted session ownership fence. Called after
+    /// `acquire_oneshot_session_ownership` succeeds so the harness-server
+    /// can fence stale/missing ownership without trusting client input.
+    fn with_ownership(mut self, owner_id: &str, generation: i64) -> Self {
+        self.owner_id = Some(owner_id.to_owned());
+        self.generation = Some(generation);
+        self
     }
 }
 
@@ -6282,6 +6328,27 @@ fn input_line_with_session_context(
     if let Some(traceparent) = &trace.traceparent {
         map.entry("traceparent")
             .or_insert_with(|| Value::String(traceparent.clone()));
+    }
+    // Inject the trusted session ownership fence into trace_metadata so the
+    // harness-server resident OMP host can fence stale/missing ownership.
+    // This is api-rs-injected (from the DB ownership lease), never client-
+    // asserted: the client never sees owner_id or generation in the input
+    // line — they are added here, after the line leaves the client boundary.
+    if let (Some(owner_id), Some(generation)) = (&trace.owner_id, trace.generation) {
+        // Overwrite trace_metadata unconditionally so a client-supplied
+        // non-object value (null, string, array) is replaced with a fresh
+        // object carrying only the trusted owner_id and generation.
+        // A malicious client cannot bypass the fence with a non-object.
+        let mut metadata = match map.get("trace_metadata") {
+            Some(Value::Object(existing)) => existing.clone(),
+            _ => serde_json::Map::new(),
+        };
+        metadata.insert("owner_id".to_owned(), Value::String(owner_id.clone()));
+        metadata.insert(
+            "generation".to_owned(),
+            Value::Number(serde_json::Number::from(generation)),
+        );
+        map.insert("trace_metadata".to_owned(), Value::Object(metadata));
     }
     merge_session_context(map, session_context_for_thread(thread_key));
     serde_json::to_string(&value).unwrap_or_else(|_| line.to_owned())
@@ -7886,6 +7953,8 @@ mod tests {
         let trace = SessionTraceContext {
             trace_id: thread_trace_id(&thread_key),
             traceparent: Some("00-0123456789abcdef0123456789abcdef-0123456789abcdef-01".to_owned()),
+            owner_id: None,
+            generation: None,
         };
 
         let line = input_line_with_session_context(
@@ -7905,6 +7974,83 @@ mod tests {
             input_line_with_session_context(&thread_key, &trace, "raw"),
             "raw"
         );
+    }
+
+    #[test]
+    fn input_line_injects_trusted_ownership_into_trace_metadata() {
+        let thread_key = ThreadKey::parse("chat:C123:1780000000.000000").unwrap();
+        let trace =
+            SessionTraceContext::new(&thread_key, None).with_ownership("api-rs-abcd1234", 7);
+
+        let line = input_line_with_session_context(&thread_key, &trace, r#"{"type":"user"}"#);
+        let value: Value = serde_json::from_str(&line).unwrap();
+
+        // The trusted ownership fence is injected by api-rs, not client-
+        // asserted. The harness-server reads owner_id + generation from
+        // trace_metadata and fences stale/missing ownership.
+        assert_eq!(value["trace_metadata"]["owner_id"], "api-rs-abcd1234");
+        assert_eq!(value["trace_metadata"]["generation"], 7);
+    }
+
+    #[test]
+    fn input_line_without_ownership_omits_trace_metadata_ownership() {
+        let thread_key = ThreadKey::parse("chat:C123:1780000000.000000").unwrap();
+        let trace = SessionTraceContext::new(&thread_key, None);
+
+        let line = input_line_with_session_context(&thread_key, &trace, r#"{"type":"user"}"#);
+        let value: Value = serde_json::from_str(&line).unwrap();
+
+        // No ownership acquired -> no owner_id/generation injected.
+        let metadata = value.get("trace_metadata");
+        if let Some(m) = metadata {
+            assert!(m.get("owner_id").is_none());
+            assert!(m.get("generation").is_none());
+        }
+    }
+
+    #[test]
+    fn input_line_overwrites_client_supplied_ownership_with_trusted_values() {
+        // Regression: a malicious client may supply owner_id/generation in
+        // trace_metadata. The api-rs injection MUST overwrite them, not
+        // preserve them. or_insert_with would let the client values survive;
+        // insert replaces them.
+        let thread_key = ThreadKey::parse("chat:C123:1780000000.000000").unwrap();
+        let trace =
+            SessionTraceContext::new(&thread_key, None).with_ownership("api-rs-trusted", 42);
+
+        // Client supplies malicious ownership in trace_metadata.
+        let line = input_line_with_session_context(
+            &thread_key,
+            &trace,
+            r#"{"type":"user","trace_metadata":{"owner_id":"malicious-client","generation":999}}"#,
+        );
+        let value: Value = serde_json::from_str(&line).unwrap();
+
+        // Trusted values overwrite the malicious ones.
+        assert_eq!(value["trace_metadata"]["owner_id"], "api-rs-trusted");
+        assert_eq!(value["trace_metadata"]["generation"], 42);
+        // Malicious values must NOT survive.
+        assert_ne!(value["trace_metadata"]["owner_id"], "malicious-client");
+        assert_ne!(value["trace_metadata"]["generation"], 999);
+    }
+
+    #[test]
+    fn input_line_replaces_non_object_trace_metadata_with_trusted_values() {
+        // Regression: a malicious client sends a non-object trace_metadata
+        // (e.g. null). api-rs must replace it with a fresh object carrying
+        // the trusted owner_id and generation.
+        let thread_key = ThreadKey::parse("chat:C123:1780000000.000000").unwrap();
+        let trace =
+            SessionTraceContext::new(&thread_key, None).with_ownership("api-rs-trusted", 99);
+
+        let line = input_line_with_session_context(
+            &thread_key,
+            &trace,
+            r#"{"type":"user","trace_metadata":null}"#,
+        );
+        let value: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(value["trace_metadata"]["owner_id"], "api-rs-trusted");
+        assert_eq!(value["trace_metadata"]["generation"], 99);
     }
 
     #[test]

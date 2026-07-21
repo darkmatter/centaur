@@ -35,7 +35,9 @@ use crate::traits::{
 };
 use crate::turn::{BridgeConfig, CodexTurnNormalizer};
 use crate::util::{absolute_path, default_codex_home, write_value};
-use crate::wire::{is_known_untyped_server_notification, notification_to_wire_value};
+use crate::wire::{
+    collab_state_wire_value, is_known_untyped_server_notification, notification_to_wire_value,
+};
 use crate::{HarnessServerError, Result};
 
 pub fn server_for(kind: HarnessKind) -> Box<dyn AppServerRuntime> {
@@ -55,8 +57,8 @@ pub fn run_blocks_server(kind: HarnessKind) -> Result<()> {
     match kind {
         HarnessKind::Codex => crate::codex::run_codex_blocks_server(CodexHarnessServer::codex()),
         HarnessKind::ClaudeCode => run_blocks_app_server(&ClaudeCodeHarness),
+        HarnessKind::Omp => crate::omp_rpc::run_omp_blocks_server(),
         HarnessKind::Amp => run_blocks_app_server(&AmpHarness),
-        HarnessKind::Omp => run_blocks_app_server(&OmpHarness),
     }
 }
 
@@ -1277,6 +1279,17 @@ fn run_harness_turn<H: HarnessServer, W: Write>(
                     if let Some(session_id) = normalized.session_id() {
                         last_session_id = Some(session_id.to_string());
                         state.harness_session_id = Some(session_id.to_string());
+                    }
+                    if let NormalizedEvent::CollabState {
+                        state,
+                        reason,
+                        room,
+                    } = &normalized
+                    {
+                        write_value(
+                            stdout,
+                            &collab_state_wire_value(state, reason.as_deref(), room),
+                        )?;
                     }
                     for notification in normalizer.process_event(&normalized)? {
                         write_value(stdout, &notification_to_wire_value(&notification)?)?;

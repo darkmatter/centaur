@@ -1,5 +1,7 @@
 use axum::response::sse::Event;
-use centaur_session_core::{HarnessType, Session, SessionEvent, SessionMessageInput, ThreadKey};
+use centaur_session_core::{
+    CollabRoomState, HarnessType, Session, SessionEvent, SessionMessageInput, ThreadKey,
+};
 use centaur_session_runtime::SESSION_OUTPUT_LINE_EVENT;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -119,6 +121,39 @@ pub struct InterruptSessionExecutionResponse {
     pub thread_key: ThreadKey,
 }
 
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct StartCollabRoomRequest {
+    pub relay_url: Option<String>,
+    pub web_url: Option<String>,
+    pub display_name: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct StartCollabRoomResponse {
+    pub ok: bool,
+    pub thread_key: ThreadKey,
+    pub room: Option<CollabRoomState>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct CollabRoomStatusResponse {
+    pub ok: bool,
+    pub thread_key: ThreadKey,
+    pub room: Option<CollabRoomState>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct StopCollabRoomRequest {
+    pub reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct StopCollabRoomResponse {
+    pub ok: bool,
+    pub thread_key: ThreadKey,
+    pub stopped: bool,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 pub struct EventsQuery {
     pub after_event_id: Option<i64>,
@@ -233,4 +268,27 @@ pub enum SessionEventConversionError {
     OutputLinePayload { event_id: i64 },
     #[error("failed to serialize session event {event_id} payload as SSE JSON: {source}")]
     JsonData { event_id: i64, source: axum::Error },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn stop_collab_response_is_canonical() {
+        let response = StopCollabRoomResponse {
+            ok: true,
+            thread_key: ThreadKey::parse("test:room").unwrap(),
+            stopped: false,
+        };
+        assert_eq!(
+            serde_json::to_value(response).unwrap(),
+            json!({
+                "ok": true,
+                "thread_key": "test:room",
+                "stopped": false,
+            })
+        );
+    }
 }

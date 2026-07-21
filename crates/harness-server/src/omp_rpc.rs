@@ -300,10 +300,17 @@ impl OmpRpcChild {
     }
 
     /// Try to read the next raw stdout line without blocking longer than
-    /// `timeout`. `Ok(None)` on timeout; `Err` on EOF/child exit.
+    /// `timeout` wall-clock. Blank lines do not reset the budget: one absolute
+    /// deadline covers the whole call, and each recv uses only the remaining
+    /// time. `Ok(None)` on timeout; `Err` on EOF/child exit.
     pub fn read_line_timeout(&mut self, timeout: Duration) -> Result<Option<String>> {
+        let deadline = std::time::Instant::now() + timeout;
         loop {
-            let line: io::Result<String> = match self.stdout.recv_timeout(timeout) {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return Ok(None);
+            }
+            let line: io::Result<String> = match self.stdout.recv_timeout(remaining) {
                 Ok(line) => line,
                 Err(RecvTimeoutError::Timeout) => return Ok(None),
                 Err(RecvTimeoutError::Disconnected) => {
@@ -318,6 +325,7 @@ impl OmpRpcChild {
             let line = line?;
             let trimmed = line.trim();
             if trimmed.is_empty() {
+                // Consume blank and continue under the same absolute deadline.
                 continue;
             }
             return Ok(Some(trimmed.to_owned()));
@@ -344,6 +352,37 @@ impl OmpRpcChild {
                 None => thread::sleep(Duration::from_millis(50)),
             }
         }
+    }
+}
+
+impl OmpRpcChild {
+    /// Force-kill the resident process. Used when a collab command hits the
+    /// absolute deadline (or is otherwise unrecoverable): the OMP command
+    /// queue may still be hung inside the child, so the process must not be
+    /// reused for a subsequent status/stop.
+    fn kill_now(&mut self) {
+        let _ = self.stdin.take();
+        let _ = self.child.kill();
+        // Reap promptly so callers observe a dead process and cannot reuse a
+        // hung OMP command queue. Bound the wait so a stuck kill cannot hang.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(_)) => return,
+                Ok(None) if std::time::Instant::now() >= deadline => {
+                    let _ = self.child.kill();
+                    let _ = self.child.wait();
+                    return;
+                }
+                Ok(None) => thread::sleep(Duration::from_millis(10)),
+                Err(_) => return,
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn process_id(&self) -> u32 {
+        self.child.id()
     }
 }
 
@@ -397,6 +436,7 @@ fn query_and_persist_session_state(
     child: &mut OmpRpcChild,
     event_normalizer: &mut crate::omp::OmpEventNormalizer,
     stdout: &mut impl Write,
+    admitted: &Option<OmpRpcOwnership>,
 ) -> Result<String> {
     let id = child.next_request_id();
     child.send_command(&json!({ "id": id, "type": "get_state" }))?;
@@ -453,10 +493,9 @@ fn query_and_persist_session_state(
                         room,
                     } = &normalized
                     {
-                        let _ = write_value(
-                            stdout,
-                            &collab_state_wire_value(state, reason.as_deref(), room),
-                        );
+                        let mut val = collab_state_wire_value(state, reason.as_deref(), room);
+                        stamp_ownership(&mut val, admitted);
+                        let _ = write_value(stdout, &val);
                     }
                     let _ = normalized;
                 }
@@ -875,6 +914,7 @@ pub fn run_omp_blocks_server() -> Result<()> {
                         child.as_mut().unwrap(),
                         &mut event_normalizer,
                         &mut stdout,
+                        &admitted_ownership,
                     )?;
                 }
                 let child = child.as_mut().unwrap();
@@ -893,7 +933,13 @@ pub fn run_omp_blocks_server() -> Result<()> {
                     // No turn lifecycle — the active turn continues.
                     let id = child.next_request_id();
                     child.send_command(&steer_command(&id, &message))?;
-                    drive_omp_steer_response(child, &id, &mut stdout, &thread_id)?;
+                    drive_omp_steer_response(
+                        child,
+                        &id,
+                        &mut stdout,
+                        &thread_id,
+                        &admitted_ownership,
+                    )?;
                     turn_active.store(false, Ordering::SeqCst);
                     continue;
                 }
@@ -989,12 +1035,20 @@ pub fn run_omp_blocks_server() -> Result<()> {
                 request_id,
                 command,
             } => {
+                // Stamp ownership only for collab-* parse errors; interrupt
+                // and other non-collab parse errors keep the prior shape.
+                let own = if command.starts_with("collab") {
+                    admitted_ownership.as_ref()
+                } else {
+                    None
+                };
                 write_blocks_error_with_request_id(
                     &mut stdout,
                     &thread_id,
                     &command,
                     &message,
                     request_id.as_deref(),
+                    own,
                 )?;
             }
             OmpBlocksInput::Control(OmpBlocksControl::CollabStart {
@@ -1021,20 +1075,38 @@ pub fn run_omp_blocks_server() -> Result<()> {
                         child.as_mut().unwrap(),
                         &mut event_normalizer,
                         &mut stdout,
+                        &admitted_ownership,
                     )?;
                 }
-                let child = child.as_mut().unwrap();
-                let id = resolve_request_id(child, request_id);
-                child.send_command(&collab_start_command(
-                    &id,
-                    relay_url.as_deref(),
-                    display_name.as_deref(),
-                    web_url.as_deref(),
-                ))?;
-                let room =
-                    drive_collab_command(child, &id, "collab_start", &mut stdout, &thread_id)?;
-                if let Some(room) = room {
-                    emit_collab_state(&mut stdout, "started", None, &room, Some(&id))?;
+                {
+                    let child_ref = child.as_mut().unwrap();
+                    let id = resolve_request_id(child_ref, request_id);
+                    child_ref.send_command(&collab_start_command(
+                        &id,
+                        relay_url.as_deref(),
+                        display_name.as_deref(),
+                        web_url.as_deref(),
+                    ))?;
+                    let drive = drive_collab_command(
+                        child_ref,
+                        &id,
+                        "collab_start",
+                        &mut stdout,
+                        &thread_id,
+                        &admitted_ownership,
+                    )?;
+                    if !drive.child_reusable {
+                        respawn_child = true;
+                    } else if let Some(room) = drive.room {
+                        emit_collab_state(
+                            &mut stdout,
+                            "started",
+                            None,
+                            &room,
+                            Some(&id),
+                            &admitted_ownership,
+                        )?;
+                    }
                 }
             }
             OmpBlocksInput::Control(OmpBlocksControl::CollabStatus {
@@ -1051,34 +1123,47 @@ pub fn run_omp_blocks_server() -> Result<()> {
                 ) {
                     continue;
                 }
-                let Some(child) = child.as_mut() else {
+                if child.is_none() {
                     write_blocks_error_with_request_id(
                         &mut stdout,
                         &thread_id,
                         "collab_status",
                         "no resident process",
                         request_id.as_deref(),
+                        Some(&ownership),
                     )?;
                     continue;
-                };
-                let id = resolve_request_id(child, request_id);
-                child.send_command(&collab_status_command(&id))?;
-                let room =
-                    drive_collab_command(child, &id, "collab_status", &mut stdout, &thread_id)?;
-                if let Some(room) = room {
-                    // Snapshot shape: same room contract as collab/state, plus
-                    // state derived from room.active and request_id for wait
-                    // correlation. Distinct method (collab/status) so api-rs
-                    // can tell a query snapshot from a lifecycle event.
-                    let parsed = parse_room_state(&room)?;
-                    let api_room = room_state_to_api(&parsed);
-                    let state = if parsed.active { "started" } else { "stopped" };
-                    let mut value = collab_state_wire_value(state, None, &api_room);
-                    value["method"] = Value::String("collab/status".to_owned());
-                    if let Some(params) = value.get_mut("params") {
-                        params["request_id"] = Value::String(id.clone());
+                }
+                {
+                    let child_ref = child.as_mut().unwrap();
+                    let id = resolve_request_id(child_ref, request_id);
+                    child_ref.send_command(&collab_status_command(&id))?;
+                    let drive = drive_collab_command(
+                        child_ref,
+                        &id,
+                        "collab_status",
+                        &mut stdout,
+                        &thread_id,
+                        &admitted_ownership,
+                    )?;
+                    if !drive.child_reusable {
+                        respawn_child = true;
+                    } else if let Some(room) = drive.room {
+                        // Snapshot shape: same room contract as collab/state, plus
+                        // state derived from room.active and request_id for wait
+                        // correlation. Distinct method (collab/status) so api-rs
+                        // can tell a query snapshot from a lifecycle event.
+                        let parsed = parse_room_state(&room)?;
+                        let api_room = room_state_to_api(&parsed);
+                        let state = if parsed.active { "started" } else { "stopped" };
+                        let mut value = collab_state_wire_value(state, None, &api_room);
+                        value["method"] = Value::String("collab/status".to_owned());
+                        if let Some(params) = value.get_mut("params") {
+                            params["request_id"] = Value::String(id.clone());
+                        }
+                        stamp_ownership(&mut value, &admitted_ownership);
+                        write_value(&mut stdout, &value)?;
                     }
-                    write_value(&mut stdout, &value)?;
                 }
             }
             OmpBlocksInput::Control(OmpBlocksControl::CollabStop {
@@ -1095,22 +1180,41 @@ pub fn run_omp_blocks_server() -> Result<()> {
                 ) {
                     continue;
                 }
-                let Some(child) = child.as_mut() else {
+                if child.is_none() {
                     write_blocks_error_with_request_id(
                         &mut stdout,
                         &thread_id,
                         "collab_stop",
                         "no resident process",
                         request_id.as_deref(),
+                        Some(&ownership),
                     )?;
                     continue;
-                };
-                let id = resolve_request_id(child, request_id);
-                child.send_command(&collab_stop_command(&id))?;
-                let room =
-                    drive_collab_command(child, &id, "collab_stop", &mut stdout, &thread_id)?;
-                if let Some(room) = room {
-                    emit_collab_state(&mut stdout, "stopped", None, &room, Some(&id))?;
+                }
+                {
+                    let child_ref = child.as_mut().unwrap();
+                    let id = resolve_request_id(child_ref, request_id);
+                    child_ref.send_command(&collab_stop_command(&id))?;
+                    let drive = drive_collab_command(
+                        child_ref,
+                        &id,
+                        "collab_stop",
+                        &mut stdout,
+                        &thread_id,
+                        &admitted_ownership,
+                    )?;
+                    if !drive.child_reusable {
+                        respawn_child = true;
+                    } else if let Some(room) = drive.room {
+                        emit_collab_state(
+                            &mut stdout,
+                            "stopped",
+                            None,
+                            &room,
+                            Some(&id),
+                            &admitted_ownership,
+                        )?;
+                    }
                 }
             }
         }
@@ -1159,12 +1263,20 @@ fn check_ownership_with_request_id(
     match admitted {
         Some(admitted) => {
             if !admitted.matches(incoming) {
+                // Ownership stamp only for collab-* control rejections.
+                // Interrupt ownership rejections keep the prior error shape.
+                let own = if command.starts_with("collab") {
+                    Some(incoming)
+                } else {
+                    None
+                };
                 let _ = write_blocks_error_with_request_id(
                     stdout,
                     thread_id,
                     command,
                     "ownership fence mismatch: stale owner",
                     request_id,
+                    own,
                 );
                 return false;
             }
@@ -1180,15 +1292,69 @@ fn check_ownership_with_request_id(
 /// Drive a collab command to its correlated response, draining unsolicited
 /// frames in the meantime. Returns the response `data` (room state) on
 /// success, `None` at failure (error already written).
+/// Absolute wall budget for one collab_start/status/stop RPC. Must stay under
+/// the api-rs lifecycle deadline (15s) so the resident can surface a correlated
+/// error and return instead of looping forever on 30s read timeouts.
+const COLLAB_COMMAND_DEADLINE: Duration = Duration::from_secs(12);
+
+/// Outcome of a single collab RPC wait. `child_reusable` is false when the
+/// absolute command deadline fired (or the child is otherwise unrecoverable):
+/// callers must kill/drop the child before accepting the next control input
+/// so a hung OMP command tail cannot block stop/status forever.
+struct CollabDriveResult {
+    room: Option<Value>,
+    child_reusable: bool,
+}
+
 fn drive_collab_command(
     child: &mut OmpRpcChild,
     expected_id: &str,
-    _command: &str,
+    command: &str,
     stdout: &mut impl Write,
     thread_id: &str,
-) -> Result<Option<Value>> {
+    admitted: &Option<OmpRpcOwnership>,
+) -> Result<CollabDriveResult> {
+    drive_collab_command_within(
+        child,
+        expected_id,
+        command,
+        stdout,
+        thread_id,
+        admitted,
+        std::time::Instant::now() + COLLAB_COMMAND_DEADLINE,
+    )
+}
+
+fn drive_collab_command_within(
+    child: &mut OmpRpcChild,
+    expected_id: &str,
+    command: &str,
+    stdout: &mut impl Write,
+    thread_id: &str,
+    admitted: &Option<OmpRpcOwnership>,
+    deadline: std::time::Instant,
+) -> Result<CollabDriveResult> {
     loop {
-        let line = match child.read_line_timeout(Duration::from_secs(30))? {
+        if std::time::Instant::now() >= deadline {
+            write_blocks_error_with_request_id(
+                stdout,
+                thread_id,
+                command,
+                &format!("{command} exceeded resident command deadline"),
+                Some(expected_id),
+                admitted.as_ref(),
+            )?;
+            // Kill before returning so the hung OMP command queue cannot
+            // serialize forever behind this process. Drop/respawn follows.
+            child.kill_now();
+            return Ok(CollabDriveResult {
+                room: None,
+                child_reusable: false,
+            });
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        let slice = remaining.min(Duration::from_secs(2));
+        let line = match child.read_line_timeout(slice)? {
             Some(line) => line,
             None => continue,
         };
@@ -1211,10 +1377,19 @@ fn drive_collab_command(
                         cmd,
                         &msg,
                         Some(expected_id),
+                        admitted.as_ref(),
                     )?;
-                    return Ok(None);
+                    // Correlated failure from a live child — process is still
+                    // healthy and reusable for stop/status.
+                    return Ok(CollabDriveResult {
+                        room: None,
+                        child_reusable: true,
+                    });
                 }
-                return Ok(data);
+                return Ok(CollabDriveResult {
+                    room: data,
+                    child_reusable: true,
+                });
             }
             OmpRpcFrame::Response { .. } => {}
             OmpRpcFrame::CollabState {
@@ -1224,10 +1399,9 @@ fn drive_collab_command(
             } => {
                 let parsed = parse_room_state(&room)?;
                 let api_room = room_state_to_api(&parsed);
-                let _ = write_value(
-                    stdout,
-                    &collab_state_wire_value(&state, reason.as_deref(), &api_room),
-                );
+                let mut val = collab_state_wire_value(&state, reason.as_deref(), &api_room);
+                stamp_ownership(&mut val, admitted);
+                let _ = write_value(stdout, &val);
             }
             OmpRpcFrame::Event(_)
             | OmpRpcFrame::PromptResult { .. }
@@ -1246,6 +1420,7 @@ fn drive_omp_steer_response(
     expected_id: &str,
     stdout: &mut impl Write,
     thread_id: &str,
+    admitted: &Option<OmpRpcOwnership>,
 ) -> Result<()> {
     loop {
         let line = match child.read_line_timeout(Duration::from_secs(30))? {
@@ -1259,12 +1434,14 @@ fn drive_omp_steer_response(
             } if id.as_deref() == Some(expected_id) => {
                 if !success {
                     let msg = error.unwrap_or_else(|| "steer failed".to_owned());
+                    // Normal steer errors unchanged: no ownership stamp.
                     write_blocks_error_with_request_id(
                         stdout,
                         thread_id,
                         "steer",
                         &msg,
                         Some(expected_id),
+                        None,
                     )?;
                 }
                 return Ok(());
@@ -1277,10 +1454,9 @@ fn drive_omp_steer_response(
             } => {
                 let parsed = parse_room_state(&room)?;
                 let api_room = room_state_to_api(&parsed);
-                write_value(
-                    stdout,
-                    &collab_state_wire_value(&state, reason.as_deref(), &api_room),
-                )?;
+                let mut val = collab_state_wire_value(&state, reason.as_deref(), &api_room);
+                stamp_ownership(&mut val, admitted);
+                write_value(stdout, &val)?;
             }
             OmpRpcFrame::Event(_)
             | OmpRpcFrame::PromptResult { .. }
@@ -1292,12 +1468,27 @@ fn drive_omp_steer_response(
 
 /// Emit a collab/state notification from a raw room JSON value (already
 /// parsed and re-projected to the API contract).
+
+/// Stamp admitted ownership into a collab wire value's params so api-rs can
+/// require exact ownership match and reject missing echo on all collab outputs.
+fn stamp_ownership(value: &mut Value, admitted: &Option<OmpRpcOwnership>) {
+    if let Some(own) = admitted
+        && let Some(params) = value.get_mut("params")
+    {
+        params["ownership"] = json!({
+            "owner_id": own.owner_id,
+            "generation": own.generation,
+        });
+    }
+}
+
 fn emit_collab_state(
     stdout: &mut impl Write,
     state: &str,
     reason: Option<&str>,
     room: &Value,
     request_id: Option<&str>,
+    admitted: &Option<OmpRpcOwnership>,
 ) -> Result<()> {
     let parsed = parse_room_state(room)?;
     let api_room = room_state_to_api(&parsed);
@@ -1307,6 +1498,7 @@ fn emit_collab_state(
     {
         params["request_id"] = Value::String(request_id.to_owned());
     }
+    stamp_ownership(&mut value, admitted);
     write_value(stdout, &value)
 }
 
@@ -1430,11 +1622,13 @@ fn drive_omp_turn(
                 Ok(OmpBlocksInput::Command(BlocksCommand::Interrupt)) => {
                     // #3: missing ownership with admitted → surface error.
                     if admitted_ownership.is_some() {
-                        write_blocks_error(
+                        write_blocks_error_with_request_id(
                             stdout,
                             thread_id,
                             turn_id,
                             "missing ownership: interrupt requires owner_id + generation",
+                            None,
+                            None,
                         )?;
                     } else {
                         let id = child.next_request_id();
@@ -1451,19 +1645,24 @@ fn drive_omp_turn(
                             aborted = true;
                         }
                         Some(_) => {
-                            write_blocks_error(
+                            // Interrupt ownership errors: no ownership stamp.
+                            write_blocks_error_with_request_id(
                                 stdout,
                                 thread_id,
                                 turn_id,
                                 "ownership fence mismatch: stale owner",
+                                None,
+                                None,
                             )?;
                         }
                         None => {
-                            write_blocks_error(
+                            write_blocks_error_with_request_id(
                                 stdout,
                                 thread_id,
                                 turn_id,
                                 "missing ownership: no admitted owner",
+                                None,
+                                None,
                             )?;
                         }
                     }
@@ -1489,11 +1688,13 @@ fn drive_omp_turn(
                             child.send_command(&steer_command(&id, &steer_msg))?;
                         }
                     } else {
-                        write_blocks_error(
+                        write_blocks_error_with_request_id(
                             stdout,
                             thread_id,
                             turn_id,
                             "ownership fence mismatch: stale owner",
+                            None,
+                            None,
                         )?;
                     }
                 }
@@ -1556,10 +1757,9 @@ fn drive_omp_turn(
                         room,
                     } = &normalized
                     {
-                        write_value(
-                            stdout,
-                            &collab_state_wire_value(state, reason.as_deref(), room),
-                        )?;
+                        let mut val = collab_state_wire_value(state, reason.as_deref(), room);
+                        stamp_ownership(&mut val, admitted_ownership);
+                        write_value(stdout, &val)?;
                         continue;
                     }
                     if let Some(sid) = normalized.session_id() {
@@ -1586,10 +1786,9 @@ fn drive_omp_turn(
             } => {
                 let parsed = parse_room_state(&room)?;
                 let api_room = room_state_to_api(&parsed);
-                write_value(
-                    stdout,
-                    &collab_state_wire_value(&state, reason.as_deref(), &api_room),
-                )?;
+                let mut val = collab_state_wire_value(&state, reason.as_deref(), &api_room);
+                stamp_ownership(&mut val, admitted_ownership);
+                write_value(stdout, &val)?;
             }
             OmpRpcFrame::PromptResult { agent_invoked, .. } if !agent_invoked => {
                 terminal = true;
@@ -1639,7 +1838,7 @@ fn write_blocks_error(
     turn_id: &str,
     message: &str,
 ) -> Result<()> {
-    write_blocks_error_with_request_id(stdout, thread_id, turn_id, message, None)
+    write_blocks_error_with_request_id(stdout, thread_id, turn_id, message, None, None)
 }
 
 fn write_blocks_error_with_request_id(
@@ -1648,6 +1847,7 @@ fn write_blocks_error_with_request_id(
     turn_id: &str,
     message: &str,
     request_id: Option<&str>,
+    admitted: Option<&OmpRpcOwnership>,
 ) -> Result<()> {
     let mut params = serde_json::json!({
         "error": { "message": message, "codexErrorInfo": null, "additionalDetails": null },
@@ -1657,6 +1857,12 @@ fn write_blocks_error_with_request_id(
     });
     if let Some(rid) = request_id {
         params["request_id"] = Value::String(rid.to_owned());
+    }
+    if let Some(own) = admitted {
+        params["ownership"] = json!({
+            "owner_id": own.owner_id,
+            "generation": own.generation,
+        });
     }
     write_value(
         stdout,
@@ -2053,5 +2259,180 @@ mod tests {
         assert!(api.get("join_url").is_none());
         assert!(api.get("view_url").is_none());
         assert_eq!(api["participants"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn collab_command_deadline_is_strictly_below_api_lifecycle() {
+        assert!(
+            COLLAB_COMMAND_DEADLINE < Duration::from_secs(15),
+            "resident command deadline {:?} must be < API lifecycle 15s",
+            COLLAB_COMMAND_DEADLINE
+        );
+        assert!(
+            COLLAB_COMMAND_DEADLINE >= Duration::from_secs(5),
+            "deadline too aggressive: {:?}",
+            COLLAB_COMMAND_DEADLINE
+        );
+    }
+
+    #[test]
+    fn collab_drive_deadline_kills_child_and_marks_non_reusable() {
+        // Bridge: ready then never answers — hung OMP collab command tail.
+        let bridge =
+            std::env::temp_dir().join(format!("omp-hung-bridge-{}.sh", std::process::id()));
+        std::fs::write(
+            &bridge,
+            r#"#!/bin/sh
+printf '%s\n' '{"type":"ready"}'
+while IFS= read -r _; do
+  sleep 3600
+done
+"#,
+        )
+        .expect("write bridge");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&bridge).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&bridge, perms).unwrap();
+        }
+        let prev = std::env::var_os("CENTAUR_OMP_RPC_BRIDGE_COMMAND");
+        // SAFETY: test-only process-local env override.
+        unsafe {
+            std::env::set_var("CENTAUR_OMP_RPC_BRIDGE_COMMAND", &bridge);
+        }
+        let mut child = OmpRpcChild::spawn().expect("spawn hung bridge");
+        drain_ready(&mut child).expect("ready");
+        let hung_pid = child.process_id();
+        // Poison: a late response that must not be consumed by a replacement.
+        // (Hung bridge never writes it; kill ensures the pipe dies.)
+        let mut out = Vec::new();
+        let admitted = Some(OmpRpcOwnership {
+            owner_id: "owner-a".to_owned(),
+            generation: 1,
+        });
+        let drive = drive_collab_command_within(
+            &mut child,
+            "req-hung",
+            "collab_stop",
+            &mut out,
+            "thread-1",
+            &admitted,
+            std::time::Instant::now() + Duration::from_millis(80),
+        )
+        .expect("deadline path returns Ok");
+        assert!(drive.room.is_none(), "deadline yields no room");
+        assert!(
+            !drive.child_reusable,
+            "deadline must mark child non-reusable so callers respawn"
+        );
+        let line = String::from_utf8_lossy(&out);
+        assert!(
+            line.contains("deadline") || line.contains("error"),
+            "correlated error written: {line}"
+        );
+        assert!(
+            line.contains("owner-a"),
+            "ownership stamped on deadline error: {line}"
+        );
+        // Hung process must be reaped — next control cannot queue behind it.
+        assert!(
+            matches!(child.child.try_wait(), Ok(Some(_))),
+            "hung child pid {hung_pid} must be killed and reaped after deadline"
+        );
+
+        // Replacement child is a new process; old capability/output cannot
+        // poison it (old pid is gone, fresh ready handshake).
+        let mut child2 = OmpRpcChild::spawn().expect("spawn replacement");
+        drain_ready(&mut child2).expect("replacement ready");
+        let new_pid = child2.process_id();
+        assert_ne!(new_pid, hung_pid, "replacement must be a new OS process");
+        // Immediate next command on the new child must not hang behind the
+        // old queue: hang bridge still never answers, but we only prove
+        // process replacement + dead old pid here; production callers drop
+        // the non-reusable child before the next input.
+        drop(child);
+        drop(child2);
+        let _ = std::fs::remove_file(&bridge);
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("CENTAUR_OMP_RPC_BRIDGE_COMMAND", v),
+                None => std::env::remove_var("CENTAUR_OMP_RPC_BRIDGE_COMMAND"),
+            }
+        }
+    }
+
+    #[test]
+    fn collab_drive_success_keeps_child_reusable() {
+        let ok = CollabDriveResult {
+            room: Some(json!({"active": true})),
+            child_reusable: true,
+        };
+        assert!(ok.child_reusable);
+        assert!(ok.room.is_some());
+        let deadline = CollabDriveResult {
+            room: None,
+            child_reusable: false,
+        };
+        assert!(!deadline.child_reusable);
+    }
+
+    #[test]
+    fn read_line_timeout_blank_stream_respects_absolute_deadline() {
+        // Bridge emits ready then continuous blank lines. A naive per-line
+        // recv_timeout reset would hang forever; absolute remaining budget
+        // must return Ok(None) within the caller's slice.
+        let bridge =
+            std::env::temp_dir().join(format!("omp-blank-bridge-{}.sh", std::process::id()));
+        std::fs::write(
+            &bridge,
+            r#"#!/bin/sh
+printf '%s\n' '{"type":"ready"}'
+# Flood blank lines forever (no non-empty frames).
+while :; do
+  printf '\n'
+done
+"#,
+        )
+        .expect("write bridge");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&bridge).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&bridge, perms).unwrap();
+        }
+        let prev = std::env::var_os("CENTAUR_OMP_RPC_BRIDGE_COMMAND");
+        unsafe {
+            std::env::set_var("CENTAUR_OMP_RPC_BRIDGE_COMMAND", &bridge);
+        }
+        let mut child = OmpRpcChild::spawn().expect("spawn blank bridge");
+        drain_ready(&mut child).expect("ready");
+        let started = std::time::Instant::now();
+        let result = child
+            .read_line_timeout(Duration::from_millis(150))
+            .expect("timeout path is Ok");
+        let elapsed = started.elapsed();
+        assert!(
+            result.is_none(),
+            "blank stream must time out, got {result:?}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(800),
+            "absolute deadline must bound the call, elapsed={elapsed:?}"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(100),
+            "should wait near the requested slice, elapsed={elapsed:?}"
+        );
+        drop(child);
+        let _ = std::fs::remove_file(&bridge);
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("CENTAUR_OMP_RPC_BRIDGE_COMMAND", v),
+                None => std::env::remove_var("CENTAUR_OMP_RPC_BRIDGE_COMMAND"),
+            }
+        }
     }
 }

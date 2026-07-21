@@ -469,6 +469,15 @@ apiRs:
   # ironProxy.secretSource is "onepassword". Empty falls back to the binary
   # default ("ai-agents").
   opVault: ""
+  # omp transcript corpus archival. When bucket is non-empty, api-rs uploads
+  # each thread's omp session corpus to
+  # s3://<bucket>/<prefix>/<encoded thread_key>/corpus.tar.gz when an
+  # execution ends. Empty bucket disables the sync. The S3 endpoint, region,
+  # and credentials come from the same env surface the Slack archive import
+  # uses (shared infra Secret).
+  transcripts:
+    bucket: ""
+    prefix: transcripts
   startupProbe:
     failureThreshold: 30
     periodSeconds: 10
@@ -484,6 +493,34 @@ apiRs:
   terminationGracePeriodSeconds: 35
   extraEnv: {}
   resources: {}
+
+# Static app-plane registry (MVP). Each entry renders a Deployment, a Service
+# (:80 -> port), an optional PVC mounted at /data, and a NetworkPolicy that
+# admits ingress only from api-rs — apps are reachable solely through the
+# api-rs /apps/{name}/* proxy, which strips caller credentials and injects the
+# app identity header. api-rs receives the registry as CENTAUR_APPS_JSON. A
+# DB-backed registry later replaces this block without changing the route or
+# header contract.
+apps: []
+# - name: omp-stats
+#   image: centaur-omp-stats:latest
+#   imagePullPolicy: Always
+#   port: 8080
+#   # Optional pod-level security context. Persistent images that run
+#   # non-root commonly need fsGroup so the mounted volume is writable.
+#   podSecurityContext:
+#     fsGroup: 1001
+#     fsGroupChangePolicy: OnRootMismatch
+#   # Extra container env, verbatim (name/value or valueFrom entries).
+#   env: []
+#   persistence:
+#     enabled: true
+#     size: 5Gi
+#     storageClass: ""
+#   resources: {}
+#   # Extra NetworkPolicy egress rules appended verbatim, e.g. the
+#   # object-storage endpoint the app syncs transcript corpora from.
+#   egress: []
 
 # Chat SDK Slackbot v2. Forwards Slack events to the api-rs control plane
 # (:8080) and streams responses back. Listens on :3001.

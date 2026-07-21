@@ -90,6 +90,18 @@ pub trait HarnessServer {
         None
     }
 
+    /// Persist the bridge-thread-id → harness-session-id mapping so a
+    /// post-restart `thread/resume` can target the id the harness actually
+    /// issued (the bridge id is minted here and unknown to the harness).
+    /// Default: no persistence — in-memory `ThreadState` is the only record.
+    fn record_session_id(&self, _thread_id: &str, _session_id: &str) {}
+
+    /// Look up a previously recorded harness session id for a bridge thread
+    /// id. `None` falls back to treating the bridge id as the session id.
+    fn resume_session_id(&self, _thread_id: &str) -> Option<String> {
+        None
+    }
+
     fn thread_state(&self, params: &ThreadStartParams, cwd: PathBuf) -> ThreadState {
         let model = params.model.clone().unwrap_or_else(|| self.default_model());
         let model_provider = params

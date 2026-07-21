@@ -1,10 +1,13 @@
+use std::collections::BTreeMap;
 use std::env;
-use std::path::PathBuf;
+use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 use std::time::Duration;
 
 use codex_app_server_protocol::UserInput;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
@@ -379,6 +382,25 @@ impl HarnessServer for OmpHarness {
     fn terminal_assistant_stop_settle(&self) -> Option<Duration> {
         Some(Duration::ZERO)
     }
+
+    /// Persist the mapping in `$OMP_SESSION_DIR/thread-map.json` so it rides
+    /// the same storage as the session JSONLs it describes: a resume after
+    /// the bridge process (or its host) is replaced can still translate the
+    /// bridge id into the omp-issued one. Failures are logged, not fatal —
+    /// the in-memory mapping still covers the current process lifetime.
+    fn record_session_id(&self, thread_id: &str, session_id: &str) {
+        let dir = omp_session_dir();
+        if let Err(err) = record_thread_session(&dir, thread_id, session_id) {
+            eprintln!(
+                "omp: failed to persist session map in {}: {err}",
+                dir.display()
+            );
+        }
+    }
+
+    fn resume_session_id(&self, thread_id: &str) -> Option<String> {
+        read_thread_map(&omp_session_dir()).remove(thread_id)
+    }
 }
 
 fn assistant_item_id(raw_id: Option<&str>) -> String {
@@ -414,6 +436,47 @@ pub(crate) fn omp_session_dir() -> PathBuf {
         })
 }
 
+const THREAD_MAP_FILE: &str = "thread-map.json";
+
+/// On-disk `thread-map.json` schema: `{"version":1,"threads":{bridge_id:
+/// omp_session_id}}`. Versioned so a future shape change can migrate rather
+/// than silently misread.
+#[derive(Debug, Serialize, Deserialize)]
+struct ThreadMapFile {
+    version: u32,
+    threads: BTreeMap<String, String>,
+}
+
+/// Missing, unreadable, or corrupt maps read as empty: the map is a resume
+/// optimization, never a reason to fail a turn.
+fn read_thread_map(dir: &Path) -> BTreeMap<String, String> {
+    let Ok(bytes) = fs::read(dir.join(THREAD_MAP_FILE)) else {
+        return BTreeMap::new();
+    };
+    serde_json::from_slice::<ThreadMapFile>(&bytes)
+        .map(|file| file.threads)
+        .unwrap_or_default()
+}
+
+/// Read-modify-write with an atomic tmp+rename in the same directory, so a
+/// crash mid-write can never leave a truncated map for the next reader.
+fn record_thread_session(dir: &Path, thread_id: &str, session_id: &str) -> io::Result<()> {
+    let mut threads = read_thread_map(dir);
+    if threads.get(thread_id).map(String::as_str) == Some(session_id) {
+        return Ok(());
+    }
+    threads.insert(thread_id.to_string(), session_id.to_string());
+    fs::create_dir_all(dir)?;
+    let payload = serde_json::to_vec_pretty(&ThreadMapFile {
+        version: 1,
+        threads,
+    })
+    .map_err(io::Error::other)?;
+    let tmp = dir.join(format!("{THREAD_MAP_FILE}.tmp.{}", std::process::id()));
+    fs::write(&tmp, payload)?;
+    fs::rename(&tmp, dir.join(THREAD_MAP_FILE))
+}
+
 fn prompt_text(input: &[UserInput]) -> String {
     let mut prompt = String::new();
     for part in user_input_to_anthropic_content(input) {
@@ -433,7 +496,9 @@ mod tests {
 
     use crate::{HarnessServer, NormalizedContent, NormalizedEvent};
 
-    use super::{OmpEventNormalizer, OmpHarness};
+    use super::{
+        OmpEventNormalizer, OmpHarness, THREAD_MAP_FILE, read_thread_map, record_thread_session,
+    };
 
     fn normalize(normalizer: &mut OmpEventNormalizer, line: &str) -> Vec<NormalizedEvent> {
         let event = OmpHarness.parse_stdout_line(line).unwrap();
@@ -441,8 +506,64 @@ mod tests {
     }
 
     #[test]
+    fn thread_map_reads_empty_when_missing_or_corrupt() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(read_thread_map(dir.path()).is_empty());
+
+        std::fs::write(dir.path().join(THREAD_MAP_FILE), b"not json{").unwrap();
+        assert!(read_thread_map(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn thread_map_round_trips_and_accumulates() {
+        let dir = tempfile::tempdir().unwrap();
+        // Directory creation is part of the write path: point at a child
+        // that does not exist yet.
+        let map_dir = dir.path().join("omp-sessions");
+
+        record_thread_session(&map_dir, "bridge-a", "omp-1").unwrap();
+        record_thread_session(&map_dir, "bridge-b", "omp-2").unwrap();
+        // Re-recording the same mapping is a no-op, not an error.
+        record_thread_session(&map_dir, "bridge-a", "omp-1").unwrap();
+
+        let map = read_thread_map(&map_dir);
+        assert_eq!(map.get("bridge-a").map(String::as_str), Some("omp-1"));
+        assert_eq!(map.get("bridge-b").map(String::as_str), Some("omp-2"));
+        assert_eq!(map.len(), 2);
+
+        // A remapped thread id overwrites in place.
+        record_thread_session(&map_dir, "bridge-a", "omp-3").unwrap();
+        assert_eq!(
+            read_thread_map(&map_dir)
+                .get("bridge-a")
+                .map(String::as_str),
+            Some("omp-3")
+        );
+
+        // On-disk shape matches the documented schema.
+        let raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(map_dir.join(THREAD_MAP_FILE)).unwrap()).unwrap();
+        assert_eq!(raw["version"], 1);
+        assert_eq!(raw["threads"]["bridge-b"], "omp-2");
+    }
+
+    #[test]
+    fn corrupt_map_is_replaced_on_next_record() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(THREAD_MAP_FILE), b"{\"threads\":42}").unwrap();
+
+        record_thread_session(dir.path(), "bridge-a", "omp-1").unwrap();
+        assert_eq!(
+            read_thread_map(dir.path())
+                .get("bridge-a")
+                .map(String::as_str),
+            Some("omp-1")
+        );
+    }
+
+    #[test]
     fn session_line_yields_harness_session_id() {
-        let mut normalizer = OmpEventNormalizer::default();
+        let mut normalizer = OmpEventNormalizer;
         let events = normalize(
             &mut normalizer,
             r#"{"type":"session","version":3,"id":"019f3bb2-40aa-7000-b7e7-5414136e3b18","timestamp":"2026-07-07T08:29:25.547Z","cwd":"/tmp/omp-p03-test"}"#,
@@ -456,7 +577,7 @@ mod tests {
 
     #[test]
     fn text_delta_streams_agent_text_keyed_by_response_id() {
-        let mut normalizer = OmpEventNormalizer::default();
+        let mut normalizer = OmpEventNormalizer;
         let events = normalize(
             &mut normalizer,
             r#"{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"ONE"},"message":{"role":"assistant","content":[{"type":"text","text":"DONE"}],"responseId":"msg_011CcnPBnPUWzpXCn7915U1v"}}"#,
@@ -470,7 +591,7 @@ mod tests {
 
     #[test]
     fn assistant_message_end_emits_usage_and_tool_use() {
-        let mut normalizer = OmpEventNormalizer::default();
+        let mut normalizer = OmpEventNormalizer;
         let events = normalize(
             &mut normalizer,
             r#"{"type":"message_end","message":{"role":"assistant","content":[{"type":"toolCall","id":"toolu_01CnTRcRztUD24oiuqg4wQq8","name":"bash","arguments":{"command":"echo centaur-tool-test","i":"Running test echo"}}],"provider":"anthropic","model":"claude-opus-4-8","usage":{"input":2,"output":80,"cacheRead":0,"cacheWrite":41021,"totalTokens":41103},"stopReason":"toolUse","responseId":"msg_011CcnPBYXnmZhM1otcyNfq5"}}"#,
@@ -511,7 +632,7 @@ mod tests {
 
     #[test]
     fn tool_execution_end_maps_tool_result() {
-        let mut normalizer = OmpEventNormalizer::default();
+        let mut normalizer = OmpEventNormalizer;
         let events = normalize(
             &mut normalizer,
             r#"{"type":"tool_execution_end","toolCallId":"toolu_01CnTRcRztUD24oiuqg4wQq8","toolName":"bash","result":{"content":[{"type":"text","text":"centaur-tool-test\n\n\nWall time: 0.07 seconds"}],"details":{"timeoutSeconds":300,"wallTimeMs":70.62383399999817}},"isError":false}"#,
@@ -528,7 +649,7 @@ mod tests {
 
     #[test]
     fn final_assistant_stop_is_terminal_and_agent_end_yields_result() {
-        let mut normalizer = OmpEventNormalizer::default();
+        let mut normalizer = OmpEventNormalizer;
         let events = normalize(
             &mut normalizer,
             r#"{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"DONE"}],"usage":{"input":2,"output":5,"cacheRead":0,"cacheWrite":41333,"totalTokens":41340},"stopReason":"stop","responseId":"msg_011CcnPBnPUWzpXCn7915U1v"}}"#,
@@ -548,7 +669,7 @@ mod tests {
 
     #[test]
     fn tool_result_message_end_is_ignored_to_avoid_double_emission() {
-        let mut normalizer = OmpEventNormalizer::default();
+        let mut normalizer = OmpEventNormalizer;
         let events = normalize(
             &mut normalizer,
             r#"{"type":"message_end","message":{"role":"toolResult","toolCallId":"toolu_01CnTRcRztUD24oiuqg4wQq8","toolName":"bash","content":[{"type":"text","text":"centaur-tool-test"}],"isError":false}}"#,

@@ -335,6 +335,18 @@ spec:
           port: {{ .Values.ironProxy.service.pgPort }}
         - protocol: TCP
           port: {{ .Values.ironProxy.service.managementPort }}
+{{- range $app := .Values.apps }}
+{{- $component := printf "app-%s" (required "apps[].name is required" $app.name) }}
+{{- $appPort := int ($app.port | default 8080) }}
+    # Registered app backends are reachable only through api-rs.
+    - to:
+        - podSelector:
+            matchLabels:
+{{ include "centaur.componentSelectorLabels" (dict "root" $ "component" $component) | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: {{ $appPort }}
+{{- end }}
 {{- if $console.enabled }}
     # console control plane: register principals/roles/grants and per-sandbox proxies.
     - to:

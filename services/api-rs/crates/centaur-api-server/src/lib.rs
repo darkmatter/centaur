@@ -1,4 +1,5 @@
 mod api_jwt;
+mod apps_proxy;
 pub mod client;
 mod error;
 mod mcp;

@@ -977,6 +977,8 @@ name = "centaur-session-runtime"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "aws-config",
+ "aws-sdk-s3",
  "centaur-iron-control",
  "centaur-sandbox-core",
  "centaur-sandbox-manager",

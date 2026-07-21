@@ -27,7 +27,7 @@ use axum::{
     routing::{any, get, post},
 };
 use base64::{Engine as _, engine::general_purpose};
-use centaur_session_core::ThreadKey;
+use centaur_session_core::{CollabStartInput, CollabStopInput, ThreadKey};
 use centaur_session_runtime::{
     ExecuteSessionInput, HarnessConflictPolicy, PersonaSummary, SandboxRuntime, SessionRuntime,
     thread_trace_id, thread_trace_parent_span_id,
@@ -58,12 +58,13 @@ use crate::{
     mcp::{mcp_get, mcp_post, mcp_protected_resource_metadata},
     slack_proxy::slack_proxy_router,
     types::{
-        AppendMessagesRequest, AppendMessagesResponse, CreateSessionRequest, CreateSessionResponse,
-        EmitWorkflowEventRequest, EventsQuery, ExecuteSessionRequest, ExecuteSessionResponse,
-        HarnessConfigAttestation, InterruptSessionExecutionRequest,
-        InterruptSessionExecutionResponse, ListWorkflowRunsQuery, OnHarnessConflict,
-        SessionContextResponse, SessionSseEvent, SlackThreadContext, WorkspaceDiffRequest,
-        WorkspaceDiffResponse, stream_error_sse,
+        AppendMessagesRequest, AppendMessagesResponse, CollabRoomStatusResponse,
+        CreateSessionRequest, CreateSessionResponse, EmitWorkflowEventRequest, EventsQuery,
+        ExecuteSessionRequest, ExecuteSessionResponse, HarnessConfigAttestation,
+        InterruptSessionExecutionRequest, InterruptSessionExecutionResponse, ListWorkflowRunsQuery,
+        OnHarnessConflict, SessionContextResponse, SessionSseEvent, SlackThreadContext,
+        StartCollabRoomRequest, StartCollabRoomResponse, StopCollabRoomRequest,
+        StopCollabRoomResponse, WorkspaceDiffRequest, WorkspaceDiffResponse, stream_error_sse,
     },
 };
 
@@ -226,6 +227,18 @@ pub fn build_router_with_app_state(state: AppState) -> Router {
         .route(
             "/api/session/{thread_key}/interrupt",
             post(interrupt_session_execution),
+        )
+        .route(
+            "/api/session/{thread_key}/collab/start",
+            post(start_collab_room),
+        )
+        .route(
+            "/api/session/{thread_key}/collab/status",
+            get(collab_room_status),
+        )
+        .route(
+            "/api/session/{thread_key}/collab/stop",
+            post(stop_collab_room),
         )
         .route("/api/session/{thread_key}/events", get(stream_events))
         .route(
@@ -749,6 +762,64 @@ async fn interrupt_session_execution(
         interrupted: outcome.interrupted,
         execution_id: outcome.execution_id,
         thread_key,
+    }))
+}
+async fn start_collab_room(
+    State(state): State<AppState>,
+    Path(raw_thread_key): Path<String>,
+    Json(request): Json<StartCollabRoomRequest>,
+) -> Result<Json<StartCollabRoomResponse>, ApiError> {
+    let thread_key = ThreadKey::try_from(raw_thread_key)?;
+    let outcome = state
+        .runtime()?
+        .start_collab_room(
+            &thread_key,
+            &CollabStartInput {
+                relay_url: request.relay_url,
+                display_name: request.display_name,
+            },
+        )
+        .await?;
+    Ok(Json(StartCollabRoomResponse {
+        ok: outcome.ok,
+        thread_key: outcome.thread_key,
+        room: outcome.room,
+    }))
+}
+
+async fn collab_room_status(
+    State(state): State<AppState>,
+    Path(raw_thread_key): Path<String>,
+) -> Result<Json<CollabRoomStatusResponse>, ApiError> {
+    let thread_key = ThreadKey::try_from(raw_thread_key)?;
+    let outcome = state.runtime()?.collab_room_status(&thread_key);
+    Ok(Json(CollabRoomStatusResponse {
+        ok: outcome.ok,
+        thread_key: outcome.thread_key,
+        room: outcome.room,
+    }))
+}
+
+async fn stop_collab_room(
+    State(state): State<AppState>,
+    Path(raw_thread_key): Path<String>,
+    Json(request): Json<StopCollabRoomRequest>,
+) -> Result<Json<StopCollabRoomResponse>, ApiError> {
+    let thread_key = ThreadKey::try_from(raw_thread_key)?;
+    let had_room = state.runtime()?.has_active_collab_room(&thread_key);
+    let outcome = state
+        .runtime()?
+        .stop_collab_room(
+            &thread_key,
+            &CollabStopInput {
+                reason: request.reason,
+            },
+        )
+        .await?;
+    Ok(Json(StopCollabRoomResponse {
+        ok: outcome.ok,
+        thread_key: outcome.thread_key,
+        stopped: had_room,
     }))
 }
 

@@ -67,6 +67,14 @@ impl IntoResponse for ApiError {
             Self::Runtime(SessionRuntimeError::Store(SessionStoreError::PersonaConflict {
                 ..
             })) => StatusCode::CONFLICT,
+            Self::Runtime(SessionRuntimeError::SessionOwned { .. }) => StatusCode::CONFLICT,
+            Self::Runtime(SessionRuntimeError::CollabNotSupported { .. }) => {
+                StatusCode::BAD_REQUEST
+            }
+            Self::Runtime(SessionRuntimeError::CollabTerminalSession { .. }) => {
+                StatusCode::BAD_REQUEST
+            }
+            Self::Runtime(SessionRuntimeError::CollabRoomLost { .. }) => StatusCode::CONFLICT,
             Self::Workflow(WorkflowRuntimeError::BadRequest(_)) => StatusCode::BAD_REQUEST,
             Self::Workflow(WorkflowRuntimeError::Disabled(_)) => StatusCode::FORBIDDEN,
             Self::Workflow(WorkflowRuntimeError::NotFound(_)) => StatusCode::NOT_FOUND,

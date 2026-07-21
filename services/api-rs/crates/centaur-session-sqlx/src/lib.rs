@@ -1103,6 +1103,59 @@ impl PgSessionStore {
         tx.commit().await?;
         row.try_into().map(Some)
     }
+    /// Appends an unscoped lifecycle event only while the caller still holds
+    /// the session fencing generation and its lease. Unlike
+    /// `append_event_if_session_owner`, this variant stores `execution_id =
+    /// NULL`, which is required for room lifecycle events that are not tied
+    /// to an agent execution.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn append_unscoped_event_if_session_owner(
+        &self,
+        thread_key: &ThreadKey,
+        owner_id: &str,
+        generation: i64,
+        lease: Duration,
+        event_type: &str,
+        payload: Value,
+    ) -> Result<Option<SessionEvent>, SessionStoreError> {
+        let lease_expires_at = stdout_lease_expires_at(lease);
+        let mut tx = self.pool.begin().await?;
+        let result = sqlx::query(
+            r#"
+            update session_owners
+            set lease_expires_at = $4, updated_at = now()
+            where thread_key = $1
+              and owner_id = $2
+              and generation = $3
+              and lease_expires_at > now()
+            "#,
+        )
+        .bind(thread_key.as_str())
+        .bind(owner_id)
+        .bind(generation)
+        .bind(lease_expires_at)
+        .execute(&mut *tx)
+        .await?;
+        if result.rows_affected() == 0 {
+            tx.commit().await?;
+            return Ok(None);
+        }
+
+        let row = sqlx::query_as::<_, SessionEventRow>(
+            r#"
+            insert into session_events (thread_key, execution_id, event_type, payload)
+            values ($1, null, $2, $3)
+            returning event_id, thread_key, execution_id, event_type, payload, created_at
+            "#,
+        )
+        .bind(thread_key.as_str())
+        .bind(event_type)
+        .bind(payload)
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        row.try_into().map(Some)
+    }
 
     pub async fn list_events_after(
         &self,

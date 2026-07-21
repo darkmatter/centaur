@@ -3508,3 +3508,120 @@ done
 
     let _ = bridge.finish_successfully();
 }
+
+#[test]
+fn resident_omp_collab_error_carries_request_id() {
+    // Cross-PR: collab command failure must include params.request_id so
+    // api-rs dispatcher can correlate and avoid 15s timeouts.
+    // Uses a custom fake that fails collab_start with the caller's request id.
+    let pidfile = temp_path("omp-rpc-pid-err-rid");
+    let _ = std::fs::remove_file(&pidfile);
+    let script_path = temp_path(&format!("fake-omp-err-rid-{}", Uuid::new_v4().simple()));
+    let script = format!(
+        r#"#!/bin/sh
+echo $$ > '{pidfile}'
+printf '%s\n' '{{"type":"ready"}}'
+while IFS= read -r line; do
+  CMD=$(printf '%s' "$line" | sed -n 's/.*"type":"\([^"]*\)".*/\1/p')
+  ID=$(printf '%s' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+  case "$CMD" in
+    get_state)
+      printf '{{"id":"%s","type":"response","command":"get_state","success":true,"data":{{"sessionId":"sess-err","sessionFile":"/tmp/s.jsonl","sessionName":"t","isStreaming":false,"isCompacting":false,"steeringMode":"all","followUpMode":"all","interruptMode":"immediate","autoCompactionEnabled":true,"messageCount":0,"queuedMessageCount":0,"todoPhases":[],"thinkingLevel":"off"}}}}\n' "$ID"
+      ;;
+    prompt)
+      printf '{{"id":"%s","type":"response","command":"prompt","success":true,"data":{{"agentInvoked":true}}}}\n' "$ID"
+      printf '%s\n' '{{"type":"agent_start"}}'
+      printf '%s\n' '{{"type":"message_update","assistantMessageEvent":{{"type":"text_delta","contentIndex":0,"delta":"admit"}},"message":{{"role":"assistant","content":[],"responseId":"msg-1"}}}}'
+      printf '%s\n' '{{"type":"message_end","message":{{"role":"assistant","content":[{{"type":"text","text":"admit"}}],"stopReason":"stop","responseId":"msg-1"}}}}'
+      printf '%s\n' '{{"type":"agent_end","messages":[]}}'
+      ;;
+    collab_start)
+      printf '%s\n' '{{"type":"collab_state","state":"failed","reason":"relay down","room":{{"active":false,"participants":[]}}}}'
+      printf '{{"id":"%s","type":"response","command":"collab_start","success":false,"error":"relay down"}}\n' "$ID"
+      ;;
+    collab_status)
+      printf '{{"id":"%s","type":"response","command":"collab_status","success":true,"data":{{"active":false,"participants":[]}}}}\n' "$ID"
+      ;;
+    collab_stop)
+      printf '%s\n' '{{"type":"collab_state","state":"stopped","room":{{"active":false,"participants":[]}}}}'
+      printf '{{"id":"%s","type":"response","command":"collab_stop","success":true,"data":{{"active":false,"participants":[]}}}}\n' "$ID"
+      ;;
+    *)
+      ;;
+  esac
+done
+"#,
+        pidfile = pidfile.display(),
+    );
+    std::fs::write(&script_path, &script).expect("write err-rid script");
+    set_executable(&script_path);
+
+    let mut bridge = spawn_omp_resident(script_path.display().to_string(), &[]);
+    let ownership = omp_ownership_json("resident-host", 1);
+
+    // Admit ownership first.
+    let _turn =
+        bridge.run_blocks_user_turn_with_ownership("admit", &ownership, Duration::from_secs(30));
+
+    // Send collab_start with a caller-supplied request id.
+    bridge.send(json!({
+        "type": "collab_start",
+        "id": "my-req-id-123",
+        "trace_metadata": ownership,
+        "relayUrl": "wss://relay.example",
+    }));
+
+    // The adapter must drain the collab_state, then emit an error frame
+    // with params.request_id == "my-req-id-123".
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut got_request_id = false;
+    while Instant::now() < deadline {
+        let v = bridge.read_json_allowing_error(deadline);
+        let method = v.get("method").and_then(Value::as_str).unwrap_or_default();
+        if method == "error" {
+            let rid = v
+                .pointer("/params/request_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            assert_eq!(
+                rid, "my-req-id-123",
+                "collab error must carry caller-supplied request_id, got: {rid}"
+            );
+            got_request_id = true;
+            break;
+        }
+    }
+    assert!(
+        got_request_id,
+        "collab_start failure must emit error with request_id"
+    );
+
+    // Also test missing-ownership control error carries request_id.
+    bridge.send(json!({
+        "type": "collab_status",
+        "id": "noown-rid-456",
+    }));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut got_noown_rid = false;
+    while Instant::now() < deadline {
+        let v = bridge.read_json_allowing_error(deadline);
+        if v.get("method").and_then(Value::as_str) == Some("error") {
+            let rid = v
+                .pointer("/params/request_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            assert_eq!(
+                rid, "noown-rid-456",
+                "missing-ownership error must carry request_id, got: {rid}"
+            );
+            got_noown_rid = true;
+            break;
+        }
+    }
+    assert!(
+        got_noown_rid,
+        "missing-ownership control must emit error with request_id"
+    );
+
+    let _ = bridge.finish_successfully();
+}

@@ -103,10 +103,23 @@ jobs:
               --body "$BODY"
           fi
 
+      - name: Dispatch CI on sync branch head
+        # GITHUB_TOKEN-opened PRs don't trigger pull_request workflows, so
+        # required checks never appear on the sync PR head. workflow_dispatch
+        # is the one event GITHUB_TOKEN CAN trigger — dispatch CI explicitly
+        # on the sync branch so checks appear for watch_product_ci.
+        if: steps.merge.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh workflow run ci.yml --repo "$GITHUB_REPOSITORY" --ref sync/upstream-main || \
+            echo "::warning::could not dispatch CI on sync/upstream-main — the overlay watcher will retry"
+
       - name: Summary
         run: |
           if [ "${{ steps.merge.outputs.changed }}" = "true" ]; then
             echo "Opened or updated sync/upstream-main PR @ ${{ steps.merge.outputs.head_sha }}."
+            echo "Dispatched CI on sync/upstream-main."
           else
             echo "Already contains upstream/main."
           fi

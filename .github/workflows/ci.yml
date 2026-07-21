@@ -10,6 +10,15 @@ on:
   push:
     branches: [main]
   merge_group:
+  # sync-upstream.yml opens the sync PR with GITHUB_TOKEN, which suppresses
+  # pull_request events. sync-upstream dispatches CI explicitly on the sync
+  # branch head so required checks appear on the PR.
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch or SHA to run CI against (defaults to main)"
+        required: false
+        default: main
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}

@@ -12,6 +12,7 @@
         "type": "object",
         "properties": {
           "relay_url": { "type": "string", "optional": true },
+          "web_url": { "type": "string", "optional": true },
           "display_name": { "type": "string", "optional": true }
         },
         "additionalProperties": false
@@ -22,7 +23,12 @@
         "properties": {
           "ok": { "type": "boolean", "const": true },
           "thread_key": { "type": "string" },
-          "room": { "$ref": "#/roomState" }
+          "room": {
+            "oneOf": [
+              { "$ref": "#/roomState" },
+              { "type": "null" }
+            ]
+          }
         }
       },
       "idempotent": true,
@@ -82,6 +88,7 @@
       "join_url": { "type": "string", "optional": true, "description": "Full omp join-capable tailnet URL from the resident host. Ingress forwards verbatim — never synthesizes the relay prefix." },
       "view_url": { "type": "string", "optional": true },
       "web_url": { "type": "string", "optional": true },
+      "web_view_url": { "type": "string", "optional": true },
       "participants": {
         "type": "array",
         "items": {

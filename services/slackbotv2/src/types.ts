@@ -112,16 +112,18 @@ export type SlackbotV2CollabRoomState = {
   participants: SlackbotV2CollabParticipant[]
   view_url?: string
   web_url?: string
+  web_view_url?: string
 }
 
 export type SlackbotV2StartCollabRequest = {
   display_name?: string
   relay_url?: string
+  web_url?: string
 }
 
 export type SlackbotV2StartCollabResponse = {
   ok: boolean
-  room: SlackbotV2CollabRoomState
+  room: SlackbotV2CollabRoomState | null
   thread_key: string
 }
 

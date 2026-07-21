@@ -225,8 +225,8 @@ describe('startCollabRoom', () => {
     const { calls, fetchFn } = stubFetch([{ json: START_RESPONSE }])
     const options = { ...baseOptions, fetch: fetchFn as never }
     const response = await startCollabRoom(options, 'slack:C123:1700000000.000100')
-    expect(response.room.join_url).toBe(JOIN_URL)
-    expect(response.room.active).toBe(true)
+    expect(response.room?.join_url).toBe(JOIN_URL)
+    expect(response.room?.active).toBe(true)
     expect(calls).toHaveLength(1)
     expect(calls[0]!.method).toBe('POST')
     expect(calls[0]!.url).toBe(

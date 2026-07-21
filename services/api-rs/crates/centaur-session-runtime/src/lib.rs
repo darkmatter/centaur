@@ -6335,19 +6335,20 @@ fn input_line_with_session_context(
     // asserted: the client never sees owner_id or generation in the input
     // line — they are added here, after the line leaves the client boundary.
     if let (Some(owner_id), Some(generation)) = (&trace.owner_id, trace.generation) {
-        let entry = map
-            .entry("trace_metadata")
-            .or_insert_with(|| Value::Object(serde_json::Map::new()));
-        if let Value::Object(metadata) = entry {
-            // Overwrite (not or_insert) so a client-supplied owner_id or
-            // generation in trace_metadata is replaced by the trusted
-            // api-rs-injected value. A malicious client cannot survive this.
-            metadata.insert("owner_id".to_owned(), Value::String(owner_id.clone()));
-            metadata.insert(
-                "generation".to_owned(),
-                Value::Number(serde_json::Number::from(generation)),
-            );
-        }
+        // Overwrite trace_metadata unconditionally so a client-supplied
+        // non-object value (null, string, array) is replaced with a fresh
+        // object carrying only the trusted owner_id and generation.
+        // A malicious client cannot bypass the fence with a non-object.
+        let mut metadata = match map.get("trace_metadata") {
+            Some(Value::Object(existing)) => existing.clone(),
+            _ => serde_json::Map::new(),
+        };
+        metadata.insert("owner_id".to_owned(), Value::String(owner_id.clone()));
+        metadata.insert(
+            "generation".to_owned(),
+            Value::Number(serde_json::Number::from(generation)),
+        );
+        map.insert("trace_metadata".to_owned(), Value::Object(metadata));
     }
     merge_session_context(map, session_context_for_thread(thread_key));
     serde_json::to_string(&value).unwrap_or_else(|_| line.to_owned())
@@ -8031,6 +8032,25 @@ mod tests {
         // Malicious values must NOT survive.
         assert_ne!(value["trace_metadata"]["owner_id"], "malicious-client");
         assert_ne!(value["trace_metadata"]["generation"], 999);
+    }
+
+    #[test]
+    fn input_line_replaces_non_object_trace_metadata_with_trusted_values() {
+        // Regression: a malicious client sends a non-object trace_metadata
+        // (e.g. null). api-rs must replace it with a fresh object carrying
+        // the trusted owner_id and generation.
+        let thread_key = ThreadKey::parse("chat:C123:1780000000.000000").unwrap();
+        let trace =
+            SessionTraceContext::new(&thread_key, None).with_ownership("api-rs-trusted", 99);
+
+        let line = input_line_with_session_context(
+            &thread_key,
+            &trace,
+            r#"{"type":"user","trace_metadata":null}"#,
+        );
+        let value: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(value["trace_metadata"]["owner_id"], "api-rs-trusted");
+        assert_eq!(value["trace_metadata"]["generation"], 99);
     }
 
     #[test]

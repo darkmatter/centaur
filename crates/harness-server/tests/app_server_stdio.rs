@@ -2695,11 +2695,11 @@ fn resident_omp_collab_start_status_stop_normalize() {
     let _turn =
         bridge.run_blocks_user_turn_with_ownership("admit", &ownership, Duration::from_secs(30));
 
-    // collab_start with caller-supplied request id for correlation.
+    // collab_start with caller-supplied request id + trusted trace_metadata ownership.
     bridge.send(json!({
         "type": "collab_start",
         "id": "req-collab-start-1",
-        "ownership": ownership,
+        "trace_metadata": ownership,
         "relayUrl": "wss://relay.example",
         "displayName": "centaur-host",
         "webUrl": "https://collab.example",
@@ -2732,11 +2732,11 @@ fn resident_omp_collab_start_status_stop_normalize() {
         "relay.example/r/room.key-and-write-token"
     );
 
-    // collab_status with caller-supplied request id.
+    // collab_status with caller-supplied request id + trusted trace_metadata ownership.
     bridge.send(json!({
         "type": "collab_status",
         "id": "req-collab-status-1",
-        "ownership": ownership,
+        "trace_metadata": ownership,
     }));
     let status_frame = bridge.read_json(Instant::now() + Duration::from_secs(30));
     assert!(
@@ -2761,10 +2761,10 @@ fn resident_omp_collab_start_status_stop_normalize() {
         "collab/status must include state derived from room.active: {status_frame}"
     );
 
-    // collab_stop
+    // collab_stop with trusted trace_metadata ownership.
     bridge.send(json!({
         "type": "collab_stop",
-        "ownership": ownership,
+        "trace_metadata": ownership,
     }));
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut stop_frame = Value::Null;
@@ -2833,7 +2833,7 @@ fn resident_omp_interrupt_with_stale_ownership_rejects() {
     let stale = omp_ownership_json("resident-host", 2);
     bridge.send(json!({
         "type": "interrupt",
-        "ownership": stale,
+        "trace_metadata": stale,
     }));
     let deadline = Instant::now() + Duration::from_secs(10);
     let value = bridge.read_json_allowing_error(deadline);
@@ -2907,6 +2907,31 @@ done
 // because it requires the release installed at /tmp/omp-release-install.
 // Run with: cargo test --test app_server_stdio -- resident_omp_real --ignored
 
+#[test]
+fn resident_omp_collab_control_rejected_without_ownership() {
+    // Fix #3: a collab control without trace_metadata ownership must be rejected.
+    let pidfile = temp_path("omp-rpc-pid-noown-control");
+    let _ = std::fs::remove_file(&pidfile);
+    let script = fake_omp_rpc_script(&pidfile, false);
+    let mut bridge = spawn_omp_resident(script, &[]);
+
+    bridge.send(json!({
+        "type": "collab_status",
+        "id": "noown-status",
+    }));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let value = bridge.read_json_allowing_error(deadline);
+    let error_msg = value
+        .pointer("/params/error/message")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    assert!(
+        error_msg.contains("ownership"),
+        "collab without ownership must be rejected, got: {error_msg}"
+    );
+    let _ = bridge.finish_successfully();
+}
+
 #[ignore = "requires real omp binary from fork release v17.0.5-centaur.1"]
 #[test]
 fn resident_omp_real_binary_collab_status_and_ownership_fence() {
@@ -2923,7 +2948,7 @@ fn resident_omp_real_binary_collab_status_and_ownership_fence() {
     bridge.send(json!({
         "type": "collab_start",
         "id": "real-start-1",
-        "ownership": ownership,
+        "trace_metadata": ownership,
         "relayUrl": "wss://relay.example",
         "displayName": "centaur-host",
     }));
@@ -2977,7 +3002,7 @@ fn resident_omp_real_binary_collab_status_and_ownership_fence() {
     bridge.send(json!({
         "type": "collab_status",
         "id": "real-status-1",
-        "ownership": ownership,
+        "trace_metadata": ownership,
     }));
     let status = bridge.read_json(Instant::now() + Duration::from_secs(15));
     assert_eq!(

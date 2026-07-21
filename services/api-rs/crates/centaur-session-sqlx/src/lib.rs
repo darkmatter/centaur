@@ -1997,6 +1997,27 @@ impl PgSessionStore {
         Ok(result.rows_affected() > 0)
     }
 
+    /// Generation-fenced release: only deletes the exact owner+generation row.
+    pub async fn release_session_ownership_at_generation(
+        &self,
+        thread_key: &ThreadKey,
+        owner_id: &str,
+        generation: i64,
+    ) -> Result<bool, SessionStoreError> {
+        let result = sqlx::query(
+            r#"
+            delete from session_owners
+            where thread_key = $1 and owner_id = $2 and generation = $3
+            "#,
+        )
+        .bind(thread_key.as_str())
+        .bind(owner_id)
+        .bind(generation)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
     /// Renews the session ownership lease iff the caller is still the current
     /// owner. Returns `true` when the renewal took effect.
     pub async fn renew_session_ownership(

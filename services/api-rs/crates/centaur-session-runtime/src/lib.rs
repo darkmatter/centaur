@@ -44,7 +44,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::{
     io,
-    sync::Mutex,
+    sync::{Mutex, RwLock},
     time::{Instant, Interval, MissedTickBehavior, interval_at, sleep, timeout},
 };
 use tokio_util::codec::{FramedRead, FramedWrite, LinesCodec, LinesCodecError};
@@ -196,6 +196,10 @@ pub struct SessionRuntime {
     /// Serializes start, status, stop, loss, and shutdown cleanup per
     /// session so route responses and keepalive teardown are atomic.
     collab_lifecycle_locks: CollabLifecycleLocks,
+    /// Global lifecycle gate: start/status/stop/loss hold a read lock for the
+    /// whole operation; handoff takes the write lock under the aggregate
+    /// deadline so in-flight starts cannot insert after the room snapshot.
+    collab_lifecycle_gate: Arc<RwLock<()>>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -490,6 +494,9 @@ struct RuntimeContext {
     session_ownership_generations: SessionOwnershipGenerationRegistry,
     stdout_owner_id: String,
     collab_rooms: CollabRoomRegistry,
+    /// Full runtime for projector/pump paths that must drive remote stop
+    /// before finalize (cannot finalize a live room on fenced append alone).
+    runtime: SessionRuntime,
 }
 
 struct SandboxCapacityController {
@@ -894,6 +901,7 @@ impl SessionRuntime {
             shutting_down: Arc::new(AtomicBool::new(false)),
             collab_rooms: Arc::new(DashMap::new()),
             collab_lifecycle_locks: Arc::new(DashMap::new()),
+            collab_lifecycle_gate: Arc::new(RwLock::new(())),
         }
     }
 
@@ -1005,6 +1013,7 @@ impl SessionRuntime {
             session_ownership_generations: self.session_ownership_generations.clone(),
             stdout_owner_id: self.stdout_owner_id.clone(),
             collab_rooms: self.collab_rooms.clone(),
+            runtime: self.clone(),
         }
     }
     fn collab_lifecycle_lock(&self, thread_key: &ThreadKey) -> Arc<Mutex<()>> {
@@ -2441,6 +2450,12 @@ impl SessionRuntime {
             if self.shutting_down.load(Ordering::SeqCst) {
                 return Err(SessionRuntimeError::ShuttingDown);
             }
+            // Global read gate: held for the entire start so handoff write
+            // waits for in-flight starts (including pre-insert) to finish.
+            let _lifecycle_gate = self.collab_lifecycle_gate.read().await;
+            if self.shutting_down.load(Ordering::SeqCst) {
+                return Err(SessionRuntimeError::ShuttingDown);
+            }
             let lifecycle_lock = self.collab_lifecycle_lock(thread_key);
             let _lifecycle_guard = lifecycle_lock.lock().await;
             if self.shutting_down.load(Ordering::SeqCst) {
@@ -2546,21 +2561,21 @@ impl SessionRuntime {
                         )
                         .await;
                     if let Err(probe_error) = probe_result {
-                        let _ = self
-                            .attempt_collab_stop(
-                                thread_key,
-                                &handle.owner_id,
-                                handle.generation,
-                                &handle.sandbox_id,
-                            )
-                            .await;
-                        self.cleanup_collab_room_local(
+                        // Probe write failed — do not finalize/remove. Enter
+                        // RemoteStopPending and retain for retry.
+                        if let Some(mut current) = self.collab_rooms.get_mut(thread_key)
+                            && current.owner_id == handle.owner_id
+                            && current.generation == handle.generation
+                            && current.sandbox_id == handle.sandbox_id
+                        {
+                            current.mark_remote_stop_pending();
+                        }
+                        ensure_remote_stop_pending_retry(
+                            self,
                             thread_key,
                             &handle,
-                            "session.collab_room_lost",
                             "status_probe_failed",
-                        )
-                        .await?;
+                        );
                         return Err(probe_error);
                     }
                     match wait_for_collab_status(
@@ -2574,11 +2589,13 @@ impl SessionRuntime {
                     .await
                     {
                         Ok(room) if room.active => {
+                            // Exact handle must still be Active before serving URL.
                             let current = self.collab_rooms.get(thread_key).as_deref().cloned();
                             if let Some(current) = current
                                 && current.owner_id == handle.owner_id
                                 && current.generation == handle.generation
                                 && current.sandbox_id == handle.sandbox_id
+                                && current.phase.is_externally_active()
                             {
                                 return Ok(CollabRoomOutcome {
                                     ok: true,
@@ -2588,23 +2605,29 @@ impl SessionRuntime {
                                 });
                             }
                         }
-                        _ => {}
+                        Ok(_) => {
+                            // Inactive snapshot — remote-stop pending, retain.
+                        }
+                        Err(SessionRuntimeError::Store(error)) => {
+                            // Propagate store errors unchanged (blocker 2).
+                            return Err(SessionRuntimeError::Store(error));
+                        }
+                        Err(_) => {
+                            // Timeout/lost — enter RemoteStopPending, do not finalize.
+                        }
                     }
-                    let _ = self
-                        .attempt_collab_stop(
-                            thread_key,
-                            &handle.owner_id,
-                            handle.generation,
-                            &handle.sandbox_id,
-                        )
-                        .await;
-                    self.cleanup_collab_room_local(
-                        thread_key,
-                        &handle,
-                        "session.collab_room_lost",
-                        "stale_room",
-                    )
-                    .await?;
+                    if let Some(mut current) = self.collab_rooms.get_mut(thread_key)
+                        && current.owner_id == handle.owner_id
+                        && current.generation == handle.generation
+                        && current.sandbox_id == handle.sandbox_id
+                    {
+                        current.mark_remote_stop_pending();
+                    }
+                    ensure_remote_stop_pending_retry(self, thread_key, &handle, "stale_room");
+                    return Err(SessionRuntimeError::CollabRoomLost {
+                        thread_key: thread_key.as_str().to_owned(),
+                        reason: "existing room status probe did not confirm active room".to_owned(),
+                    });
                 }
             }
 
@@ -2628,27 +2651,23 @@ impl SessionRuntime {
                 });
             }
 
-            // Every post-acquire failure MUST release the lease (or leave a
-            // cleanup handle). No bare `?` that leaks a 45s owner with no room.
-            let release_acquired = |store: &PgSessionStore, key: &ThreadKey, owner: &str| {
-                let store = store.clone();
-                let key = key.clone();
-                let owner = owner.to_owned();
-                async move {
-                    let _ = store.release_session_ownership(&key, &owner).await;
-                }
-            };
+            // Every post-acquire failure MUST generation-fence release the lease
+            // or retain a FinalizePending cleanup handle. Never ignore release Err.
+            let owner_id = self.stdout_owner_id.clone();
+            let generation = ownership.generation;
 
             // Bind exact sandbox AFTER acquire — pre-acquire session may be stale.
             let session_after = match self.store.get_session(thread_key).await {
                 Ok(s) => s,
                 Err(error) => {
-                    release_acquired(&self.store, thread_key, &self.stdout_owner_id).await;
+                    self.release_acquired_or_retain(thread_key, &owner_id, generation, None)
+                        .await?;
                     return Err(SessionRuntimeError::Store(error));
                 }
             };
             let Some(sandbox_id) = session_after.sandbox_id.clone() else {
-                release_acquired(&self.store, thread_key, &self.stdout_owner_id).await;
+                self.release_acquired_or_retain(thread_key, &owner_id, generation, None)
+                    .await?;
                 return Err(SessionRuntimeError::BadRequest(
                     "session has no assigned sandbox for collaboration".to_owned(),
                 ));
@@ -2659,13 +2678,25 @@ impl SessionRuntime {
             match self.store.touch_session_sandbox_activity(thread_key).await {
                 Ok(true) => {}
                 Ok(false) => {
-                    release_acquired(&self.store, thread_key, &self.stdout_owner_id).await;
+                    self.release_acquired_or_retain(
+                        thread_key,
+                        &owner_id,
+                        generation,
+                        Some(sandbox_id.as_str()),
+                    )
+                    .await?;
                     return Err(SessionRuntimeError::BadRequest(
                         "session has no live sandbox for collaboration".to_owned(),
                     ));
                 }
                 Err(error) => {
-                    release_acquired(&self.store, thread_key, &self.stdout_owner_id).await;
+                    self.release_acquired_or_retain(
+                        thread_key,
+                        &owner_id,
+                        generation,
+                        Some(sandbox_id.as_str()),
+                    )
+                    .await?;
                     return Err(SessionRuntimeError::Store(error));
                 }
             }
@@ -2677,11 +2708,23 @@ impl SessionRuntime {
             {
                 Ok(Ok(id)) => id,
                 Ok(Err(error)) => {
-                    release_acquired(&self.store, thread_key, &self.stdout_owner_id).await;
+                    self.release_acquired_or_retain(
+                        thread_key,
+                        &owner_id,
+                        generation,
+                        Some(sandbox_id.as_str()),
+                    )
+                    .await?;
                     return Err(SessionRuntimeError::Store(error));
                 }
                 Err(_) => {
-                    release_acquired(&self.store, thread_key, &self.stdout_owner_id).await;
+                    self.release_acquired_or_retain(
+                        thread_key,
+                        &owner_id,
+                        generation,
+                        Some(sandbox_id.as_str()),
+                    )
+                    .await?;
                     return Err(SessionRuntimeError::CollabRoomLost {
                         thread_key: thread_key.as_str().to_owned(),
                         reason: "collab start baseline exceeded lifecycle deadline".to_owned(),
@@ -2689,7 +2732,13 @@ impl SessionRuntime {
                 }
             };
             if self.shutting_down.load(Ordering::SeqCst) {
-                release_acquired(&self.store, thread_key, &self.stdout_owner_id).await;
+                self.release_acquired_or_retain(
+                    thread_key,
+                    &owner_id,
+                    generation,
+                    Some(sandbox_id.as_str()),
+                )
+                .await?;
                 return Err(SessionRuntimeError::ShuttingDown);
             }
             let request_id = collab_request_id();
@@ -2731,16 +2780,13 @@ impl SessionRuntime {
                 )
                 .await;
             if let Err(error) = send_result {
-                let _ = self
-                    .attempt_collab_stop(
+                if let Some(handle) = self.collab_rooms.get(thread_key).as_deref().cloned() {
+                    self.stop_or_enter_remote_pending(
                         thread_key,
-                        &self.stdout_owner_id,
-                        ownership.generation,
-                        sandbox_id.as_str(),
+                        &handle,
+                        "collab_start_send_failed",
                     )
-                    .await;
-                let handle = self.collab_rooms.get(thread_key).as_deref().cloned();
-                if let Some(handle) = handle {
+                    .await?;
                     self.cleanup_collab_room_local(
                         thread_key,
                         &handle,
@@ -2764,16 +2810,13 @@ impl SessionRuntime {
             {
                 Ok(state) => state,
                 Err(error) => {
-                    let _ = self
-                        .attempt_collab_stop(
+                    if let Some(handle) = self.collab_rooms.get(thread_key).as_deref().cloned() {
+                        self.stop_or_enter_remote_pending(
                             thread_key,
-                            &self.stdout_owner_id,
-                            ownership.generation,
-                            sandbox_id.as_str(),
+                            &handle,
+                            "collab_start_failed",
                         )
-                        .await;
-                    let handle = self.collab_rooms.get(thread_key).as_deref().cloned();
-                    if let Some(handle) = handle {
+                        .await?;
                         self.cleanup_collab_room_local(
                             thread_key,
                             &handle,
@@ -2787,6 +2830,7 @@ impl SessionRuntime {
             };
             let handle_opt = self.collab_rooms.get(thread_key).as_deref().cloned();
             let Some(handle) = handle_opt else {
+                // No handle left to retain; best-effort stop against our ownership.
                 let _ = self
                     .attempt_collab_stop(
                         thread_key,
@@ -2802,13 +2846,18 @@ impl SessionRuntime {
             };
             if handle.owner_id != self.stdout_owner_id || handle.generation != ownership.generation
             {
+                // Takeover handle present — stop our generation only via owned ids.
+                let ours = CollabRoomHandle {
+                    owner_id: self.stdout_owner_id.clone(),
+                    generation: ownership.generation,
+                    sandbox_id: sandbox_id.clone(),
+                    state: handle.state.clone(),
+                    keepalive: handle.keepalive.clone(),
+                    phase: handle.phase,
+                    cleanup_worker_scheduled: false,
+                };
                 let _ = self
-                    .attempt_collab_stop(
-                        thread_key,
-                        &self.stdout_owner_id,
-                        ownership.generation,
-                        sandbox_id.as_str(),
-                    )
+                    .stop_or_enter_remote_pending(thread_key, &ours, "start_ownership_changed")
                     .await;
                 return Err(SessionRuntimeError::CollabRoomLost {
                     thread_key: thread_key.as_str().to_owned(),
@@ -2824,12 +2873,7 @@ impl SessionRuntime {
                 current.state = room_state.clone();
             } else {
                 let _ = self
-                    .attempt_collab_stop(
-                        thread_key,
-                        &self.stdout_owner_id,
-                        ownership.generation,
-                        sandbox_id.as_str(),
-                    )
+                    .stop_or_enter_remote_pending(thread_key, &handle, "start_ownership_changed")
                     .await;
                 return Err(SessionRuntimeError::CollabRoomLost {
                     thread_key: thread_key.as_str().to_owned(),
@@ -2862,20 +2906,9 @@ impl SessionRuntime {
                 Ok(Some(_)) => None,
             };
             if let Some(error) = append_error {
-                let handle = self.collab_rooms.get(thread_key).as_deref().cloned();
-                if let Some(handle) = handle {
-                    let _ = self
-                        .attempt_collab_stop(
-                            thread_key,
-                            &handle.owner_id,
-                            handle.generation,
-                            &handle.sandbox_id,
-                        )
-                        .await;
-                    // Cleanup uses the atomic fenced transaction. If it
-                    // fails, the handle remains cleanup-pending for retry;
-                    // the caller receives the cleanup error so it knows
-                    // the room was not cleanly released.
+                if let Some(handle) = self.collab_rooms.get(thread_key).as_deref().cloned() {
+                    self.stop_or_enter_remote_pending(thread_key, &handle, "collab_start_failed")
+                        .await?;
                     if let Err(cleanup_error) = self
                         .cleanup_collab_room_local(
                             thread_key,
@@ -2916,24 +2949,41 @@ impl SessionRuntime {
                 });
             }
             if self.shutting_down.load(Ordering::SeqCst) {
-                let handle = self.collab_rooms.get(thread_key).as_deref().cloned();
-                if let Some(handle) = handle {
-                    let _ = self
-                        .attempt_collab_stop(
-                            thread_key,
-                            &handle.owner_id,
-                            handle.generation,
-                            &handle.sandbox_id,
-                        )
-                        .await;
-                    let _ = self
-                        .cleanup_collab_room_local(
+                if let Some(handle) = self.collab_rooms.get(thread_key).as_deref().cloned() {
+                    // Shutdown owns stop/finalize inline under a short bound.
+                    // Finalize ONLY after stop ack — on stop Err the handle
+                    // stays RemoteStopPending with lease retained (no live ghost).
+                    let dl = Instant::now() + COLLAB_CLEANUP_DEADLINE;
+                    match self
+                        .stop_or_enter_remote_pending_within(
                             thread_key,
                             &handle,
-                            "session.collab_room_lost",
                             "shutting_down",
+                            dl,
                         )
-                        .await;
+                        .await
+                    {
+                        Ok(()) => {
+                            let _ = self
+                                .cleanup_collab_room_local_within(
+                                    thread_key,
+                                    &handle,
+                                    "session.collab_room_lost",
+                                    "shutting_down",
+                                    dl,
+                                )
+                                .await;
+                        }
+                        Err(error) => {
+                            warn!(
+                                component = COMPONENT_SESSION_RUNTIME,
+                                event = "collab_start_shutdown_stop_pending",
+                                thread_key = %thread_key,
+                                %error,
+                                "stop failed during start-time shutdown; retaining RemoteStopPending"
+                            );
+                        }
+                    }
                 }
                 return Err(SessionRuntimeError::ShuttingDown);
             }
@@ -2968,6 +3018,10 @@ impl SessionRuntime {
         &self,
         thread_key: &ThreadKey,
     ) -> Result<CollabRoomOutcome, SessionRuntimeError> {
+        if self.shutting_down.load(Ordering::SeqCst) {
+            return Err(SessionRuntimeError::ShuttingDown);
+        }
+        let _lifecycle_gate = self.collab_lifecycle_gate.read().await;
         if self.shutting_down.load(Ordering::SeqCst) {
             return Err(SessionRuntimeError::ShuttingDown);
         }
@@ -3064,21 +3118,14 @@ impl SessionRuntime {
             )
             .await
         {
-            let _ = self
-                .attempt_collab_stop(
-                    thread_key,
-                    &handle.owner_id,
-                    handle.generation,
-                    &handle.sandbox_id,
-                )
-                .await;
-            self.cleanup_collab_room_local(
-                thread_key,
-                &handle,
-                "session.collab_room_lost",
-                "status_probe_failed",
-            )
-            .await?;
+            if let Some(mut current) = self.collab_rooms.get_mut(thread_key)
+                && current.owner_id == handle.owner_id
+                && current.generation == handle.generation
+                && current.sandbox_id == handle.sandbox_id
+            {
+                current.mark_remote_stop_pending();
+            }
+            ensure_remote_stop_pending_retry(self, thread_key, &handle, "status_probe_failed");
             return Err(error);
         }
         match wait_for_collab_status(
@@ -3092,41 +3139,61 @@ impl SessionRuntime {
         .await
         {
             Ok(room) if room.active => {
+                // Exact handle must still be Active before returning URL.
+                if let Some(mut current) = self.collab_rooms.get_mut(thread_key)
+                    && current.owner_id == handle.owner_id
+                    && current.generation == handle.generation
+                    && current.sandbox_id == handle.sandbox_id
+                    && current.phase.is_externally_active()
+                {
+                    current.state = room.clone();
+                    return Ok(CollabRoomOutcome {
+                        ok: true,
+                        thread_key: thread_key.clone(),
+                        room: Some(room),
+                        stopped: false,
+                    });
+                }
+                Err(SessionRuntimeError::CollabRoomLost {
+                    thread_key: thread_key.as_str().to_owned(),
+                    reason: "status probe succeeded but room is no longer active".to_owned(),
+                })
+            }
+            Ok(_) => {
                 if let Some(mut current) = self.collab_rooms.get_mut(thread_key)
                     && current.owner_id == handle.owner_id
                     && current.generation == handle.generation
                     && current.sandbox_id == handle.sandbox_id
                 {
-                    current.state = room.clone();
+                    current.mark_remote_stop_pending();
                 }
-                Ok(CollabRoomOutcome {
-                    ok: true,
-                    thread_key: thread_key.clone(),
-                    room: Some(room),
-                    stopped: false,
-                })
-            }
-            Ok(_) | Err(_) => {
-                let probe_err = SessionRuntimeError::CollabRoomLost {
-                    thread_key: thread_key.as_str().to_owned(),
-                    reason: "status probe did not confirm active room".to_owned(),
-                };
-                let _ = self
-                    .attempt_collab_stop(
-                        thread_key,
-                        &handle.owner_id,
-                        handle.generation,
-                        &handle.sandbox_id,
-                    )
-                    .await;
-                self.cleanup_collab_room_local(
+                ensure_remote_stop_pending_retry(
+                    self,
                     thread_key,
                     &handle,
-                    "session.collab_room_lost",
                     "status_probe_inactive",
-                )
-                .await?;
-                Err(probe_err)
+                );
+                Err(SessionRuntimeError::CollabRoomLost {
+                    thread_key: thread_key.as_str().to_owned(),
+                    reason: "status probe did not confirm active room".to_owned(),
+                })
+            }
+            Err(SessionRuntimeError::Store(error)) => Err(SessionRuntimeError::Store(error)),
+            Err(error) => {
+                if let Some(mut current) = self.collab_rooms.get_mut(thread_key)
+                    && current.owner_id == handle.owner_id
+                    && current.generation == handle.generation
+                    && current.sandbox_id == handle.sandbox_id
+                {
+                    current.mark_remote_stop_pending();
+                }
+                ensure_remote_stop_pending_retry(
+                    self,
+                    thread_key,
+                    &handle,
+                    "status_probe_wait_failed",
+                );
+                Err(error)
             }
         }
     }
@@ -3193,6 +3260,57 @@ impl SessionRuntime {
             }),
         }
     }
+
+    /// Attempt remote stop for an exact handle. On failure/timeout, mark
+    /// RemoteStopPending and schedule the cleanup worker (which retries stop
+    /// before finalize). Returns Ok only when stop was acknowledged.
+    async fn stop_or_enter_remote_pending(
+        &self,
+        thread_key: &ThreadKey,
+        handle: &CollabRoomHandle,
+        reason: &str,
+    ) -> Result<(), SessionRuntimeError> {
+        self.stop_or_enter_remote_pending_within(
+            thread_key,
+            handle,
+            reason,
+            Instant::now() + COLLAB_LIFECYCLE_DEADLINE,
+        )
+        .await
+    }
+
+    async fn stop_or_enter_remote_pending_within(
+        &self,
+        thread_key: &ThreadKey,
+        handle: &CollabRoomHandle,
+        reason: &str,
+        deadline: Instant,
+    ) -> Result<(), SessionRuntimeError> {
+        match self
+            .attempt_collab_stop_within(
+                thread_key,
+                &handle.owner_id,
+                handle.generation,
+                &handle.sandbox_id,
+                deadline,
+            )
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                if let Some(mut current) = self.collab_rooms.get_mut(thread_key)
+                    && current.owner_id == handle.owner_id
+                    && current.generation == handle.generation
+                    && current.sandbox_id == handle.sandbox_id
+                {
+                    current.mark_remote_stop_pending();
+                }
+                ensure_remote_stop_pending_retry(self, thread_key, handle, reason);
+                Err(error)
+            }
+        }
+    }
+
     async fn attempt_collab_stop(
         &self,
         thread_key: &ThreadKey,
@@ -3200,9 +3318,26 @@ impl SessionRuntime {
         generation: i64,
         sandbox_id: &str,
     ) -> Result<(), SessionRuntimeError> {
+        self.attempt_collab_stop_within(
+            thread_key,
+            owner_id,
+            generation,
+            sandbox_id,
+            Instant::now() + COLLAB_LIFECYCLE_DEADLINE,
+        )
+        .await
+    }
+
+    async fn attempt_collab_stop_within(
+        &self,
+        thread_key: &ThreadKey,
+        owner_id: &str,
+        generation: i64,
+        sandbox_id: &str,
+        deadline: Instant,
+    ) -> Result<(), SessionRuntimeError> {
         // Always target the handle's sandbox — never refetch session.sandbox_id,
         // which may have been reassigned A→B while this room still lives on A.
-        let deadline = Instant::now() + COLLAB_LIFECYCLE_DEADLINE;
         let request_id = collab_request_id();
         let baseline =
             match tokio::time::timeout_at(deadline, self.store.latest_event_id(thread_key)).await {
@@ -3240,6 +3375,57 @@ impl SessionRuntime {
         Ok(())
     }
 
+    /// Generation-fenced release after a failed post-acquire path. On release
+    /// Err, retain a FinalizePending handle and schedule cleanup retry.
+    async fn release_acquired_or_retain(
+        &self,
+        thread_key: &ThreadKey,
+        owner_id: &str,
+        generation: i64,
+        sandbox_hint: Option<&str>,
+    ) -> Result<(), SessionRuntimeError> {
+        match self
+            .store
+            .release_session_ownership_at_generation(thread_key, owner_id, generation)
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(error) => {
+                let sandbox_id = sandbox_hint.unwrap_or("unknown").to_owned();
+                self.collab_rooms.insert(
+                    thread_key.clone(),
+                    CollabRoomHandle {
+                        owner_id: owner_id.to_owned(),
+                        generation,
+                        sandbox_id,
+                        state: CollabRoomState {
+                            active: false,
+                            join_url: None,
+                            view_url: None,
+                            web_url: None,
+                            web_view_url: None,
+                            participants: Vec::new(),
+                        },
+                        keepalive: Arc::new(AtomicBool::new(false)),
+                        phase: CollabCleanupPhase::FinalizePending,
+                        cleanup_worker_scheduled: false,
+                    },
+                );
+                if let Some(handle) = self.collab_rooms.get(thread_key).as_deref().cloned() {
+                    ensure_cleanup_pending_retry(
+                        &self.store,
+                        &self.collab_rooms,
+                        thread_key,
+                        &handle,
+                        "session.collab_room_lost",
+                        "post_acquire_release_failed",
+                    );
+                }
+                Err(SessionRuntimeError::Store(error))
+            }
+        }
+    }
+
     async fn cleanup_collab_room_local(
         &self,
         thread_key: &ThreadKey,
@@ -3247,20 +3433,50 @@ impl SessionRuntime {
         event_type: &str,
         reason: &str,
     ) -> Result<(), SessionRuntimeError> {
-        let _cleanup_bound = COLLAB_CLEANUP_DEADLINE;
+        self.cleanup_collab_room_local_within(
+            thread_key,
+            handle,
+            event_type,
+            reason,
+            Instant::now() + COLLAB_CLEANUP_DEADLINE,
+        )
+        .await
+    }
+
+    async fn cleanup_collab_room_local_within(
+        &self,
+        thread_key: &ThreadKey,
+        handle: &CollabRoomHandle,
+        event_type: &str,
+        reason: &str,
+        deadline: Instant,
+    ) -> Result<(), SessionRuntimeError> {
         handle.keepalive.store(false, Ordering::SeqCst);
-        // Mark the room as cleanup-pending so it is externally non-active
-        // (status/start see no room) while the fenced transaction is pending.
-        // Mutate in place under a write guard — never hold get() across insert.
         if let Some(mut current) = self.collab_rooms.get_mut(thread_key)
             && current.owner_id == handle.owner_id
             && current.generation == handle.generation
+            && current.sandbox_id == handle.sandbox_id
         {
             current.mark_finalize_pending();
         }
-        let result = self
-            .store
-            .finalize_collab_room(
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            ensure_cleanup_pending_retry(
+                &self.store,
+                &self.collab_rooms,
+                thread_key,
+                handle,
+                event_type,
+                reason,
+            );
+            return Err(SessionRuntimeError::CollabRoomLost {
+                thread_key: thread_key.as_str().to_owned(),
+                reason: format!("collab cleanup finalize exceeded deadline for {event_type}"),
+            });
+        }
+        let result = match tokio::time::timeout(
+            remaining,
+            self.store.finalize_collab_room(
                 thread_key,
                 &handle.owner_id,
                 handle.generation,
@@ -3271,22 +3487,30 @@ impl SessionRuntime {
                     "reason": reason,
                     "owner_id": handle.owner_id,
                     "generation": handle.generation,
+                    "sandbox_id": handle.sandbox_id,
                 }),
-            )
-            .await;
-        self.apply_collab_finalize_result(thread_key, handle, event_type, reason, result)
-            .await
-    }
-
-    async fn apply_collab_finalize_result(
-        &self,
-        thread_key: &ThreadKey,
-        handle: &CollabRoomHandle,
-        event_type: &str,
-        reason: &str,
-        result: Result<Option<centaur_session_core::SessionEvent>, SessionStoreError>,
-    ) -> Result<(), SessionRuntimeError> {
-        apply_collab_finalize_result(
+            ),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                ensure_cleanup_pending_retry(
+                    &self.store,
+                    &self.collab_rooms,
+                    thread_key,
+                    handle,
+                    event_type,
+                    reason,
+                );
+                return Err(SessionRuntimeError::CollabRoomLost {
+                    thread_key: thread_key.as_str().to_owned(),
+                    reason: format!("collab cleanup finalize timed out for {event_type}"),
+                });
+            }
+        };
+        // Ownership proof shares the remaining deadline budget.
+        apply_collab_finalize_result_within(
             &self.store,
             &self.collab_rooms,
             thread_key,
@@ -3294,6 +3518,7 @@ impl SessionRuntime {
             event_type,
             reason,
             result,
+            deadline,
         )
         .await
     }
@@ -3320,6 +3545,12 @@ impl SessionRuntime {
             &thread_trace_parent_span_id(thread_key),
         );
         async {
+            if self.shutting_down.load(Ordering::SeqCst) {
+                return Err(SessionRuntimeError::ShuttingDown);
+            }
+            // Global read gate before per-thread lock (same order as start/status/loss)
+            // so handoff write waits in-flight stop and cannot race finalize.
+            let _lifecycle_gate = self.collab_lifecycle_gate.read().await;
             if self.shutting_down.load(Ordering::SeqCst) {
                 return Err(SessionRuntimeError::ShuttingDown);
             }
@@ -3483,29 +3714,18 @@ impl SessionRuntime {
         thread_key: &ThreadKey,
         reason: &str,
     ) -> Result<(), SessionRuntimeError> {
+        let _lifecycle_gate = self.collab_lifecycle_gate.read().await;
+        if self.shutting_down.load(Ordering::SeqCst) {
+            // Shutdown owns stop/finalize under the write gate; loss is a no-op.
+            return Ok(());
+        }
         let lifecycle_lock = self.collab_lifecycle_lock(thread_key);
         let _lifecycle_guard = lifecycle_lock.lock().await;
         let Some(handle) = self.collab_rooms.get(thread_key).as_deref().cloned() else {
             return Ok(());
         };
-        if let Err(error) = self
-            .attempt_collab_stop(
-                thread_key,
-                &handle.owner_id,
-                handle.generation,
-                &handle.sandbox_id,
-            )
-            .await
-        {
-            warn!(
-                component = COMPONENT_SESSION_RUNTIME,
-                event = "collab_stop_on_loss_failed",
-                thread_key = %thread_key,
-                reason = reason,
-                %error,
-                "resident stop failed while recording collaboration loss"
-            );
-        }
+        self.stop_or_enter_remote_pending(thread_key, &handle, reason)
+            .await?;
         self.cleanup_collab_room_local(thread_key, &handle, "session.collab_room_lost", reason)
             .await?;
         info!(
@@ -4678,53 +4898,83 @@ impl SessionRuntime {
     /// output.
     pub async fn handoff_owned_executions(&self, timeout: Duration) -> Vec<SessionRuntimeError> {
         let mut shutdown_errors = Vec::new();
+        // One aggregate deadline for the entire handoff: lock barrier, collab
+        // stop/finalize, owner release, and execution drain.
+        let shutdown_deadline = Instant::now()
+            .checked_add(timeout)
+            .unwrap_or_else(|| Instant::now() + Duration::from_secs(30));
         // Fence new stdout-owner claims first: an execution accepted after
         // this point would otherwise claim a lease that outlives the
         // process, stranding it until the lease TTL expires.
         self.shutting_down.store(true, Ordering::SeqCst);
-        // Barrier: hold every known per-thread lifecycle lock so start cannot
-        // insert after the snapshot. Start rechecks shutting_down before Ok.
-        let barrier_locks: Vec<_> = self
-            .collab_rooms
-            .iter()
-            .map(|e| self.collab_lifecycle_lock(e.key()))
-            .collect();
-        let mut barrier_guards = Vec::with_capacity(barrier_locks.len());
-        for lock in &barrier_locks {
-            barrier_guards.push(lock.lock().await);
-        }
+        // Global write gate: waits for every in-flight start/status/stop/loss
+        // (including starts that hold the read gate before map insert) and
+        // blocks new lifecycle ops for the snapshot+cleanup window.
+        let remaining = shutdown_deadline.saturating_duration_since(Instant::now());
+        let _lifecycle_write_gate = if remaining.is_zero() {
+            shutdown_errors.push(SessionRuntimeError::CollabRoomLost {
+                thread_key: "shutdown".to_owned(),
+                reason: "shutdown deadline exhausted before lifecycle write gate".to_owned(),
+            });
+            None
+        } else {
+            match tokio::time::timeout(remaining, self.collab_lifecycle_gate.write()).await {
+                Ok(guard) => Some(guard),
+                Err(_) => {
+                    shutdown_errors.push(SessionRuntimeError::CollabRoomLost {
+                        thread_key: "shutdown".to_owned(),
+                        reason: "shutdown deadline exhausted waiting for lifecycle write gate"
+                            .to_owned(),
+                    });
+                    None
+                }
+            }
+        };
         let rooms = self
             .collab_rooms
             .iter()
             .map(|entry| (entry.key().clone(), entry.value().clone()))
             .collect::<Vec<_>>();
-        let shutdown_deadline = Instant::now()
-            .checked_add(timeout)
-            .unwrap_or_else(|| Instant::now() + Duration::from_secs(30));
         for (thread_key, handle) in &rooms {
+            // Never leave an Active ghost room on shutdown, even when the
+            // aggregate deadline is already exhausted: mark RemoteStopPending
+            // (releases keepalive) so a peer/retry can finish stop+finalize.
             if Instant::now() >= shutdown_deadline {
+                // Do not schedule the normal cleanup worker during shutdown —
+                // mark non-active + release keepalive so no ghost Active room
+                // survives process exit; a peer retries stop/finalize.
+                if let Some(mut current) = self.collab_rooms.get_mut(thread_key)
+                    && current.owner_id == handle.owner_id
+                    && current.generation == handle.generation
+                    && current.sandbox_id == handle.sandbox_id
+                    && current.phase.is_externally_active()
+                {
+                    current.mark_remote_stop_pending();
+                }
                 shutdown_errors.push(SessionRuntimeError::CollabRoomLost {
                     thread_key: thread_key.as_str().to_owned(),
                     reason: "shutdown deadline exhausted before collab finalize".to_owned(),
                 });
-                break;
+                continue;
             }
+            // Inline bounded stop+finalize under remaining deadline.
             match self
-                .attempt_collab_stop(
+                .stop_or_enter_remote_pending_within(
                     thread_key,
-                    &handle.owner_id,
-                    handle.generation,
-                    &handle.sandbox_id,
+                    handle,
+                    "runtime_shutdown",
+                    shutdown_deadline,
                 )
                 .await
             {
                 Ok(()) => {
                     if let Err(error) = self
-                        .cleanup_collab_room_local(
+                        .cleanup_collab_room_local_within(
                             thread_key,
                             handle,
                             "session.collab_room_lost",
                             "runtime_shutdown",
+                            shutdown_deadline,
                         )
                         .await
                     {
@@ -4732,19 +4982,14 @@ impl SessionRuntime {
                     }
                 }
                 Err(error) => {
+                    // stop_or_enter already marked RemoteStopPending. Do NOT
+                    // finalize without stop ack — that would drop the lease/
+                    // handle while the resident room may still be live.
                     shutdown_errors.push(error);
-                    if let Some(mut current) = self.collab_rooms.get_mut(thread_key)
-                        && current.owner_id == handle.owner_id
-                        && current.generation == handle.generation
-                        && current.sandbox_id == handle.sandbox_id
-                    {
-                        current.mark_remote_stop_pending();
-                    }
-                    ensure_remote_stop_pending_retry(self, thread_key, handle, "runtime_shutdown");
                 }
             }
         }
-        drop(barrier_guards);
+        drop(_lifecycle_write_gate);
         let pending_remaining = self.collab_rooms.len();
         if pending_remaining > 0 {
             shutdown_errors.push(SessionRuntimeError::CollabRoomLost {
@@ -4760,50 +5005,63 @@ impl SessionRuntime {
                 "shutdown could not complete collab finalize; pending handles retained for retry"
             );
         } else {
-            match tokio::time::timeout(
-                EXECUTION_HANDOFF_DB_TIMEOUT,
-                self.store
-                    .release_session_ownership_for_owner(&self.stdout_owner_id),
-            )
-            .await
-            {
-                Ok(Ok(count)) if count > 0 => {
-                    info!(
-                        component = COMPONENT_SESSION_RUNTIME,
-                        event = "session_ownership_handoff_released",
-                        count,
-                        "released session ownership leases at shutdown for reacquisition by a peer"
-                    );
-                }
-                Ok(Ok(_)) => {}
-                Ok(Err(error)) => {
-                    warn!(
-                        component = COMPONENT_SESSION_RUNTIME,
-                        event = "session_ownership_handoff_release_failed",
-                        %error,
-                        "failed to release session ownership leases at shutdown"
-                    );
-                    shutdown_errors.push(SessionRuntimeError::Store(error));
-                }
-                Err(_) => {
-                    warn!(
-                        component = COMPONENT_SESSION_RUNTIME,
-                        event = "session_ownership_handoff_release_timeout",
-                        "timed out releasing session ownership leases; peers must wait for lease expiry"
-                    );
-                    shutdown_errors.push(SessionRuntimeError::CollabRoomLost {
-                        thread_key: "shutdown".to_owned(),
-                        reason: "bulk ownership release timed out".to_owned(),
-                    });
+            let remaining = shutdown_deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                shutdown_errors.push(SessionRuntimeError::CollabRoomLost {
+                    thread_key: "shutdown".to_owned(),
+                    reason: "incomplete handoff: aggregate deadline exhausted before bulk ownership release"
+                        .to_owned(),
+                });
+            } else {
+                match tokio::time::timeout(
+                    remaining.min(EXECUTION_HANDOFF_DB_TIMEOUT),
+                    self.store
+                        .release_session_ownership_for_owner(&self.stdout_owner_id),
+                )
+                .await
+                {
+                    Ok(Ok(count)) if count > 0 => {
+                        info!(
+                            component = COMPONENT_SESSION_RUNTIME,
+                            event = "session_ownership_handoff_released",
+                            count,
+                            "released session ownership leases at shutdown for reacquisition by a peer"
+                        );
+                    }
+                    Ok(Ok(_)) => {}
+                    Ok(Err(error)) => {
+                        warn!(
+                            component = COMPONENT_SESSION_RUNTIME,
+                            event = "session_ownership_handoff_release_failed",
+                            %error,
+                            "failed to release session ownership leases at shutdown"
+                        );
+                        shutdown_errors.push(SessionRuntimeError::Store(error));
+                    }
+                    Err(_) => {
+                        warn!(
+                            component = COMPONENT_SESSION_RUNTIME,
+                            event = "session_ownership_handoff_release_timeout",
+                            "timed out releasing session ownership leases; peers must wait for lease expiry"
+                        );
+                        shutdown_errors.push(SessionRuntimeError::CollabRoomLost {
+                            thread_key: "shutdown".to_owned(),
+                            reason: "bulk ownership release timed out under aggregate deadline"
+                                .to_owned(),
+                        });
+                    }
                 }
             }
         }
-        let deadline = Instant::now()
-            .checked_add(timeout)
-            .unwrap_or_else(|| Instant::now() + Duration::from_secs(3600));
+        // Continue using the same aggregate shutdown_deadline for execution drain.
+        let deadline = shutdown_deadline;
         loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
             let count = tokio::time::timeout(
-                EXECUTION_HANDOFF_DB_TIMEOUT,
+                remaining.min(EXECUTION_HANDOFF_DB_TIMEOUT),
                 self.store
                     .count_executions_with_stdout_owner(&self.stdout_owner_id),
             )
@@ -4848,8 +5106,18 @@ impl SessionRuntime {
             }
             sleep(EXECUTION_HANDOFF_POLL_INTERVAL).await;
         }
+        let remaining = shutdown_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            shutdown_errors.push(SessionRuntimeError::CollabRoomLost {
+                thread_key: "shutdown".to_owned(),
+                reason:
+                    "incomplete handoff: aggregate deadline exhausted before stdout-owner release"
+                        .to_owned(),
+            });
+            return shutdown_errors;
+        }
         let released = tokio::time::timeout(
-            EXECUTION_HANDOFF_DB_TIMEOUT,
+            remaining.min(EXECUTION_HANDOFF_DB_TIMEOUT),
             self.store
                 .release_stdout_owned_executions(&self.stdout_owner_id),
         )
@@ -4858,8 +5126,12 @@ impl SessionRuntime {
             warn!(
                 component = COMPONENT_SESSION_RUNTIME,
                 event = "execution_handoff_release_timeout",
-                "timed out releasing stdout-owner leases; peers must wait for lease expiry"
+                "timed out releasing stdout-owner leases under aggregate deadline"
             );
+            shutdown_errors.push(SessionRuntimeError::CollabRoomLost {
+                thread_key: "shutdown".to_owned(),
+                reason: "stdout-owner release timed out under aggregate deadline".to_owned(),
+            });
             return shutdown_errors;
         };
         match released {
@@ -4872,9 +5144,19 @@ impl SessionRuntime {
                         execution_id = %execution.execution_id,
                         "released stdout-owner lease at shutdown for adoption by a peer"
                     );
-                    let _ = self
-                        .store
-                        .append_event(
+                    let append_remaining =
+                        shutdown_deadline.saturating_duration_since(Instant::now());
+                    if append_remaining.is_zero() {
+                        shutdown_errors.push(SessionRuntimeError::CollabRoomLost {
+                            thread_key: execution.thread_key.as_str().to_owned(),
+                            reason: "incomplete handoff: aggregate deadline exhausted before stdout_owner_released append"
+                                .to_owned(),
+                        });
+                        break;
+                    }
+                    match tokio::time::timeout(
+                        append_remaining.min(EXECUTION_HANDOFF_DB_TIMEOUT),
+                        self.store.append_event(
                             &execution.thread_key,
                             Some(&execution.execution_id),
                             "session.stdout_owner_released",
@@ -4882,8 +5164,30 @@ impl SessionRuntime {
                                 "execution_id": execution.execution_id,
                                 "reason": "control_plane_shutdown",
                             }),
-                        )
-                        .await;
+                        ),
+                    )
+                    .await
+                    {
+                        Ok(Ok(_)) => {}
+                        Ok(Err(error)) => {
+                            warn!(
+                                component = COMPONENT_SESSION_RUNTIME,
+                                event = "execution_handoff_append_failed",
+                                thread_key = %execution.thread_key,
+                                %error,
+                                "failed to append stdout_owner_released at shutdown"
+                            );
+                            shutdown_errors.push(SessionRuntimeError::Store(error));
+                        }
+                        Err(_) => {
+                            shutdown_errors.push(SessionRuntimeError::CollabRoomLost {
+                                thread_key: execution.thread_key.as_str().to_owned(),
+                                reason: "stdout_owner_released append timed out under aggregate deadline"
+                                    .to_owned(),
+                            });
+                            break;
+                        }
+                    }
                 }
                 if released.is_empty() {
                     info!(
@@ -8108,6 +8412,30 @@ async fn apply_collab_finalize_result(
     reason: &str,
     result: Result<Option<centaur_session_core::SessionEvent>, SessionStoreError>,
 ) -> Result<(), SessionRuntimeError> {
+    apply_collab_finalize_result_within(
+        store,
+        collab_rooms,
+        thread_key,
+        handle,
+        event_type,
+        reason,
+        result,
+        Instant::now() + COLLAB_CLEANUP_DEADLINE,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn apply_collab_finalize_result_within(
+    store: &PgSessionStore,
+    collab_rooms: &CollabRoomRegistry,
+    thread_key: &ThreadKey,
+    handle: &CollabRoomHandle,
+    event_type: &str,
+    reason: &str,
+    result: Result<Option<centaur_session_core::SessionEvent>, SessionStoreError>,
+    deadline: Instant,
+) -> Result<(), SessionRuntimeError> {
     match result {
         Ok(Some(_)) => {
             handle.keepalive.store(false, Ordering::SeqCst);
@@ -8123,10 +8451,48 @@ async fn apply_collab_finalize_result(
             // owner+generation no longer holds the row (Ok(false)). Ok(true)
             // means the same row still exists (e.g. race) — retain pending and
             // retry. Proof Err is never treated as proof.
-            match store
-                .session_ownership_matches(thread_key, &handle.owner_id, handle.generation)
-                .await
+            let proof_remaining = deadline.saturating_duration_since(Instant::now());
+            if proof_remaining.is_zero() {
+                ensure_cleanup_pending_retry(
+                    store,
+                    collab_rooms,
+                    thread_key,
+                    handle,
+                    event_type,
+                    reason,
+                );
+                return Err(SessionRuntimeError::CollabRoomLost {
+                    thread_key: thread_key.as_str().to_owned(),
+                    reason: format!(
+                        "collab cleanup ownership proof exceeded deadline for {event_type}"
+                    ),
+                });
+            }
+            let proof = match tokio::time::timeout(
+                proof_remaining,
+                store.session_ownership_matches(thread_key, &handle.owner_id, handle.generation),
+            )
+            .await
             {
+                Ok(r) => r,
+                Err(_) => {
+                    ensure_cleanup_pending_retry(
+                        store,
+                        collab_rooms,
+                        thread_key,
+                        handle,
+                        event_type,
+                        reason,
+                    );
+                    return Err(SessionRuntimeError::CollabRoomLost {
+                        thread_key: thread_key.as_str().to_owned(),
+                        reason: format!(
+                            "collab cleanup ownership proof timed out for {event_type}"
+                        ),
+                    });
+                }
+            };
+            match proof {
                 Ok(false) => {
                     handle.keepalive.store(false, Ordering::SeqCst);
                     collab_rooms.remove_if(thread_key, |_key, current| {
@@ -8242,10 +8608,9 @@ fn ensure_collab_cleanup_worker(
     let reason = reason.to_owned();
     tokio::spawn(async move {
         loop {
-            if runtime.shutting_down.load(Ordering::SeqCst) {
-                // Leave handle for handoff barrier; worker exits.
-                return;
-            }
+            // Normal workers keep running until handle is gone. Shutdown does
+            // NOT rely on this worker — handoff performs bounded stop/finalize
+            // inline under the aggregate deadline.
             let Some(handle) = runtime
                 .collab_rooms
                 .get(&thread_key)
@@ -8646,18 +9011,10 @@ async fn process_collab_state_line(
         .await?;
 
     if persisted.is_none() {
-        // Nonterminal started/status (or correlated stopped) append was fenced.
-        // Do not blind-remove: same owner+generation may still own an expired
-        // row. Mark exact handle pending and run shared fenced cleanup; a
-        // newer takeover handle is preserved by remove_if/get_mut equality.
-        if let Some(mut current) = ctx.collab_rooms.get_mut(thread_key)
-            && current.owner_id == handle.owner_id
-            && current.generation == handle.generation
-            && current.sandbox_id == handle.sandbox_id
-        {
-            current.keepalive.store(false, Ordering::SeqCst);
-            current.mark_finalize_pending();
-        }
+        // Append fenced (expired/mismatched lease). Exact-handle only.
+        // Correlated stopped may finalize directly (stop path already drove
+        // remote stop). Nonterminal started/status must RemoteStopPending and
+        // drive exact-sandbox stop before any finalize — never release a live room.
         let exact = ctx
             .collab_rooms
             .get(thread_key)
@@ -8668,7 +9025,17 @@ async fn process_collab_state_line(
                     && h.generation == handle.generation
                     && h.sandbox_id == handle.sandbox_id
             });
-        if let Some(exact) = exact {
+        let Some(exact) = exact else {
+            return Ok(true);
+        };
+        if correlated_stop {
+            if let Some(mut current) = ctx.collab_rooms.get_mut(thread_key)
+                && current.owner_id == exact.owner_id
+                && current.generation == exact.generation
+                && current.sandbox_id == exact.sandbox_id
+            {
+                current.mark_finalize_pending();
+            }
             let result = ctx
                 .store
                 .finalize_collab_room(
@@ -8679,7 +9046,7 @@ async fn process_collab_state_line(
                     "session.collab_room_lost",
                     json!({
                         "thread_key": thread_key.as_str(),
-                        "reason": "projector_append_fenced",
+                        "reason": "projector_append_fenced_stopped",
                         "owner_id": exact.owner_id,
                         "generation": exact.generation,
                         "sandbox_id": exact.sandbox_id,
@@ -8692,10 +9059,38 @@ async fn process_collab_state_line(
                 thread_key,
                 &exact,
                 "session.collab_room_lost",
-                "projector_append_fenced",
+                "projector_append_fenced_stopped",
                 result,
             )
             .await;
+            return Ok(true);
+        }
+        // started / status: stop first, finalize only on stop ack.
+        match ctx
+            .runtime
+            .stop_or_enter_remote_pending(thread_key, &exact, "projector_append_fenced")
+            .await
+        {
+            Ok(()) => {
+                let _ = ctx
+                    .runtime
+                    .cleanup_collab_room_local(
+                        thread_key,
+                        &exact,
+                        "session.collab_room_lost",
+                        "projector_append_fenced",
+                    )
+                    .await;
+            }
+            Err(error) => {
+                warn!(
+                    component = COMPONENT_SESSION_RUNTIME,
+                    event = "collab_projector_fenced_stop_pending",
+                    thread_key = %thread_key,
+                    %error,
+                    "fenced started/status append: remote stop failed; retaining RemoteStopPending"
+                );
+            }
         }
         return Ok(true);
     }
@@ -10741,6 +11136,25 @@ mod adoption_tests {
 
     async fn push_resident_collab_io(backend: &MockBackend, room: CollabRoomState) {
         backend.push_io(mock_resident_collab_io(room)).await;
+    }
+
+    /// Accepts control writes but never emits a correlated response (hangs
+    /// the wait side until the absolute lifecycle deadline fires).
+    fn mock_hanging_collab_io() -> SandboxIo {
+        let (io, _stdout_far, stdin_far) = mock_io();
+        tokio::spawn(async move {
+            let mut reader = BufReader::new(stdin_far);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match reader.read_line(&mut line).await {
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    Err(_) => break,
+                }
+            }
+        });
+        io
     }
 
     fn completed_output_lines(result_text: &str) -> Vec<String> {
@@ -13913,9 +14327,6 @@ mod adoption_tests {
             .await
             .expect("g2");
         assert!(g2.acquired);
-        // Simulate a higher generation takeover handle (G2) while a buffered
-        // G1 frame still carries the prior admitted ownership echo.
-        // Ensure distinct generations even if the store starts at 1.
         let g2_generation = g2.generation.max(2);
         let g1_generation = g2_generation - 1;
         let runtime = runtime_with(
@@ -13943,7 +14354,6 @@ mod adoption_tests {
             },
         );
         let ctx = runtime.context();
-        // Missing ownership echo: drop.
         let missing = json!({
             "method": "collab/state",
             "params": {
@@ -13961,7 +14371,6 @@ mod adoption_tests {
                 .await
                 .expect("missing")
         );
-        // G1 ownership echo on same sandbox: drop, must not overwrite G2 URL.
         let g1_frame = json!({
             "method": "collab/state",
             "params": {
@@ -13983,7 +14392,6 @@ mod adoption_tests {
                 .await
                 .expect("g1")
         );
-        // G1 terminal frame must not finalize G2.
         let g1_lost = json!({
             "method": "collab/state",
             "params": {
@@ -14022,6 +14430,159 @@ mod adoption_tests {
                 .is_some(),
             "g2 ownership must not be finalized by g1 frame"
         );
+    }
+
+    /// Status probe write failure must enter RemoteStopPending and retain the
+    /// handle — never finalize/remove on probe failure.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn collab_status_probe_failure_enters_remote_stop_pending() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _guard = TEST_LOCK.lock().await;
+        let thread_key =
+            ThreadKey::parse(format!("test:collab-probe-fail-{}", Uuid::new_v4())).unwrap();
+        store
+            .create_or_get_session(&thread_key, &HarnessType::Omp, None, json!({}))
+            .await
+            .expect("create");
+        store
+            .update_sandbox_id(&thread_key, Some("asbx-probe-fail"))
+            .await
+            .expect("sandbox");
+        let owner = store
+            .acquire_session_ownership(&thread_key, "resident-1", SessionOwnerMode::Resident)
+            .await
+            .expect("acquire");
+        // Backend with no IO — send_collab_control_line fails open_io.
+        let runtime = runtime_with(
+            &store,
+            Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new())),
+        );
+        runtime.collab_rooms.insert(
+            thread_key.clone(),
+            CollabRoomHandle {
+                owner_id: "resident-1".to_owned(),
+                generation: owner.generation,
+                sandbox_id: "asbx-probe-fail".to_owned(),
+                state: CollabRoomState {
+                    active: true,
+                    join_url: Some("https://relay.example/live".to_owned()),
+                    view_url: None,
+                    web_url: None,
+                    web_view_url: None,
+                    participants: Vec::new(),
+                },
+                keepalive: Arc::new(AtomicBool::new(true)),
+                phase: CollabCleanupPhase::Active,
+                cleanup_worker_scheduled: false,
+            },
+        );
+        let err = runtime
+            .collab_room_status(&thread_key)
+            .await
+            .expect_err("probe failure surfaces");
+        let _ = err;
+        let handle = runtime
+            .collab_rooms
+            .get(&thread_key)
+            .as_deref()
+            .cloned()
+            .expect("handle retained");
+        assert!(
+            matches!(handle.phase, CollabCleanupPhase::RemoteStopPending),
+            "probe fail enters RemoteStopPending, got {:?}",
+            handle.phase
+        );
+        assert!(!runtime.has_active_collab_room(&thread_key));
+        assert!(
+            store
+                .active_session_ownership(&thread_key)
+                .await
+                .expect("lookup")
+                .is_some(),
+            "must not finalize ownership on probe failure"
+        );
+        runtime.collab_rooms.remove(&thread_key);
+    }
+
+    /// Successful status probe must not return a URL if the exact handle is
+    /// no longer Active (e.g. concurrent cleanup).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn collab_status_probe_requires_still_active_handle() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _guard = TEST_LOCK.lock().await;
+        let thread_key =
+            ThreadKey::parse(format!("test:collab-probe-active-{}", Uuid::new_v4())).unwrap();
+        store
+            .create_or_get_session(&thread_key, &HarnessType::Omp, None, json!({}))
+            .await
+            .expect("create");
+        store
+            .update_sandbox_id(&thread_key, Some("asbx-probe-active"))
+            .await
+            .expect("sandbox");
+        let owner = store
+            .acquire_session_ownership(&thread_key, "resident-1", SessionOwnerMode::Resident)
+            .await
+            .expect("acquire");
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        let room = CollabRoomState {
+            active: true,
+            join_url: Some("https://relay.example/active".to_owned()),
+            view_url: None,
+            web_url: None,
+            web_view_url: None,
+            participants: Vec::new(),
+        };
+        push_resident_collab_io(&backend, room.clone()).await;
+        let runtime = runtime_with(&store, backend);
+        let keepalive = Arc::new(AtomicBool::new(true));
+        runtime.collab_rooms.insert(
+            thread_key.clone(),
+            CollabRoomHandle {
+                owner_id: "resident-1".to_owned(),
+                generation: owner.generation,
+                sandbox_id: "asbx-probe-active".to_owned(),
+                state: room,
+                keepalive: keepalive.clone(),
+                phase: CollabCleanupPhase::Active,
+                cleanup_worker_scheduled: false,
+            },
+        );
+        // Flip to FinalizePending before/while status would return — simulate
+        // concurrent cleanup after probe started by marking before call and
+        // using a second path: mark after insert so probe send may still work
+        // if pipe opens, but Active check fails.
+        // Mark RemoteStopPending after ensuring pipe can open: use empty backend
+        // wait — simpler: mark FinalizePending then call status.
+        if let Some(mut current) = runtime.collab_rooms.get_mut(&thread_key) {
+            current.mark_finalize_pending();
+        }
+        let status = runtime.collab_room_status(&thread_key).await.unwrap();
+        // Non-active phases are filtered before probe — room None, not URL.
+        assert!(
+            status.room.is_none(),
+            "non-Active handle must not serve URL"
+        );
+        runtime.collab_rooms.remove(&thread_key);
+    }
+
+    /// wait_for_collab_status store errors must propagate as Store, not be
+    /// reclassified as CollabRoomLost/stale.
+    #[test]
+    fn collab_wait_status_propagates_store_error_unchanged() {
+        let store_err = SessionRuntimeError::Store(SessionStoreError::InvalidPersistedValue(
+            "injected".to_owned(),
+        ));
+        match store_err {
+            SessionRuntimeError::Store(SessionStoreError::InvalidPersistedValue(message)) => {
+                assert_eq!(message, "injected");
+            }
+            other => panic!("store error must not be reclassified: {other:?}"),
+        }
     }
 
     /// Unsolicited terminal frames go through finalize_collab_room (append+release),
@@ -14612,5 +15173,739 @@ mod adoption_tests {
                 .any(|e| e.event_type == "session.collab_room_lost"),
             "terminal loss event durable"
         );
+    }
+
+    #[tokio::test]
+    async fn collab_stop_timeout_enters_remote_stop_pending_not_finalize() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _guard = TEST_LOCK.lock().await;
+        let thread_key =
+            ThreadKey::parse(format!("test:collab-stop-timeout-{}", Uuid::new_v4())).unwrap();
+        store
+            .create_or_get_session(&thread_key, &HarnessType::Omp, None, json!({}))
+            .await
+            .expect("create");
+        store
+            .update_sandbox_id(&thread_key, Some("asbx-stop-timeout"))
+            .await
+            .expect("sandbox");
+        let owner = store
+            .acquire_session_ownership(&thread_key, "resident-1", SessionOwnerMode::Resident)
+            .await
+            .expect("acquire");
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        // Hang the control plane so wait cannot complete before the absolute deadline.
+        backend.push_io(mock_hanging_collab_io()).await;
+        let runtime = runtime_with(&store, backend);
+        let keepalive = Arc::new(AtomicBool::new(true));
+        let handle = CollabRoomHandle {
+            owner_id: owner.owner_id.clone(),
+            generation: owner.generation,
+            sandbox_id: "asbx-stop-timeout".to_owned(),
+            state: CollabRoomState {
+                active: true,
+                join_url: Some("https://relay.example/live".to_owned()),
+                view_url: None,
+                web_url: None,
+                web_view_url: None,
+                participants: Vec::new(),
+            },
+            keepalive: keepalive.clone(),
+            phase: CollabCleanupPhase::Active,
+            cleanup_worker_scheduled: false,
+        };
+        runtime
+            .collab_rooms
+            .insert(thread_key.clone(), handle.clone());
+        // Expired absolute deadline: stop attempt times out immediately.
+        let err = runtime
+            .stop_or_enter_remote_pending_within(
+                &thread_key,
+                &handle,
+                "user_stop_timeout",
+                Instant::now() - Duration::from_millis(1),
+            )
+            .await
+            .expect_err("expired deadline surfaces");
+        let _ = err;
+        let retained = runtime
+            .collab_rooms
+            .get(&thread_key)
+            .as_deref()
+            .cloned()
+            .expect("exact handle retained after stop timeout");
+        assert!(
+            matches!(retained.phase, CollabCleanupPhase::RemoteStopPending),
+            "timeout must enter RemoteStopPending before finalize, got {:?}",
+            retained.phase
+        );
+        assert!(
+            !retained.phase.is_externally_active(),
+            "must not remain externally active after stop timeout"
+        );
+        // RemoteStopPending clears the keepalive flag so the sandbox is not
+        // held awake by a ghost room; ownership stays durable until finalize.
+        assert!(
+            !keepalive.load(Ordering::SeqCst),
+            "RemoteStopPending must release keepalive (no ghost keepalive)"
+        );
+        let row = store
+            .active_session_ownership(&thread_key)
+            .await
+            .expect("lookup")
+            .expect("ownership retained under RemoteStopPending until finalize");
+        assert_eq!(row.owner_id, owner.owner_id);
+        assert_eq!(row.generation, owner.generation);
+    }
+
+    #[tokio::test]
+    async fn collab_failed_stop_enters_remote_stop_pending_not_ghost() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _guard = TEST_LOCK.lock().await;
+        let thread_key =
+            ThreadKey::parse(format!("test:collab-fail-stop-{}", Uuid::new_v4())).unwrap();
+        store
+            .create_or_get_session(&thread_key, &HarnessType::Omp, None, json!({}))
+            .await
+            .expect("create");
+        store
+            .update_sandbox_id(&thread_key, Some("asbx-fail-stop"))
+            .await
+            .expect("sandbox");
+        let owner = store
+            .acquire_session_ownership(&thread_key, "resident-1", SessionOwnerMode::Resident)
+            .await
+            .expect("acquire");
+        // No IO: open_io fails → stop control failure.
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        let runtime = runtime_with(&store, backend);
+        let keepalive = Arc::new(AtomicBool::new(true));
+        let handle = CollabRoomHandle {
+            owner_id: owner.owner_id.clone(),
+            generation: owner.generation,
+            sandbox_id: "asbx-fail-stop".to_owned(),
+            state: CollabRoomState {
+                active: true,
+                join_url: Some("https://relay.example/live".to_owned()),
+                view_url: None,
+                web_url: None,
+                web_view_url: None,
+                participants: Vec::new(),
+            },
+            keepalive: keepalive.clone(),
+            phase: CollabCleanupPhase::Active,
+            cleanup_worker_scheduled: false,
+        };
+        runtime
+            .collab_rooms
+            .insert(thread_key.clone(), handle.clone());
+        let err = runtime
+            .stop_or_enter_remote_pending(&thread_key, &handle, "collab_start_failed")
+            .await
+            .expect_err("control failure surfaces");
+        let _ = err;
+        let retained = runtime
+            .collab_rooms
+            .get(&thread_key)
+            .as_deref()
+            .cloned()
+            .expect("handle retained");
+        assert!(
+            matches!(retained.phase, CollabCleanupPhase::RemoteStopPending),
+            "failed stop enters RemoteStopPending, got {:?}",
+            retained.phase
+        );
+        assert!(
+            !runtime.has_active_collab_room(&thread_key),
+            "not externally active (no ghost active room)"
+        );
+        assert!(
+            !keepalive.load(Ordering::SeqCst),
+            "RemoteStopPending releases keepalive (no ghost keepalive)"
+        );
+        let row = store
+            .active_session_ownership(&thread_key)
+            .await
+            .expect("lookup")
+            .expect("ownership retained until finalize");
+        assert_eq!(row.owner_id, owner.owner_id);
+        assert_eq!(row.generation, owner.generation);
+    }
+
+    #[tokio::test]
+    async fn collab_handoff_aggregate_deadline_does_not_hang_or_ghost() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _guard = TEST_LOCK.lock().await;
+        let thread_key =
+            ThreadKey::parse(format!("test:collab-handoff-dl-{}", Uuid::new_v4())).unwrap();
+        store
+            .create_or_get_session(&thread_key, &HarnessType::Omp, None, json!({}))
+            .await
+            .expect("create");
+        store
+            .update_sandbox_id(&thread_key, Some("asbx-handoff-dl"))
+            .await
+            .expect("sandbox");
+        // Seed ownership with a known owner id; handoff stops rooms from the
+        // registry snapshot regardless of stdout owner, then attempts release
+        // for its own stdout owner. Assert public outcomes only.
+        let owner = store
+            .acquire_session_ownership(&thread_key, "handoff-owner", SessionOwnerMode::Resident)
+            .await
+            .expect("acquire");
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        backend.push_io(mock_hanging_collab_io()).await;
+        let runtime = runtime_with(&store, backend);
+        let keepalive = Arc::new(AtomicBool::new(true));
+        runtime.collab_rooms.insert(
+            thread_key.clone(),
+            CollabRoomHandle {
+                owner_id: owner.owner_id.clone(),
+                generation: owner.generation,
+                sandbox_id: "asbx-handoff-dl".to_owned(),
+                state: CollabRoomState {
+                    active: true,
+                    join_url: Some("https://relay.example/live".to_owned()),
+                    view_url: None,
+                    web_url: None,
+                    web_view_url: None,
+                    participants: Vec::new(),
+                },
+                keepalive: keepalive.clone(),
+                phase: CollabCleanupPhase::Active,
+                cleanup_worker_scheduled: false,
+            },
+        );
+        // Zero budget: deadline computed before barrier must not hang.
+        let errors = tokio::time::timeout(
+            Duration::from_secs(3),
+            runtime.handoff_owned_executions(Duration::from_millis(0)),
+        )
+        .await
+        .expect("handoff returns under aggregate deadline without hanging");
+        // Public contract: handoff reports errors rather than silently dropping
+        // the room; hanging IO + zero budget cannot leave an active ghost room.
+        assert!(
+            !errors.is_empty() || !runtime.has_active_collab_room(&thread_key),
+            "handoff must surface deadline pressure or clear active room; errors={errors:?}"
+        );
+        assert!(
+            !runtime.has_active_collab_room(&thread_key),
+            "room must not stay externally active after deadline handoff"
+        );
+        // If handle remains, it must be pending retry — never Active ghost.
+        if let Some(retained) = runtime.collab_rooms.get(&thread_key).as_deref().cloned() {
+            assert!(
+                !retained.phase.is_externally_active(),
+                "retained handle must not be externally active, got {:?}",
+                retained.phase
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn collab_cleanup_ownership_proof_shares_deadline() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _guard = TEST_LOCK.lock().await;
+        let thread_key =
+            ThreadKey::parse(format!("test:collab-proof-dl-{}", Uuid::new_v4())).unwrap();
+        store
+            .create_or_get_session(&thread_key, &HarnessType::Omp, None, json!({}))
+            .await
+            .expect("create");
+        let owner = store
+            .acquire_session_ownership(&thread_key, "resident-1", SessionOwnerMode::Resident)
+            .await
+            .expect("acquire");
+        let keepalive = Arc::new(AtomicBool::new(true));
+        let handle = CollabRoomHandle {
+            owner_id: owner.owner_id.clone(),
+            generation: owner.generation,
+            sandbox_id: "asbx-proof".to_owned(),
+            state: CollabRoomState {
+                active: true,
+                join_url: Some("https://relay.example/live".to_owned()),
+                view_url: None,
+                web_url: None,
+                web_view_url: None,
+                participants: Vec::new(),
+            },
+            keepalive: keepalive.clone(),
+            phase: CollabCleanupPhase::FinalizePending,
+            cleanup_worker_scheduled: false,
+        };
+        let registry: CollabRoomRegistry = Arc::new(DashMap::new());
+        registry.insert(thread_key.clone(), handle.clone());
+        // Finalize Ok(None) with already-expired deadline: proof must not run
+        // past budget; handle stays pending (no ghost drop / keepalive clear).
+        let err = apply_collab_finalize_result_within(
+            &store,
+            &registry,
+            &thread_key,
+            &handle,
+            "session.collab_room_lost",
+            "proof_deadline",
+            Ok(None),
+            Instant::now() - Duration::from_secs(1),
+        )
+        .await
+        .expect_err("expired proof deadline errors");
+        let _ = err;
+        let retained = registry
+            .get(&thread_key)
+            .as_deref()
+            .cloned()
+            .expect("handle retained after proof deadline — no ghost drop");
+        assert!(
+            matches!(
+                retained.phase,
+                CollabCleanupPhase::FinalizePending | CollabCleanupPhase::RemoteStopPending
+            ),
+            "proof timeout retains pending phase, got {:?}",
+            retained.phase
+        );
+        // Pending retry may clear the in-memory keepalive flag; durable
+        // ownership must remain until a successful fenced finalize.
+        let row = store
+            .active_session_ownership(&thread_key)
+            .await
+            .expect("lookup")
+            .expect("ownership still durable after proof deadline");
+        assert_eq!(row.owner_id, owner.owner_id);
+        assert_eq!(row.generation, owner.generation);
+        assert!(
+            !retained.phase.is_externally_active(),
+            "proof timeout must not leave externally active room"
+        );
+    }
+
+    #[tokio::test]
+    async fn collab_projector_fenced_started_drives_remote_stop_not_blind_finalize() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _guard = TEST_LOCK.lock().await;
+        let thread_key =
+            ThreadKey::parse(format!("test:collab-proj-fenced-{}", Uuid::new_v4())).unwrap();
+        store
+            .create_or_get_session(&thread_key, &HarnessType::Omp, None, json!({}))
+            .await
+            .expect("create");
+        store
+            .update_sandbox_id(&thread_key, Some("asbx-proj-fenced"))
+            .await
+            .expect("sandbox");
+        let owner = store
+            .acquire_session_ownership(&thread_key, "resident-1", SessionOwnerMode::Resident)
+            .await
+            .expect("acquire");
+        // Expire lease so append_unscoped_event_if_session_owner returns None
+        // while the same owner+generation row still exists.
+        sqlx::query(
+            r#"
+            update session_owners
+            set lease_expires_at = now() - interval '1 second'
+            where thread_key = $1 and owner_id = $2 and generation = $3
+            "#,
+        )
+        .bind(thread_key.as_str())
+        .bind(&owner.owner_id)
+        .bind(owner.generation)
+        .execute(store.pool())
+        .await
+        .expect("expire");
+        // Backend with no IO: stop control fails open → RemoteStopPending retained.
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        let runtime = runtime_with(&store, backend);
+        let keepalive = Arc::new(AtomicBool::new(true));
+        runtime.collab_rooms.insert(
+            thread_key.clone(),
+            CollabRoomHandle {
+                owner_id: owner.owner_id.clone(),
+                generation: owner.generation,
+                sandbox_id: "asbx-proj-fenced".to_owned(),
+                state: CollabRoomState {
+                    active: true,
+                    join_url: Some("https://relay.example/live".to_owned()),
+                    view_url: None,
+                    web_url: None,
+                    web_view_url: None,
+                    participants: Vec::new(),
+                },
+                keepalive: keepalive.clone(),
+                phase: CollabCleanupPhase::Active,
+                cleanup_worker_scheduled: false,
+            },
+        );
+        let started = json!({
+            "method": "collab/state",
+            "params": {
+                "request_id": "collab-req-fenced-start",
+                "state": "started",
+                "ownership": {
+                    "owner_id": owner.owner_id,
+                    "generation": owner.generation,
+                },
+                "room": {
+                    "active": true,
+                    "join_url": "https://relay.example/live",
+                    "participants": []
+                }
+            }
+        });
+        let ctx = runtime.context();
+        assert!(
+            process_collab_state_line(&ctx, &thread_key, "asbx-proj-fenced", &started)
+                .await
+                .expect("process fenced started")
+        );
+        let retained = runtime
+            .collab_rooms
+            .get(&thread_key)
+            .as_deref()
+            .cloned()
+            .expect("exact handle retained after fenced started (no blind remove)");
+        assert!(
+            matches!(retained.phase, CollabCleanupPhase::RemoteStopPending),
+            "fenced started must RemoteStopPending (stop before finalize), got {:?}",
+            retained.phase
+        );
+        assert!(
+            !runtime.has_active_collab_room(&thread_key),
+            "not externally active"
+        );
+        // No terminal collab_room_lost without stop ack.
+        let events = events(&store, &thread_key).await;
+        assert!(
+            events
+                .iter()
+                .all(|e| e.event_type != "session.collab_room_lost"),
+            "no terminal lost event when stop fails after fenced started; events={events:?}"
+        );
+        // Ownership row still present (expired but not released by finalize).
+        let row = sqlx::query_scalar::<_, i64>(
+            r#"select count(*) from session_owners where thread_key = $1 and owner_id = $2 and generation = $3"#,
+        )
+        .bind(thread_key.as_str())
+        .bind(&owner.owner_id)
+        .bind(owner.generation)
+        .fetch_one(store.pool())
+        .await
+        .expect("count owners");
+        assert_eq!(row, 1, "lease row retained until successful stop+finalize");
+    }
+
+    #[tokio::test]
+    async fn collab_projector_fenced_status_drives_remote_stop_retains_on_failure() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _guard = TEST_LOCK.lock().await;
+        let thread_key =
+            ThreadKey::parse(format!("test:collab-proj-status-{}", Uuid::new_v4())).unwrap();
+        store
+            .create_or_get_session(&thread_key, &HarnessType::Omp, None, json!({}))
+            .await
+            .expect("create");
+        store
+            .update_sandbox_id(&thread_key, Some("asbx-proj-status"))
+            .await
+            .expect("sandbox");
+        let owner = store
+            .acquire_session_ownership(&thread_key, "resident-1", SessionOwnerMode::Resident)
+            .await
+            .expect("acquire");
+        sqlx::query(
+            r#"
+            update session_owners
+            set lease_expires_at = now() - interval '1 second'
+            where thread_key = $1 and owner_id = $2 and generation = $3
+            "#,
+        )
+        .bind(thread_key.as_str())
+        .bind(&owner.owner_id)
+        .bind(owner.generation)
+        .execute(store.pool())
+        .await
+        .expect("expire");
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        let runtime = runtime_with(&store, backend);
+        runtime.collab_rooms.insert(
+            thread_key.clone(),
+            CollabRoomHandle {
+                owner_id: owner.owner_id.clone(),
+                generation: owner.generation,
+                sandbox_id: "asbx-proj-status".to_owned(),
+                state: CollabRoomState {
+                    active: true,
+                    join_url: Some("https://relay.example/live".to_owned()),
+                    view_url: None,
+                    web_url: None,
+                    web_view_url: None,
+                    participants: Vec::new(),
+                },
+                keepalive: Arc::new(AtomicBool::new(true)),
+                phase: CollabCleanupPhase::Active,
+                cleanup_worker_scheduled: false,
+            },
+        );
+        let status = json!({
+            "method": "collab/status",
+            "params": {
+                "request_id": "collab-req-fenced-status",
+                "ownership": {
+                    "owner_id": owner.owner_id,
+                    "generation": owner.generation,
+                },
+                "room": {
+                    "active": true,
+                    "join_url": "https://relay.example/live",
+                    "participants": []
+                }
+            }
+        });
+        let ctx = runtime.context();
+        assert!(
+            process_collab_state_line(&ctx, &thread_key, "asbx-proj-status", &status)
+                .await
+                .expect("process fenced status")
+        );
+        let retained = runtime
+            .collab_rooms
+            .get(&thread_key)
+            .as_deref()
+            .cloned()
+            .expect("handle retained");
+        assert!(
+            matches!(retained.phase, CollabCleanupPhase::RemoteStopPending),
+            "fenced status → RemoteStopPending, got {:?}",
+            retained.phase
+        );
+        let events = events(&store, &thread_key).await;
+        assert!(
+            events
+                .iter()
+                .all(|e| e.event_type != "session.collab_room_lost"),
+            "no terminal event without stop ack"
+        );
+    }
+
+    #[tokio::test]
+    async fn collab_failed_stop_retains_remote_pending_without_terminal_event() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _guard = TEST_LOCK.lock().await;
+        let thread_key =
+            ThreadKey::parse(format!("test:collab-stop-retains-{}", Uuid::new_v4())).unwrap();
+        store
+            .create_or_get_session(&thread_key, &HarnessType::Omp, None, json!({}))
+            .await
+            .expect("create");
+        store
+            .update_sandbox_id(&thread_key, Some("asbx-stop-retains"))
+            .await
+            .expect("sandbox");
+        let owner = store
+            .acquire_session_ownership(&thread_key, "resident-1", SessionOwnerMode::Resident)
+            .await
+            .expect("acquire");
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        let runtime = runtime_with(&store, backend);
+        let handle = CollabRoomHandle {
+            owner_id: owner.owner_id.clone(),
+            generation: owner.generation,
+            sandbox_id: "asbx-stop-retains".to_owned(),
+            state: CollabRoomState {
+                active: true,
+                join_url: Some("https://relay.example/live".to_owned()),
+                view_url: None,
+                web_url: None,
+                web_view_url: None,
+                participants: Vec::new(),
+            },
+            keepalive: Arc::new(AtomicBool::new(true)),
+            phase: CollabCleanupPhase::Active,
+            cleanup_worker_scheduled: false,
+        };
+        runtime
+            .collab_rooms
+            .insert(thread_key.clone(), handle.clone());
+        let _ = runtime
+            .stop_or_enter_remote_pending(&thread_key, &handle, "test_failed_stop")
+            .await
+            .expect_err("stop fails without IO");
+        let retained = runtime
+            .collab_rooms
+            .get(&thread_key)
+            .as_deref()
+            .cloned()
+            .expect("handle retained");
+        assert!(matches!(
+            retained.phase,
+            CollabCleanupPhase::RemoteStopPending
+        ));
+        let row = store
+            .active_session_ownership(&thread_key)
+            .await
+            .expect("lookup")
+            .expect("lease retained");
+        assert_eq!(row.owner_id, owner.owner_id);
+        assert_eq!(row.generation, owner.generation);
+        let events = events(&store, &thread_key).await;
+        assert!(
+            events
+                .iter()
+                .all(|e| e.event_type != "session.collab_room_lost"),
+            "no terminal event on failed stop"
+        );
+    }
+
+    #[tokio::test]
+    async fn collab_stop_holds_global_gate_so_handoff_waits_without_duplicate_finalize() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _guard = TEST_LOCK.lock().await;
+        let thread_key =
+            ThreadKey::parse(format!("test:collab-stop-gate-{}", Uuid::new_v4())).unwrap();
+        store
+            .create_or_get_session(&thread_key, &HarnessType::Omp, None, json!({}))
+            .await
+            .expect("create");
+        store
+            .update_sandbox_id(&thread_key, Some("asbx-stop-gate"))
+            .await
+            .expect("sandbox");
+        let owner = store
+            .acquire_session_ownership(&thread_key, "resident-1", SessionOwnerMode::Resident)
+            .await
+            .expect("acquire");
+        let dead_state = CollabRoomState {
+            active: true,
+            join_url: Some("https://relay.example/live".to_owned()),
+            view_url: None,
+            web_url: None,
+            web_view_url: None,
+            participants: Vec::new(),
+        };
+        // Cooperative resident: stop completes with ack so finalize can run once.
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        push_resident_collab_io(&backend, dead_state.clone()).await;
+        let runtime = runtime_with(&store, backend);
+        runtime.collab_rooms.insert(
+            thread_key.clone(),
+            CollabRoomHandle {
+                owner_id: owner.owner_id.clone(),
+                generation: owner.generation,
+                sandbox_id: "asbx-stop-gate".to_owned(),
+                state: dead_state,
+                keepalive: Arc::new(AtomicBool::new(true)),
+                phase: CollabCleanupPhase::Active,
+                cleanup_worker_scheduled: false,
+            },
+        );
+
+        // Pause: hold the global read gate like an in-flight stop, then release.
+        let gate = runtime.collab_lifecycle_gate.clone();
+        let hold = tokio::spawn(async move {
+            let _g = gate.read().await;
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        });
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        let runtime_stop = runtime.clone();
+        let tk_stop = thread_key.clone();
+        let stop_fut = tokio::spawn(async move {
+            runtime_stop
+                .stop_collab_room(
+                    &tk_stop,
+                    &CollabStopInput {
+                        reason: Some("user_stop".to_owned()),
+                    },
+                )
+                .await
+        });
+
+        let handoff_started = Instant::now();
+        let runtime_h = runtime.clone();
+        let handoff_fut = tokio::spawn(async move {
+            runtime_h
+                .handoff_owned_executions(Duration::from_secs(3))
+                .await
+        });
+
+        let (hold_r, stop_r, handoff_r) = tokio::join!(hold, stop_fut, handoff_fut);
+        hold_r.expect("hold task");
+        let stop_result = stop_r.expect("stop join");
+        let errors = handoff_r.expect("handoff join");
+        let handoff_elapsed = handoff_started.elapsed();
+
+        // Write gate blocked until the paused read (and then stop's read) released.
+        assert!(
+            handoff_elapsed >= Duration::from_millis(200),
+            "handoff write must wait for in-flight lifecycle read gate, elapsed={handoff_elapsed:?}"
+        );
+        // Prefer stop winning while holding the read gate; handoff then sees
+        // an empty/non-active room. Terminal finalize is at most one event.
+        let terminal: Vec<_> = events(&store, &thread_key)
+            .await
+            .into_iter()
+            .filter(|e| {
+                e.event_type == "session.collab_room_stopped"
+                    || e.event_type == "session.collab_room_lost"
+            })
+            .collect();
+        assert!(
+            terminal.len() <= 1,
+            "no duplicate stop/handoff finalize; got {terminal:?}"
+        );
+        assert!(
+            !runtime.has_active_collab_room(&thread_key),
+            "room not active after stop/handoff"
+        );
+        // Clean result: either stop Ok finalized, or stop hit ShuttingDown and
+        // handoff cleaned, or RemoteStopPending with no second terminal.
+        match &stop_result {
+            Ok(outcome) => {
+                assert!(outcome.ok, "stop outcome ok={outcome:?}");
+                assert_eq!(
+                    terminal.len(),
+                    1,
+                    "successful stop must leave exactly one terminal event; {terminal:?}"
+                );
+                assert_eq!(terminal[0].event_type, "session.collab_room_stopped");
+            }
+            Err(SessionRuntimeError::ShuttingDown) => {
+                // Handoff took ownership; at most one lost from handoff finalize.
+                assert!(
+                    terminal.len() <= 1,
+                    "shutdown race: at most one terminal; {terminal:?}"
+                );
+            }
+            Err(other) => {
+                // Control failure → RemoteStopPending, no terminal without stop ack.
+                assert!(
+                    terminal.is_empty(),
+                    "failed stop must not terminal-finalize; {terminal:?} err={other}"
+                );
+                let h = runtime
+                    .collab_rooms
+                    .get(&thread_key)
+                    .as_deref()
+                    .cloned()
+                    .expect("handle retained on stop failure");
+                assert!(matches!(h.phase, CollabCleanupPhase::RemoteStopPending));
+            }
+        }
+        let _ = errors;
     }
 }

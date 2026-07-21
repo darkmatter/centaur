@@ -397,6 +397,7 @@ fn query_and_persist_session_state(
     child: &mut OmpRpcChild,
     event_normalizer: &mut crate::omp::OmpEventNormalizer,
     stdout: &mut impl Write,
+    admitted: &Option<OmpRpcOwnership>,
 ) -> Result<String> {
     let id = child.next_request_id();
     child.send_command(&json!({ "id": id, "type": "get_state" }))?;
@@ -453,10 +454,9 @@ fn query_and_persist_session_state(
                         room,
                     } = &normalized
                     {
-                        let _ = write_value(
-                            stdout,
-                            &collab_state_wire_value(state, reason.as_deref(), room),
-                        );
+                        let mut val = collab_state_wire_value(state, reason.as_deref(), room);
+                        stamp_ownership(&mut val, admitted);
+                        let _ = write_value(stdout, &val);
                     }
                     let _ = normalized;
                 }
@@ -875,6 +875,7 @@ pub fn run_omp_blocks_server() -> Result<()> {
                         child.as_mut().unwrap(),
                         &mut event_normalizer,
                         &mut stdout,
+                        &admitted_ownership,
                     )?;
                 }
                 let child = child.as_mut().unwrap();
@@ -893,7 +894,13 @@ pub fn run_omp_blocks_server() -> Result<()> {
                     // No turn lifecycle — the active turn continues.
                     let id = child.next_request_id();
                     child.send_command(&steer_command(&id, &message))?;
-                    drive_omp_steer_response(child, &id, &mut stdout, &thread_id)?;
+                    drive_omp_steer_response(
+                        child,
+                        &id,
+                        &mut stdout,
+                        &thread_id,
+                        &admitted_ownership,
+                    )?;
                     turn_active.store(false, Ordering::SeqCst);
                     continue;
                 }
@@ -989,12 +996,20 @@ pub fn run_omp_blocks_server() -> Result<()> {
                 request_id,
                 command,
             } => {
+                // Stamp ownership only for collab-* parse errors; interrupt
+                // and other non-collab parse errors keep the prior shape.
+                let own = if command.starts_with("collab") {
+                    admitted_ownership.as_ref()
+                } else {
+                    None
+                };
                 write_blocks_error_with_request_id(
                     &mut stdout,
                     &thread_id,
                     &command,
                     &message,
                     request_id.as_deref(),
+                    own,
                 )?;
             }
             OmpBlocksInput::Control(OmpBlocksControl::CollabStart {
@@ -1021,6 +1036,7 @@ pub fn run_omp_blocks_server() -> Result<()> {
                         child.as_mut().unwrap(),
                         &mut event_normalizer,
                         &mut stdout,
+                        &admitted_ownership,
                     )?;
                 }
                 let child = child.as_mut().unwrap();
@@ -1031,10 +1047,23 @@ pub fn run_omp_blocks_server() -> Result<()> {
                     display_name.as_deref(),
                     web_url.as_deref(),
                 ))?;
-                let room =
-                    drive_collab_command(child, &id, "collab_start", &mut stdout, &thread_id)?;
+                let room = drive_collab_command(
+                    child,
+                    &id,
+                    "collab_start",
+                    &mut stdout,
+                    &thread_id,
+                    &admitted_ownership,
+                )?;
                 if let Some(room) = room {
-                    emit_collab_state(&mut stdout, "started", None, &room, Some(&id))?;
+                    emit_collab_state(
+                        &mut stdout,
+                        "started",
+                        None,
+                        &room,
+                        Some(&id),
+                        &admitted_ownership,
+                    )?;
                 }
             }
             OmpBlocksInput::Control(OmpBlocksControl::CollabStatus {
@@ -1058,13 +1087,20 @@ pub fn run_omp_blocks_server() -> Result<()> {
                         "collab_status",
                         "no resident process",
                         request_id.as_deref(),
+                        Some(&ownership),
                     )?;
                     continue;
                 };
                 let id = resolve_request_id(child, request_id);
                 child.send_command(&collab_status_command(&id))?;
-                let room =
-                    drive_collab_command(child, &id, "collab_status", &mut stdout, &thread_id)?;
+                let room = drive_collab_command(
+                    child,
+                    &id,
+                    "collab_status",
+                    &mut stdout,
+                    &thread_id,
+                    &admitted_ownership,
+                )?;
                 if let Some(room) = room {
                     // Snapshot shape: same room contract as collab/state, plus
                     // state derived from room.active and request_id for wait
@@ -1078,6 +1114,7 @@ pub fn run_omp_blocks_server() -> Result<()> {
                     if let Some(params) = value.get_mut("params") {
                         params["request_id"] = Value::String(id.clone());
                     }
+                    stamp_ownership(&mut value, &admitted_ownership);
                     write_value(&mut stdout, &value)?;
                 }
             }
@@ -1102,15 +1139,29 @@ pub fn run_omp_blocks_server() -> Result<()> {
                         "collab_stop",
                         "no resident process",
                         request_id.as_deref(),
+                        Some(&ownership),
                     )?;
                     continue;
                 };
                 let id = resolve_request_id(child, request_id);
                 child.send_command(&collab_stop_command(&id))?;
-                let room =
-                    drive_collab_command(child, &id, "collab_stop", &mut stdout, &thread_id)?;
+                let room = drive_collab_command(
+                    child,
+                    &id,
+                    "collab_stop",
+                    &mut stdout,
+                    &thread_id,
+                    &admitted_ownership,
+                )?;
                 if let Some(room) = room {
-                    emit_collab_state(&mut stdout, "stopped", None, &room, Some(&id))?;
+                    emit_collab_state(
+                        &mut stdout,
+                        "stopped",
+                        None,
+                        &room,
+                        Some(&id),
+                        &admitted_ownership,
+                    )?;
                 }
             }
         }
@@ -1159,12 +1210,20 @@ fn check_ownership_with_request_id(
     match admitted {
         Some(admitted) => {
             if !admitted.matches(incoming) {
+                // Ownership stamp only for collab-* control rejections.
+                // Interrupt ownership rejections keep the prior error shape.
+                let own = if command.starts_with("collab") {
+                    Some(incoming)
+                } else {
+                    None
+                };
                 let _ = write_blocks_error_with_request_id(
                     stdout,
                     thread_id,
                     command,
                     "ownership fence mismatch: stale owner",
                     request_id,
+                    own,
                 );
                 return false;
             }
@@ -1186,6 +1245,7 @@ fn drive_collab_command(
     _command: &str,
     stdout: &mut impl Write,
     thread_id: &str,
+    admitted: &Option<OmpRpcOwnership>,
 ) -> Result<Option<Value>> {
     loop {
         let line = match child.read_line_timeout(Duration::from_secs(30))? {
@@ -1211,6 +1271,7 @@ fn drive_collab_command(
                         cmd,
                         &msg,
                         Some(expected_id),
+                        admitted.as_ref(),
                     )?;
                     return Ok(None);
                 }
@@ -1224,10 +1285,9 @@ fn drive_collab_command(
             } => {
                 let parsed = parse_room_state(&room)?;
                 let api_room = room_state_to_api(&parsed);
-                let _ = write_value(
-                    stdout,
-                    &collab_state_wire_value(&state, reason.as_deref(), &api_room),
-                );
+                let mut val = collab_state_wire_value(&state, reason.as_deref(), &api_room);
+                stamp_ownership(&mut val, admitted);
+                let _ = write_value(stdout, &val);
             }
             OmpRpcFrame::Event(_)
             | OmpRpcFrame::PromptResult { .. }
@@ -1246,6 +1306,7 @@ fn drive_omp_steer_response(
     expected_id: &str,
     stdout: &mut impl Write,
     thread_id: &str,
+    admitted: &Option<OmpRpcOwnership>,
 ) -> Result<()> {
     loop {
         let line = match child.read_line_timeout(Duration::from_secs(30))? {
@@ -1259,12 +1320,14 @@ fn drive_omp_steer_response(
             } if id.as_deref() == Some(expected_id) => {
                 if !success {
                     let msg = error.unwrap_or_else(|| "steer failed".to_owned());
+                    // Normal steer errors unchanged: no ownership stamp.
                     write_blocks_error_with_request_id(
                         stdout,
                         thread_id,
                         "steer",
                         &msg,
                         Some(expected_id),
+                        None,
                     )?;
                 }
                 return Ok(());
@@ -1277,10 +1340,9 @@ fn drive_omp_steer_response(
             } => {
                 let parsed = parse_room_state(&room)?;
                 let api_room = room_state_to_api(&parsed);
-                write_value(
-                    stdout,
-                    &collab_state_wire_value(&state, reason.as_deref(), &api_room),
-                )?;
+                let mut val = collab_state_wire_value(&state, reason.as_deref(), &api_room);
+                stamp_ownership(&mut val, admitted);
+                write_value(stdout, &val)?;
             }
             OmpRpcFrame::Event(_)
             | OmpRpcFrame::PromptResult { .. }
@@ -1292,12 +1354,27 @@ fn drive_omp_steer_response(
 
 /// Emit a collab/state notification from a raw room JSON value (already
 /// parsed and re-projected to the API contract).
+
+/// Stamp admitted ownership into a collab wire value's params so api-rs can
+/// require exact ownership match and reject missing echo on all collab outputs.
+fn stamp_ownership(value: &mut Value, admitted: &Option<OmpRpcOwnership>) {
+    if let Some(own) = admitted
+        && let Some(params) = value.get_mut("params")
+    {
+        params["ownership"] = json!({
+            "owner_id": own.owner_id,
+            "generation": own.generation,
+        });
+    }
+}
+
 fn emit_collab_state(
     stdout: &mut impl Write,
     state: &str,
     reason: Option<&str>,
     room: &Value,
     request_id: Option<&str>,
+    admitted: &Option<OmpRpcOwnership>,
 ) -> Result<()> {
     let parsed = parse_room_state(room)?;
     let api_room = room_state_to_api(&parsed);
@@ -1307,6 +1384,7 @@ fn emit_collab_state(
     {
         params["request_id"] = Value::String(request_id.to_owned());
     }
+    stamp_ownership(&mut value, admitted);
     write_value(stdout, &value)
 }
 
@@ -1430,11 +1508,13 @@ fn drive_omp_turn(
                 Ok(OmpBlocksInput::Command(BlocksCommand::Interrupt)) => {
                     // #3: missing ownership with admitted → surface error.
                     if admitted_ownership.is_some() {
-                        write_blocks_error(
+                        write_blocks_error_with_request_id(
                             stdout,
                             thread_id,
                             turn_id,
                             "missing ownership: interrupt requires owner_id + generation",
+                            None,
+                            None,
                         )?;
                     } else {
                         let id = child.next_request_id();
@@ -1451,19 +1531,24 @@ fn drive_omp_turn(
                             aborted = true;
                         }
                         Some(_) => {
-                            write_blocks_error(
+                            // Interrupt ownership errors: no ownership stamp.
+                            write_blocks_error_with_request_id(
                                 stdout,
                                 thread_id,
                                 turn_id,
                                 "ownership fence mismatch: stale owner",
+                                None,
+                                None,
                             )?;
                         }
                         None => {
-                            write_blocks_error(
+                            write_blocks_error_with_request_id(
                                 stdout,
                                 thread_id,
                                 turn_id,
                                 "missing ownership: no admitted owner",
+                                None,
+                                None,
                             )?;
                         }
                     }
@@ -1489,11 +1574,13 @@ fn drive_omp_turn(
                             child.send_command(&steer_command(&id, &steer_msg))?;
                         }
                     } else {
-                        write_blocks_error(
+                        write_blocks_error_with_request_id(
                             stdout,
                             thread_id,
                             turn_id,
                             "ownership fence mismatch: stale owner",
+                            None,
+                            None,
                         )?;
                     }
                 }
@@ -1556,10 +1643,9 @@ fn drive_omp_turn(
                         room,
                     } = &normalized
                     {
-                        write_value(
-                            stdout,
-                            &collab_state_wire_value(state, reason.as_deref(), room),
-                        )?;
+                        let mut val = collab_state_wire_value(state, reason.as_deref(), room);
+                        stamp_ownership(&mut val, admitted_ownership);
+                        write_value(stdout, &val)?;
                         continue;
                     }
                     if let Some(sid) = normalized.session_id() {
@@ -1586,10 +1672,9 @@ fn drive_omp_turn(
             } => {
                 let parsed = parse_room_state(&room)?;
                 let api_room = room_state_to_api(&parsed);
-                write_value(
-                    stdout,
-                    &collab_state_wire_value(&state, reason.as_deref(), &api_room),
-                )?;
+                let mut val = collab_state_wire_value(&state, reason.as_deref(), &api_room);
+                stamp_ownership(&mut val, admitted_ownership);
+                write_value(stdout, &val)?;
             }
             OmpRpcFrame::PromptResult { agent_invoked, .. } if !agent_invoked => {
                 terminal = true;
@@ -1639,7 +1724,7 @@ fn write_blocks_error(
     turn_id: &str,
     message: &str,
 ) -> Result<()> {
-    write_blocks_error_with_request_id(stdout, thread_id, turn_id, message, None)
+    write_blocks_error_with_request_id(stdout, thread_id, turn_id, message, None, None)
 }
 
 fn write_blocks_error_with_request_id(
@@ -1648,6 +1733,7 @@ fn write_blocks_error_with_request_id(
     turn_id: &str,
     message: &str,
     request_id: Option<&str>,
+    admitted: Option<&OmpRpcOwnership>,
 ) -> Result<()> {
     let mut params = serde_json::json!({
         "error": { "message": message, "codexErrorInfo": null, "additionalDetails": null },
@@ -1657,6 +1743,12 @@ fn write_blocks_error_with_request_id(
     });
     if let Some(rid) = request_id {
         params["request_id"] = Value::String(rid.to_owned());
+    }
+    if let Some(own) = admitted {
+        params["ownership"] = json!({
+            "owner_id": own.owner_id,
+            "generation": own.generation,
+        });
     }
     write_value(
         stdout,

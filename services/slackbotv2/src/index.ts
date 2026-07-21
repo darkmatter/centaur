@@ -573,6 +573,7 @@ export async function handleExportCommand(
   if (!options.consolePublicUrl) return false
   const trace = createHandoffTrace(thread, message, 'append')
   traceLog(options, 'slackbotv2_export_command_started', trace, { trigger })
+  await setAssistantStatus(thread, '', options, trace)
   try {
     await thread.post(`Transcript export: ${exportLinkForThread(options.consolePublicUrl, thread.id)}`)
     traceLog(options, 'slackbotv2_export_command_complete', trace, { trigger })

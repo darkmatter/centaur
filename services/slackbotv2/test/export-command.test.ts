@@ -76,13 +76,26 @@ describe('env → options → handler contract', () => {
     const env = { ...baseEnvs, CENTAUR_CONSOLE_PUBLIC_URL: 'https://console.example.test/' }
     const options = buildSlackbotV2Options(env, silentLogger)
     expect(options.consolePublicUrl).toBe('https://console.example.test/')
-    // handleExportCommand only reads message.text (via isSlackExportCommand)
-    // and thread.id / thread.post; stub just those and cast to the SDK types.
+    // handleExportCommand reads message.text, thread.id/post, and clears any
+    // stale assistant status before posting the link.
     const posted: string[] = []
-    const thread = { id: 'slack:C123:1721400000.000100', post: async (text: string) => { posted.push(text); return undefined } } as never
+    const statuses: string[] = []
+    const thread = {
+      id: 'slack:C123:1721400000.000100',
+      adapter: {
+        setAssistantStatus: async (_channel: string, _threadTs: string, status: string) => {
+          statuses.push(status)
+        }
+      },
+      post: async (text: string) => {
+        posted.push(text)
+        return undefined
+      }
+    } as never
     const message = { text: 'please export this thread' } as never
     const handled = await handleExportCommand(thread, message, options, 'test')
     expect(handled).toBe(true)
+    expect(statuses).toEqual([''])
     expect(posted).toHaveLength(1)
     expect(posted[0]).toBe(
       'Transcript export: https://console.example.test/console/apps/omp-stats/export/slack%3AC123%3A1721400000.000100'

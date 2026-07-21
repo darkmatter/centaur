@@ -56,6 +56,24 @@ class Console::AppsControllerTest < ActionDispatch::IntegrationTest
     assert_nil call[:body]
   end
 
+  test "sandboxes inline transcript HTML away from the Console origin" do
+    get "/console/apps/omp-stats/export/slack%3AC123%3A1700.42"
+
+    assert_response :ok
+    assert_equal "sandbox allow-scripts", response.headers["Content-Security-Policy"]
+  end
+
+  test "denies fleet-wide stats to non-admin users" do
+    delete logout_url
+    member = users(:member_user)
+    post login_url, params: { email: member.email, password: "password123456" }
+
+    get "/console/apps/omp-stats/api/stats/recent"
+
+    assert_response :not_found
+    assert_empty @client.calls
+  end
+
   test "denies an OMP transcript export when the current user does not own the thread" do
     delete logout_url
     member = users(:member_user)

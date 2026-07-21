@@ -23,6 +23,7 @@ use crate::{
 };
 
 const APPS_JSON_ENV: &str = "CENTAUR_APPS_JSON";
+const APP_PROXY_API_KEY_ENV: &str = "CENTAUR_APP_PROXY_API_KEY";
 const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const HTTP_READ_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -58,14 +59,22 @@ struct AppEntry {
 
 #[derive(Clone, Default)]
 struct AppsRegistry {
+    api_key: Option<Arc<str>>,
     apps: Arc<Vec<AppEntry>>,
 }
 
 impl AppsRegistry {
     fn new(apps: Vec<AppEntry>) -> Self {
         Self {
+            api_key: None,
             apps: Arc::new(apps),
         }
+    }
+
+    #[cfg(test)]
+    fn with_api_key(mut self, api_key: impl Into<Arc<str>>) -> Self {
+        self.api_key = Some(api_key.into());
+        self
     }
 
     fn resolve(&self, name: &str) -> Option<&AppEntry> {
@@ -74,10 +83,11 @@ impl AppsRegistry {
 }
 
 fn registry_from_env() -> AppsRegistry {
-    let Some(raw) = non_empty_env(APPS_JSON_ENV) else {
-        return AppsRegistry::default();
-    };
-    parse_registry(&raw)
+    let api_key = non_empty_env(APP_PROXY_API_KEY_ENV).map(Arc::<str>::from);
+    let mut registry =
+        non_empty_env(APPS_JSON_ENV).map_or_else(AppsRegistry::default, |raw| parse_registry(&raw));
+    registry.api_key = api_key;
+    registry
 }
 
 /// Invalid configuration degrades to an empty registry (all apps 404) rather
@@ -142,6 +152,7 @@ async fn forward_to_app(
     headers: &HeaderMap,
     body: Body,
 ) -> Result<Response, ApiError> {
+    authorize_app_proxy(registry, headers)?;
     let app = registry
         .resolve(name)
         .ok_or_else(|| ApiError::NotFound(format!("unknown app: {name}")))?;
@@ -179,6 +190,32 @@ async fn forward_to_app(
     builder
         .body(Body::from_stream(upstream.bytes_stream()))
         .map_err(|error| ApiError::Internal(format!("failed to build app proxy response: {error}")))
+}
+
+fn authorize_app_proxy(registry: &AppsRegistry, headers: &HeaderMap) -> Result<(), ApiError> {
+    let expected = registry
+        .api_key
+        .as_deref()
+        .ok_or_else(|| ApiError::Unauthorized("app proxy API key is not configured".to_owned()))?;
+    let actual = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| ApiError::Unauthorized("missing app proxy bearer token".to_owned()))?;
+    if constant_time_eq(actual.as_bytes(), expected.as_bytes()) {
+        Ok(())
+    } else {
+        Err(ApiError::Unauthorized(
+            "invalid app proxy bearer token".to_owned(),
+        ))
+    }
+}
+
+fn constant_time_eq(actual: &[u8], expected: &[u8]) -> bool {
+    use subtle::ConstantTimeEq;
+
+    actual.ct_eq(expected).into()
 }
 
 /// Inbound credentials are stripped so apps only ever trust `x-centaur-app`;
@@ -249,10 +286,13 @@ mod tests {
     }
 
     fn proxy_router(upstream_url: String) -> Router {
-        apps_proxy_router_with_registry(AppsRegistry::new(vec![AppEntry {
-            name: "omp-stats".to_owned(),
-            url: upstream_url,
-        }]))
+        apps_proxy_router_with_registry(
+            AppsRegistry::new(vec![AppEntry {
+                name: "omp-stats".to_owned(),
+                url: upstream_url,
+            }])
+            .with_api_key("secret"),
+        )
         .with_state(AppState::unready())
     }
 
@@ -305,6 +345,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/apps/omp-stats")
+                    .header("authorization", "Bearer secret")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -327,6 +368,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/apps/omp-stats/")
+                    .header("authorization", "Bearer secret")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -355,6 +397,7 @@ mod tests {
                     Request::builder()
                         .method(method.clone())
                         .uri("/apps/omp-stats/echo")
+                        .header("authorization", "Bearer secret")
                         .body(Body::empty())
                         .unwrap(),
                 )
@@ -376,6 +419,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/apps/nope/anything")
+                    .header("authorization", "Bearer secret")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -390,13 +434,14 @@ mod tests {
 
     #[tokio::test]
     async fn empty_registry_is_not_found() {
-        let app = apps_proxy_router_with_registry(AppsRegistry::default())
+        let app = apps_proxy_router_with_registry(AppsRegistry::default().with_api_key("secret"))
             .with_state(AppState::unready());
 
         let response = app
             .oneshot(
                 Request::builder()
                     .uri("/apps/omp-stats/anything")
+                    .header("authorization", "Bearer secret")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -421,6 +466,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/apps/omp-stats/anything")
+                    .header("authorization", "Bearer secret")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -430,6 +476,25 @@ mod tests {
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
         let body = json_body(response).await;
         assert_eq!(body["ok"], false);
+    }
+
+    #[tokio::test]
+    async fn rejects_missing_or_invalid_proxy_credentials() {
+        let addr = spawn_stub_upstream().await;
+
+        for authorization in [None, Some("Bearer wrong")] {
+            let app = proxy_router(format!("http://{addr}"));
+            let mut request = Request::builder().uri("/apps/omp-stats/");
+            if let Some(value) = authorization {
+                request = request.header("authorization", value);
+            }
+            let response = app
+                .oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
     }
 
     #[test]

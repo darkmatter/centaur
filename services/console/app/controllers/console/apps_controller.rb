@@ -30,6 +30,7 @@ class Console::AppsController < ApplicationController
       body: request.raw_post.presence,
       content_type: request.content_type
     )
+    response.headers["Content-Security-Policy"] = "sandbox allow-scripts" if transcript_export?(params[:name], params[:path].to_s)
     send_data upstream.body.to_s,
               type: upstream.content_type.presence || "application/octet-stream",
               disposition: "inline",
@@ -44,11 +45,15 @@ class Console::AppsController < ApplicationController
     return false if decoded_path.include?("\\")
     return false if decoded_path.split("/").any? { |segment| segment == "." || segment == ".." }
 
-    export_path = decoded_path == "export" || decoded_path.start_with?("export/")
-    return true unless name == "omp-stats" && export_path
+    return true unless name == "omp-stats"
+    return acting_admin? unless transcript_export?(name, decoded_path)
 
     match = decoded_path.match(%r{\Aexport/([^/]+)/?\z})
     match && console_thread_readable?(match[1])
+  end
+
+  def transcript_export?(name, decoded_path)
+    name == "omp-stats" && (decoded_path == "export" || decoded_path.start_with?("export/"))
   end
 
   # Preserve the raw path when forwarding so percent-encoded thread keys keep

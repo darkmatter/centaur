@@ -11,6 +11,8 @@ firewall:
   existingCaKeySecretName: test-ca-key
 agentSandbox:
   enabled: false
+console:
+  enabled: true
 apps:
   - name: omp-stats
     image: example.invalid/omp-stats:test
@@ -37,4 +39,27 @@ printf '%s\n' "$rendered" | yq -e '
   .spec.egress[] |
   select(.to[].podSelector.matchLabels."app.kubernetes.io/component" == "app-omp-stats") |
   select(.ports[].protocol == "TCP" and .ports[].port == 8080)
+' >/dev/null
+
+printf '%s\n' "$rendered" | yq -e '
+  select(.kind == "Deployment" and .metadata.name == "test-centaur-api-rs") |
+  .spec.template.spec.containers[] |
+  select(.name == "api-rs") |
+  .env[] |
+  select(.name == "CENTAUR_APP_PROXY_API_KEY") |
+  select(
+    .valueFrom.secretKeyRef.name == "test-infra" and
+    .valueFrom.secretKeyRef.key == "IRON_CONTROL_INITIAL_API_KEY"
+  )
+' >/dev/null
+printf '%s\n' "$rendered" | yq -e '
+  select(.kind == "Deployment" and .metadata.labels."app.kubernetes.io/component" == "console") |
+  .spec.template.spec.containers[] |
+  select(.name == "console") |
+  .env[] |
+  select(.name == "CENTAUR_CONSOLE_APP_PROXY_API_KEY") |
+  select(
+    .valueFrom.secretKeyRef.name == "test-infra" and
+    .valueFrom.secretKeyRef.key == "IRON_CONTROL_INITIAL_API_KEY"
+  )
 ' >/dev/null

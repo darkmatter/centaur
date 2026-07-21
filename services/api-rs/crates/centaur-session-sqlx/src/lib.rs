@@ -1247,6 +1247,7 @@ impl PgSessionStore {
                 where thread_key = $1
                   and owner_id = $2
                   and generation = $3
+                  and lease_expires_at > now()
             )
             "#,
         )

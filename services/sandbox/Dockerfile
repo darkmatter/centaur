@@ -67,7 +67,16 @@ RUN useradd -m -s /bin/bash -u 1001 agent \
 ARG CLAUDE_CODE_VERSION=2.1.154
 ARG CODEX_VERSION=0.144.0
 ARG PI_CODING_AGENT_VERSION=0.67.2
-ARG OMP_VERSION=16.3.5
+ARG OMP_VERSION=17.0.5
+# Immutable fork release of @oh-my-pi/pi-coding-agent carrying native RPC
+# collaboration controls (collab_start/status/stop) on top of upstream v17.0.5.
+# Published at czxtm/oh-my-pi (fork of can1357/oh-my-pi); the upstream PR was
+# auto-closed because @czxtm is not vouched, so the sandbox pins the fork
+# release asset directly with SHA-256 verification rather than the npm registry.
+ARG OMP_RELEASE_TAG=v17.0.5-centaur.1
+ARG OMP_RELEASE_ASSET=https://github.com/czxtm/oh-my-pi/releases/download/${OMP_RELEASE_TAG}/oh-my-pi-pi-coding-agent-17.0.5.tgz
+ARG OMP_RELEASE_SHA256=8e19613db2b1427d22c8d661ccf9c6bc259c2426ea7c0485e340a4508f23136a
+ARG OMP_SOURCE_COMMIT=e88f1a8da324de76d3932b0c9a8141b6f32f0b2d
 ARG NUSHELL_VERSION=0.112.2
 ARG KUBECTL_VERSION=v1.34.2
 ARG KACHE_VERSION=v0.7.0
@@ -113,13 +122,25 @@ RUN --mount=type=cache,target=/root/.npm,sharing=locked \
       "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
       "@openai/codex@${CODEX_VERSION}" \
       "@mariozechner/pi-coding-agent@${PI_CODING_AGENT_VERSION}" \
-      "@oh-my-pi/pi-coding-agent@${OMP_VERSION}" \
       "pnpm@${PNPM_VERSION}" \
       agent-browser@0.26.0 \
     && find /usr/lib/node_modules -type f \( -name '*.map' -o -name '*.tsbuildinfo' \) -delete \
     && claude --version | grep -F "${CLAUDE_CODE_VERSION}" \
     && codex --version | grep -F "${CODEX_VERSION}" \
     && pnpm --version | grep -F "${PNPM_VERSION}"
+
+# ── omp: immutable fork release asset (checksum-verified) ───────────────────
+# Downloads the czxtm/oh-my-pi fork release tarball, verifies its SHA-256
+# against the pinned digest, and installs it globally from the local file.
+# This pins an exact immutable artifact (not a mutable npm registry version)
+# carrying the native RPC collaboration controls on top of upstream v17.0.5.
+RUN --mount=type=cache,target=/root/.npm,sharing=locked \
+    set -eux; \
+    curl -fsSL "${OMP_RELEASE_ASSET}" -o /tmp/omp-fork.tgz; \
+    echo "${OMP_RELEASE_SHA256}  /tmp/omp-fork.tgz" | sha256sum -c -; \
+    npm install -g --prefer-online --force /tmp/omp-fork.tgz; \
+    rm -f /tmp/omp-fork.tgz; \
+    find /usr/lib/node_modules/@oh-my-pi/pi-coding-agent -type f \( -name '*.map' -o -name '*.tsbuildinfo' \) -delete
 
 # ── agent-browser system deps (must run as root before USER agent) ───────────
 # Chrome for Testing doesn't provide Linux ARM64 builds; fall back to system chromium

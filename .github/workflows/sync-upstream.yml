@@ -4,6 +4,9 @@ name: sync upstream
 # rewriting main. The workflow opens/updates a PR from `sync/upstream-main`
 # whenever upstream/main advances. Conflicts fail the run so a human can resolve
 # them explicitly in the PR branch instead of silently dropping fork changes.
+#
+# Auto-merge, CI watching, GitOps pin bumps, and Slack live in the overlay
+# workflow `upstream_sync` — this Action is the mechanical merge primitive only.
 on:
   schedule:
     - cron: "17 10 * * 1-5"
@@ -37,33 +40,73 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git remote add upstream https://github.com/paradigmxyz/centaur.git
           git fetch upstream main
+          git fetch origin main
 
           if git merge-base --is-ancestor upstream/main origin/main; then
             echo "changed=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
+          UPSTREAM_SHA=$(git rev-parse upstream/main)
+          BASE_SHA=$(git rev-parse origin/main)
+          SHORT_LOG=$(git log --oneline --no-merges "${BASE_SHA}..upstream/main" | head -40 || true)
+          COMMIT_COUNT=$(git rev-list --count "${BASE_SHA}..upstream/main")
+
           git switch -C sync/upstream-main origin/main
           git merge --no-edit upstream/main
+          HEAD_SHA=$(git rev-parse HEAD)
           git push --force-with-lease origin sync/upstream-main
           echo "changed=true" >> "$GITHUB_OUTPUT"
+          echo "head_sha=${HEAD_SHA}" >> "$GITHUB_OUTPUT"
+          echo "upstream_sha=${UPSTREAM_SHA}" >> "$GITHUB_OUTPUT"
+          echo "base_sha=${BASE_SHA}" >> "$GITHUB_OUTPUT"
+
+          BODY=$(cat <<EOF
+          <!-- centaur:upstream-sync -->
+          Merge latest \`paradigmxyz/centaur\` main into the Darkmatter product fork.
+
+          | | |
+          |---|---|
+          | upstream tip | \`${UPSTREAM_SHA}\` |
+          | previous main | \`${BASE_SHA}\` |
+          | sync head | \`${HEAD_SHA}\` |
+          | commits | ${COMMIT_COUNT} |
+
+          ### Upstream commits (first 40)
+          \`\`\`
+          ${SHORT_LOG}
+          \`\`\`
+
+          **Do not squash-merge this PR.** Use a merge commit so upstream ancestry stays intact for the next \`merge-base --is-ancestor\` check.
+
+          Conflicts fail this Action so a human resolves them on \`sync/upstream-main\`. The overlay \`upstream_sync\` workflow watches CI and auto-merges only when clean (\`gh pr merge --merge --match-head-commit\`).
+          EOF
+          )
 
           if gh pr view sync/upstream-main --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh pr edit sync/upstream-main --repo "$GITHUB_REPOSITORY" \
               --title "sync: merge upstream main" \
-              --body "Merge latest paradigmxyz/centaur main into the Darkmatter product fork. Resolve conflicts here; do not rewrite main."
+              --body "$BODY"
+            gh pr edit sync/upstream-main --repo "$GITHUB_REPOSITORY" \
+              --add-label "upstream-sync" 2>/dev/null || true
           else
             gh pr create --repo "$GITHUB_REPOSITORY" \
               --base main \
               --head sync/upstream-main \
               --title "sync: merge upstream main" \
-              --body "Merge latest paradigmxyz/centaur main into the Darkmatter product fork. Resolve conflicts here; do not rewrite main."
+              --label "upstream-sync" \
+              --body "$BODY" 2>/dev/null \
+            || gh pr create --repo "$GITHUB_REPOSITORY" \
+              --base main \
+              --head sync/upstream-main \
+              --title "sync: merge upstream main" \
+              --body "$BODY"
           fi
 
       - name: Summary
         run: |
           if [ "${{ steps.merge.outputs.changed }}" = "true" ]; then
-            echo "Opened or updated sync/upstream-main PR."
+            echo "Opened or updated sync/upstream-main PR @ ${{ steps.merge.outputs.head_sha }}."
           else
             echo "Already contains upstream/main."
           fi

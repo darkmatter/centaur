@@ -1,8 +1,9 @@
 name: darkmatter images
 
-# Build + push the darkmatter Centaur images (api-rs control plane, the omp
-# sandbox agent, and the console) in CI — never locally, so deployed images
-# always match the committed source. Runs on the darkmatter fork only.
+# Build + push every darkmatter Centaur image that GitOps pins by product SHA
+# (api-rs, agent, console, slackbotv2, collab-relay). Never build these
+# locally — deployed tags must match committed source. Darkmatter fork only.
+# (publish-images.yml is upstream-oriented and skips owner=darkmatter.)
 on:
   push:
     branches: [main]
@@ -16,6 +17,11 @@ on:
       - "workflows/**"
       - "services/console/**"
       - "services/collab-relay/**"
+      - "services/slackbotv2/**"
+      - "packages/**"
+      - "package.json"
+      - "pnpm-lock.yaml"
+      - "pnpm-workspace.yaml"
       - ".github/workflows/darkmatter-images.yml"
   workflow_dispatch: {}
 
@@ -115,6 +121,36 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha,scope=console
           cache-to: type=gha,mode=max,scope=console
+
+  slackbotv2:
+    if: github.repository_owner == 'darkmatter'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/centaur-slackbotv2
+          tags: |
+            type=sha,format=long
+            type=raw,value=latest,enable={{is_default_branch}}
+      - uses: docker/build-push-action@v6
+        with:
+          # Workspace root: Dockerfile copies packages/, pnpm workspace, harness.
+          context: .
+          file: services/slackbotv2/Dockerfile
+          platforms: linux/amd64 # k3s nodes
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=slackbotv2
+          cache-to: type=gha,mode=max,scope=slackbotv2
 
   collab-relay:
     if: github.repository_owner == 'darkmatter'

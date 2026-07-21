@@ -8014,8 +8014,8 @@ mod tests {
         // preserve them. or_insert_with would let the client values survive;
         // insert replaces them.
         let thread_key = ThreadKey::parse("chat:C123:1780000000.000000").unwrap();
-        let trace = SessionTraceContext::new(&thread_key, None)
-            .with_ownership("api-rs-trusted", 42);
+        let trace =
+            SessionTraceContext::new(&thread_key, None).with_ownership("api-rs-trusted", 42);
 
         // Client supplies malicious ownership in trace_metadata.
         let line = input_line_with_session_context(

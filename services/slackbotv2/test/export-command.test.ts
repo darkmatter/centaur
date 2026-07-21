@@ -1,17 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 import { exportLinkForThread, isSlackExportCommand } from '../src/export-command'
-import { buildSlackbotV2Options } from '../src/options'
 import { handleExportCommand } from '../src/index'
-import type { Logger } from 'chat'
-
-// Minimal logger stub: the builder wires warnings through it; tests stay quiet.
-const silentLogger: Logger = {
-  debug: () => {},
-  info: () => {},
-  warn: () => {},
-  error: () => {},
-  child: () => silentLogger
-}
 
 
 describe('Slack export command detection', () => {
@@ -47,37 +36,20 @@ describe('Slack export command detection', () => {
 
 describe('export link construction', () => {
   test('percent-encodes the thread key and trims trailing slash', () => {
-    expect(exportLinkForThread('https://console.example.test/', 'slack:C123:1721400000.000100')).toBe(
-      'https://console.example.test/console/apps/omp-stats/export/slack%3AC123%3A1721400000.000100'
+    expect(exportLinkForThread('https://omp-viewer.example.ts.net/', 'slack:C123:1721400000.000100')).toBe(
+      'https://omp-viewer.example.ts.net/export/slack%3AC123%3A1721400000.000100'
     )
   })
 
   test('leaves a slashless base untouched', () => {
-    expect(exportLinkForThread('https://console.example.test', 'T1')).toBe(
-      'https://console.example.test/console/apps/omp-stats/export/T1'
+    expect(exportLinkForThread('https://omp-viewer.example.ts.net', 'T1')).toBe(
+      'https://omp-viewer.example.ts.net/export/T1'
     )
   })
 })
 
-describe('env → options → handler contract', () => {
-  // The chart (slackbotv2.yaml) supplies CENTAUR_CONSOLE_PUBLIC_URL and
-  // buildSlackbotV2Options maps it verbatim onto options.consolePublicUrl.
-  // handleExportCommand guards on that same field. This test exercises the
-  // SAME mapping and handler production uses — a regression that re-introduces
-  // a parallel env (e.g. CONSOLE_BASE_URL, which the chart never populates)
-  // would fail here: the builder would not set consolePublicUrl from it, the
-  // handler guard would fall through, and no link would be posted.
-  const baseEnvs = {
-    SLACK_BOT_TOKEN: 'xoxb-test',
-    SLACK_SIGNING_SECRET: 'shss-test'
-  }
-
-  test('CENTAUR_CONSOLE_PUBLIC_URL flows through the real builder and handler to the posted link', async () => {
-    const env = { ...baseEnvs, CENTAUR_CONSOLE_PUBLIC_URL: 'https://console.example.test/' }
-    const options = buildSlackbotV2Options(env, silentLogger)
-    expect(options.consolePublicUrl).toBe('https://console.example.test/')
-    // handleExportCommand reads message.text, thread.id/post, and clears any
-    // stale assistant status before posting the link.
+describe('viewer handoff', () => {
+  test('posts the direct viewer link without starting an agent turn', async () => {
     const posted: string[] = []
     const statuses: string[] = []
     const thread = {
@@ -89,33 +61,36 @@ describe('env → options → handler contract', () => {
       },
       post: async (text: string) => {
         posted.push(text)
-        return undefined
       }
     } as never
-    const message = { text: 'please export this thread' } as never
-    const handled = await handleExportCommand(thread, message, options, 'test')
+    const handled = await handleExportCommand(
+      thread,
+      { text: 'please export this thread' } as never,
+      { ompViewerUrl: 'https://omp-viewer.example.ts.net/' } as never,
+      'test'
+    )
     expect(handled).toBe(true)
     expect(statuses).toEqual([''])
-    expect(posted).toHaveLength(1)
-    expect(posted[0]).toBe(
-      'Transcript export: https://console.example.test/console/apps/omp-stats/export/slack%3AC123%3A1721400000.000100'
-    )
+    expect(posted).toEqual([
+      'Transcript export: https://omp-viewer.example.ts.net/export/slack%3AC123%3A1721400000.000100'
+    ])
   })
 
-  test('falls through (returns false, posts nothing) when CENTAUR_CONSOLE_PUBLIC_URL is unset', async () => {
-    const options = buildSlackbotV2Options(baseEnvs, silentLogger)
-    expect(options.consolePublicUrl).toBeUndefined()
+  test('falls through when the viewer URL is unset', async () => {
     const posted: string[] = []
-    const thread = { id: 'slack:C1:1', post: async (text: string) => { posted.push(text); return undefined } } as never
-    const message = { text: 'export' } as never
-    const handled = await handleExportCommand(thread, message, options, 'test')
+    const thread = {
+      id: 'slack:C1:1',
+      post: async (text: string) => {
+        posted.push(text)
+      }
+    } as never
+    const handled = await handleExportCommand(
+      thread,
+      { text: 'export' } as never,
+      {} as never,
+      'test'
+    )
     expect(handled).toBe(false)
-    expect(posted).toHaveLength(0)
-  })
-
-  test('a parallel CONSOLE_BASE_URL env does NOT populate consolePublicUrl (regression guard)', () => {
-    const env = { ...baseEnvs, CONSOLE_BASE_URL: 'https://evil.example.test/' }
-    const options = buildSlackbotV2Options(env, silentLogger)
-    expect(options.consolePublicUrl).toBeUndefined()
+    expect(posted).toEqual([])
   })
 })

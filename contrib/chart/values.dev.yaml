@@ -51,13 +51,3 @@ sandbox:
 # production sandbox topology.
 toolServer:
   enabled: true
-
-# App-plane example (see the `apps` block in values.yaml for all fields):
-# apps:
-#   - name: omp-stats
-#     image: centaur-omp-stats:latest
-#     imagePullPolicy: IfNotPresent
-#     port: 8080
-#     persistence:
-#       enabled: true
-#       size: 5Gi

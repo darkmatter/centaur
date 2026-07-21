@@ -160,11 +160,12 @@ export type SlackbotV2Options = {
   /**
    * Public origin of the Console UI (same value the Console itself uses,
    * `CENTAUR_CONSOLE_PUBLIC_URL`). When set, the first assistant message in a
-   * Slack thread gets an "Open chat in Console" context link AND the Slack
-   * "export this thread" reply deep-link into the omp-stats app is built from
-   * it. Unset skips both behaviors.
+   * Slack thread gets an "Open chat in Console" context link. Unset skips
+   * the block entirely.
    */
   consolePublicUrl?: string
+  /** Tailnet-only OMP viewer origin. Unset leaves export requests to the agent. */
+  ompViewerUrl?: string
   /**
    * Per-channel default harness/model/provider/reasoning, keyed by Slack
    * conversation id (SLACKBOTV2_CHANNEL_DEFAULTS). See channel-defaults.ts.

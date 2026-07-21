@@ -36,6 +36,25 @@ class Console::ThreadsControllerTest < ActionDispatch::IntegrationTest
     assert_select ".console-thread-group-title", text: /Chats/
   end
 
+  test "viewer URL adds a direct tailnet Usage link" do
+    with_env("CENTAUR_OMP_VIEWER_URL" => "https://omp-viewer.example.ts.net/") do
+      with_recent_first_error { get console_threads_url }
+    end
+
+    assert_response :ok
+    assert_select "a.console-nav-link[href=?]", "https://omp-viewer.example.ts.net/", text: /Usage/
+  end
+
+  test "viewer export URL percent-encodes the durable thread key" do
+    with_env("CENTAUR_OMP_VIEWER_URL" => "https://omp-viewer.example.ts.net/") do
+      controller = ApplicationController.new
+      assert_equal(
+        "https://omp-viewer.example.ts.net/export/slack%3AC123%3A1234.5000",
+        controller.omp_viewer_export_url("slack:C123:1234.5000")
+      )
+    end
+  end
+
   test "threads page falls back to the new chat screen when session database is unavailable" do
     with_recent_first_error do
       get console_threads_url

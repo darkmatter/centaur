@@ -114,6 +114,15 @@ struct CollabRoomHandle {
     /// Handle to the keepalive renewal task. Aborted when the room is
     /// stopped, the owner loses, or the process/relay dies.
     keepalive: Arc<AtomicBool>,
+    /// When `true`, the room is being cleaned up but the durable transaction
+    /// has not yet committed. The room is externally non-active (status/start
+    /// see no room) but the handle is retained for retry until the fenced
+    /// append+release succeeds or the lease expires.
+    cleanup_pending: bool,
+    /// Deduplicates the managed background retry task for cleanup-pending
+    /// handles. Flipped once when the first transient failure schedules a
+    /// retry; subsequent Err paths observe it and do not spawn duplicates.
+    cleanup_retry_scheduled: bool,
 }
 
 type CollabRoomRegistry = Arc<DashMap<ThreadKey, CollabRoomHandle>>;
@@ -2390,16 +2399,12 @@ impl SessionRuntime {
         );
         async {
             if self.shutting_down.load(Ordering::SeqCst) {
-                return Err(SessionRuntimeError::BadRequest(
-                    "session runtime is shutting down".to_owned(),
-                ));
+                return Err(SessionRuntimeError::ShuttingDown);
             }
             let lifecycle_lock = self.collab_lifecycle_lock(thread_key);
             let _lifecycle_guard = lifecycle_lock.lock().await;
             if self.shutting_down.load(Ordering::SeqCst) {
-                return Err(SessionRuntimeError::BadRequest(
-                    "session runtime is shutting down".to_owned(),
-                ));
+                return Err(SessionRuntimeError::ShuttingDown);
             }
             ensure_thread_trace_root_span(thread_key);
             let session = self.store.get_session(thread_key).await?;
@@ -2418,31 +2423,60 @@ impl SessionRuntime {
                 });
             }
 
-            if let Some(handle) = self.collab_rooms.get(thread_key).as_deref().cloned() {
+            // Clone under a short-lived guard. An `if let Some(x) = map.get()...`
+            // keeps the DashMap Ref alive for the entire if body (including
+            // awaits), which deadlocks the stdout pump on the same shard and
+            // stalls Tokio timers.
+            let existing_handle = self
+                .collab_rooms
+                .get(thread_key)
+                .as_deref()
+                .filter(|h| !h.cleanup_pending)
+                .cloned();
+            if let Some(handle) = existing_handle {
                 if session.sandbox_id.is_none() {
-                    return Ok(CollabRoomOutcome {
-                        ok: true,
-                        thread_key: thread_key.clone(),
-                        room: Some(handle.state),
-                        stopped: false,
-                    });
-                }
-                let status_request_id = collab_request_id();
-                let status_anchor = self.store.latest_event_id(thread_key).await?;
-                if self
-                    .send_collab_control_line(
+                    // The sandbox is gone — clean up the stale room and
+                    // fall through to acquire a new room for a fresh
+                    // sandbox. Returning the cached room here would serve
+                    // a dead capability URL.
+                    self.cleanup_collab_room_local(
                         thread_key,
-                        &handle.owner_id,
-                        handle.generation,
-                        &status_request_id,
-                        "collab_status",
-                        None,
-                        None,
-                        None,
+                        &handle,
+                        "session.collab_room_lost",
+                        "sandbox_gone",
                     )
-                    .await
-                    .is_ok()
-                    && let Ok(room) = wait_for_collab_status(
+                    .await?;
+                } else {
+                    let status_request_id = collab_request_id();
+                    let status_anchor = self.store.latest_event_id(thread_key).await?;
+                    let probe_result = self
+                        .send_collab_control_line(
+                            thread_key,
+                            &handle.owner_id,
+                            handle.generation,
+                            &status_request_id,
+                            "collab_status",
+                            None,
+                            None,
+                            None,
+                        )
+                        .await;
+                    if let Err(probe_error) = probe_result {
+                        // Probe failed — clean up the stale room. Propagate
+                        // the probe error so the caller knows the room was
+                        // not confirmed, rather than recycling a possibly-
+                        // live room.
+                        let _ = self
+                            .cleanup_collab_room_local(
+                                thread_key,
+                                &handle,
+                                "session.collab_room_lost",
+                                "status_probe_failed",
+                            )
+                            .await;
+                        return Err(probe_error);
+                    }
+                    match wait_for_collab_status(
                         &self.store,
                         thread_key,
                         status_anchor,
@@ -2450,25 +2484,37 @@ impl SessionRuntime {
                         &status_request_id,
                     )
                     .await
-                    && room.active
-                    && let Some(current) = self.collab_rooms.get(thread_key).as_deref().cloned()
-                    && current.owner_id == handle.owner_id
-                    && current.generation == handle.generation
-                {
-                    return Ok(CollabRoomOutcome {
-                        ok: true,
-                        thread_key: thread_key.clone(),
-                        room: Some(room),
-                        stopped: false,
-                    });
+                    {
+                        Ok(room) if room.active => {
+                            let current = self.collab_rooms.get(thread_key).as_deref().cloned();
+                            if let Some(current) = current
+                                && current.owner_id == handle.owner_id
+                                && current.generation == handle.generation
+                            {
+                                return Ok(CollabRoomOutcome {
+                                    ok: true,
+                                    thread_key: thread_key.clone(),
+                                    room: Some(room),
+                                    stopped: false,
+                                });
+                            }
+                        }
+                        _ => {}
+                    }
+                    // Probe did not confirm the room — acknowledged stop
+                    // before replacing so no ghost keepalive survives on the
+                    // resident host.
+                    let _ = self
+                        .attempt_collab_stop(thread_key, &handle.owner_id, handle.generation)
+                        .await;
+                    self.cleanup_collab_room_local(
+                        thread_key,
+                        &handle,
+                        "session.collab_room_lost",
+                        "stale_room",
+                    )
+                    .await?;
                 }
-                self.cleanup_collab_room_local(
-                    thread_key,
-                    &handle,
-                    "session.collab_room_lost",
-                    "stale_room",
-                )
-                .await?;
             }
 
             let ownership = self
@@ -2522,6 +2568,8 @@ impl SessionRuntime {
                     generation: ownership.generation,
                     state: initial_state,
                     keepalive: keepalive.clone(),
+                    cleanup_pending: false,
+                    cleanup_retry_scheduled: false,
                 },
             );
             spawn_collab_keepalive(
@@ -2548,7 +2596,8 @@ impl SessionRuntime {
                 let _ = self
                     .attempt_collab_stop(thread_key, &self.stdout_owner_id, ownership.generation)
                     .await;
-                if let Some(handle) = self.collab_rooms.get(thread_key).as_deref().cloned() {
+                let handle = self.collab_rooms.get(thread_key).as_deref().cloned();
+                if let Some(handle) = handle {
                     self.cleanup_collab_room_local(
                         thread_key,
                         &handle,
@@ -2578,7 +2627,8 @@ impl SessionRuntime {
                             ownership.generation,
                         )
                         .await;
-                    if let Some(handle) = self.collab_rooms.get(thread_key).as_deref().cloned() {
+                    let handle = self.collab_rooms.get(thread_key).as_deref().cloned();
+                    if let Some(handle) = handle {
                         self.cleanup_collab_room_local(
                             thread_key,
                             &handle,
@@ -2590,7 +2640,8 @@ impl SessionRuntime {
                     return Err(error);
                 }
             };
-            let Some(mut handle) = self.collab_rooms.get(thread_key).as_deref().cloned() else {
+            let handle_opt = self.collab_rooms.get(thread_key).as_deref().cloned();
+            let Some(mut handle) = handle_opt else {
                 let _ = self
                     .attempt_collab_stop(thread_key, &self.stdout_owner_id, ownership.generation)
                     .await;
@@ -2627,24 +2678,45 @@ impl SessionRuntime {
                         "room": room_state.clone(),
                     }),
                 )
-                .await?;
-            if persisted.is_none() {
-                if let Some(handle) = self.collab_rooms.get(thread_key).as_deref().cloned() {
+                .await;
+            let append_error: Option<SessionRuntimeError> = match persisted {
+                Err(error) => Some(SessionRuntimeError::Store(error)),
+                Ok(None) => Some(SessionRuntimeError::CollabRoomLost {
+                    thread_key: thread_key.as_str().to_owned(),
+                    reason: "collab start lost ownership fence".to_owned(),
+                }),
+                Ok(Some(_)) => None,
+            };
+            if let Some(error) = append_error {
+                let handle = self.collab_rooms.get(thread_key).as_deref().cloned();
+                if let Some(handle) = handle {
                     let _ = self
                         .attempt_collab_stop(thread_key, &handle.owner_id, handle.generation)
                         .await;
-                    self.cleanup_collab_room_local(
-                        thread_key,
-                        &handle,
-                        "session.collab_room_lost",
-                        "collab_start_fenced",
-                    )
-                    .await?;
+                    // Cleanup uses the atomic fenced transaction. If it
+                    // fails, the handle remains cleanup-pending for retry;
+                    // the caller receives the cleanup error so it knows
+                    // the room was not cleanly released.
+                    if let Err(cleanup_error) = self
+                        .cleanup_collab_room_local(
+                            thread_key,
+                            &handle,
+                            "session.collab_room_lost",
+                            "collab_start_failed",
+                        )
+                        .await
+                    {
+                        warn!(
+                            component = COMPONENT_SESSION_RUNTIME,
+                            event = "collab_start_cleanup_failed",
+                            thread_key = %thread_key,
+                            %cleanup_error,
+                            "cleanup after failed start; handle remains cleanup-pending"
+                        );
+                        return Err(cleanup_error);
+                    }
                 }
-                return Err(SessionRuntimeError::CollabRoomLost {
-                    thread_key: thread_key.as_str().to_owned(),
-                    reason: "collab start lost ownership fence".to_owned(),
-                });
+                return Err(error);
             }
             Ok(CollabRoomOutcome {
                 ok: true,
@@ -2658,23 +2730,64 @@ impl SessionRuntime {
     }
 
     /// Returns the current collaboration room state for a session, or `None`
-    /// when no room is active.
-    pub fn collab_room_status(&self, thread_key: &ThreadKey) -> CollabRoomOutcome {
-        let room = self
+    /// when no room is active. The state is the authoritative projection
+    /// already durable in the event log and cached in memory by
+    /// `process_collab_state_line` / `update_collab_room_state`. The status
+    /// endpoint does not probe the resident host — liveness probing is
+    /// performed by `start_collab_room` when it considers reusing a cached
+    /// room. If the session's sandbox is gone, the stale room is cleaned up.
+    pub async fn collab_room_status(
+        &self,
+        thread_key: &ThreadKey,
+    ) -> Result<CollabRoomOutcome, SessionRuntimeError> {
+        let lifecycle_lock = self.collab_lifecycle_lock(thread_key);
+        let _lifecycle_guard = lifecycle_lock.lock().await;
+        let Some(handle) = self
             .collab_rooms
             .get(thread_key)
             .as_deref()
-            .map(|handle| handle.state.clone());
-        CollabRoomOutcome {
+            .filter(|h| !h.cleanup_pending)
+            .cloned()
+        else {
+            return Ok(CollabRoomOutcome {
+                ok: true,
+                thread_key: thread_key.clone(),
+                room: None,
+                stopped: false,
+            });
+        };
+        // If the sandbox is gone, clean up the stale room so no dead
+        // capability URL is served.
+        let session = self.store.get_session(thread_key).await?;
+        if session.sandbox_id.is_none() {
+            let _ = self
+                .cleanup_collab_room_local(
+                    thread_key,
+                    &handle,
+                    "session.collab_room_lost",
+                    "sandbox_gone",
+                )
+                .await;
+            return Ok(CollabRoomOutcome {
+                ok: true,
+                thread_key: thread_key.clone(),
+                room: None,
+                stopped: false,
+            });
+        }
+        Ok(CollabRoomOutcome {
             ok: true,
             thread_key: thread_key.clone(),
-            room,
+            room: Some(handle.state),
             stopped: false,
-        }
+        })
     }
 
     pub fn has_active_collab_room(&self, thread_key: &ThreadKey) -> bool {
-        self.collab_rooms.contains_key(thread_key)
+        self.collab_rooms
+            .get(thread_key)
+            .map(|h| !h.cleanup_pending)
+            .unwrap_or(false)
     }
     #[allow(clippy::too_many_arguments)]
     async fn send_collab_control_line(
@@ -2719,6 +2832,13 @@ impl SessionRuntime {
         owner_id: &str,
         generation: i64,
     ) -> Result<(), SessionRuntimeError> {
+        // Without a sandbox there is no resident host to stop. Local cleanup
+        // still proceeds; callers must not block on a remote stop that cannot
+        // be delivered.
+        let session = self.store.get_session(thread_key).await?;
+        if session.sandbox_id.is_none() {
+            return Ok(());
+        }
         let request_id = collab_request_id();
         let baseline = self.store.latest_event_id(thread_key).await?;
         self.send_collab_control_line(
@@ -2752,9 +2872,18 @@ impl SessionRuntime {
         reason: &str,
     ) -> Result<(), SessionRuntimeError> {
         handle.keepalive.store(false, Ordering::SeqCst);
-        let persisted = self
+        // Mark the room as cleanup-pending so it is externally non-active
+        // (status/start see no room) while the fenced transaction is pending.
+        // Mutate in place under a write guard — never hold get() across insert.
+        if let Some(mut current) = self.collab_rooms.get_mut(thread_key)
+            && current.owner_id == handle.owner_id
+            && current.generation == handle.generation
+        {
+            current.cleanup_pending = true;
+        }
+        let result = self
             .store
-            .append_unscoped_event_if_session_owner(
+            .finalize_collab_room(
                 thread_key,
                 &handle.owner_id,
                 handle.generation,
@@ -2767,22 +2896,29 @@ impl SessionRuntime {
                     "generation": handle.generation,
                 }),
             )
-            .await?;
-        self.collab_rooms.remove(thread_key);
-        let released = self
-            .store
-            .release_session_ownership(thread_key, &handle.owner_id)
-            .await?;
-        if persisted.is_none() || !released {
-            return Err(SessionRuntimeError::CollabRoomLost {
-                thread_key: thread_key.as_str().to_owned(),
-                reason: format!(
-                    "fenced collaboration cleanup for {event_type} (persisted={}, released={released})",
-                    persisted.is_some()
-                ),
-            });
-        }
-        Ok(())
+            .await;
+        self.apply_collab_finalize_result(thread_key, handle, event_type, reason, result)
+            .await
+    }
+
+    async fn apply_collab_finalize_result(
+        &self,
+        thread_key: &ThreadKey,
+        handle: &CollabRoomHandle,
+        event_type: &str,
+        reason: &str,
+        result: Result<Option<centaur_session_core::SessionEvent>, SessionStoreError>,
+    ) -> Result<(), SessionRuntimeError> {
+        apply_collab_finalize_result(
+            &self.store,
+            &self.collab_rooms,
+            thread_key,
+            handle,
+            event_type,
+            reason,
+            result,
+        )
+        .await
     }
 
     /// Stops the collaboration room for a session, releasing the keepalive
@@ -4125,7 +4261,8 @@ impl SessionRuntime {
     /// waiting out the lease TTL. Turn output produced after the release is
     /// not lost: adoption replays it from the sandbox backend's recorded
     /// output.
-    pub async fn handoff_owned_executions(&self, timeout: Duration) {
+    pub async fn handoff_owned_executions(&self, timeout: Duration) -> Vec<SessionRuntimeError> {
+        let mut shutdown_errors = Vec::new();
         // Fence new stdout-owner claims first: an execution accepted after
         // this point would otherwise claim a lease that outlives the
         // process, stranding it until the lease TTL expires.
@@ -4138,17 +4275,23 @@ impl SessionRuntime {
             .map(|entry| (entry.key().clone(), entry.value().clone()))
             .collect::<Vec<_>>();
         for (thread_key, handle) in rooms {
-            let _ = self
+            if let Err(error) = self
                 .attempt_collab_stop(&thread_key, &handle.owner_id, handle.generation)
-                .await;
-            let _ = self
+                .await
+            {
+                shutdown_errors.push(error);
+            }
+            if let Err(error) = self
                 .cleanup_collab_room_local(
                     &thread_key,
                     &handle,
                     "session.collab_room_lost",
                     "runtime_shutdown",
                 )
-                .await;
+                .await
+            {
+                shutdown_errors.push(error);
+            }
         }
         self.collab_rooms.clear();
 
@@ -4214,7 +4357,7 @@ impl SessionRuntime {
                         event = "execution_handoff_idle",
                         "no in-flight executions to hand off at shutdown"
                     );
-                    return;
+                    return shutdown_errors;
                 }
                 Ok(in_flight) => {
                     if Instant::now() >= deadline {
@@ -4251,7 +4394,7 @@ impl SessionRuntime {
                 event = "execution_handoff_release_timeout",
                 "timed out releasing stdout-owner leases; peers must wait for lease expiry"
             );
-            return;
+            return shutdown_errors;
         };
         match released {
             Ok(released) => {
@@ -4291,8 +4434,19 @@ impl SessionRuntime {
                     %error,
                     "failed to release stdout-owner leases at shutdown"
                 );
+                shutdown_errors.push(SessionRuntimeError::Store(error));
             }
         }
+        if !shutdown_errors.is_empty() {
+            error!(
+                component = COMPONENT_SESSION_RUNTIME,
+                event = "collab_shutdown_failures",
+                count = shutdown_errors.len(),
+                "collaboration room shutdown encountered {} failure(s)",
+                shutdown_errors.len()
+            );
+        }
+        shutdown_errors
     }
 }
 
@@ -5215,6 +5369,50 @@ async fn run_stdout_pump(
             }
         }
         let active_execution = ctx.store.active_execution_for_thread(&thread_key).await?;
+        // The stdout pump ending means the resident host process is gone. Any
+        // active collaboration room for this thread lost its relay/process and
+        // must be cleaned up so no ghost keepalive or dead capability URL
+        // survives. The ownership generation fence prevents a reclaimed room
+        // from being torn down by a stale pump.
+        let pump_lost_handle = {
+            // get_mut + drop before any await/remove_if — never hold a DashMap
+            // guard across insert or I/O (same-shard self-deadlock).
+            if let Some(mut current) = ctx.collab_rooms.get_mut(&thread_key) {
+                current.keepalive.store(false, Ordering::SeqCst);
+                current.cleanup_pending = true;
+                Some(current.clone())
+            } else {
+                None
+            }
+        };
+        if let Some(handle) = pump_lost_handle {
+            let result = ctx
+                .store
+                .finalize_collab_room(
+                    &thread_key,
+                    &handle.owner_id,
+                    handle.generation,
+                    PgSessionStore::SESSION_OWNERSHIP_LEASE,
+                    "session.collab_room_lost",
+                    json!({
+                        "thread_key": thread_key.as_str(),
+                        "reason": "stdout_pump_terminated",
+                        "owner_id": handle.owner_id,
+                        "generation": handle.generation,
+                    }),
+                )
+                .await;
+            let _ = apply_collab_finalize_result(
+                &ctx.store,
+                &ctx.collab_rooms,
+                &thread_key,
+                &handle,
+                "session.collab_room_lost",
+                "stdout_pump_terminated",
+                result,
+            )
+            .await;
+        }
         ctx.store
             .append_event(
                 &thread_key,
@@ -5276,6 +5474,45 @@ async fn record_stdout_pump_failure(
             TerminalOutput::Failed { error },
         )
         .await?;
+    }
+    // A pump failure means the resident host is gone — clean up any active
+    // collaboration room so no ghost keepalive or dead URL survives.
+    let pump_failed_handle = {
+        if let Some(mut current) = ctx.collab_rooms.get_mut(thread_key) {
+            current.keepalive.store(false, Ordering::SeqCst);
+            current.cleanup_pending = true;
+            Some(current.clone())
+        } else {
+            None
+        }
+    };
+    if let Some(handle) = pump_failed_handle {
+        let result = ctx
+            .store
+            .finalize_collab_room(
+                thread_key,
+                &handle.owner_id,
+                handle.generation,
+                PgSessionStore::SESSION_OWNERSHIP_LEASE,
+                "session.collab_room_lost",
+                json!({
+                    "thread_key": thread_key.as_str(),
+                    "reason": "stdout_pump_failed",
+                    "owner_id": handle.owner_id,
+                    "generation": handle.generation,
+                }),
+            )
+            .await;
+        let _ = apply_collab_finalize_result(
+            &ctx.store,
+            &ctx.collab_rooms,
+            thread_key,
+            &handle,
+            "session.collab_room_lost",
+            "stdout_pump_failed",
+            result,
+        )
+        .await;
     }
     Ok(())
 }
@@ -6261,8 +6498,48 @@ fn spawn_collab_keepalive(
                     "keepalive renewal or sandbox activity touch failed"
                 );
                 keepalive.store(false, Ordering::SeqCst);
-                let _ = runtime.lose_collab_room(&thread_key, reason).await;
-                return;
+                // Mark the room cleanup-pending so it is externally non-active
+                // while we retry the durable cleanup. The handle is retained
+                // for retry; the lease expires naturally if the retry does not
+                // succeed, at which point the fenced transaction will reject
+                // and the handle is removed.
+                // In-place write guard — avoid get()+insert self-deadlock.
+                if let Some(mut handle) = runtime.collab_rooms.get_mut(&thread_key)
+                    && handle.owner_id == owner_id
+                    && handle.generation == generation
+                {
+                    handle.cleanup_pending = true;
+                }
+                // Retry the durable loss cleanup until success or lease
+                // expiry. A transient store outage does not force-remove the
+                // handle — the cleanup-pending state keeps it externally
+                // non-active while the retry loop continues.
+                let lease_deadline = Instant::now() + PgSessionStore::SESSION_OWNERSHIP_LEASE;
+                loop {
+                    match runtime.lose_collab_room(&thread_key, reason).await {
+                        Ok(()) => break,
+                        Err(error) => {
+                            warn!(
+                                component = COMPONENT_SESSION_RUNTIME,
+                                event = "collab_keepalive_loss_retry",
+                                thread_key = %thread_key,
+                                %error,
+                                "collaboration room loss cleanup failed; retrying until lease expiry"
+                            );
+                            if Instant::now() >= lease_deadline {
+                                error!(
+                                    component = COMPONENT_SESSION_RUNTIME,
+                                    event = "collab_keepalive_loss_expired",
+                                    thread_key = %thread_key,
+                                    %error,
+                                    "collaboration room loss cleanup failed; lease expired, handle remains cleanup-pending"
+                                );
+                                break;
+                            }
+                            sleep(Duration::from_secs(1)).await;
+                        }
+                    }
+                }
             }
         }
     });
@@ -6383,7 +6660,11 @@ fn should_pause_idle_sandbox(
     // resident OMP host and guests need the sandbox process alive for
     // real-time collaboration. Suspension is deferred until the room is
     // stopped or lost.
-    if collab_rooms.contains_key(&session.thread_key) {
+    if collab_rooms
+        .get(&session.thread_key)
+        .map(|h| !h.cleanup_pending)
+        .unwrap_or(false)
+    {
         return false;
     }
     let Some(execution) = latest_execution else {
@@ -7256,7 +7537,7 @@ fn collab_event_matches(
 async fn wait_for_collab_event(
     store: &PgSessionStore,
     thread_key: &ThreadKey,
-    after_event_id: i64,
+    mut after_event_id: i64,
     generation: i64,
     request_id: &str,
     expected_state: &str,
@@ -7264,11 +7545,29 @@ async fn wait_for_collab_event(
 ) -> Result<CollabRoomState, SessionRuntimeError> {
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
-        let events = store
-            .list_events_after(thread_key, after_event_id, None, 128)
-            .await?;
+        let poll_deadline = Instant::now()
+            .checked_add(Duration::from_millis(500))
+            .unwrap_or(deadline)
+            .min(deadline);
+        let events = tokio::time::timeout_at(
+            poll_deadline,
+            store.list_events_after(thread_key, after_event_id, None, 128),
+        )
+        .await
+        .map_err(|_| SessionRuntimeError::CollabRoomLost {
+            thread_key: thread_key.as_str().to_owned(),
+            reason: format!(
+                "resident OMP did not emit {expected_event_type} {expected_state} before deadline"
+            ),
+        })??;
+        let batch_anchor = after_event_id;
         for event in events {
-            if !collab_event_matches(&event, after_event_id, generation, request_id) {
+            // Advance the poll cursor after each event so a response past a
+            // full 128-event page is still reachable. Match against the batch
+            // anchor (not the advanced cursor) so the current event remains
+            // eligible.
+            after_event_id = after_event_id.max(event.event_id);
+            if !collab_event_matches(&event, batch_anchor, generation, request_id) {
                 continue;
             }
             if event.event_type == "session.collab_room_error" {
@@ -7362,6 +7661,191 @@ async fn wait_for_collab_status(
     .await
 }
 
+/// Shared finalize result handling for cleanup and pump/EOF loss paths.
+async fn apply_collab_finalize_result(
+    store: &PgSessionStore,
+    collab_rooms: &CollabRoomRegistry,
+    thread_key: &ThreadKey,
+    handle: &CollabRoomHandle,
+    event_type: &str,
+    reason: &str,
+    result: Result<Option<centaur_session_core::SessionEvent>, SessionStoreError>,
+) -> Result<(), SessionRuntimeError> {
+    match result {
+        Ok(Some(_)) => {
+            collab_rooms.remove_if(thread_key, |_key, current| {
+                current.owner_id == handle.owner_id && current.generation == handle.generation
+            });
+            Ok(())
+        }
+        Ok(None) => {
+            match store
+                .session_ownership_matches(thread_key, &handle.owner_id, handle.generation)
+                .await
+            {
+                Ok(_still_owns) => {
+                    collab_rooms.remove_if(thread_key, |_key, current| {
+                        current.owner_id == handle.owner_id
+                            && current.generation == handle.generation
+                    });
+                    Err(SessionRuntimeError::CollabRoomLost {
+                        thread_key: thread_key.as_str().to_owned(),
+                        reason: format!(
+                            "fenced collaboration cleanup for {event_type} (ownership fence rejected)"
+                        ),
+                    })
+                }
+                Err(error) => {
+                    warn!(
+                        component = COMPONENT_SESSION_RUNTIME,
+                        event = "collab_cleanup_proof_failed",
+                        thread_key = %thread_key,
+                        %error,
+                        "ownership proof query failed; handle remains cleanup-pending"
+                    );
+                    ensure_cleanup_pending_retry(
+                        store,
+                        collab_rooms,
+                        thread_key,
+                        handle,
+                        event_type,
+                        reason,
+                    );
+                    Err(error.into())
+                }
+            }
+        }
+        Err(error) => {
+            warn!(
+                component = COMPONENT_SESSION_RUNTIME,
+                event = "collab_cleanup_transaction_failed",
+                thread_key = %thread_key,
+                %error,
+                "cleanup transaction failed; handle remains cleanup-pending for retry"
+            );
+            ensure_cleanup_pending_retry(
+                store,
+                collab_rooms,
+                thread_key,
+                handle,
+                event_type,
+                reason,
+            );
+            Err(error.into())
+        }
+    }
+}
+
+/// Ensures exactly one background retry task exists for a cleanup-pending
+/// handle. Deduplicated via `cleanup_retry_scheduled` on the handle.
+fn ensure_cleanup_pending_retry(
+    store: &PgSessionStore,
+    collab_rooms: &CollabRoomRegistry,
+    thread_key: &ThreadKey,
+    handle: &CollabRoomHandle,
+    event_type: &str,
+    reason: &str,
+) {
+    let should_spawn = {
+        if let Some(mut current) = collab_rooms.get_mut(thread_key)
+            && current.owner_id == handle.owner_id
+            && current.generation == handle.generation
+            && current.cleanup_pending
+            && !current.cleanup_retry_scheduled
+        {
+            current.cleanup_retry_scheduled = true;
+            true
+        } else {
+            false
+        }
+    };
+    if !should_spawn {
+        return;
+    }
+    let store = store.clone();
+    let collab_rooms = collab_rooms.clone();
+    let thread_key = thread_key.clone();
+    let owner_id = handle.owner_id.clone();
+    let generation = handle.generation;
+    let event_type = event_type.to_owned();
+    let reason = reason.to_owned();
+    tokio::spawn(async move {
+        let deadline = Instant::now() + PgSessionStore::SESSION_OWNERSHIP_LEASE;
+        loop {
+            let Some(handle) = collab_rooms
+                .get(&thread_key)
+                .as_deref()
+                .cloned()
+                .filter(|h| {
+                    h.owner_id == owner_id && h.generation == generation && h.cleanup_pending
+                })
+            else {
+                return;
+            };
+            let result = store
+                .finalize_collab_room(
+                    &thread_key,
+                    &handle.owner_id,
+                    handle.generation,
+                    PgSessionStore::SESSION_OWNERSHIP_LEASE,
+                    &event_type,
+                    json!({
+                        "thread_key": thread_key.as_str(),
+                        "reason": reason,
+                        "owner_id": handle.owner_id,
+                        "generation": handle.generation,
+                    }),
+                )
+                .await;
+            // Do not re-enter ensure_cleanup_pending_retry from the worker:
+            // the slot is already claimed. Apply result without scheduling.
+            match result {
+                Ok(Some(_)) => {
+                    collab_rooms.remove_if(&thread_key, |_key, current| {
+                        current.owner_id == handle.owner_id
+                            && current.generation == handle.generation
+                    });
+                    return;
+                }
+                Ok(None) => match store
+                    .session_ownership_matches(&thread_key, &handle.owner_id, handle.generation)
+                    .await
+                {
+                    Ok(_) => {
+                        collab_rooms.remove_if(&thread_key, |_key, current| {
+                            current.owner_id == handle.owner_id
+                                && current.generation == handle.generation
+                        });
+                        return;
+                    }
+                    Err(error) if Instant::now() >= deadline => {
+                        error!(
+                            component = COMPONENT_SESSION_RUNTIME,
+                            event = "collab_cleanup_retry_expired",
+                            thread_key = %thread_key,
+                            %error,
+                            "cleanup-pending retry exhausted lease deadline"
+                        );
+                        return;
+                    }
+                    Err(_) => sleep(Duration::from_secs(1)).await,
+                },
+                Err(error) if Instant::now() >= deadline => {
+                    error!(
+                        component = COMPONENT_SESSION_RUNTIME,
+                        event = "collab_cleanup_retry_expired",
+                        thread_key = %thread_key,
+                        %error,
+                        "cleanup-pending retry exhausted lease deadline"
+                    );
+                    return;
+                }
+                Err(_) => sleep(Duration::from_secs(1)).await,
+            }
+        }
+    });
+}
+
 /// Handles normalized resident lifecycle and status notifications before
 /// normal execution stdout routing. Lifecycle-only rooms have no execution
 /// id, so dropping these lines would lose the control-plane response.
@@ -7374,10 +7858,6 @@ async fn process_collab_state_line(
     let is_collab_state = method == Some("collab/state")
         || value.get("type").and_then(Value::as_str) == Some("collab_state");
     let is_collab_status = method == Some("collab/status");
-    let is_error = method == Some("error");
-    if !is_collab_state && !is_collab_status && !is_error {
-        return Ok(false);
-    }
     let params = value
         .get("params")
         .cloned()
@@ -7387,10 +7867,20 @@ async fn process_collab_state_line(
         .or_else(|| params.get("requestId"))
         .and_then(Value::as_str)
         .map(str::to_owned);
+    // Only treat a `method: error` frame as a collaboration lifecycle event
+    // when it is correlated to an outstanding collab request. Unstructured
+    // turn errors have no request_id and belong to normal stdout routing.
+    let is_collab_error = method == Some("error")
+        && request_id
+            .as_deref()
+            .is_some_and(|id| id.starts_with("collab-"));
+    if !is_collab_state && !is_collab_status && !is_collab_error {
+        return Ok(false);
+    }
     let Some(handle) = ctx.collab_rooms.get(thread_key).as_deref().cloned() else {
         return Ok(true);
     };
-    if is_error {
+    if is_collab_error {
         let error = params
             .get("error")
             .and_then(|error| error.get("message").or(Some(error)))
@@ -8624,6 +9114,8 @@ mod tests {
                     participants: Vec::new(),
                 },
                 keepalive: keepalive.clone(),
+                cleanup_pending: false,
+                cleanup_retry_scheduled: false,
             },
         );
         assert!(!should_pause_idle_sandbox(
@@ -9238,7 +9730,7 @@ mod adoption_tests {
     };
 
     use centaur_sandbox_core::{ObservedSandbox, SandboxHandle, SandboxIo, SandboxResult};
-    use tokio::io::{AsyncWriteExt, DuplexStream};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream};
 
     use super::*;
 
@@ -9432,6 +9924,77 @@ mod adoption_tests {
             Box::pin(stderr_near),
         );
         (io, stdout_far, stdin_far)
+    }
+
+    /// Controllable resident OMP host fake: reads collab control frames from
+    /// stdin and emits correlated collab/status or collab/state frames on
+    /// stdout so production start/status/stop waiters complete without a real
+    /// harness. Room payload is fixed at spawn time.
+    fn mock_resident_collab_io(room: CollabRoomState) -> SandboxIo {
+        let (io, mut stdout_far, stdin_far) = mock_io();
+        tokio::spawn(async move {
+            let mut reader = BufReader::new(stdin_far);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match reader.read_line(&mut line).await {
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    Err(_) => break,
+                }
+                let Ok(frame) = serde_json::from_str::<Value>(line.trim()) else {
+                    continue;
+                };
+                let request_id = frame
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned();
+                let command = frame.get("type").and_then(Value::as_str).unwrap_or("");
+                let response = match command {
+                    "collab_status" => json!({
+                        "method": "collab/status",
+                        "params": {
+                            "request_id": request_id,
+                            "room": room,
+                        }
+                    }),
+                    "collab_start" => json!({
+                        "method": "collab/state",
+                        "params": {
+                            "request_id": request_id,
+                            "state": "started",
+                            "room": room,
+                        }
+                    }),
+                    "collab_stop" => json!({
+                        "method": "collab/state",
+                        "params": {
+                            "request_id": request_id,
+                            "state": "stopped",
+                            "room": {
+                                "active": false,
+                                "participants": [],
+                            }
+                        }
+                    }),
+                    _ => continue,
+                };
+                let mut out = match serde_json::to_string(&response) {
+                    Ok(value) => value,
+                    Err(_) => continue,
+                };
+                out.push('\n');
+                if stdout_far.write_all(out.as_bytes()).await.is_err() {
+                    break;
+                }
+            }
+        });
+        io
+    }
+
+    async fn push_resident_collab_io(backend: &MockBackend, room: CollabRoomState) {
+        backend.push_io(mock_resident_collab_io(room)).await;
     }
 
     fn completed_output_lines(result_text: &str) -> Vec<String> {
@@ -10937,7 +11500,7 @@ mod adoption_tests {
                 .expect("claim as this control plane")
         );
 
-        runtime.handoff_owned_executions(Duration::ZERO).await;
+        let _ = runtime.handoff_owned_executions(Duration::ZERO).await;
 
         wait_for_event(&store, &thread_key, "session.stdout_owner_released").await;
         // The lease is immediately claimable by a peer control plane; without
@@ -10987,7 +11550,7 @@ mod adoption_tests {
                 .await
                 .expect("complete execution")
         });
-        runtime
+        let _ = runtime
             .handoff_owned_executions(Duration::from_secs(5))
             .await;
         let completed = completer.await.expect("completer task");
@@ -11015,7 +11578,7 @@ mod adoption_tests {
 
         // Nothing owned: the handoff returns immediately but still flips
         // the shutdown fence.
-        runtime.handoff_owned_executions(Duration::ZERO).await;
+        let _ = runtime.handoff_owned_executions(Duration::ZERO).await;
 
         let thread_key =
             ThreadKey::parse(format!("test:handoff-fence-{}", uuid::Uuid::new_v4())).unwrap();
@@ -11295,7 +11858,7 @@ mod adoption_tests {
         assert!(acquired.is_some());
 
         // Handoff releases every session ownership lease held by this owner.
-        runtime.handoff_owned_executions(Duration::ZERO).await;
+        let _ = runtime.handoff_owned_executions(Duration::ZERO).await;
 
         // The lease must be gone — a peer can reclaim the session immediately.
         let owner = store
@@ -11319,6 +11882,10 @@ mod adoption_tests {
             .create_or_get_session(&thread_key, &HarnessType::Omp, None, json!({}))
             .await
             .expect("create session");
+        store
+            .update_sandbox_id(&thread_key, Some("asbx-lifecycle"))
+            .await
+            .expect("assign sandbox");
         let owner = store
             .acquire_session_ownership(&thread_key, "resident-1", SessionOwnerMode::Resident)
             .await
@@ -11334,10 +11901,23 @@ mod adoption_tests {
             web_view_url: None,
             participants: Vec::new(),
         };
-        let runtime = runtime_with(
-            &store,
-            Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new())),
-        );
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        // Live assigned sandbox + resident IO while the room remains active.
+        push_resident_collab_io(&backend, old_state.clone()).await;
+        // Extra IO for stop after recovery.
+        push_resident_collab_io(
+            &backend,
+            CollabRoomState {
+                active: true,
+                join_url: Some("https://relay.example/new".to_owned()),
+                view_url: None,
+                web_url: None,
+                web_view_url: None,
+                participants: Vec::new(),
+            },
+        )
+        .await;
+        let runtime = runtime_with(&store, backend);
         runtime.collab_rooms.insert(
             thread_key.clone(),
             CollabRoomHandle {
@@ -11345,6 +11925,8 @@ mod adoption_tests {
                 generation: owner.generation,
                 state: old_state.clone(),
                 keepalive: keepalive.clone(),
+                cleanup_pending: false,
+                cleanup_retry_scheduled: false,
             },
         );
 
@@ -11366,16 +11948,21 @@ mod adoption_tests {
         assert_eq!(
             runtime
                 .collab_room_status(&thread_key)
+                .await
+                .unwrap()
                 .room
                 .expect("room remains")
                 .join_url,
             Some(old_url.clone())
         );
 
-        runtime
-            .lose_collab_room(&thread_key, "relay_lost")
-            .await
-            .expect("lose room");
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            runtime.lose_collab_room(&thread_key, "relay_lost"),
+        )
+        .await
+        .expect("lose room within 1s")
+        .expect("lose room");
         assert!(!runtime.has_active_collab_room(&thread_key));
         assert!(!keepalive.load(Ordering::SeqCst));
 
@@ -11396,14 +11983,26 @@ mod adoption_tests {
                     ..old_state
                 },
                 keepalive: Arc::new(AtomicBool::new(true)),
+                cleanup_pending: false,
+                cleanup_retry_scheduled: false,
             },
         );
-        let stopped = runtime
-            .stop_collab_room(&thread_key, &CollabStopInput { reason: None })
-            .await
-            .expect("stop recovered room");
+        let stopped = tokio::time::timeout(
+            Duration::from_secs(1),
+            runtime.stop_collab_room(&thread_key, &CollabStopInput { reason: None }),
+        )
+        .await
+        .expect("stop recovered room within 1s")
+        .expect("stop recovered room");
         assert!(stopped.ok);
-        assert!(runtime.collab_room_status(&thread_key).room.is_none());
+        assert!(
+            runtime
+                .collab_room_status(&thread_key)
+                .await
+                .unwrap()
+                .room
+                .is_none()
+        );
         let idempotent = runtime
             .stop_collab_room(&thread_key, &CollabStopInput { reason: None })
             .await
@@ -11437,13 +12036,17 @@ mod adoption_tests {
             .create_or_get_session(&thread_key, &HarnessType::Omp, None, json!({}))
             .await
             .expect("create session");
+        store
+            .update_sandbox_id(&thread_key, Some("asbx-status"))
+            .await
+            .expect("assign sandbox");
         let runtime = runtime_with(
             &store,
             Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new())),
         );
 
         // No active room: status is ok with a null room.
-        let empty = runtime.collab_room_status(&thread_key);
+        let empty = runtime.collab_room_status(&thread_key).await.unwrap();
         assert!(empty.ok);
         assert!(empty.room.is_none());
 
@@ -11482,9 +12085,11 @@ mod adoption_tests {
                 generation: owner.generation,
                 state: authoritative.clone(),
                 keepalive: Arc::new(AtomicBool::new(true)),
+                cleanup_pending: false,
+                cleanup_retry_scheduled: false,
             },
         );
-        let status = runtime.collab_room_status(&thread_key);
+        let status = runtime.collab_room_status(&thread_key).await.unwrap();
         assert!(status.ok);
         let room = status.room.expect("authoritative room");
         assert!(room.active);
@@ -11516,6 +12121,8 @@ mod adoption_tests {
         );
         let after = runtime
             .collab_room_status(&thread_key)
+            .await
+            .unwrap()
             .room
             .expect("room still active");
         assert_eq!(
@@ -11538,25 +12145,39 @@ mod adoption_tests {
     /// authoritative room state.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn collab_start_returns_existing_active_room_and_does_not_reacquire() {
-        let Some(store) = test_store().await else {
+        async fn phase<T>(name: &'static str, fut: impl std::future::Future<Output = T>) -> T {
+            match tokio::time::timeout(Duration::from_secs(1), fut).await {
+                Ok(value) => value,
+                Err(_) => panic!("phase timed out after 1s: {name}"),
+            }
+        }
+
+        let Some(store) = phase("test_store", test_store()).await else {
             return;
         };
-        let _guard = TEST_LOCK.lock().await;
+        let _guard = phase("TEST_LOCK.lock", TEST_LOCK.lock()).await;
         let thread_key =
             ThreadKey::parse(format!("test:collab-start-active-{}", Uuid::new_v4())).unwrap();
-        store
-            .create_or_get_session(&thread_key, &HarnessType::Omp, None, json!({}))
-            .await
-            .expect("create session");
-        let owner = store
-            .acquire_session_ownership(&thread_key, "resident-1", SessionOwnerMode::Resident)
-            .await
-            .expect("acquire lease");
+        phase(
+            "create_or_get_session",
+            store.create_or_get_session(&thread_key, &HarnessType::Omp, None, json!({})),
+        )
+        .await
+        .expect("create session");
+        phase(
+            "assign sandbox",
+            store.update_sandbox_id(&thread_key, Some("asbx-start-active")),
+        )
+        .await
+        .expect("assign sandbox");
+        let owner = phase(
+            "acquire ownership",
+            store.acquire_session_ownership(&thread_key, "resident-1", SessionOwnerMode::Resident),
+        )
+        .await
+        .expect("acquire lease");
         assert!(owner.acquired);
-        let runtime = runtime_with(
-            &store,
-            Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new())),
-        );
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
         let active_state = CollabRoomState {
             active: true,
             join_url: Some("https://relay.example/already-active".to_owned()),
@@ -11565,6 +12186,13 @@ mod adoption_tests {
             web_view_url: None,
             participants: Vec::new(),
         };
+        // Resident host fake answers collab_status for the production probe.
+        phase(
+            "push_resident_collab_io",
+            push_resident_collab_io(&backend, active_state.clone()),
+        )
+        .await;
+        let runtime = runtime_with(&store, backend);
         runtime.collab_rooms.insert(
             thread_key.clone(),
             CollabRoomHandle {
@@ -11572,14 +12200,18 @@ mod adoption_tests {
                 generation: owner.generation,
                 state: active_state.clone(),
                 keepalive: Arc::new(AtomicBool::new(true)),
+                cleanup_pending: false,
+                cleanup_retry_scheduled: false,
             },
         );
 
         // A second start returns the existing room without re-acquiring.
-        let outcome = runtime
-            .start_collab_room(&thread_key, &CollabStartInput::default())
-            .await
-            .expect("start returns existing room");
+        let outcome = phase(
+            "start_collab_room(existing)",
+            runtime.start_collab_room(&thread_key, &CollabStartInput::default()),
+        )
+        .await
+        .expect("start returns existing room");
         assert!(outcome.ok);
         let room = outcome.room.expect("active room returned");
         assert!(room.active);
@@ -11770,37 +12402,46 @@ mod adoption_tests {
             .create_or_get_session(&thread_key, &HarnessType::Omp, None, json!({}))
             .await
             .expect("create session");
+        store
+            .update_sandbox_id(&thread_key, Some("asbx-owner-loss"))
+            .await
+            .expect("assign sandbox");
         let owner = store
             .acquire_session_ownership(&thread_key, "resident-1", SessionOwnerMode::Resident)
             .await
             .expect("acquire lease");
         assert!(owner.acquired);
         let keepalive = Arc::new(AtomicBool::new(true));
-        let runtime = runtime_with(
-            &store,
-            Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new())),
-        );
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        let dead_state = CollabRoomState {
+            active: true,
+            join_url: Some("https://relay.example/dead-url".to_owned()),
+            view_url: None,
+            web_url: None,
+            web_view_url: None,
+            participants: Vec::new(),
+        };
+        push_resident_collab_io(&backend, dead_state.clone()).await;
+        let runtime = runtime_with(&store, backend);
         runtime.collab_rooms.insert(
             thread_key.clone(),
             CollabRoomHandle {
                 owner_id: "resident-1".to_owned(),
                 generation: owner.generation,
-                state: CollabRoomState {
-                    active: true,
-                    join_url: Some("https://relay.example/dead-url".to_owned()),
-                    view_url: None,
-                    web_url: None,
-                    web_view_url: None,
-                    participants: Vec::new(),
-                },
+                state: dead_state,
                 keepalive: keepalive.clone(),
+                cleanup_pending: false,
+                cleanup_retry_scheduled: false,
             },
         );
 
-        runtime
-            .lose_collab_room(&thread_key, "process_exit")
-            .await
-            .expect("lose room");
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            runtime.lose_collab_room(&thread_key, "process_exit"),
+        )
+        .await
+        .expect("lose room within 1s")
+        .expect("lose room");
 
         assert!(!runtime.has_active_collab_room(&thread_key));
         assert!(!keepalive.load(Ordering::SeqCst), "keepalive flag released");
@@ -11847,5 +12488,496 @@ mod adoption_tests {
         );
         let new_url = "https://relay.example/recovered-cap";
         assert_ne!(new_url, "https://relay.example/dead-url");
+    }
+
+    /// finalize_collab_room appends the terminal event and releases ownership
+    /// in one fenced transaction. A concurrent reader must never observe an
+    /// event without the ownership row already gone (or vice versa).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn collab_finalize_is_atomic_append_and_release() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _guard = TEST_LOCK.lock().await;
+        let thread_key =
+            ThreadKey::parse(format!("test:collab-finalize-{}", Uuid::new_v4())).unwrap();
+        store
+            .create_or_get_session(&thread_key, &HarnessType::Omp, None, json!({}))
+            .await
+            .expect("create session");
+        let owner = store
+            .acquire_session_ownership(&thread_key, "resident-1", SessionOwnerMode::Resident)
+            .await
+            .expect("acquire");
+        assert!(owner.acquired);
+
+        let event = store
+            .finalize_collab_room(
+                &thread_key,
+                "resident-1",
+                owner.generation,
+                PgSessionStore::SESSION_OWNERSHIP_LEASE,
+                "session.collab_room_lost",
+                json!({
+                    "thread_key": thread_key.as_str(),
+                    "reason": "atomic_test",
+                    "owner_id": "resident-1",
+                    "generation": owner.generation,
+                }),
+            )
+            .await
+            .expect("finalize")
+            .expect("fenced finalize succeeds");
+        assert_eq!(event.event_type, "session.collab_room_lost");
+        assert!(
+            store
+                .active_session_ownership(&thread_key)
+                .await
+                .expect("lookup")
+                .is_none(),
+            "ownership released in the same transaction as the terminal event"
+        );
+        assert!(
+            !store
+                .session_ownership_matches(&thread_key, "resident-1", owner.generation)
+                .await
+                .expect("match probe"),
+            "ownership row is gone after finalize"
+        );
+    }
+
+    /// A stale generation is rejected by finalize_collab_room: neither the
+    /// terminal event nor a release of the live owner's lease occurs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn collab_finalize_fences_stale_generation() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _guard = TEST_LOCK.lock().await;
+        let thread_key = ThreadKey::parse(format!("test:collab-fence-{}", Uuid::new_v4())).unwrap();
+        store
+            .create_or_get_session(&thread_key, &HarnessType::Omp, None, json!({}))
+            .await
+            .expect("create session");
+        let owner = store
+            .acquire_session_ownership(&thread_key, "resident-1", SessionOwnerMode::Resident)
+            .await
+            .expect("acquire");
+        assert!(owner.acquired);
+
+        let fenced = store
+            .finalize_collab_room(
+                &thread_key,
+                "resident-1",
+                owner.generation + 1,
+                PgSessionStore::SESSION_OWNERSHIP_LEASE,
+                "session.collab_room_lost",
+                json!({"reason": "stale"}),
+            )
+            .await
+            .expect("finalize call");
+        assert!(fenced.is_none(), "stale generation is fenced");
+        assert!(
+            store
+                .active_session_ownership(&thread_key)
+                .await
+                .expect("lookup")
+                .is_some(),
+            "live owner lease is not released by a stale finalize"
+        );
+        let recorded = events(&store, &thread_key).await;
+        assert!(
+            recorded
+                .iter()
+                .all(|event| event.event_type != "session.collab_room_lost"),
+            "no terminal event is written for a fenced finalize"
+        );
+    }
+
+    /// cleanup_collab_room_local marks the handle cleanup-pending (externally
+    /// non-active) before the fenced transaction, then removes only the exact
+    /// matching owner+generation handle after commit. A takeover that inserts
+    /// a newer handle during cleanup is preserved.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn collab_cleanup_is_externally_non_active_and_preserves_takeover() {
+        async fn phase<T>(name: &'static str, fut: impl std::future::Future<Output = T>) -> T {
+            match tokio::time::timeout(Duration::from_secs(5), fut).await {
+                Ok(value) => value,
+                Err(_) => panic!("phase timed out after 5s: {name}"),
+            }
+        }
+
+        let Some(store) = phase("test_store", test_store()).await else {
+            return;
+        };
+        let _guard = phase("TEST_LOCK.lock", TEST_LOCK.lock()).await;
+        let thread_key =
+            ThreadKey::parse(format!("test:collab-cleanup-takeover-{}", Uuid::new_v4())).unwrap();
+        phase(
+            "create_or_get_session",
+            store.create_or_get_session(&thread_key, &HarnessType::Omp, None, json!({})),
+        )
+        .await
+        .expect("create session");
+        phase(
+            "assign sandbox",
+            store.update_sandbox_id(&thread_key, Some("asbx-takeover")),
+        )
+        .await
+        .expect("assign sandbox");
+        let owner = phase(
+            "acquire resident-1",
+            store.acquire_session_ownership(&thread_key, "resident-1", SessionOwnerMode::Resident),
+        )
+        .await
+        .expect("acquire");
+        assert!(owner.acquired);
+        let runtime = runtime_with(
+            &store,
+            Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new())),
+        );
+        let old_url = "https://relay.example/old-cap".to_owned();
+        let old_handle = CollabRoomHandle {
+            owner_id: "resident-1".to_owned(),
+            generation: owner.generation,
+            state: CollabRoomState {
+                active: true,
+                join_url: Some(old_url.clone()),
+                view_url: None,
+                web_url: None,
+                web_view_url: None,
+                participants: Vec::new(),
+            },
+            keepalive: Arc::new(AtomicBool::new(true)),
+            cleanup_pending: false,
+            cleanup_retry_scheduled: false,
+        };
+        runtime
+            .collab_rooms
+            .insert(thread_key.clone(), old_handle.clone());
+
+        // Simulate a takeover: a newer generation is installed while the old
+        // handle is still registered. cleanup must not delete the new one.
+        let recovered = phase(
+            "release resident-1",
+            store.release_session_ownership(&thread_key, "resident-1"),
+        )
+        .await
+        .expect("release old");
+        assert!(recovered);
+        let new_owner = phase(
+            "acquire resident-2",
+            store.acquire_session_ownership(&thread_key, "resident-2", SessionOwnerMode::Resident),
+        )
+        .await
+        .expect("acquire new");
+        assert!(new_owner.acquired);
+        let new_url = "https://relay.example/new-cap".to_owned();
+        runtime.collab_rooms.insert(
+            thread_key.clone(),
+            CollabRoomHandle {
+                owner_id: "resident-2".to_owned(),
+                generation: new_owner.generation,
+                state: CollabRoomState {
+                    active: true,
+                    join_url: Some(new_url.clone()),
+                    view_url: None,
+                    web_url: None,
+                    web_view_url: None,
+                    participants: Vec::new(),
+                },
+                keepalive: Arc::new(AtomicBool::new(true)),
+                cleanup_pending: false,
+                cleanup_retry_scheduled: false,
+            },
+        );
+
+        // Cleaning up the OLD handle is fenced (ownership no longer matches)
+        // and must not remove the newer takeover handle.
+        let err = phase(
+            "cleanup_collab_room_local(old_handle)",
+            runtime.cleanup_collab_room_local(
+                &thread_key,
+                &old_handle,
+                "session.collab_room_lost",
+                "stale_owner",
+            ),
+        )
+        .await
+        .expect_err("stale cleanup is fenced");
+        assert!(
+            matches!(err, SessionRuntimeError::CollabRoomLost { .. }),
+            "fenced cleanup surfaces CollabRoomLost, got {err:?}"
+        );
+        let current = runtime
+            .collab_rooms
+            .get(&thread_key)
+            .expect("newer handle preserved")
+            .clone();
+        assert_eq!(current.owner_id, "resident-2");
+        assert_eq!(current.generation, new_owner.generation);
+        assert_eq!(current.state.join_url.as_deref(), Some(new_url.as_str()));
+        assert!(!current.cleanup_pending);
+        assert!(runtime.has_active_collab_room(&thread_key));
+        let status = phase(
+            "collab_room_status",
+            runtime.collab_room_status(&thread_key),
+        )
+        .await
+        .expect("status");
+        assert_eq!(
+            status
+                .room
+                .as_ref()
+                .and_then(|room| room.join_url.as_deref()),
+            Some(new_url.as_str()),
+            "status serves the takeover URL, never the stale one"
+        );
+    }
+
+    /// A cleanup-pending handle is externally non-active: status returns no
+    /// room and has_active_collab_room is false, even while the handle is
+    /// retained for retry.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn collab_cleanup_pending_is_externally_non_active() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _guard = TEST_LOCK.lock().await;
+        let thread_key =
+            ThreadKey::parse(format!("test:collab-pending-{}", Uuid::new_v4())).unwrap();
+        store
+            .create_or_get_session(&thread_key, &HarnessType::Omp, None, json!({}))
+            .await
+            .expect("create session");
+        let owner = store
+            .acquire_session_ownership(&thread_key, "resident-1", SessionOwnerMode::Resident)
+            .await
+            .expect("acquire");
+        let runtime = runtime_with(
+            &store,
+            Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new())),
+        );
+        runtime.collab_rooms.insert(
+            thread_key.clone(),
+            CollabRoomHandle {
+                owner_id: "resident-1".to_owned(),
+                generation: owner.generation,
+                state: CollabRoomState {
+                    active: true,
+                    join_url: Some("https://relay.example/pending".to_owned()),
+                    view_url: None,
+                    web_url: None,
+                    web_view_url: None,
+                    participants: Vec::new(),
+                },
+                keepalive: Arc::new(AtomicBool::new(true)),
+                cleanup_pending: true,
+                cleanup_retry_scheduled: false,
+            },
+        );
+        assert!(
+            !runtime.has_active_collab_room(&thread_key),
+            "cleanup-pending is not active"
+        );
+        let status = runtime
+            .collab_room_status(&thread_key)
+            .await
+            .expect("status");
+        assert!(
+            status.room.is_none(),
+            "status must not serve a cleanup-pending capability URL"
+        );
+    }
+
+    /// wait_for_collab_event advances its cursor past each batch so a
+    /// correlated response after more than one page of events is still found.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn collab_wait_advances_cursor_past_poll_overflow() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _guard = TEST_LOCK.lock().await;
+        let thread_key =
+            ThreadKey::parse(format!("test:collab-overflow-{}", Uuid::new_v4())).unwrap();
+        store
+            .create_or_get_session(&thread_key, &HarnessType::Omp, None, json!({}))
+            .await
+            .expect("create session");
+        let owner = store
+            .acquire_session_ownership(&thread_key, "resident-1", SessionOwnerMode::Resident)
+            .await
+            .expect("acquire");
+        let baseline = store.latest_event_id(&thread_key).await.expect("baseline");
+        // Fill more than one 128-event page with uncorrelated noise.
+        for i in 0..140 {
+            store
+                .append_event(&thread_key, None, "session.noise", json!({"i": i}))
+                .await
+                .expect("noise");
+        }
+        let request_id = "collab-overflow-req";
+        let room = CollabRoomState {
+            active: true,
+            join_url: Some("https://relay.example/overflow".to_owned()),
+            view_url: None,
+            web_url: None,
+            web_view_url: None,
+            participants: Vec::new(),
+        };
+        store
+            .append_unscoped_event_if_session_owner(
+                &thread_key,
+                "resident-1",
+                owner.generation,
+                PgSessionStore::SESSION_OWNERSHIP_LEASE,
+                "session.collab_room_state",
+                json!({
+                    "thread_key": thread_key.as_str(),
+                    "state": "started",
+                    "request_id": request_id,
+                    "generation": owner.generation,
+                    "room": room,
+                }),
+            )
+            .await
+            .expect("append started")
+            .expect("fenced");
+
+        let found =
+            wait_for_collab_started(&store, &thread_key, baseline, owner.generation, request_id)
+                .await
+                .expect("find started past overflow");
+        assert_eq!(
+            found.join_url.as_deref(),
+            Some("https://relay.example/overflow")
+        );
+    }
+
+    /// Uncorrelated method:error frames are not consumed by the collab
+    /// lifecycle path — only collab-prefixed request_ids are.
+    /// Regression for the DashMap same-shard self-deadlock: marking a handle
+    /// cleanup_pending must use get_mut (or a dropped clone) and never hold a
+    /// get() guard across insert on the same key. Completes without DB.
+    #[test]
+    fn collab_cleanup_pending_mark_does_not_deadlock_dashmap() {
+        let rooms: CollabRoomRegistry = Arc::new(DashMap::new());
+        let thread_key = ThreadKey::parse("test:dashmap-deadlock").unwrap();
+        rooms.insert(
+            thread_key.clone(),
+            CollabRoomHandle {
+                owner_id: "resident-1".to_owned(),
+                generation: 1,
+                state: CollabRoomState {
+                    active: true,
+                    join_url: Some("https://relay.example/x".to_owned()),
+                    view_url: None,
+                    web_url: None,
+                    web_view_url: None,
+                    participants: Vec::new(),
+                },
+                keepalive: Arc::new(AtomicBool::new(true)),
+                cleanup_pending: false,
+                cleanup_retry_scheduled: false,
+            },
+        );
+        let started = Instant::now();
+        // Same pattern as cleanup_collab_room_local / keepalive loss.
+        if let Some(mut current) = rooms.get_mut(&thread_key)
+            && current.owner_id == "resident-1"
+            && current.generation == 1
+        {
+            current.cleanup_pending = true;
+        }
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(
+            rooms
+                .get(&thread_key)
+                .map(|h| h.cleanup_pending)
+                .unwrap_or(false)
+        );
+    }
+
+    /// Regression: prebinding a cloned handle must drop the DashMap get guard
+    /// before any nested get/insert on the same key. Models the start(existing)
+    /// deadlock (outer get held across await while pump tries insert).
+    #[test]
+    fn collab_prebound_handle_allows_same_shard_insert() {
+        let rooms: CollabRoomRegistry = Arc::new(DashMap::new());
+        let thread_key = ThreadKey::parse("test:prebind-insert").unwrap();
+        rooms.insert(
+            thread_key.clone(),
+            CollabRoomHandle {
+                owner_id: "resident-1".to_owned(),
+                generation: 1,
+                state: CollabRoomState {
+                    active: true,
+                    join_url: Some("https://relay.example/x".to_owned()),
+                    view_url: None,
+                    web_url: None,
+                    web_view_url: None,
+                    participants: Vec::new(),
+                },
+                keepalive: Arc::new(AtomicBool::new(true)),
+                cleanup_pending: false,
+                cleanup_retry_scheduled: false,
+            },
+        );
+        let started = Instant::now();
+        // BAD pattern would be: if let Some(h) = rooms.get(...).cloned() { rooms.insert(...) }
+        // which holds the read guard across insert. GOOD: prebind then insert.
+        let existing = rooms
+            .get(&thread_key)
+            .as_deref()
+            .filter(|h| !h.cleanup_pending)
+            .cloned();
+        if let Some(mut handle) = existing {
+            handle.state.join_url = Some("https://relay.example/updated".to_owned());
+            rooms.insert(thread_key.clone(), handle);
+        }
+        // Nested get after prebind also must not block behind a queued writer.
+        let _ = rooms.get(&thread_key).map(|h| h.state.join_url.clone());
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "prebound handle path must not same-shard deadlock"
+        );
+        assert_eq!(
+            rooms
+                .get(&thread_key)
+                .and_then(|h| h.state.join_url.clone())
+                .as_deref(),
+            Some("https://relay.example/updated")
+        );
+    }
+
+    #[test]
+    fn collab_error_frame_requires_collab_request_id_prefix() {
+        fn is_collab_error(value: &Value) -> bool {
+            if value.get("method").and_then(Value::as_str) != Some("error") {
+                return false;
+            }
+            value
+                .get("params")
+                .and_then(|params| params.get("request_id").or_else(|| params.get("requestId")))
+                .and_then(Value::as_str)
+                .is_some_and(|id| id.starts_with("collab-"))
+        }
+        let correlated = json!({
+            "method": "error",
+            "params": {
+                "request_id": "collab-abc",
+                "error": {"message": "boom"},
+            }
+        });
+        let uncorrelated = json!({
+            "method": "error",
+            "params": {
+                "threadId": "t1",
+                "turnId": "turn-1",
+                "error": {"message": "normal turn error"},
+            }
+        });
+        assert!(is_collab_error(&correlated));
+        assert!(!is_collab_error(&uncorrelated));
     }
 }

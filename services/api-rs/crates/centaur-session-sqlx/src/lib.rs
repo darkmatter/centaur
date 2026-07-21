@@ -1157,6 +1157,107 @@ impl PgSessionStore {
         row.try_into().map(Some)
     }
 
+    /// Atomically appends a terminal lifecycle event and releases the session
+    /// ownership lease in a single fenced transaction. The fence checks
+    /// `owner_id`, `generation`, and a live lease before appending the event
+    /// and deleting the ownership row. Returns `Some(event)` on success,
+    /// `None` when the fence rejected (stale owner or expired lease), or
+    /// `Err` on a transient database failure. Callers must only remove the
+    /// in-memory registry handle after a `Some` result, and must prove the
+    /// ownership row is absent or changed before removing on a `None` result.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn finalize_collab_room(
+        &self,
+        thread_key: &ThreadKey,
+        owner_id: &str,
+        generation: i64,
+        lease: Duration,
+        event_type: &str,
+        payload: Value,
+    ) -> Result<Option<SessionEvent>, SessionStoreError> {
+        let lease_expires_at = stdout_lease_expires_at(lease);
+        let mut tx = self.pool.begin().await?;
+        let result = sqlx::query(
+            r#"
+            update session_owners
+            set lease_expires_at = $4, updated_at = now()
+            where thread_key = $1
+              and owner_id = $2
+              and generation = $3
+              and lease_expires_at > now()
+            "#,
+        )
+        .bind(thread_key.as_str())
+        .bind(owner_id)
+        .bind(generation)
+        .bind(lease_expires_at)
+        .execute(&mut *tx)
+        .await?;
+        if result.rows_affected() == 0 {
+            tx.commit().await?;
+            return Ok(None);
+        }
+        let row = sqlx::query_as::<_, SessionEventRow>(
+            r#"
+            insert into session_events (thread_key, execution_id, event_type, payload)
+            values ($1, null, $2, $3)
+            returning event_id, thread_key, execution_id, event_type, payload, created_at
+            "#,
+        )
+        .bind(thread_key.as_str())
+        .bind(event_type)
+        .bind(payload)
+        .fetch_one(&mut *tx)
+        .await?;
+        let deleted = sqlx::query(
+            r#"
+            delete from session_owners
+            where thread_key = $1
+              and owner_id = $2
+              and generation = $3
+            "#,
+        )
+        .bind(thread_key.as_str())
+        .bind(owner_id)
+        .bind(generation)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        if deleted.rows_affected() == 0 {
+            return Ok(None);
+        }
+        row.try_into().map(Some)
+    }
+
+    /// Probes whether this owner still holds the session ownership row with
+    /// the given generation. Returns `true` when the row exists and matches,
+    /// `false` when the row is absent or owned by a different owner/generation.
+    /// Used by cleanup to prove a fenced `finalize_collab_room` result before
+    /// removing the in-memory handle.
+    pub async fn session_ownership_matches(
+        &self,
+        thread_key: &ThreadKey,
+        owner_id: &str,
+        generation: i64,
+    ) -> Result<bool, SessionStoreError> {
+        let matched = sqlx::query_scalar::<_, bool>(
+            r#"
+            select exists(
+                select 1 from session_owners
+                where thread_key = $1
+                  and owner_id = $2
+                  and generation = $3
+            )
+            "#,
+        )
+        .bind(thread_key.as_str())
+        .bind(owner_id)
+        .bind(generation)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(matched)
+    }
+
     /// Returns the true latest event id for a session without applying a page
     /// limit. Lifecycle request anchors must use this rather than taking the
     /// maximum of a bounded ascending page, which can point at an old event

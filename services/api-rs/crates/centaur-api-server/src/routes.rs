@@ -793,7 +793,7 @@ async fn collab_room_status(
     Path(raw_thread_key): Path<String>,
 ) -> Result<Json<CollabRoomStatusResponse>, ApiError> {
     let thread_key = ThreadKey::try_from(raw_thread_key)?;
-    let outcome = state.runtime()?.collab_room_status(&thread_key);
+    let outcome = state.runtime()?.collab_room_status(&thread_key).await?;
     Ok(Json(CollabRoomStatusResponse {
         ok: outcome.ok,
         thread_key: outcome.thread_key,

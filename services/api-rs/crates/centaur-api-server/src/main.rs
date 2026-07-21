@@ -9,7 +9,7 @@ use centaur_workflows::WorkflowRuntime;
 use clap::Parser;
 use thiserror::Error;
 use tokio::net::TcpListener;
-use tracing::info;
+use tracing::{error, info};
 
 use args::Args;
 
@@ -38,7 +38,13 @@ async fn main() -> Result<(), ServerError> {
                 // streams can keep the server future alive until SIGKILL, and
                 // the lease release must not be lost to that.
                 if let Some(runtime) = shutdown_state.session_runtime() {
-                    runtime.handoff_owned_executions(drain_timeout).await;
+                    let errors = runtime.handoff_owned_executions(drain_timeout).await;
+                    if !errors.is_empty() {
+                        error!(
+                            "collaboration room shutdown encountered {} failure(s)",
+                            errors.len()
+                        );
+                    }
                 }
             })
             .await

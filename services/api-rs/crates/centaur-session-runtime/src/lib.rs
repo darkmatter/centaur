@@ -1966,6 +1966,7 @@ impl SessionRuntime {
             &thread_trace_id(thread_key),
             &thread_trace_parent_span_id(thread_key),
         );
+        let mut acquired_session_ownership_generation = None;
         let result = async {
             ensure_thread_trace_root_span(thread_key);
             info!(
@@ -2003,6 +2004,7 @@ impl SessionRuntime {
             let ownership_generation = self
                 .acquire_oneshot_session_ownership(thread_key, &session.harness_type)
                 .await?;
+            acquired_session_ownership_generation = ownership_generation;
             let mut execution_metadata =
                 execution_metadata(metadata, idle_timeout_ms, max_duration_ms);
             if let Some(generation) = ownership_generation
@@ -2028,10 +2030,13 @@ impl SessionRuntime {
                     status = %execution.execution.status,
                     "returning existing execution"
                 );
-                let _ = self
-                    .store
-                    .release_session_ownership(thread_key, &self.stdout_owner_id)
-                    .await;
+                release_session_ownership_generation(
+                    &self.store,
+                    thread_key,
+                    &self.stdout_owner_id,
+                    ownership_generation,
+                )
+                .await;
                 return Ok(execution.execution);
             }
             let claim = self
@@ -2054,10 +2059,13 @@ impl SessionRuntime {
                     status = %execution.status,
                     "execution was already claimed or terminal"
                 );
-                let _ = self
-                    .store
-                    .release_session_ownership(thread_key, &self.stdout_owner_id)
-                    .await;
+                release_session_ownership_generation(
+                    &self.store,
+                    thread_key,
+                    &self.stdout_owner_id,
+                    ownership_generation,
+                )
+                .await;
                 return Ok(execution);
             }
             if let Some(generation) = ownership_generation {
@@ -2068,6 +2076,15 @@ impl SessionRuntime {
                 self.record_execution_failure(thread_key, &execution.execution_id, &error)
                     .await;
                 return Err(error);
+            }
+            if let Some(generation) = ownership_generation {
+                spawn_execution_session_owner_renewer(
+                    self.context(),
+                    thread_key.clone(),
+                    execution.execution_id.clone(),
+                    generation,
+                    session_ownership_renew_interval(),
+                );
             }
             let execution_trace_span = info_span!(
                 "centaur.api_rs.session.execution",
@@ -2206,15 +2223,15 @@ impl SessionRuntime {
                 %error,
                 "session execution failed"
             );
-            // Release any one-shot session ownership lease acquired for this
-            // attempt (OMP only). The record_execution_failure path inside the
-            // async block already releases for executions that reached the
-            // stdout-owner stage; this covers the create_execution failure
-            // path where no execution row exists to fail.
-            let _ = self
-                .store
-                .release_session_ownership(thread_key, &self.stdout_owner_id)
-                .await;
+            // Release exactly the one-shot generation acquired by this attempt.
+            // A slow failure path must not delete a newer successor's lease.
+            release_session_ownership_generation(
+                &self.store,
+                thread_key,
+                &self.stdout_owner_id,
+                acquired_session_ownership_generation,
+            )
+            .await;
         }
         result
     }
@@ -2226,7 +2243,10 @@ impl SessionRuntime {
         error: &SessionRuntimeError,
     ) {
         self.execution_spans.lock().await.remove(execution_id);
-        self.session_ownership_generations.remove(execution_id);
+        let ownership_generation = self
+            .session_ownership_generations
+            .remove(execution_id)
+            .map(|(_, generation)| generation);
         let error_message = error.to_string();
         let execution = match self
             .store
@@ -2262,12 +2282,15 @@ impl SessionRuntime {
             Some(runtime_error_failure_class(error)),
         )
         .await;
-        // Release the one-shot session ownership lease (OMP only) so a resident
-        // host can reclaim the session after a failed execution.
-        let _ = self
-            .store
-            .release_session_ownership(thread_key, &self.stdout_owner_id)
-            .await;
+        // Release only the generation acquired for this execution. A stale
+        // failure path cannot delete a successor that reclaimed the session.
+        release_session_ownership_generation(
+            &self.store,
+            thread_key,
+            &self.stdout_owner_id,
+            ownership_generation,
+        )
+        .await;
     }
 
     async fn forward_messages_to_active_execution(
@@ -6986,15 +7009,9 @@ async fn record_terminal_output(
         sandbox_id.to_owned(),
     );
     ctx.execution_spans.lock().await.remove(execution_id);
-    ctx.session_ownership_generations.remove(execution_id);
-    // A one-shot session ownership lease (OMP only) is released now that the
-    // execution has reached a terminal state, letting a resident host or a
-    // later one-shot reclaim the session. Non-OMP sessions have no row and
-    // this is a no-op.
-    let _ = ctx
-        .store
-        .release_session_ownership(thread_key, &ctx.stdout_owner_id)
-        .await;
+    // Release only the one-shot generation acquired for this execution. A
+    // delayed terminal path must not delete a successor's ownership.
+    release_execution_session_ownership(ctx, thread_key, execution_id).await;
     if let Err(error) = ctx
         .store
         .touch_sandbox_activity(thread_key, sandbox_id)
@@ -7271,6 +7288,89 @@ fn spawn_max_duration_failure(
     });
 }
 
+async fn release_session_ownership_generation(
+    store: &PgSessionStore,
+    thread_key: &ThreadKey,
+    owner_id: &str,
+    generation: Option<i64>,
+) {
+    let Some(generation) = generation else {
+        return;
+    };
+    if let Err(error) = store
+        .release_session_ownership_at_generation(thread_key, owner_id, generation)
+        .await
+    {
+        warn!(
+            component = COMPONENT_SESSION_RUNTIME,
+            event = "session_owner_release_failed",
+            thread_key = %thread_key,
+            owner_id,
+            generation,
+            %error,
+            "failed to release session ownership generation"
+        );
+    }
+}
+
+async fn release_execution_session_ownership(
+    ctx: &RuntimeContext,
+    thread_key: &ThreadKey,
+    execution_id: &str,
+) {
+    let generation = ctx
+        .session_ownership_generations
+        .remove(execution_id)
+        .map(|(_, generation)| generation);
+    release_session_ownership_generation(&ctx.store, thread_key, &ctx.stdout_owner_id, generation)
+        .await;
+}
+
+fn session_ownership_renew_interval() -> Duration {
+    PgSessionStore::SESSION_OWNERSHIP_LEASE
+        .checked_div(3)
+        .unwrap_or(Duration::from_secs(15))
+}
+
+fn spawn_execution_session_owner_renewer(
+    ctx: RuntimeContext,
+    thread_key: ThreadKey,
+    execution_id: String,
+    generation: i64,
+    renew_interval: Duration,
+) {
+    tokio::spawn(async move {
+        loop {
+            sleep(renew_interval).await;
+            match ctx
+                .store
+                .renew_session_ownership_if_active_execution_owner(
+                    &thread_key,
+                    &execution_id,
+                    &ctx.stdout_owner_id,
+                    generation,
+                )
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => break,
+                Err(error) => {
+                    warn!(
+                        component = COMPONENT_SESSION_RUNTIME,
+                        event = "session_owner_renew_failed",
+                        thread_key = %thread_key,
+                        execution_id,
+                        owner_id = %ctx.stdout_owner_id,
+                        generation,
+                        %error,
+                        "failed to renew active execution session ownership"
+                    );
+                }
+            }
+        }
+    });
+}
+
 fn spawn_stdout_owner_renewer(ctx: RuntimeContext, execution_id: String) {
     tokio::spawn(async move {
         loop {
@@ -7289,9 +7389,8 @@ fn spawn_stdout_owner_renewer(ctx: RuntimeContext, execution_id: String) {
                         execution_id,
                         stdout_owner_id = %ctx.stdout_owner_id,
                         %error,
-                        "failed to renew stdout owner lease"
+                        "failed to renew stdout owner lease; retrying"
                     );
-                    break;
                 }
             }
         }
@@ -7315,7 +7414,6 @@ async fn record_max_duration_failure(
         return Ok(());
     };
     ctx.execution_spans.lock().await.remove(execution_id);
-    ctx.session_ownership_generations.remove(execution_id);
     if let Err(error) = ctx.store.touch_session_sandbox_activity(thread_key).await {
         warn!(
             component = COMPONENT_SESSION_RUNTIME,
@@ -7348,10 +7446,7 @@ async fn record_max_duration_failure(
         Some("timeout"),
     )
     .await;
-    let _ = ctx
-        .store
-        .release_session_ownership(thread_key, &ctx.stdout_owner_id)
-        .await;
+    release_execution_session_ownership(ctx, thread_key, execution_id).await;
     if let Some(idle_timeout) = idle_timeout.or_else(|| idle_timeout_from_execution(&execution))
         && let Some(sandbox_id) = ctx.store.get_session(thread_key).await?.sandbox_id
     {
@@ -7396,9 +7491,7 @@ fn spawn_collab_keepalive(
     generation: i64,
     keepalive: Arc<AtomicBool>,
 ) {
-    let renew_interval = PgSessionStore::SESSION_OWNERSHIP_LEASE
-        .checked_div(3)
-        .unwrap_or(Duration::from_secs(15));
+    let renew_interval = session_ownership_renew_interval();
     tokio::spawn(async move {
         // First tick after renew_interval — never fire while start still holds
         // the lifecycle lock and is waiting for durable started.
@@ -13173,6 +13266,152 @@ mod adoption_tests {
         }
         let _ = store
             .release_session_ownership(&thread_key, "api-rs-runtime")
+            .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn omp_oneshot_owner_renews_past_the_initial_lease() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _guard = TEST_LOCK.lock().await;
+        let thread_key =
+            ThreadKey::parse(format!("test:omp-oneshot-renew-{}", Uuid::new_v4())).unwrap();
+        store
+            .create_or_get_session(&thread_key, &HarnessType::Omp, None, json!({}))
+            .await
+            .expect("create session");
+        let runtime = runtime_with(
+            &store,
+            Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new())),
+        );
+        let generation = runtime
+            .acquire_oneshot_session_ownership(&thread_key, &HarnessType::Omp)
+            .await
+            .expect("acquire one-shot ownership")
+            .expect("OMP ownership generation");
+        let execution = store
+            .create_execution(
+                &thread_key,
+                None,
+                json!({"_session_owner_generation": generation}),
+            )
+            .await
+            .expect("create execution")
+            .execution;
+        store
+            .mark_execution_running(&execution.execution_id)
+            .await
+            .expect("mark running");
+        runtime
+            .session_ownership_generations
+            .insert(execution.execution_id.clone(), generation);
+        runtime
+            .claim_stdout_owner(&execution.execution_id)
+            .await
+            .expect("claim stdout owner");
+
+        sqlx::query(
+            r#"
+            update session_owners
+            set lease_expires_at = now() + interval '150 milliseconds'
+            where thread_key = $1 and owner_id = $2 and generation = $3
+            "#,
+        )
+        .bind(thread_key.as_str())
+        .bind(&runtime.stdout_owner_id)
+        .bind(generation)
+        .execute(store.pool())
+        .await
+        .expect("shorten initial session ownership lease");
+        spawn_execution_session_owner_renewer(
+            runtime.context(),
+            thread_key.clone(),
+            execution.execution_id.clone(),
+            generation,
+            Duration::from_millis(25),
+        );
+
+        sleep(Duration::from_millis(300)).await;
+        let appended = store
+            .append_event_if_stdout_owner(
+                &thread_key,
+                &execution.execution_id,
+                &runtime.stdout_owner_id,
+                STDOUT_OWNER_LEASE,
+                SESSION_OUTPUT_LINE_EVENT,
+                json!("line after initial lease"),
+            )
+            .await
+            .expect("append after initial ownership lease");
+        assert!(
+            appended.is_some(),
+            "one-shot ownership renewal must preserve late execution output"
+        );
+
+        store
+            .fail_execution_if_active(&execution.execution_id, "test cleanup")
+            .await
+            .expect("terminalize execution");
+        sqlx::query(
+            r#"
+            update session_owners
+            set lease_expires_at = now() + interval '150 milliseconds'
+            where thread_key = $1 and owner_id = $2 and generation = $3
+            "#,
+        )
+        .bind(thread_key.as_str())
+        .bind(&runtime.stdout_owner_id)
+        .bind(generation)
+        .execute(store.pool())
+        .await
+        .expect("shorten completed execution ownership");
+        sleep(Duration::from_millis(300)).await;
+        assert!(
+            store
+                .active_session_ownership(&thread_key)
+                .await
+                .expect("check completed execution ownership")
+                .is_none(),
+            "one-shot renewer must stop after the execution becomes terminal"
+        );
+        let successor = store
+            .acquire_session_ownership(
+                &thread_key,
+                &runtime.stdout_owner_id,
+                SessionOwnerMode::Oneshot,
+            )
+            .await
+            .expect("successor acquires ownership");
+        assert!(successor.acquired);
+        assert!(successor.generation > generation);
+
+        release_execution_session_ownership(
+            &runtime.context(),
+            &thread_key,
+            &execution.execution_id,
+        )
+        .await;
+        assert!(
+            store
+                .session_ownership_matches(
+                    &thread_key,
+                    &runtime.stdout_owner_id,
+                    successor.generation,
+                )
+                .await
+                .expect("check successor ownership"),
+            "stale execution cleanup must not release a newer generation"
+        );
+        let _ = store
+            .release_session_ownership_at_generation(
+                &thread_key,
+                &runtime.stdout_owner_id,
+                successor.generation,
+            )
+            .await;
+        let _ = store
+            .release_stdout_owner(&execution.execution_id, &runtime.stdout_owner_id)
             .await;
     }
 

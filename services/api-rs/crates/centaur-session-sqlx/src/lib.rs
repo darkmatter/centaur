@@ -2071,6 +2071,48 @@ impl PgSessionStore {
         Ok(result.rows_affected() > 0)
     }
 
+    /// Renews an exact ownership generation only while the execution that
+    /// acquired it is still active. This prevents a one-shot renewer from
+    /// keeping the session alive after its execution reaches a terminal state.
+    pub async fn renew_session_ownership_if_active_execution_owner(
+        &self,
+        thread_key: &ThreadKey,
+        execution_id: &str,
+        owner_id: &str,
+        generation: i64,
+    ) -> Result<bool, SessionStoreError> {
+        let expires_at = stdout_lease_expires_at(Self::SESSION_OWNERSHIP_LEASE);
+        let result = sqlx::query(
+            r#"
+            update session_owners owner
+            set lease_expires_at = $5, updated_at = now()
+            where owner.thread_key = $1
+              and owner.owner_id = $2
+              and owner.generation = $3
+              and owner.lease_expires_at > now()
+              and exists (
+                  select 1
+                  from session_executions execution
+                  where execution.execution_id = $4
+                    and execution.thread_key = owner.thread_key
+                    and execution.status in ($6, $7)
+                    and execution.metadata->>'_session_owner_generation' =
+                        owner.generation::text
+              )
+            "#,
+        )
+        .bind(thread_key.as_str())
+        .bind(owner_id)
+        .bind(generation)
+        .bind(execution_id)
+        .bind(expires_at)
+        .bind(ExecutionStatus::Queued.as_ref())
+        .bind(ExecutionStatus::Running.as_ref())
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
     /// Returns `true` when `generation` matches the current owner's generation.
     /// Used to fence stale owners: after a loss/reacquire the generation bumps,
     /// so a stale owner's events no longer match and are rejected.

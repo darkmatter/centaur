@@ -106,7 +106,7 @@ pub struct OmpMessageId {
 pub struct OmpMessage {
     pub role: String,
     #[serde(default)]
-    pub content: Vec<OmpContentBlock>,
+    pub content: OmpMessageContent,
     #[serde(default)]
     pub model: Option<String>,
     #[serde(default)]
@@ -117,6 +117,19 @@ pub struct OmpMessage {
     pub error_message: Option<String>,
     #[serde(default, rename = "responseId")]
     pub response_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum OmpMessageContent {
+    Blocks(Vec<OmpContentBlock>),
+    Text(String),
+}
+
+impl Default for OmpMessageContent {
+    fn default() -> Self {
+        Self::Blocks(Vec::new())
+    }
 }
 
 impl OmpMessage {
@@ -136,30 +149,35 @@ impl OmpMessage {
 
     fn into_normalized_content(self) -> Vec<NormalizedContent> {
         let item_id = assistant_item_id(self.response_id.as_deref());
-        self.content
-            .into_iter()
-            .enumerate()
-            .filter_map(|(index, block)| match block {
-                OmpContentBlock::Text { text } => Some(NormalizedContent::AgentText {
-                    item_id: item_id.clone(),
-                    text,
-                }),
-                OmpContentBlock::Thinking { thinking } => Some(NormalizedContent::ReasoningText {
-                    item_id: reasoning_item_id(&item_id, index),
-                    text: thinking,
-                }),
-                OmpContentBlock::ToolCall {
-                    id,
-                    name,
-                    arguments,
-                } => Some(NormalizedContent::ToolUse {
-                    raw_id: id,
-                    tool: name,
-                    arguments,
-                }),
-                OmpContentBlock::Unknown => None,
-            })
-            .collect()
+        match self.content {
+            OmpMessageContent::Blocks(blocks) => blocks
+                .into_iter()
+                .enumerate()
+                .filter_map(|(index, block)| match block {
+                    OmpContentBlock::Text { text } => Some(NormalizedContent::AgentText {
+                        item_id: item_id.clone(),
+                        text,
+                    }),
+                    OmpContentBlock::Thinking { thinking } => {
+                        Some(NormalizedContent::ReasoningText {
+                            item_id: reasoning_item_id(&item_id, index),
+                            text: thinking,
+                        })
+                    }
+                    OmpContentBlock::ToolCall {
+                        id,
+                        name,
+                        arguments,
+                    } => Some(NormalizedContent::ToolUse {
+                        raw_id: id,
+                        tool: name,
+                        arguments,
+                    }),
+                    OmpContentBlock::Unknown => None,
+                })
+                .collect(),
+            OmpMessageContent::Text(text) => vec![NormalizedContent::AgentText { item_id, text }],
+        }
     }
 }
 
@@ -675,6 +693,38 @@ mod tests {
             r#"{"type":"message_end","message":{"role":"toolResult","toolCallId":"toolu_01CnTRcRztUD24oiuqg4wQq8","toolName":"bash","content":[{"type":"text","text":"centaur-tool-test"}],"isError":false}}"#,
         );
         assert!(events.is_empty());
+    }
+
+    #[test]
+    fn user_message_end_with_string_content_is_ignored() {
+        let mut normalizer = OmpEventNormalizer;
+        let events = normalize(
+            &mut normalizer,
+            r#"{"type":"message_end","message":{"role":"user","content":"<system-notice>workflow instructions</system-notice>"}}"#,
+        );
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn assistant_message_end_with_string_content_emits_text() {
+        let mut normalizer = OmpEventNormalizer;
+        let events = normalize(
+            &mut normalizer,
+            r#"{"type":"message_end","message":{"role":"assistant","content":"DONE","stopReason":"stop","responseId":"msg_string_content"}}"#,
+        );
+        assert!(matches!(
+            events.as_slice(),
+            [NormalizedEvent::AssistantMessage {
+                partial: false,
+                stop_reason: Some(reason),
+                content,
+            }] if reason == "end_turn"
+                && matches!(
+                    content.as_slice(),
+                    [NormalizedContent::AgentText { item_id, text }]
+                        if item_id == "msg_string_content" && text == "DONE"
+                )
+        ));
     }
 
     #[test]

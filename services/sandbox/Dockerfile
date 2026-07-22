@@ -190,8 +190,6 @@ RUN --mount=type=cache,target=/home/agent/.cargo/registry,uid=1001,gid=1001,shar
     && kache --version
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 RUN curl -fsSL https://bun.sh/install | bash -s "${BUN_VERSION}"
-# omp's npm bin shim runs dist/cli.js under bun (shebang), so it can only be
-# verified once bun is on PATH — not in the root npm install layer above.
 RUN omp --version | grep -F "${OMP_VERSION}"
 RUN --mount=type=cache,target=/home/agent/.cache/uv,uid=1001,gid=1001,sharing=locked \
     uv tool install "manim==${MANIM_VERSION}" \
@@ -244,6 +242,24 @@ FROM toolchain AS sandbox
 
 USER root
 RUN rm -f /etc/sudoers.d/agent
+# The fork release's npm bin points at src/cli.ts, whose filesystem fallback
+# cannot see the repository docs directory omitted from the release tarball.
+# Run the prepacked bundle so omp:// resolves its embedded documentation index.
+RUN set -eux; \
+    omp_bundle=/usr/lib/node_modules/@oh-my-pi/pi-coding-agent/dist/cli.js; \
+    test -f "$omp_bundle"; \
+    grep -Fq '"session-operations-export-share-fork-resume.md"' "$omp_bundle"; \
+    grep -Fq 'collab_start' "$omp_bundle"; \
+    ln -sf "$omp_bundle" /usr/bin/omp; \
+    test "$(readlink -f "$(command -v omp)")" = "$omp_bundle"; \
+    omp --version | grep -F "${OMP_VERSION}"; \
+    omp read omp:// >/tmp/omp-docs-index.md; \
+    omp read omp://session-operations-export-share-fork-resume.md >/tmp/omp-export-doc.md; \
+    omp read omp://user-facing-packages.md >/tmp/omp-packages-doc.md; \
+    grep -Fq '# Documentation' /tmp/omp-docs-index.md; \
+    grep -Fq '# Session Operations:' /tmp/omp-export-doc.md; \
+    grep -Fq '# User-Facing Packages' /tmp/omp-packages-doc.md; \
+    rm -f /tmp/omp-docs-index.md /tmp/omp-export-doc.md /tmp/omp-packages-doc.md
 # BuildKit's COPY --link creates parent directories without an explicit mode,
 # which can leave /etc/centaur without the execute bit for non-root users.
 # Pre-create it as 0755 so the agent user can traverse into it at runtime.

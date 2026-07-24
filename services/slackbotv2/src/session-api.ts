@@ -4,6 +4,7 @@ import { renderSlackDisplayText, slackMessagePromptText } from './slack-display-
 import type {
   ForwardSessionInput,
   JsonObject,
+  SlackbotV2BlockActionPayload,
   JsonValue,
   SlackbotV2ApiAttachment,
   SlackbotV2ApiMessageLink,
@@ -172,7 +173,8 @@ type ForwardSessionApiCallbacks = {
   onMessagesAppended?(): Promise<void>
   /**
    * Fires when session creation restarted the thread onto a new harness
-   * (sticky --claude/--amp/--codex state on a thread pinned to another harness).
+   * (sticky --claude/--amp/--codex/--nanocodex state on a thread pinned to
+   * another harness).
    * Runs before append/execute, so the callback may set
    * `input.contextPreamble` to re-feed thread history to the fresh harness.
    */
@@ -539,6 +541,34 @@ export async function forwardToSessionApi(
   return openSessionEventStream(options, input)
 }
 
+export async function dispatchSlackBlockAction(
+  options: SlackbotV2Options,
+  payload: SlackbotV2BlockActionPayload
+): Promise<void> {
+  const action = `dispatch Slack block action ${payload.action_id}`
+  const response = await recordSessionApiOperation(
+    'emit_workflow_event',
+    () =>
+      fetchWithTimeout(
+        options.fetch ?? globalThis.fetch,
+        new URL('/api/workflows/events', ensureTrailingSlash(options.apiUrl)),
+        {
+          body: JSON.stringify({
+            event_name: `slack.block_action.${payload.action_id}`,
+            payload
+          }),
+          headers: apiHeaders(options),
+          method: 'POST'
+        },
+        sessionApiTimeoutMs(options),
+        action
+      ),
+    sessionApiTimeoutMs(options),
+    action
+  )
+  await ensureApiOk(response, action)
+}
+
 export async function openSessionEventStream(
   options: SlackbotV2Options,
   input: Pick<ForwardSessionInput, 'afterEventId' | 'executionId' | 'onEventId' | 'threadId' | 'trace'>
@@ -784,8 +814,8 @@ async function createSession(
   message?: SlackbotV2ApiMessage
 ): Promise<CreateSessionOutcome> {
   const requested = harnessType ?? options.defaultHarnessType ?? DEFAULT_HARNESS_TYPE
-  // A sticky --claude/--amp/--codex selection restarts a thread pinned to
-  // another harness; the implicit default never forces a switch.
+  // A sticky --claude/--amp/--codex/--nanocodex selection restarts a thread
+  // pinned to another harness; the implicit default never forces a switch.
   const response = await postCreateSession(
     options,
     threadId,
@@ -894,12 +924,14 @@ function sessionRequesterMetadata(
 ): JsonObject {
   const slackUserId = identity?.slackUserId ?? messageRequesterUserId(message)
   const slackTeamId = identity?.slackTeamId ?? messageSlackTeamId(message)
+  const slackChannelId = slackConversationId(message)
   const slackUserName = identity?.slackUserName ?? message?.author.userName
   const slackDisplayName = identity?.slackDisplayName ?? message?.author.fullName
   const slackEmail = identity?.slackEmail
   return {
     ...(slackUserId ? { slack_user_id: slackUserId } : {}),
     ...(slackTeamId ? { slack_team_id: slackTeamId } : {}),
+    ...(slackChannelId ? { slack_channel_id: slackChannelId } : {}),
     ...(slackUserName ? { slack_user_name: slackUserName } : {}),
     ...(slackDisplayName ? { slack_display_name: slackDisplayName } : {}),
     ...(slackEmail ? { slack_user_email: slackEmail } : {}),
@@ -1072,7 +1104,8 @@ async function resolveConversationName(
 // and falling back to the conversation segment of the thread key
 // (`<source>:[<team>:]<conversation>[:<ts>]`). Slack ids carry their type in the
 // first letter: C/G are channels/groups, D is a direct message.
-function slackConversationId(message: SlackbotV2ApiMessage): string | undefined {
+function slackConversationId(message?: SlackbotV2ApiMessage): string | undefined {
+  if (!message) return undefined
   const fromRaw = rawSlackString(message.raw, 'channel')
   if (fromRaw) return fromRaw
   for (const segment of message.threadId.split(':').slice(1)) {

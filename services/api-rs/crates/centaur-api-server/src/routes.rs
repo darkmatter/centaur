@@ -27,7 +27,7 @@ use axum::{
     routing::{any, get, post},
 };
 use base64::{Engine as _, engine::general_purpose};
-use centaur_session_core::{CollabStartInput, CollabStopInput, ThreadKey};
+use centaur_session_core::{ChatDestination, CollabStartInput, CollabStopInput, ThreadKey};
 use centaur_session_runtime::{
     ExecuteSessionInput, HarnessConflictPolicy, PersonaSummary, SandboxRuntime, SessionRuntime,
     thread_trace_id, thread_trace_parent_span_id,
@@ -42,7 +42,7 @@ use centaur_workflows::{
     WorkflowWebhookSpec, WorkflowWebhookTriggerKey,
 };
 use futures_util::{Stream, StreamExt};
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -59,9 +59,10 @@ use crate::{
     slack_proxy::slack_proxy_router,
     types::{
         AppendMessagesRequest, AppendMessagesResponse, CollabRoomStatusResponse,
-        CreateSessionRequest, CreateSessionResponse, EmitWorkflowEventRequest, EventsQuery,
-        ExecuteSessionRequest, ExecuteSessionResponse, HarnessConfigAttestation,
-        InterruptSessionExecutionRequest, InterruptSessionExecutionResponse, ListWorkflowRunsQuery,
+        CreateSessionRequest, CreateSessionResponse, DiscordThreadContext,
+        EmitWorkflowEventRequest, EventsQuery, ExecuteSessionRequest, ExecuteSessionResponse,
+        GithubThreadContext, HarnessConfigAttestation, InterruptSessionExecutionRequest,
+        InterruptSessionExecutionResponse, LinearThreadContext, ListWorkflowRunsQuery,
         OnHarnessConflict, SessionContextResponse, SessionSseEvent, SlackThreadContext,
         StartCollabRoomRequest, StartCollabRoomResponse, StopCollabRoomRequest,
         StopCollabRoomResponse, WorkspaceDiffRequest, WorkspaceDiffResponse, stream_error_sse,
@@ -480,6 +481,73 @@ async fn get_session_context(
 ) -> Result<Json<SessionContextResponse>, ApiError> {
     let runtime = state.runtime()?;
     let thread_key = ThreadKey::try_from(raw_thread_key)?;
+    let destination = thread_key.chat_destination();
+    let platform = destination
+        .as_ref()
+        .map(ChatDestination::platform)
+        .unwrap_or("unknown")
+        .to_owned();
+    let (slack, discord, linear, github) = match destination {
+        Some(ChatDestination::Slack {
+            channel_id,
+            thread_ts,
+        }) => (
+            Some(SlackThreadContext {
+                channel_id,
+                thread_ts,
+            }),
+            None,
+            None,
+            None,
+        ),
+        Some(ChatDestination::Discord {
+            guild_id,
+            channel_id,
+            thread_id,
+        }) => (
+            None,
+            Some(DiscordThreadContext {
+                guild_id,
+                channel_id,
+                thread_id,
+            }),
+            None,
+            None,
+        ),
+        Some(ChatDestination::Linear {
+            issue_id,
+            comment_id,
+            agent_session_id,
+        }) => (
+            None,
+            None,
+            Some(LinearThreadContext {
+                issue_id,
+                comment_id,
+                agent_session_id,
+            }),
+            None,
+        ),
+        Some(ChatDestination::Github {
+            owner,
+            repo,
+            number,
+            kind,
+            review_comment_id,
+        }) => (
+            None,
+            None,
+            None,
+            Some(GithubThreadContext {
+                owner,
+                repo,
+                number,
+                kind: kind.as_str().to_owned(),
+                review_comment_id,
+            }),
+        ),
+        None => (None, None, None, None),
+    };
     let title = match runtime.session_title(&thread_key).await {
         Ok(title) => title,
         Err(error) => {
@@ -492,9 +560,13 @@ async fn get_session_context(
         }
     };
     Ok(Json(SessionContextResponse {
-        slack: slack_thread_context(&thread_key),
         title,
         thread_key,
+        platform,
+        slack,
+        discord,
+        linear,
+        github,
     }))
 }
 
@@ -502,29 +574,6 @@ async fn list_personas(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<PersonaSummary>>, ApiError> {
     Ok(Json(state.runtime()?.personas()))
-}
-
-fn slack_thread_context(thread_key: &ThreadKey) -> Option<SlackThreadContext> {
-    let parts = thread_key.as_str().split(':').collect::<Vec<_>>();
-    let (channel_id, thread_ts) = match parts.as_slice() {
-        ["slack", channel_id, thread_ts] => (*channel_id, *thread_ts),
-        ["slack", _team_id, channel_id, thread_ts] => (*channel_id, *thread_ts),
-        [channel_id, thread_ts] if is_slack_conversation_id(channel_id) => {
-            (*channel_id, *thread_ts)
-        }
-        _ => return None,
-    };
-    if channel_id.is_empty() || thread_ts.is_empty() {
-        return None;
-    }
-    Some(SlackThreadContext {
-        channel_id: channel_id.to_owned(),
-        thread_ts: thread_ts.to_owned(),
-    })
-}
-
-fn is_slack_conversation_id(value: &str) -> bool {
-    matches!(value.as_bytes().first(), Some(b'C' | b'D' | b'G'))
 }
 
 async fn append_messages(
@@ -2608,9 +2657,24 @@ async fn emit_workflow_event(
     Json(request): Json<EmitWorkflowEventRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let workflows = workflow_runtime(&state)?;
-    workflows
-        .emit_event(&request.event_name, request.payload)
-        .await?;
+    let event_name = match (
+        request.event_name.as_deref(),
+        request.event_type.as_deref(),
+        request.correlation_id.as_deref(),
+    ) {
+        (Some(event_name), None, None) if !event_name.trim().is_empty() => event_name.to_owned(),
+        (None, Some(event_type), Some(correlation_id))
+            if !event_type.trim().is_empty() && !correlation_id.trim().is_empty() =>
+        {
+            centaur_workflows::python_workflow_event_name(event_type, correlation_id)
+        }
+        _ => {
+            return Err(ApiError::BadRequest(
+                "provide either event_name or both event_type and correlation_id".to_owned(),
+            ));
+        }
+    };
+    workflows.emit_event(&event_name, request.payload).await?;
     Ok(Json(json!({ "ok": true })))
 }
 

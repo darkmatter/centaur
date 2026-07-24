@@ -33,7 +33,7 @@ use centaur_session_core::HarnessType;
 use centaur_session_runtime::{
     PersonaRegistry, SandboxCapacityConfig, SandboxWorkloadMode, SessionSandboxCleanupConfig,
 };
-use centaur_workflows::WorkflowHostSandboxRuntime;
+use centaur_workflows::{WorkflowHostSandboxRuntime, WorkflowPrincipalRegistrar};
 use clap::{Args as ClapArgs, Parser, ValueEnum};
 use tracing::{info, warn};
 
@@ -123,6 +123,7 @@ pub(crate) struct IronControlRuntime {
     pub(crate) registrar: SessionRegistrar,
     pub(crate) warm_pool_bootstrap_principal: String,
     pub(crate) workflow_host_principal: String,
+    pub(crate) workflow_principal_registrar: WorkflowPrincipalRegistrar,
 }
 
 #[derive(Debug, ClapArgs)]
@@ -741,7 +742,7 @@ impl SandboxArgs {
         }
         let default_labels = (!access.is_empty())
             .then(|| BTreeMap::from([("centaur.sandbox_repo_cache".to_owned(), access)]));
-        let mut registrar = SessionRegistrar::new(client, namespace, role_ids);
+        let mut registrar = SessionRegistrar::new(client.clone(), namespace.clone(), role_ids);
         if let Some(labels) = default_labels {
             registrar = registrar.with_default_labels(labels);
         }
@@ -749,6 +750,7 @@ impl SandboxArgs {
             registrar,
             warm_pool_bootstrap_principal: bootstrap.id,
             workflow_host_principal: workflow_host.id,
+            workflow_principal_registrar: WorkflowPrincipalRegistrar::new(client, namespace),
         }))
     }
 
@@ -1874,7 +1876,7 @@ impl IronProxyHarnessArgs {
             HarnessType::Amp,
             HarnessType::Omp,
         ] {
-            if engine == self.engine {
+            if harness_fragment_engine_name(&engine) == harness_fragment_engine_name(&self.engine) {
                 continue;
             }
             let auth_mode = harness_auth_mode_env(&engine).unwrap_or_else(|| "api_key".to_owned());
@@ -1956,6 +1958,7 @@ fn harness_fragment_engine_name(engine: &HarnessType) -> &'static str {
         HarnessType::Codex => "codex",
         HarnessType::Amp => "amp",
         HarnessType::ClaudeCode => "claude-code",
+        HarnessType::Nanocodex => "codex",
         HarnessType::Omp => "omp",
     }
 }
@@ -1974,6 +1977,7 @@ fn harness_auth_mode_env(engine: &HarnessType) -> Option<String> {
         HarnessType::Codex => env::var("CODEX_AUTH_MODE").ok(),
         HarnessType::ClaudeCode => env::var("CLAUDE_CODE_AUTH_MODE").ok(),
         HarnessType::Amp => None,
+        HarnessType::Nanocodex => Some("api_key".to_owned()),
         // omp gets its upstream key through the plain sandbox env (LiteLLM
         // gateway), not an iron-proxy auth fragment — the amp pattern.
         HarnessType::Omp => None,
@@ -2959,6 +2963,18 @@ mod tests {
         assert_eq!(
             args.sandbox.iron_proxy.harness.engine,
             HarnessType::ClaudeCode
+        );
+    }
+
+    #[test]
+    fn nanocodex_reuses_the_codex_proxy_fragment() {
+        assert_eq!(
+            harness_fragment_engine_name(&HarnessType::Nanocodex),
+            harness_fragment_engine_name(&HarnessType::Codex)
+        );
+        assert_eq!(
+            harness_auth_mode_env(&HarnessType::Nanocodex).as_deref(),
+            Some("api_key")
         );
     }
 }

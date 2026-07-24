@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use std::collections::BTreeMap;
 
 use crate::{
     ObservedSandbox, SandboxHandle, SandboxId, SandboxIo, SandboxResult, SandboxSpec, SandboxStatus,
@@ -78,6 +79,7 @@ pub trait SandboxBackend: Send + Sync {
         &self,
         _id: &SandboxId,
         _principal_id: &str,
+        _labels: &BTreeMap<String, String>,
     ) -> SandboxResult<()> {
         Err(crate::SandboxError::Unsupported {
             backend: self.name(),
@@ -92,6 +94,7 @@ pub trait SandboxBackend: Send + Sync {
         &self,
         _id: &SandboxId,
         _principal_id: &str,
+        _labels: &BTreeMap<String, String>,
     ) -> SandboxResult<()> {
         Ok(())
     }

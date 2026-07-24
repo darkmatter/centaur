@@ -222,6 +222,7 @@ async fn test_harness_wire_values(http: &HttpClient, base_url: &str) -> Result<(
         (HarnessType::Codex, "codex"),
         (HarnessType::Amp, "amp"),
         (HarnessType::ClaudeCode, "claudecode"),
+        (HarnessType::Nanocodex, "nanocodex"),
         (HarnessType::Omp, "omp"),
     ];
 

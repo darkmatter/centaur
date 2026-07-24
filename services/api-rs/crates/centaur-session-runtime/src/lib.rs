@@ -8363,6 +8363,12 @@ fn input_line_with_session_context(
         map.entry("traceparent")
             .or_insert_with(|| Value::String(traceparent.clone()));
     }
+    // max_duration_ms is a reserved control-plane field. Remove any caller
+    // value even when this execution has no configured maximum; otherwise the
+    // OMP harness would trust a deadline that api-rs is not enforcing.
+    if let Some(Value::Object(metadata)) = map.get_mut("trace_metadata") {
+        metadata.remove("max_duration_ms");
+    }
     // Inject trusted execution controls into trace_metadata after the line
     // leaves the client boundary. Client-supplied values are overwritten.
     if trace.owner_id.is_some() || trace.max_duration_ms.is_some() {
@@ -10420,6 +10426,23 @@ mod tests {
         assert_eq!(value["trace_metadata"]["max_duration_ms"], 2_700_000);
         assert_eq!(value["trace_metadata"]["owner_id"], "api-rs-owner");
         assert_eq!(value["trace_metadata"]["generation"], 7);
+    }
+
+    #[test]
+    fn absent_execution_max_duration_removes_client_harness_override() {
+        let thread_key = ThreadKey::parse("workflow:test:repair").unwrap();
+        let trace = SessionTraceContext::new(&thread_key, None).with_ownership("api-rs-owner", 7);
+        let input = r#"{"type":"user","text":"repair","trace_metadata":{"max_duration_ms":2700000,"client_tag":"kept"}}"#;
+
+        let value: Value =
+            serde_json::from_str(&input_line_with_session_context(&thread_key, &trace, input))
+                .unwrap();
+        let metadata = value["trace_metadata"].as_object().unwrap();
+
+        assert!(!metadata.contains_key("max_duration_ms"));
+        assert_eq!(metadata["client_tag"], "kept");
+        assert_eq!(metadata["owner_id"], "api-rs-owner");
+        assert_eq!(metadata["generation"], 7);
     }
 
     #[test]

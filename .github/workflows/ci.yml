@@ -10,9 +10,9 @@ on:
   push:
     branches: [main]
   merge_group:
-  # sync-upstream.yml opens the sync PR with GITHUB_TOKEN, which suppresses
-  # pull_request events. sync-upstream dispatches CI explicitly on the sync
-  # branch head so required checks appear on the PR.
+  # The overlay upstream_sync workflow opens/updates the sync PR through a
+  # token that suppresses pull_request events, then dispatches CI explicitly
+  # on the repaired sync branch head.
   workflow_dispatch:
     inputs:
       ref:

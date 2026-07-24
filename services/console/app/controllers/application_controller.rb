@@ -10,7 +10,7 @@ class ApplicationController < ActionController::Base
   rescue_from ActiveRecord::RecordNotFound, with: :render_not_found
 
   helper_method :current_user, :acting_admin?, :descoped?, :password_login_enabled?
-  helper_method :public_base_url, :oauth_callback_redirect_uri
+  helper_method :public_base_url, :oauth_callback_redirect_uri, :omp_viewer_url, :omp_viewer_export_url
 
   # The public origin the console is reached at. Derived from the request by
   # default; CENTAUR_CONSOLE_PUBLIC_URL overrides it for deployments behind
@@ -26,6 +26,14 @@ class ApplicationController < ActionController::Base
   # "<public base>/oauth/<slug>/callback". One per app, keyed by its slug.
   def oauth_callback_redirect_uri(slug)
     URI.join(public_base_url, "/oauth/#{slug}/callback").to_s
+  end
+
+  def omp_viewer_url
+    ENV["CENTAUR_OMP_VIEWER_URL"].presence
+  end
+
+  def omp_viewer_export_url(thread_key)
+    "#{omp_viewer_url.delete_suffix("/")}/export/#{ERB::Util.url_encode(thread_key)}"
   end
 
   # Gate every UI route behind a console session by default. Controllers that
@@ -69,6 +77,10 @@ class ApplicationController < ActionController::Base
   # permissions ("view as operator"). Self-healing: the flag is dropped if the
   # user is no longer an admin, so it can never outlive the privileges it pauses.
   def descoped?
+    # Outside a dispatched request (unit-style tests build bare controller
+    # instances) there is no session to descope through; reading `session`
+    # would raise a DelegationError on the nil @_request.
+    return false if request.nil?
     return false unless session[:descoped]
     return true if current_user&.admin?
 
@@ -202,6 +214,10 @@ class ApplicationController < ActionController::Base
   end
 
   def console_sidebar_visible_thread_scope
+    # Mirrors Console::ThreadsController#visible_thread_scope: admins see all
+    # threads, including unowned system threads (workflow:*, executor jobs).
+    return CentaurSession.all if acting_admin?
+
     slack_owners = console_sidebar_slack_thread_owners_for_current_user
     conditions = [
       console_sidebar_console_thread_owner_sql,

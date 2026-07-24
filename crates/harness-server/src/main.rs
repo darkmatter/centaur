@@ -23,6 +23,7 @@ enum CliCommand {
     Amp(HarnessCommand),
     /// Run Nanocodex directly as a library and stream its native typed events.
     Nanocodex,
+    Omp(HarnessCommand),
     ValidateJsonrpc,
     ValidateAgentDeltas,
 }
@@ -56,6 +57,7 @@ fn run() -> Result<()> {
         CliCommand::ClaudeCode(command) => run_mode(HarnessKind::ClaudeCode, command.mode),
         CliCommand::Amp(command) => run_mode(HarnessKind::Amp, command.mode),
         CliCommand::Nanocodex => run_nanocodex_blocks_server(),
+        CliCommand::Omp(command) => run_mode(HarnessKind::Omp, command.mode),
         CliCommand::ValidateJsonrpc => run_validate_jsonrpc(),
         CliCommand::ValidateAgentDeltas => run_validate_agent_deltas(),
     }

@@ -17,7 +17,12 @@ import type {
   SlackbotV2InterruptSessionResponse,
   SlackbotV2Options,
   SlackbotV2RendererSource,
-  SlackbotV2SessionMessage
+  SlackbotV2StartCollabRequest,
+  SlackbotV2StartCollabResponse,
+  SlackbotV2StatusCollabResponse,
+  SlackbotV2SessionMessage,
+  SlackbotV2StopCollabRequest,
+  SlackbotV2StopCollabResponse
 } from './types'
 import { observeSeconds, slackbotMetrics } from './metrics'
 import { rawSlackUserId } from './slack-user'
@@ -601,6 +606,56 @@ export async function interruptSessionExecution(
   )
 }
 
+/**
+ * Start or reuse the session's native OMP collaboration room. Returns the
+ * room state carrying `join_url`, the full `omp join`-capable capability URL
+ * emitted by the resident host via api-rs. Ingress forwards it verbatim — it
+ * never synthesises the tailnet relay prefix.
+ */
+export async function startCollabRoom(
+  options: SlackbotV2Options,
+  threadId: string,
+  request: SlackbotV2StartCollabRequest = {}
+): Promise<SlackbotV2StartCollabResponse> {
+  return recordSessionApiOperation(
+    'collab_start',
+    () => postCollabStart(options, threadId, request),
+    sessionApiTimeoutMs(options),
+    'start collab room'
+  )
+}
+
+/** Query the native OMP collaboration room state for a session. */
+export async function statusCollabRoom(
+  options: SlackbotV2Options,
+  threadId: string
+): Promise<SlackbotV2StatusCollabResponse> {
+  return recordSessionApiOperation(
+    'collab_status',
+    () => getCollabStatus(options, threadId),
+    sessionApiTimeoutMs(options),
+    'status collab room'
+  )
+}
+
+/**
+ * Close the native OMP collaboration room. Idempotent: a 200 with
+ * `stopped: false` means there was no live room to stop, which the caller
+ * treats as success.
+ */
+export async function stopCollabRoom(
+  options: SlackbotV2Options,
+  threadId: string,
+  request: SlackbotV2StopCollabRequest = {}
+): Promise<SlackbotV2StopCollabResponse> {
+  return recordSessionApiOperation(
+    'collab_stop',
+    () => postCollabStop(options, threadId, request),
+    sessionApiTimeoutMs(options),
+    'stop collab room'
+  )
+}
+
 const RESTART_CONTEXT_MAX_CHARS = 24_000
 
 /**
@@ -1049,7 +1104,8 @@ async function resolveConversationName(
 // and falling back to the conversation segment of the thread key
 // (`<source>:[<team>:]<conversation>[:<ts>]`). Slack ids carry their type in the
 // first letter: C/G are channels/groups, D is a direct message.
-function slackConversationId(message: SlackbotV2ApiMessage): string | undefined {
+function slackConversationId(message?: SlackbotV2ApiMessage): string | undefined {
+  if (!message) return undefined
   const fromRaw = rawSlackString(message.raw, 'channel')
   if (fromRaw) return fromRaw
   for (const segment of message.threadId.split(':').slice(1)) {
@@ -1305,6 +1361,67 @@ async function postInterruptSessionExecution(
   return (await response.json()) as SlackbotV2InterruptSessionResponse
 }
 
+async function postCollabStart(
+  options: SlackbotV2Options,
+  threadId: string,
+  request: SlackbotV2StartCollabRequest
+): Promise<SlackbotV2StartCollabResponse> {
+  const fetchFn = options.fetch ?? fetch
+  const response = await fetchWithTimeout(
+    fetchFn,
+    apiSessionUrl(options.apiUrl, threadId, 'collab/start'),
+    {
+      method: 'POST',
+      headers: apiHeaders(options),
+      body: JSON.stringify(request)
+    },
+    sessionApiTimeoutMs(options),
+    'start collab room'
+  )
+  await ensureApiOk(response, 'start collab room')
+  return (await response.json()) as SlackbotV2StartCollabResponse
+}
+
+async function getCollabStatus(
+  options: SlackbotV2Options,
+  threadId: string
+): Promise<SlackbotV2StatusCollabResponse> {
+  const fetchFn = options.fetch ?? fetch
+  const response = await fetchWithTimeout(
+    fetchFn,
+    apiSessionUrl(options.apiUrl, threadId, 'collab/status'),
+    {
+      method: 'GET',
+      headers: apiHeaders(options, false)
+    },
+    sessionApiTimeoutMs(options),
+    'status collab room'
+  )
+  await ensureApiOk(response, 'status collab room')
+  return (await response.json()) as SlackbotV2StatusCollabResponse
+}
+
+async function postCollabStop(
+  options: SlackbotV2Options,
+  threadId: string,
+  request: SlackbotV2StopCollabRequest
+): Promise<SlackbotV2StopCollabResponse> {
+  const fetchFn = options.fetch ?? fetch
+  const response = await fetchWithTimeout(
+    fetchFn,
+    apiSessionUrl(options.apiUrl, threadId, 'collab/stop'),
+    {
+      method: 'POST',
+      headers: apiHeaders(options),
+      body: JSON.stringify(request)
+    },
+    sessionApiTimeoutMs(options),
+    'stop collab room'
+  )
+  await ensureApiOk(response, 'stop collab room')
+  return (await response.json()) as SlackbotV2StopCollabResponse
+}
+
 async function ensureApiOk(response: Response, action: string): Promise<void> {
   if (response.ok) return
   let body = ''
@@ -1355,7 +1472,7 @@ async function streamSessionNotifications(
 function apiSessionUrl(
   apiUrl: string,
   threadId: string,
-  suffix?: 'messages' | 'execute' | 'events' | 'interrupt'
+  suffix?: 'collab/start' | 'collab/status' | 'collab/stop' | 'events' | 'execute' | 'interrupt' | 'messages'
 ): string {
   const path = `/api/session/${encodeURIComponent(threadId)}${suffix ? `/${suffix}` : ''}`
   return new URL(path, ensureTrailingSlash(apiUrl)).toString()

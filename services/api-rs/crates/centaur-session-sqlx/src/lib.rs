@@ -83,6 +83,39 @@ pub struct WorkflowOwnedSandbox {
     pub sandbox_id: String,
 }
 
+/// Ownership mode for a session boundary.
+///
+/// `Resident` holders gate all one-shot execution; `Oneshot` holders are the
+/// transient execution path and are rejected while a resident holds the session.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SessionOwnerMode {
+    Resident,
+    Oneshot,
+}
+
+impl SessionOwnerMode {
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Resident => "resident",
+            Self::Oneshot => "oneshot",
+        }
+    }
+}
+
+/// Result of [`PgSessionStore::acquire_session_ownership`].
+///
+/// `acquired` is true when the caller won the atomic acquisition. Losers see
+/// the winning `owner_id` and `generation` so they can report contention and
+/// respect fencing.
+#[derive(Clone, Debug)]
+pub struct SessionOwnership {
+    pub thread_key: ThreadKey,
+    pub owner_id: String,
+    pub generation: i64,
+    pub mode: SessionOwnerMode,
+    pub acquired: bool,
+}
+
 #[derive(Clone)]
 pub struct PgSessionStore {
     pool: PgPool,
@@ -448,6 +481,30 @@ impl PgSessionStore {
         row.map(TryInto::try_into).transpose()
     }
 
+    /// Looks up an existing execution by its client idempotency key without
+    /// creating a new row. Runtime callers use this before session ownership
+    /// acquisition so an exact retry can attach to its original execution even
+    /// while another owner holds the session.
+    pub async fn execution_for_idempotency_key(
+        &self,
+        thread_key: &ThreadKey,
+        idempotency_key: &str,
+    ) -> Result<Option<SessionExecution>, SessionStoreError> {
+        let row = sqlx::query_as::<_, SessionExecutionRow>(
+            r#"
+            select execution_id, idempotency_key, thread_key, status, metadata, error,
+                   created_at, updated_at, started_at, completed_at
+            from session_executions
+            where thread_key = $1 and idempotency_key = $2
+            "#,
+        )
+        .bind(thread_key.as_str())
+        .bind(idempotency_key)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(TryInto::try_into).transpose()
+    }
+
     pub async fn mark_execution_running(
         &self,
         execution_id: &str,
@@ -728,6 +785,20 @@ impl PgSessionStore {
             where execution_id = $1
               and status in ($3, $4)
               and stdout_owner_id = $5
+              and (
+                  not exists (
+                      select 1 from session_owners
+                      where thread_key = session_executions.thread_key
+                  )
+                  or exists (
+                      select 1 from session_owners owner
+                      where owner.thread_key = session_executions.thread_key
+                        and owner.owner_id = $5
+                        and owner.lease_expires_at > now()
+                        and owner.generation::text =
+                            session_executions.metadata->>'_session_owner_generation'
+                  )
+              )
             returning execution_id, idempotency_key, thread_key, status, metadata, error, created_at, updated_at, started_at, completed_at
             "#,
         )
@@ -818,6 +889,20 @@ impl PgSessionStore {
             where execution_id = $1
               and status in ($4, $5)
               and stdout_owner_id = $6
+              and (
+                  not exists (
+                      select 1 from session_owners
+                      where thread_key = session_executions.thread_key
+                  )
+                  or exists (
+                      select 1 from session_owners owner
+                      where owner.thread_key = session_executions.thread_key
+                        and owner.owner_id = $6
+                        and owner.lease_expires_at > now()
+                        and owner.generation::text =
+                            session_executions.metadata->>'_session_owner_generation'
+                  )
+              )
             returning execution_id, idempotency_key, thread_key, status, metadata, error, created_at, updated_at, started_at, completed_at
             "#,
         )
@@ -856,6 +941,20 @@ impl PgSessionStore {
             where execution_id = $1
               and status in ($4, $5)
               and stdout_owner_id = $6
+              and (
+                  not exists (
+                      select 1 from session_owners
+                      where thread_key = session_executions.thread_key
+                  )
+                  or exists (
+                      select 1 from session_owners owner
+                      where owner.thread_key = session_executions.thread_key
+                        and owner.owner_id = $6
+                        and owner.lease_expires_at > now()
+                        and owner.generation::text =
+                            session_executions.metadata->>'_session_owner_generation'
+                  )
+              )
             returning execution_id, idempotency_key, thread_key, status, metadata, error, created_at, updated_at, started_at, completed_at
             "#,
         )
@@ -920,6 +1019,20 @@ impl PgSessionStore {
               and stdout_owner_id = $2
               and status in ($4, $5)
               and thread_key = $6
+              and (
+                  not exists (
+                      select 1 from session_owners
+                      where thread_key = session_executions.thread_key
+                  )
+                  or exists (
+                      select 1 from session_owners owner
+                      where owner.thread_key = session_executions.thread_key
+                        and owner.owner_id = $2
+                        and owner.lease_expires_at > now()
+                        and owner.generation::text =
+                            session_executions.metadata->>'_session_owner_generation'
+                  )
+              )
             "#,
         )
         .bind(execution_id)
@@ -952,6 +1065,230 @@ impl PgSessionStore {
 
         tx.commit().await?;
         row.try_into().map(Some)
+    }
+
+    /// Appends an event only while the caller still holds the session fencing
+    /// generation and its lease is live. The ownership renewal and event insert
+    /// are one transaction, so a stale owner cannot commit after takeover.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn append_event_if_session_owner(
+        &self,
+        thread_key: &ThreadKey,
+        execution_id: &str,
+        owner_id: &str,
+        generation: i64,
+        lease: Duration,
+        event_type: &str,
+        payload: Value,
+    ) -> Result<Option<SessionEvent>, SessionStoreError> {
+        let lease_expires_at = stdout_lease_expires_at(lease);
+        let mut tx = self.pool.begin().await?;
+        let result = sqlx::query(
+            r#"
+            update session_owners
+            set lease_expires_at = $4, updated_at = now()
+            where thread_key = $1
+              and owner_id = $2
+              and generation = $3
+              and lease_expires_at > now()
+            "#,
+        )
+        .bind(thread_key.as_str())
+        .bind(owner_id)
+        .bind(generation)
+        .bind(lease_expires_at)
+        .execute(&mut *tx)
+        .await?;
+        if result.rows_affected() == 0 {
+            tx.commit().await?;
+            return Ok(None);
+        }
+
+        let row = sqlx::query_as::<_, SessionEventRow>(
+            r#"
+            insert into session_events (thread_key, execution_id, event_type, payload)
+            values ($1, $2, $3, $4)
+            returning event_id, thread_key, execution_id, event_type, payload, created_at
+            "#,
+        )
+        .bind(thread_key.as_str())
+        .bind(execution_id)
+        .bind(event_type)
+        .bind(payload)
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        row.try_into().map(Some)
+    }
+    /// Appends an unscoped lifecycle event only while the caller still holds
+    /// the session fencing generation and its lease. Unlike
+    /// `append_event_if_session_owner`, this variant stores `execution_id =
+    /// NULL`, which is required for room lifecycle events that are not tied
+    /// to an agent execution.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn append_unscoped_event_if_session_owner(
+        &self,
+        thread_key: &ThreadKey,
+        owner_id: &str,
+        generation: i64,
+        lease: Duration,
+        event_type: &str,
+        payload: Value,
+    ) -> Result<Option<SessionEvent>, SessionStoreError> {
+        let lease_expires_at = stdout_lease_expires_at(lease);
+        let mut tx = self.pool.begin().await?;
+        let result = sqlx::query(
+            r#"
+            update session_owners
+            set lease_expires_at = $4, updated_at = now()
+            where thread_key = $1
+              and owner_id = $2
+              and generation = $3
+              and lease_expires_at > now()
+            "#,
+        )
+        .bind(thread_key.as_str())
+        .bind(owner_id)
+        .bind(generation)
+        .bind(lease_expires_at)
+        .execute(&mut *tx)
+        .await?;
+        if result.rows_affected() == 0 {
+            tx.commit().await?;
+            return Ok(None);
+        }
+
+        let row = sqlx::query_as::<_, SessionEventRow>(
+            r#"
+            insert into session_events (thread_key, execution_id, event_type, payload)
+            values ($1, null, $2, $3)
+            returning event_id, thread_key, execution_id, event_type, payload, created_at
+            "#,
+        )
+        .bind(thread_key.as_str())
+        .bind(event_type)
+        .bind(payload)
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        row.try_into().map(Some)
+    }
+
+    /// Atomically appends a terminal lifecycle event and releases the session
+    /// ownership lease in a single fenced transaction. The fence checks
+    /// `owner_id`, `generation`, and a live lease before appending the event
+    /// and deleting the ownership row. Returns `Some(event)` on success,
+    /// `None` when the fence rejected (stale owner or expired lease), or
+    /// `Err` on a transient database failure. Callers must only remove the
+    /// in-memory registry handle after a `Some` result, and must prove the
+    /// ownership row is absent or changed before removing on a `None` result.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn finalize_collab_room(
+        &self,
+        thread_key: &ThreadKey,
+        owner_id: &str,
+        generation: i64,
+        lease: Duration,
+        event_type: &str,
+        payload: Value,
+    ) -> Result<Option<SessionEvent>, SessionStoreError> {
+        let lease_expires_at = stdout_lease_expires_at(lease);
+        let mut tx = self.pool.begin().await?;
+        let result = sqlx::query(
+            r#"
+            update session_owners
+            set lease_expires_at = $4, updated_at = now()
+            where thread_key = $1
+              and owner_id = $2
+              and generation = $3
+              and lease_expires_at > now()
+            "#,
+        )
+        .bind(thread_key.as_str())
+        .bind(owner_id)
+        .bind(generation)
+        .bind(lease_expires_at)
+        .execute(&mut *tx)
+        .await?;
+        if result.rows_affected() == 0 {
+            tx.commit().await?;
+            return Ok(None);
+        }
+        let row = sqlx::query_as::<_, SessionEventRow>(
+            r#"
+            insert into session_events (thread_key, execution_id, event_type, payload)
+            values ($1, null, $2, $3)
+            returning event_id, thread_key, execution_id, event_type, payload, created_at
+            "#,
+        )
+        .bind(thread_key.as_str())
+        .bind(event_type)
+        .bind(payload)
+        .fetch_one(&mut *tx)
+        .await?;
+        let deleted = sqlx::query(
+            r#"
+            delete from session_owners
+            where thread_key = $1
+              and owner_id = $2
+              and generation = $3
+            "#,
+        )
+        .bind(thread_key.as_str())
+        .bind(owner_id)
+        .bind(generation)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        if deleted.rows_affected() == 0 {
+            return Ok(None);
+        }
+        row.try_into().map(Some)
+    }
+
+    /// Probes whether this owner still holds the session ownership row with
+    /// the given generation. Returns `true` when the row exists and matches,
+    /// `false` when the row is absent or owned by a different owner/generation.
+    /// Used by cleanup to prove a fenced `finalize_collab_room` result before
+    /// removing the in-memory handle.
+    pub async fn session_ownership_matches(
+        &self,
+        thread_key: &ThreadKey,
+        owner_id: &str,
+        generation: i64,
+    ) -> Result<bool, SessionStoreError> {
+        let matched = sqlx::query_scalar::<_, bool>(
+            r#"
+            select exists(
+                select 1 from session_owners
+                where thread_key = $1
+                  and owner_id = $2
+                  and generation = $3
+                  and lease_expires_at > now()
+            )
+            "#,
+        )
+        .bind(thread_key.as_str())
+        .bind(owner_id)
+        .bind(generation)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(matched)
+    }
+
+    /// Returns the true latest event id for a session without applying a page
+    /// limit. Lifecycle request anchors must use this rather than taking the
+    /// maximum of a bounded ascending page, which can point at an old event
+    /// once a session has more than one page of history.
+    pub async fn latest_event_id(&self, thread_key: &ThreadKey) -> Result<i64, SessionStoreError> {
+        sqlx::query_scalar::<_, Option<i64>>(
+            "select max(event_id) from session_events where thread_key = $1",
+        )
+        .bind(thread_key.as_str())
+        .fetch_one(&self.pool)
+        .await
+        .map(|latest| latest.unwrap_or(0))
+        .map_err(Into::into)
     }
 
     pub async fn list_events_after(
@@ -1539,6 +1876,299 @@ impl PgSessionStore {
         .await?;
         Ok(())
     }
+
+    // ---- session exclusive ownership (centaur-3w2.2) ----
+
+    /// Default lease for a resident session owner. A resident host renews this
+    /// periodically; if it stops renewing, the lease expires and a peer (or a
+    /// one-shot execution) can reclaim the session.
+    pub const SESSION_OWNERSHIP_LEASE: Duration = Duration::from_secs(45);
+
+    /// Atomically acquires exclusive ownership of a session.
+    ///
+    /// Exactly one caller wins when leases overlap. A `Resident` owner blocks
+    /// `Oneshot` acquisition; an expired lease is reclaimable by anyone. The
+    /// returned [`SessionOwnership`] always carries the winning `owner_id` and
+    /// `generation` so losers can report contention and respect fencing.
+    pub async fn acquire_session_ownership(
+        &self,
+        thread_key: &ThreadKey,
+        owner_id: &str,
+        mode: SessionOwnerMode,
+    ) -> Result<SessionOwnership, SessionStoreError> {
+        let lease = Self::SESSION_OWNERSHIP_LEASE;
+        let expires_at = stdout_lease_expires_at(lease);
+
+        // Try to claim a free or expired slot. A live owner always blocks a
+        // different caller, regardless of whether it is resident or one-shot.
+        let won = sqlx::query_as::<_, (String, i64, String)>(
+            r#"
+            insert into session_owners
+                (thread_key, owner_id, generation, mode, lease_expires_at)
+            values ($1, $2, 1, $3, $4)
+            on conflict (thread_key) do update
+            set owner_id = excluded.owner_id,
+                generation = session_owners.generation + 1,
+                mode = excluded.mode,
+                lease_expires_at = excluded.lease_expires_at,
+                acquired_at = now(),
+                updated_at = now()
+            where session_owners.lease_expires_at < now()
+            returning owner_id, generation, mode
+            "#,
+        )
+        .bind(thread_key.as_str())
+        .bind(owner_id)
+        .bind(mode.as_str())
+        .bind(expires_at)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        if let Some((winning_owner, generation, mode_str)) = won {
+            let won_mode = match mode_str.as_str() {
+                "resident" => SessionOwnerMode::Resident,
+                _ => SessionOwnerMode::Oneshot,
+            };
+            return Ok(SessionOwnership {
+                thread_key: thread_key.clone(),
+                owner_id: winning_owner.clone(),
+                generation,
+                mode: won_mode,
+                acquired: winning_owner == owner_id,
+            });
+        }
+
+        // Acquisition lost: read the winning owner for the caller.
+        let (winning_owner, generation, mode_str) = sqlx::query_as::<_, (String, i64, String)>(
+            r#"
+            select owner_id, generation, mode
+            from session_owners
+            where thread_key = $1
+            "#,
+        )
+        .bind(thread_key.as_str())
+        .fetch_one(&self.pool)
+        .await?;
+        let winning_mode = match mode_str.as_str() {
+            "resident" => SessionOwnerMode::Resident,
+            _ => SessionOwnerMode::Oneshot,
+        };
+        Ok(SessionOwnership {
+            thread_key: thread_key.clone(),
+            owner_id: winning_owner,
+            generation,
+            mode: winning_mode,
+            acquired: false,
+        })
+    }
+
+    /// Returns the current live session owner, if any. Expired rows are
+    /// intentionally hidden so callers cannot treat a dead owner as active.
+    pub async fn active_session_ownership(
+        &self,
+        thread_key: &ThreadKey,
+    ) -> Result<Option<SessionOwnership>, SessionStoreError> {
+        let row = sqlx::query_as::<_, (String, i64, String)>(
+            r#"
+            select owner_id, generation, mode
+            from session_owners
+            where thread_key = $1 and lease_expires_at > now()
+            "#,
+        )
+        .bind(thread_key.as_str())
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some((owner_id, generation, mode_str)) = row else {
+            return Ok(None);
+        };
+        let mode = match mode_str.as_str() {
+            "resident" => SessionOwnerMode::Resident,
+            _ => SessionOwnerMode::Oneshot,
+        };
+        Ok(Some(SessionOwnership {
+            thread_key: thread_key.clone(),
+            owner_id,
+            generation,
+            mode,
+            acquired: false,
+        }))
+    }
+
+    /// Releases the session ownership lease iff the caller is the current
+    /// owner. Returns `true` when the release took effect.
+    pub async fn release_session_ownership(
+        &self,
+        thread_key: &ThreadKey,
+        owner_id: &str,
+    ) -> Result<bool, SessionStoreError> {
+        let result = sqlx::query(
+            r#"
+            delete from session_owners
+            where thread_key = $1 and owner_id = $2
+            "#,
+        )
+        .bind(thread_key.as_str())
+        .bind(owner_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Generation-fenced release: only deletes the exact owner+generation row.
+    pub async fn release_session_ownership_at_generation(
+        &self,
+        thread_key: &ThreadKey,
+        owner_id: &str,
+        generation: i64,
+    ) -> Result<bool, SessionStoreError> {
+        let result = sqlx::query(
+            r#"
+            delete from session_owners
+            where thread_key = $1 and owner_id = $2 and generation = $3
+            "#,
+        )
+        .bind(thread_key.as_str())
+        .bind(owner_id)
+        .bind(generation)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Renews the session ownership lease iff the caller is still the current
+    /// owner. Returns `true` when the renewal took effect.
+    pub async fn renew_session_ownership(
+        &self,
+        thread_key: &ThreadKey,
+        owner_id: &str,
+    ) -> Result<bool, SessionStoreError> {
+        let expires_at = stdout_lease_expires_at(Self::SESSION_OWNERSHIP_LEASE);
+        let result = sqlx::query(
+            r#"
+            update session_owners
+            set lease_expires_at = $3, updated_at = now()
+            where thread_key = $1
+              and owner_id = $2
+              and lease_expires_at > now()
+            "#,
+        )
+        .bind(thread_key.as_str())
+        .bind(owner_id)
+        .bind(expires_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+    /// Renews a resident lease only when both the owner generation and the
+    /// unexpired lease still match. An expired process cannot resurrect its
+    /// ownership by renewing after the fact.
+    pub async fn renew_session_ownership_if_session_owner(
+        &self,
+        thread_key: &ThreadKey,
+        owner_id: &str,
+        generation: i64,
+    ) -> Result<bool, SessionStoreError> {
+        let expires_at = stdout_lease_expires_at(Self::SESSION_OWNERSHIP_LEASE);
+        let result = sqlx::query(
+            r#"
+            update session_owners
+            set lease_expires_at = $4, updated_at = now()
+            where thread_key = $1
+              and owner_id = $2
+              and generation = $3
+              and lease_expires_at > now()
+            "#,
+        )
+        .bind(thread_key.as_str())
+        .bind(owner_id)
+        .bind(generation)
+        .bind(expires_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Renews an exact ownership generation only while the execution that
+    /// acquired it is still active. This prevents a one-shot renewer from
+    /// keeping the session alive after its execution reaches a terminal state.
+    pub async fn renew_session_ownership_if_active_execution_owner(
+        &self,
+        thread_key: &ThreadKey,
+        execution_id: &str,
+        owner_id: &str,
+        generation: i64,
+    ) -> Result<bool, SessionStoreError> {
+        let expires_at = stdout_lease_expires_at(Self::SESSION_OWNERSHIP_LEASE);
+        let result = sqlx::query(
+            r#"
+            update session_owners owner
+            set lease_expires_at = $5, updated_at = now()
+            where owner.thread_key = $1
+              and owner.owner_id = $2
+              and owner.generation = $3
+              and owner.lease_expires_at > now()
+              and exists (
+                  select 1
+                  from session_executions execution
+                  where execution.execution_id = $4
+                    and execution.thread_key = owner.thread_key
+                    and execution.status in ($6, $7)
+                    and execution.metadata->>'_session_owner_generation' =
+                        owner.generation::text
+              )
+            "#,
+        )
+        .bind(thread_key.as_str())
+        .bind(owner_id)
+        .bind(generation)
+        .bind(execution_id)
+        .bind(expires_at)
+        .bind(ExecutionStatus::Queued.as_ref())
+        .bind(ExecutionStatus::Running.as_ref())
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Returns `true` when `generation` matches the current owner's generation.
+    /// Used to fence stale owners: after a loss/reacquire the generation bumps,
+    /// so a stale owner's events no longer match and are rejected.
+    pub async fn session_ownership_fence_matches(
+        &self,
+        thread_key: &ThreadKey,
+        generation: i64,
+    ) -> Result<bool, SessionStoreError> {
+        let row = sqlx::query_scalar::<_, i64>(
+            r#"
+            select generation
+            from session_owners
+            where thread_key = $1
+            "#,
+        )
+        .bind(thread_key.as_str())
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row == Some(generation))
+    }
+
+    /// Releases every session ownership lease held by `owner_id` in one
+    /// statement. Used by a clean control-plane shutdown so a peer's adoption
+    /// scan can reclaim sessions immediately instead of waiting out the lease.
+    pub async fn release_session_ownership_for_owner(
+        &self,
+        owner_id: &str,
+    ) -> Result<u64, SessionStoreError> {
+        let result = sqlx::query(
+            r#"
+            delete from session_owners
+            where owner_id = $1
+            "#,
+        )
+        .bind(owner_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
 }
 
 pub struct SessionEventListener {
@@ -1921,7 +2551,9 @@ mod tests {
     use time::{Duration as TimeDuration, OffsetDateTime};
     use uuid::Uuid;
 
-    use super::{IdleSandboxCandidateRow, PgSessionStore, SessionEventNotification};
+    use super::{
+        IdleSandboxCandidateRow, PgSessionStore, SessionEventNotification, SessionOwnerMode,
+    };
 
     async fn test_store() -> Option<PgSessionStore> {
         let Ok(url) = std::env::var("SESSION_RUNTIME_TEST_DATABASE_URL") else {
@@ -2395,6 +3027,362 @@ mod tests {
                 .await
                 .expect("list referenced sandboxes")
                 .contains(&sandbox_id)
+        );
+    }
+
+    // ---- session exclusive ownership (centaur-3w2.2) ----
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn session_ownership_duplicate_acquire_has_one_winner() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let thread_key =
+            ThreadKey::parse(format!("test:own-duplicate-{}", Uuid::new_v4())).unwrap();
+        store
+            .create_or_get_session(
+                &thread_key,
+                &HarnessType::Omp,
+                None,
+                json!({}),
+                BTreeMap::new(),
+            )
+            .await
+            .expect("create session");
+
+        let a = store
+            .acquire_session_ownership(&thread_key, "resident-a", SessionOwnerMode::Resident)
+            .await
+            .expect("resident-a acquires");
+        assert!(a.acquired, "first acquire wins");
+        assert_eq!(a.owner_id, "resident-a");
+        assert_eq!(a.mode, SessionOwnerMode::Resident);
+        let gen_a = a.generation;
+
+        // A concurrent resident acquire while the lease is live loses.
+        let b = store
+            .acquire_session_ownership(&thread_key, "resident-b", SessionOwnerMode::Resident)
+            .await
+            .expect("resident-b acquire lookup");
+        assert!(!b.acquired, "second concurrent acquire must lose");
+        assert_eq!(b.generation, gen_a, "loser sees the winning generation");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn session_ownership_releases_lease_permits_reacquisition() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let thread_key = ThreadKey::parse(format!("test:own-release-{}", Uuid::new_v4())).unwrap();
+        store
+            .create_or_get_session(
+                &thread_key,
+                &HarnessType::Omp,
+                None,
+                json!({}),
+                BTreeMap::new(),
+            )
+            .await
+            .expect("create session");
+
+        store
+            .acquire_session_ownership(&thread_key, "resident-a", SessionOwnerMode::Resident)
+            .await
+            .expect("acquire");
+        assert!(
+            store
+                .release_session_ownership(&thread_key, "resident-a")
+                .await
+                .expect("release"),
+            "release succeeds for the holding owner"
+        );
+
+        // A different owner can acquire immediately after release — no expiry wait.
+        let b = store
+            .acquire_session_ownership(&thread_key, "resident-b", SessionOwnerMode::Resident)
+            .await
+            .expect("resident-b acquires after release");
+        assert!(b.acquired);
+        assert_eq!(b.owner_id, "resident-b");
+        assert!(
+            b.generation > 0,
+            "reacquisition mints a fresh fencing generation"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn session_ownership_oneshot_blocked_by_resident() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let thread_key = ThreadKey::parse(format!("test:own-block-{}", Uuid::new_v4())).unwrap();
+        store
+            .create_or_get_session(
+                &thread_key,
+                &HarnessType::Omp,
+                None,
+                json!({}),
+                BTreeMap::new(),
+            )
+            .await
+            .expect("create session");
+
+        store
+            .acquire_session_ownership(&thread_key, "resident-a", SessionOwnerMode::Resident)
+            .await
+            .expect("resident acquires");
+
+        // A one-shot execution cannot acquire while the resident holds the session.
+        let blocked = store
+            .acquire_session_ownership(&thread_key, "oneshot-1", SessionOwnerMode::Oneshot)
+            .await
+            .expect("oneshot acquire lookup");
+        assert!(
+            !blocked.acquired,
+            "oneshot must not start against resident-owned session"
+        );
+
+        // Releasing the resident lease lets the one-shot through.
+        store
+            .release_session_ownership(&thread_key, "resident-a")
+            .await
+            .expect("release");
+        let allowed = store
+            .acquire_session_ownership(&thread_key, "oneshot-1", SessionOwnerMode::Oneshot)
+            .await
+            .expect("oneshot acquires after release");
+        assert!(allowed.acquired);
+        assert_eq!(allowed.mode, SessionOwnerMode::Oneshot);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn session_ownership_fence_rejects_stale_owner_events() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let thread_key = ThreadKey::parse(format!("test:own-fence-{}", Uuid::new_v4())).unwrap();
+        store
+            .create_or_get_session(
+                &thread_key,
+                &HarnessType::Omp,
+                None,
+                json!({}),
+                BTreeMap::new(),
+            )
+            .await
+            .expect("create session");
+
+        let a = store
+            .acquire_session_ownership(&thread_key, "resident-a", SessionOwnerMode::Resident)
+            .await
+            .expect("acquire a");
+        let gen_a = a.generation;
+
+        // Simulate a loss: force the lease to expire so a new owner can take over.
+        sqlx::query("update session_owners set lease_expires_at = now() - interval '1 second' where thread_key = $1")
+            .bind(thread_key.as_str())
+            .execute(store.pool())
+            .await
+            .expect("expire lease");
+
+        let b = store
+            .acquire_session_ownership(&thread_key, "resident-b", SessionOwnerMode::Resident)
+            .await
+            .expect("resident-b acquires after expiry");
+        assert!(b.acquired);
+        assert!(
+            b.generation > gen_a,
+            "reacquisition after loss mints a higher fencing generation"
+        );
+        let gen_b = b.generation;
+
+        // A stale owner (old generation) cannot commit a fenced event.
+        assert!(
+            !store
+                .session_ownership_fence_matches(&thread_key, gen_a)
+                .await
+                .expect("fence check a"),
+            "stale generation must not match after reacquisition"
+        );
+        // The current owner's generation matches.
+        assert!(
+            store
+                .session_ownership_fence_matches(&thread_key, gen_b)
+                .await
+                .expect("fence check b"),
+            "current generation must match"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn session_ownership_fences_event_commit_after_takeover() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let thread_key =
+            ThreadKey::parse(format!("test:own-event-fence-{}", Uuid::new_v4())).unwrap();
+        store
+            .create_or_get_session(
+                &thread_key,
+                &HarnessType::Omp,
+                None,
+                json!({}),
+                BTreeMap::new(),
+            )
+            .await
+            .expect("create session");
+        let execution_id = store
+            .create_execution(&thread_key, None, json!({}))
+            .await
+            .expect("create execution")
+            .execution
+            .execution_id;
+
+        let a = store
+            .acquire_session_ownership(&thread_key, "resident-a", SessionOwnerMode::Resident)
+            .await
+            .expect("acquire a");
+        assert!(
+            store
+                .append_event_if_session_owner(
+                    &thread_key,
+                    &execution_id,
+                    "resident-a",
+                    a.generation,
+                    Duration::from_secs(5),
+                    "session.collab.lifecycle",
+                    json!({"state":"started"}),
+                )
+                .await
+                .expect("owner-a appends")
+                .is_some(),
+            "current owner can commit events"
+        );
+
+        sqlx::query(
+            "update session_owners set lease_expires_at = now() - interval '1 second' where thread_key = $1",
+        )
+        .bind(thread_key.as_str())
+        .execute(store.pool())
+        .await
+        .expect("expire lease");
+        let b = store
+            .acquire_session_ownership(&thread_key, "resident-b", SessionOwnerMode::Resident)
+            .await
+            .expect("acquire b");
+        assert!(b.acquired);
+
+        assert!(
+            store
+                .append_event_if_session_owner(
+                    &thread_key,
+                    &execution_id,
+                    "resident-a",
+                    a.generation,
+                    Duration::from_secs(5),
+                    "session.collab.lifecycle",
+                    json!({"state":"stale"}),
+                )
+                .await
+                .expect("stale append is fenced")
+                .is_none(),
+            "stale owner cannot commit after takeover"
+        );
+        assert!(
+            store
+                .append_event_if_session_owner(
+                    &thread_key,
+                    &execution_id,
+                    "resident-b",
+                    b.generation,
+                    Duration::from_secs(5),
+                    "session.collab.lifecycle",
+                    json!({"state":"active"}),
+                )
+                .await
+                .expect("owner-b appends")
+                .is_some(),
+            "current owner can commit after takeover"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn session_ownership_expired_lease_permits_reacquisition() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let thread_key = ThreadKey::parse(format!("test:own-expiry-{}", Uuid::new_v4())).unwrap();
+        store
+            .create_or_get_session(
+                &thread_key,
+                &HarnessType::Omp,
+                None,
+                json!({}),
+                BTreeMap::new(),
+            )
+            .await
+            .expect("create session");
+
+        let a = store
+            .acquire_session_ownership(&thread_key, "resident-a", SessionOwnerMode::Resident)
+            .await
+            .expect("acquire a");
+        assert!(a.acquired);
+
+        // Expire the lease without an explicit release.
+        sqlx::query("update session_owners set lease_expires_at = now() - interval '1 second' where thread_key = $1")
+            .bind(thread_key.as_str())
+            .execute(store.pool())
+            .await
+            .expect("expire lease");
+
+        // A new owner can take over purely via expiry.
+        let b = store
+            .acquire_session_ownership(&thread_key, "resident-b", SessionOwnerMode::Resident)
+            .await
+            .expect("resident-b acquires after expiry");
+        assert!(b.acquired, "expired lease permits reacquisition");
+        assert_eq!(b.owner_id, "resident-b");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn session_ownership_release_rejects_wrong_owner() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let thread_key =
+            ThreadKey::parse(format!("test:own-wrong-release-{}", Uuid::new_v4())).unwrap();
+        store
+            .create_or_get_session(
+                &thread_key,
+                &HarnessType::Omp,
+                None,
+                json!({}),
+                BTreeMap::new(),
+            )
+            .await
+            .expect("create session");
+        store
+            .acquire_session_ownership(&thread_key, "resident-a", SessionOwnerMode::Resident)
+            .await
+            .expect("acquire a");
+
+        // A different owner cannot release a lease it doesn't hold.
+        assert!(
+            !store
+                .release_session_ownership(&thread_key, "resident-b")
+                .await
+                .expect("wrong release"),
+            "release must be scoped to the holding owner"
+        );
+
+        // The original owner can still release.
+        assert!(
+            store
+                .release_session_ownership(&thread_key, "resident-a")
+                .await
+                .expect("correct release"),
+            "holding owner releases"
         );
     }
 }

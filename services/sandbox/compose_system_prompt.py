@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import os
+from collections.abc import Sequence
 from pathlib import Path
 
 
@@ -35,6 +36,8 @@ def compose_system_prompt(
     home_dir: Path,
     target_prompt: Path,
     repo_mount: Path,
+    configured_prompt_files: Sequence[Path] | None = None,
+    legacy_overlay_dir: Path | None = None,
 ) -> None:
     base_prompt = home_dir / "AGENTS_BASE.md"
     baked_prompt = home_dir / "AGENTS.md"
@@ -45,9 +48,24 @@ def compose_system_prompt(
     else:
         return
 
-    appended: set[Path] = set()
-
     home_overlay = home_dir / "AGENTS_OVERLAY.md"
+    if configured_prompt_files is not None:
+        for prompt_path in reversed(configured_prompt_files):
+            if _append_prompt(target_prompt, prompt_path):
+                return
+        if _append_prompt(target_prompt, home_overlay):
+            return
+        if legacy_overlay_dir is not None:
+            _append_prompt(target_prompt, legacy_overlay_dir / OVERLAY_PROMPT)
+        return
+
+    if legacy_overlay_dir is not None:
+        if _append_prompt(target_prompt, home_overlay):
+            return
+        _append_prompt(target_prompt, legacy_overlay_dir / OVERLAY_PROMPT)
+        return
+
+    appended: set[Path] = set()
     if _append_prompt(target_prompt, home_overlay):
         appended.add(home_overlay.resolve())
 
@@ -69,10 +87,17 @@ def main() -> int:
     args = parser.parse_args()
 
     home_dir = Path(args.home_dir)
+    prompt_files = os.environ.get("CENTAUR_OVERLAY_PROMPT_FILES")
+    configured_prompt_files = (
+        [Path(path) for path in prompt_files.split(os.pathsep) if path] if prompt_files else None
+    )
+    legacy_overlay_dir = os.environ.get("CENTAUR_OVERLAY_DIR")
     compose_system_prompt(
         home_dir=home_dir,
         target_prompt=Path(args.target_prompt),
         repo_mount=Path(args.repo_mount) if args.repo_mount else home_dir / "github",
+        configured_prompt_files=configured_prompt_files,
+        legacy_overlay_dir=Path(legacy_overlay_dir) if legacy_overlay_dir else None,
     )
     return 0
 

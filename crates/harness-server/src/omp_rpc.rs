@@ -42,6 +42,19 @@ use crate::turn::CodexTurnNormalizer;
 use crate::util::write_value;
 use crate::wire::collab_state_wire_value;
 use crate::{HarnessServerError, Result};
+const DEFAULT_OMP_TURN_TIMEOUT: Duration = Duration::from_secs(300);
+const OMP_TURN_TIMEOUT_GRACE: Duration = Duration::from_secs(5);
+
+fn turn_timeout_from_trace_context(trace_context: &crate::otel::TraceContext) -> Duration {
+    trace_context
+        .metadata
+        .get("max_duration_ms")
+        .and_then(Value::as_u64)
+        .filter(|duration_ms| *duration_ms > 0)
+        .map(Duration::from_millis)
+        .and_then(|duration| duration.checked_add(OMP_TURN_TIMEOUT_GRACE))
+        .unwrap_or(DEFAULT_OMP_TURN_TIMEOUT)
+}
 
 /// The resident session ownership fence. Admission requires both fields; a
 /// stale generation (one that no longer matches the current owner) or a
@@ -963,6 +976,8 @@ pub fn run_omp_blocks_server() -> Result<()> {
                     write_value(&mut stdout, &notification_to_wire_value(&notification)?)?;
                 }
 
+                let turn_timeout = turn_timeout_from_trace_context(&trace_context);
+
                 let drive_result = drive_omp_turn(
                     child,
                     &mut event_normalizer,
@@ -974,6 +989,7 @@ pub fn run_omp_blocks_server() -> Result<()> {
                     &thread_id,
                     &input_rx,
                     &admitted_ownership,
+                    turn_timeout,
                 )?;
 
                 turn_active.store(false, Ordering::SeqCst);
@@ -1546,6 +1562,7 @@ fn drive_omp_turn(
     thread_id: &str,
     active_rx: &mpsc::Receiver<OmpBlocksInput>,
     admitted_ownership: &Option<OmpRpcOwnership>,
+    turn_timeout: Duration,
 ) -> Result<TurnDriveResult> {
     use crate::omp::OmpHarness;
     use crate::traits::{HarnessServer, NormalizedEvent};
@@ -1558,12 +1575,12 @@ fn drive_omp_turn(
     let mut prompt_error: Option<String> = None;
     // Settle window: arm only after a terminal assistant stop.
     let mut settle_deadline: Option<std::time::Instant> = None;
-    let absolute_deadline = std::time::Instant::now() + Duration::from_secs(300);
+    let absolute_deadline = std::time::Instant::now().checked_add(turn_timeout);
 
     while !terminal {
         // #5: check deadlines unconditionally, regardless of frame flow.
         let now = std::time::Instant::now();
-        if now >= absolute_deadline {
+        if absolute_deadline.is_some_and(|deadline| now >= deadline) {
             eprintln!("omp rpc: absolute turn timeout, terminating");
             let abort_id = child.next_request_id();
             child.send_command(&abort_command(&abort_id))?;
@@ -2376,6 +2393,49 @@ done
             child_reusable: false,
         };
         assert!(!deadline.child_reusable);
+    }
+
+    #[test]
+    fn configured_max_duration_extends_the_omp_turn_deadline() {
+        let trace_context = crate::otel::TraceContext {
+            metadata: std::collections::BTreeMap::from([(
+                "max_duration_ms".to_owned(),
+                json!(2_700_000),
+            )]),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            turn_timeout_from_trace_context(&trace_context),
+            Duration::from_millis(2_705_000)
+        );
+    }
+
+    #[test]
+    fn missing_invalid_or_zero_max_duration_keeps_the_default_deadline() {
+        assert_eq!(
+            turn_timeout_from_trace_context(&crate::otel::TraceContext::default()),
+            DEFAULT_OMP_TURN_TIMEOUT
+        );
+        let invalid = crate::otel::TraceContext {
+            metadata: std::collections::BTreeMap::from([(
+                "max_duration_ms".to_owned(),
+                json!("2700000"),
+            )]),
+            ..Default::default()
+        };
+        assert_eq!(
+            turn_timeout_from_trace_context(&invalid),
+            DEFAULT_OMP_TURN_TIMEOUT
+        );
+        let zero = crate::otel::TraceContext {
+            metadata: std::collections::BTreeMap::from([("max_duration_ms".to_owned(), json!(0))]),
+            ..Default::default()
+        };
+        assert_eq!(
+            turn_timeout_from_trace_context(&zero),
+            DEFAULT_OMP_TURN_TIMEOUT
+        );
     }
 
     #[test]

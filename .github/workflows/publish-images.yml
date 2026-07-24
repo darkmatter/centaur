@@ -44,6 +44,11 @@ jobs:
   # arm64 is only built on pushes to main and release tags — PR and manual
   # dispatch builds stay amd64-only to keep iteration fast.
   build:
+    # Upstream's Depot builders + registry token don't exist in the darkmatter
+    # fork (every build fails "permission_denied: Invalid token" — a permanent
+    # red on all fork PRs and mains). The fork ships its images via
+    # darkmatter-images.yml instead; `merge` follows via needs.
+    if: github.repository_owner != 'darkmatter'
     runs-on: ${{ matrix.platform == 'linux/arm64' && 'depot-ubuntu-24.04-arm-16' || 'depot-ubuntu-24.04-16' }}
     strategy:
       fail-fast: false

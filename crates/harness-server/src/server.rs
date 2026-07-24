@@ -30,6 +30,7 @@ use uuid::Uuid;
 use crate::amp::AmpHarness;
 use crate::claude::ClaudeCodeHarness;
 use crate::codex::CodexHarnessServer;
+use crate::omp::OmpHarness;
 use crate::otel::{self, HarnessUsageSpan, TraceContext};
 use crate::traits::{
     AppServerNormalizer, AppServerRuntime, HarnessChild, HarnessKind, HarnessServer,
@@ -37,7 +38,9 @@ use crate::traits::{
 };
 use crate::turn::{BridgeConfig, CodexTurnNormalizer};
 use crate::util::{absolute_path, default_codex_home, write_value};
-use crate::wire::{is_known_untyped_server_notification, notification_to_wire_value};
+use crate::wire::{
+    collab_state_wire_value, is_known_untyped_server_notification, notification_to_wire_value,
+};
 use crate::{HarnessServerError, Result};
 
 pub fn server_for(kind: HarnessKind) -> Box<dyn AppServerRuntime> {
@@ -45,6 +48,7 @@ pub fn server_for(kind: HarnessKind) -> Box<dyn AppServerRuntime> {
         HarnessKind::Codex => Box::new(CodexHarnessServer::codex()),
         HarnessKind::ClaudeCode => Box::new(AppServerNormalizer::new(ClaudeCodeHarness)),
         HarnessKind::Amp => Box::new(AppServerNormalizer::new(AmpHarness)),
+        HarnessKind::Omp => Box::new(AppServerNormalizer::new(OmpHarness)),
     }
 }
 
@@ -56,6 +60,7 @@ pub fn run_blocks_server(kind: HarnessKind) -> Result<()> {
     match kind {
         HarnessKind::Codex => crate::codex::run_codex_blocks_server(CodexHarnessServer::codex()),
         HarnessKind::ClaudeCode => run_blocks_app_server(&ClaudeCodeHarness),
+        HarnessKind::Omp => crate::omp_rpc::run_omp_blocks_server(),
         HarnessKind::Amp => run_blocks_app_server(&AmpHarness),
     }
 }
@@ -1053,7 +1058,9 @@ fn resumed_thread_state<H: HarnessServer>(
             .clone()
             .unwrap_or_else(|| harness.default_model_provider().to_string()),
         service_tier: params.service_tier.clone().flatten(),
-        harness_session_id: Some(params.thread_id.clone()),
+        harness_session_id: harness
+            .resume_session_id(&params.thread_id)
+            .or_else(|| Some(params.thread_id.clone())),
         completed_turns: Vec::new(),
         process: None,
         thread_started_sent: false,
@@ -1278,7 +1285,7 @@ fn run_harness_turn<H: HarnessServer, W: Write>(
     let usage_span_turn_id = normalizer.turn_id().to_string();
     let usage_span_input = usage_span_input_value(input);
     let mut usage_span_output = UsageSpanOutput::default();
-    ensure_harness_process(harness, state)?;
+    ensure_harness_process(harness, state, input)?;
     {
         let process = state
             .process
@@ -1345,8 +1352,22 @@ fn run_harness_turn<H: HarnessServer, W: Write>(
                     }
                     append_usage_span_output(&normalized, &mut usage_span_output);
                     if let Some(session_id) = normalized.session_id() {
+                        if state.harness_session_id.as_deref() != Some(session_id) {
+                            harness.record_session_id(&state.id, session_id);
+                        }
                         last_session_id = Some(session_id.to_string());
                         state.harness_session_id = Some(session_id.to_string());
+                    }
+                    if let NormalizedEvent::CollabState {
+                        state,
+                        reason,
+                        room,
+                    } = &normalized
+                    {
+                        write_value(
+                            stdout,
+                            &collab_state_wire_value(state, reason.as_deref(), room),
+                        )?;
                     }
                     for notification in normalizer.process_event(&normalized)? {
                         write_value(stdout, &notification_to_wire_value(&notification)?)?;
@@ -1544,7 +1565,11 @@ fn append_usage_span_output(event: &NormalizedEvent, output: &mut UsageSpanOutpu
     }
 }
 
-fn ensure_harness_process<H: HarnessServer>(harness: &H, state: &mut ThreadState) -> Result<()> {
+fn ensure_harness_process<H: HarnessServer>(
+    harness: &H,
+    state: &mut ThreadState,
+    input: &[UserInput],
+) -> Result<()> {
     if let Some(process) = state.process.as_mut() {
         if process.child.try_wait()?.is_none() {
             return Ok(());
@@ -1552,7 +1577,7 @@ fn ensure_harness_process<H: HarnessServer>(harness: &H, state: &mut ThreadState
         state.process = None;
     }
 
-    let mut command = harness.command_for_turn(state);
+    let mut command = harness.command_for_turn(state, input);
     let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

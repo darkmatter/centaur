@@ -16,6 +16,7 @@ thiserror.workspace = true
 urlencoding.workspace = true
 
 [dev-dependencies]
+parking_lot = "0.12"
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread"] }
 
 [lints]

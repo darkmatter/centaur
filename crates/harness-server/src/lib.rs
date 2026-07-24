@@ -5,6 +5,8 @@ pub mod codex;
 mod error;
 mod nanocodex;
 mod nanocodex_subagents;
+pub mod omp;
+mod omp_rpc;
 mod otel;
 mod server;
 mod traits;
@@ -23,7 +25,8 @@ pub use traits::{
 pub use turn::{BridgeConfig, CodexTurnNormalizer};
 pub use validation::run_validate_agent_deltas;
 pub use wire::{
-    is_known_untyped_server_notification, notification_to_jsonrpc, notification_to_wire_value,
+    collab_state_wire_value, is_known_untyped_server_notification, notification_to_jsonrpc,
+    notification_to_wire_value,
 };
 
 pub(crate) use util::{command_from_override, stable_id, user_input_to_anthropic_content};

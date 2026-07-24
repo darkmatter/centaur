@@ -31,7 +31,7 @@ product-specific defaults solely to make them neutral unless the user asks.
 - Never expose credentials in output, logs, fixtures, commits, or command-line
   arguments. Use placeholders and configured secret paths.
 - Do not mutate a remote environment unless the user explicitly asks. Local
-  testing does not authorize committing, pushing, deploying, or restarting.
+  testing does not authorize pushing, deploying, or restarting.
 - Before any Kubernetes operation, verify the current context and namespace.
   Pass an explicit `--context` for non-local or destructive work; never rely on
   an ambient context when a mistake could affect another environment.
@@ -41,7 +41,7 @@ product-specific defaults solely to make them neutral unless the user asks.
 - Concretely, a PR request means validate, commit, push the branch, open or
   update the PR, and return its link. If the user also asks for CI, rollout, or
   dependent-PR follow-through, monitor and repair that requested boundary too.
-- Use conventional commit prefixes when a commit is requested: `feat:`, `fix:`,
+- Use conventional commit prefixes for repository commits: `feat:`, `fix:`,
   `docs:`, `refactor:`, `test:`, or `chore:`.
 
 ## Architecture boundaries
@@ -103,7 +103,7 @@ For a runtime change requested for publication, local proof means:
 2. build the affected runtime artifact with the repository's build recipes;
 3. deploy it to the local stack;
 4. make a real request through the changed path and inspect the durable result;
-5. only then commit or push, and only if requested.
+5. commit the validated change; push only if requested.
 
 For a missing, duplicate, or stalled chat response, trace the full chain:
 platform receipt -> session creation -> durable message -> execution -> event

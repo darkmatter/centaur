@@ -2164,7 +2164,8 @@ impl SessionRuntime {
                 }
             };
 
-            let trace = SessionTraceContext::new(thread_key, Some(&execution_trace_span));
+            let trace = SessionTraceContext::new(thread_key, Some(&execution_trace_span))
+                .with_max_duration_ms(max_duration_ms);
             // Inject the trusted ownership fence (acquired above) so the
             // harness-server resident OMP host can fence stale/missing
             // ownership. Only OMP sessions have a generation; non-OMP skip.
@@ -8270,6 +8271,9 @@ struct SessionTraceContext {
     /// on this ownership; a stale or missing fence is rejected.
     owner_id: Option<String>,
     generation: Option<i64>,
+    /// Trusted execution duration forwarded to the harness as a local safety
+    /// deadline. api-rs remains authoritative and records the timeout first.
+    max_duration_ms: Option<u64>,
 }
 
 impl SessionTraceContext {
@@ -8279,7 +8283,13 @@ impl SessionTraceContext {
             traceparent: execution_span.and_then(centaur_telemetry::traceparent_for_span),
             owner_id: None,
             generation: None,
+            max_duration_ms: None,
         }
+    }
+
+    fn with_max_duration_ms(mut self, max_duration_ms: Option<u64>) -> Self {
+        self.max_duration_ms = max_duration_ms;
+        self
     }
 
     /// Attach the trusted session ownership fence. Called after
@@ -8353,25 +8363,23 @@ fn input_line_with_session_context(
         map.entry("traceparent")
             .or_insert_with(|| Value::String(traceparent.clone()));
     }
-    // Inject the trusted session ownership fence into trace_metadata so the
-    // harness-server resident OMP host can fence stale/missing ownership.
-    // This is api-rs-injected (from the DB ownership lease), never client-
-    // asserted: the client never sees owner_id or generation in the input
-    // line — they are added here, after the line leaves the client boundary.
-    if let (Some(owner_id), Some(generation)) = (&trace.owner_id, trace.generation) {
-        // Overwrite trace_metadata unconditionally so a client-supplied
-        // non-object value (null, string, array) is replaced with a fresh
-        // object carrying only the trusted owner_id and generation.
-        // A malicious client cannot bypass the fence with a non-object.
+    // Inject trusted execution controls into trace_metadata after the line
+    // leaves the client boundary. Client-supplied values are overwritten.
+    if trace.owner_id.is_some() || trace.max_duration_ms.is_some() {
         let mut metadata = match map.get("trace_metadata") {
             Some(Value::Object(existing)) => existing.clone(),
             _ => serde_json::Map::new(),
         };
-        metadata.insert("owner_id".to_owned(), Value::String(owner_id.clone()));
-        metadata.insert(
-            "generation".to_owned(),
-            Value::Number(serde_json::Number::from(generation)),
-        );
+        if let (Some(owner_id), Some(generation)) = (&trace.owner_id, trace.generation) {
+            metadata.insert("owner_id".to_owned(), Value::String(owner_id.clone()));
+            metadata.insert(
+                "generation".to_owned(),
+                Value::Number(serde_json::Number::from(generation)),
+            );
+        }
+        if let Some(max_duration_ms) = trace.max_duration_ms {
+            metadata.insert("max_duration_ms".to_owned(), json!(max_duration_ms));
+        }
         map.insert("trace_metadata".to_owned(), Value::Object(metadata));
     }
     merge_session_context(map, session_context_for_thread(thread_key));
@@ -10398,6 +10406,23 @@ mod tests {
     }
 
     #[test]
+    fn execution_max_duration_is_injected_into_trusted_harness_metadata() {
+        let thread_key = ThreadKey::parse("workflow:test:repair").unwrap();
+        let trace = SessionTraceContext::new(&thread_key, None)
+            .with_max_duration_ms(Some(2_700_000))
+            .with_ownership("api-rs-owner", 7);
+        let input = r#"{"type":"user","text":"repair","trace_metadata":{"max_duration_ms":1}}"#;
+
+        let value: Value =
+            serde_json::from_str(&input_line_with_session_context(&thread_key, &trace, input))
+                .unwrap();
+
+        assert_eq!(value["trace_metadata"]["max_duration_ms"], 2_700_000);
+        assert_eq!(value["trace_metadata"]["owner_id"], "api-rs-owner");
+        assert_eq!(value["trace_metadata"]["generation"], 7);
+    }
+
+    #[test]
     fn execution_metadata_preserves_idle_and_max_duration() {
         let metadata =
             execution_metadata(Some(json!({"source": "test"})), Some(2_000), Some(5_000));
@@ -11104,6 +11129,7 @@ mod tests {
             traceparent: Some("00-0123456789abcdef0123456789abcdef-0123456789abcdef-01".to_owned()),
             owner_id: None,
             generation: None,
+            max_duration_ms: None,
         };
 
         let line = input_line_with_session_context(

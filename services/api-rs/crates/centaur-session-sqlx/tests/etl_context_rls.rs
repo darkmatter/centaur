@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     env,
     error::Error,
     str::FromStr,
@@ -8,6 +9,7 @@ use std::{
 use sqlx::{Connection, Executor, PgConnection, Row, postgres::PgConnectOptions};
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
+static DATABASE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[derive(Debug, PartialEq, Eq)]
 struct VisibleRows {
@@ -41,6 +43,7 @@ struct CompanyContextSearchRows {
 
 #[tokio::test]
 async fn etl_context_rls_enforces_channel_visibility() -> Result<(), Box<dyn Error>> {
+    let _database_test_guard = DATABASE_TEST_LOCK.lock().await;
     let Some(database_url) = test_database_url() else {
         return Ok(());
     };
@@ -55,6 +58,60 @@ async fn etl_context_rls_enforces_channel_visibility() -> Result<(), Box<dyn Err
     };
 
     let result = run_rls_assertions(&mut conn).await;
+    let close_result = conn.close().await;
+    let drop_result = database.drop(&mut admin_conn).await;
+
+    result?;
+    close_result?;
+    drop_result?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn migrations_upgrade_from_deployed_version_47() -> Result<(), Box<dyn Error>> {
+    let _database_test_guard = DATABASE_TEST_LOCK.lock().await;
+    let Some(database_url) = test_database_url() else {
+        return Ok(());
+    };
+    let mut admin_conn = PgConnection::connect(&database_url).await?;
+    let database = TestDatabase::create(&mut admin_conn, &database_url).await?;
+    let mut conn = match PgConnection::connect_with(&database.options).await {
+        Ok(conn) => conn,
+        Err(err) => {
+            database.drop(&mut admin_conn).await?;
+            return Err(err.into());
+        }
+    };
+
+    let result = async {
+        let deployed_migrator = sqlx::migrate::Migrator {
+            migrations: Cow::Owned(
+                MIGRATOR
+                    .iter()
+                    .filter(|migration| migration.version <= 47)
+                    .cloned()
+                    .collect(),
+            ),
+            ..sqlx::migrate::Migrator::DEFAULT
+        };
+        deployed_migrator.run(&mut conn).await?;
+        let deployed_version =
+            sqlx::query_scalar::<_, i64>("select max(version) from _sqlx_migrations")
+                .fetch_one(&mut conn)
+                .await?;
+        assert_eq!(deployed_version, 47);
+
+        MIGRATOR.run(&mut conn).await?;
+        let new_versions = sqlx::query_scalar::<_, i64>(
+            "select version from _sqlx_migrations where version > 47 order by version",
+        )
+        .fetch_all(&mut conn)
+        .await?;
+        assert_eq!(new_versions, vec![48, 49, 50]);
+
+        Ok::<(), Box<dyn Error>>(())
+    }
+    .await;
     let close_result = conn.close().await;
     let drop_result = database.drop(&mut admin_conn).await;
 

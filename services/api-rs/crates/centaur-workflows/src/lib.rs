@@ -4,7 +4,7 @@ use std::{
     path::PathBuf,
     str::FromStr,
     sync::{Arc, RwLock},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use absurd::{
@@ -469,6 +469,10 @@ struct ScheduleTickInput {
     scheduled_at: DateTime<Utc>,
 }
 
+fn default_schedule_allow_overlap() -> bool {
+    true
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct RegisteredWorkflowSchedule {
     pub schedule_id: String,
@@ -483,6 +487,8 @@ pub struct RegisteredWorkflowSchedule {
     pub enabled: bool,
     #[serde(default)]
     pub no_delivery: bool,
+    #[serde(default = "default_schedule_allow_overlap")]
+    pub allow_overlap: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1447,6 +1453,7 @@ fn normalize_schedule(raw: Value) -> Result<RegisteredWorkflowSchedule, Workflow
     }
     let enabled = schedule_bool(object.get("enabled"), true);
     let no_delivery = schedule_bool(object.get("no_delivery"), false);
+    let allow_overlap = schedule_bool(object.get("allow_overlap"), true);
     let timezone = object
         .get("timezone")
         .and_then(Value::as_str)
@@ -1487,6 +1494,7 @@ fn normalize_schedule(raw: Value) -> Result<RegisteredWorkflowSchedule, Workflow
         input,
         enabled,
         no_delivery,
+        allow_overlap,
     })
 }
 
@@ -2299,6 +2307,27 @@ async fn fetch_active_named_tasks(
         .collect())
 }
 
+fn active_workflow_task<'a>(
+    active_tasks: &'a [(String, String)],
+    workflow_name: &str,
+) -> Option<&'a str> {
+    active_tasks
+        .iter()
+        .find(|(_, active_name)| active_name == workflow_name)
+        .map(|(task_id, _)| task_id.as_str())
+}
+
+fn overlapping_workflow_task<'a>(
+    schedule: &RegisteredWorkflowSchedule,
+    active_tasks: &'a [(String, String)],
+) -> Option<&'a str> {
+    if schedule.allow_overlap {
+        None
+    } else {
+        active_workflow_task(active_tasks, &schedule.workflow_name)
+    }
+}
+
 /// Counts consecutive reconcile passes in which each referenced name was
 /// absent from `known_names`, and returns the task ids whose name has been
 /// missing for at least `threshold` passes. Counters for names that are known
@@ -2352,6 +2381,12 @@ async fn run_schedule_tick(
     {
         Some(schedule) if schedule.enabled => schedule,
         Some(schedule) => {
+            centaur_telemetry::record_workflow_schedule_tick(
+                &schedule.schedule_id,
+                &schedule.workflow_name,
+                "disabled",
+                Utc::now().timestamp_millis() as f64 / 1_000.0,
+            );
             info!(
                 schedule_id = %schedule.schedule_id,
                 "skipping disabled workflow schedule tick"
@@ -2381,12 +2416,51 @@ async fn run_schedule_tick(
         schedule.schedule_id,
         input.scheduled_at.to_rfc3339()
     );
-    let target_client = match workflow_queue_class(&schedule.workflow_name) {
+    let queue_class = workflow_queue_class(&schedule.workflow_name);
+    let target_client = match queue_class {
         WorkflowQueueClass::Standard => &workflow_clients.standard,
         WorkflowQueueClass::SlackLive => &workflow_clients.slack_live,
         WorkflowQueueClass::Etl => &workflow_clients.etl,
         WorkflowQueueClass::EtlBackfill => &workflow_clients.etl_backfill,
     };
+    let next_run_at = next_schedule_time_after_tick(&schedule, input.scheduled_at, Utc::now())
+        .map_err(absurd_error)?;
+    if !schedule.allow_overlap {
+        let active_tasks = fetch_active_named_tasks(
+            target_client,
+            queue_name_for_class(queue_class),
+            WORKFLOW_TASK,
+            "workflow_name",
+        )
+        .await
+        .map_err(absurd_error)?;
+        if let Some(active_task_id) = overlapping_workflow_task(&schedule, &active_tasks) {
+            spawn_schedule_tick(&schedule_client, &schedule, next_run_at)
+                .await
+                .map_err(absurd_error)?;
+            centaur_telemetry::record_workflow_schedule_tick(
+                &schedule.schedule_id,
+                &schedule.workflow_name,
+                "overlap_skipped",
+                Utc::now().timestamp_millis() as f64 / 1_000.0,
+            );
+            info!(
+                schedule_id = %schedule.schedule_id,
+                workflow_name = %schedule.workflow_name,
+                active_task_id,
+                "skipping overlapping workflow schedule tick"
+            );
+            return Ok(json!({
+                "schedule_id": schedule.schedule_id,
+                "workflow_name": schedule.workflow_name,
+                "scheduled_at": input.scheduled_at.to_rfc3339(),
+                "skipped": true,
+                "reason": "overlap",
+                "active_task_id": active_task_id,
+                "next_run_at": next_run_at.to_rfc3339(),
+            }));
+        }
+    }
     let workflow_spawn = target_client
         .spawn(
             WORKFLOW_TASK,
@@ -2401,11 +2475,27 @@ async fn run_schedule_tick(
             },
         )
         .await?;
-    let next_run_at = next_schedule_time_after_tick(&schedule, input.scheduled_at, Utc::now())
-        .map_err(absurd_error)?;
     spawn_schedule_tick(&schedule_client, &schedule, next_run_at)
         .await
         .map_err(absurd_error)?;
+    let schedule_outcome = if workflow_spawn.created {
+        "spawned"
+    } else {
+        "deduped"
+    };
+    centaur_telemetry::record_workflow_schedule_tick(
+        &schedule.schedule_id,
+        &schedule.workflow_name,
+        schedule_outcome,
+        Utc::now().timestamp_millis() as f64 / 1_000.0,
+    );
+    info!(
+        schedule_id = %schedule.schedule_id,
+        workflow_name = %schedule.workflow_name,
+        outcome = schedule_outcome,
+        workflow_created = workflow_spawn.created,
+        "workflow schedule tick completed"
+    );
     Ok(json!({
         "schedule_id": schedule.schedule_id,
         "workflow_name": schedule.workflow_name,
@@ -2587,6 +2677,33 @@ fn normalize_cron_expression(expr: &str) -> String {
     }
 }
 
+fn workflow_output_outcome(output: &Value) -> Result<&'static str, WorkflowRuntimeError> {
+    if output.is_null() {
+        return Err(WorkflowRuntimeError::Internal(
+            "workflow completed without output".to_owned(),
+        ));
+    }
+    Ok(match output.get("outcome").and_then(Value::as_str) {
+        Some("noop") => "noop",
+        Some("queued") => "queued",
+        Some("waiting") => "waiting",
+        Some("blocked") => "blocked",
+        Some("degraded") => "degraded",
+        Some("dry_run") => "dry_run",
+        Some("failed") => "failed",
+        _ => "succeeded",
+    })
+}
+
+fn workflow_attempt_outcome(result: &absurd::Result<WorkflowResult>) -> Option<&'static str> {
+    match result {
+        Ok(result) => workflow_output_outcome(&result.output).ok(),
+        Err(absurd::Error::Suspend) => None,
+        Err(absurd::Error::Cancelled) => Some("cancelled"),
+        Err(_) => Some("failed"),
+    }
+}
+
 async fn run_centaur_workflow(
     input: WorkflowTaskInput,
     ctx: TaskContext,
@@ -2594,6 +2711,9 @@ async fn run_centaur_workflow(
     workflow_host_sandbox: Option<WorkflowHostSandboxRuntime>,
     workflow_clients: WorkflowQueueClients,
 ) -> absurd::Result<WorkflowResult> {
+    let workflow_name = input.workflow_name.clone();
+    let queue_name = queue_name_for_class(workflow_queue_class(&workflow_name));
+    let started_at = Instant::now();
     let mut cleanup_guard =
         WorkflowSandboxCleanupGuard::new(session_runtime.clone(), ctx.run_id().to_owned());
     let result = run_centaur_workflow_inner(
@@ -2603,7 +2723,28 @@ async fn run_centaur_workflow(
         workflow_host_sandbox,
         workflow_clients,
     )
-    .await;
+    .await
+    .and_then(|result| {
+        workflow_output_outcome(&result.output)
+            .map(|_| result)
+            .map_err(absurd_error)
+    });
+    if let Some(outcome) = workflow_attempt_outcome(&result) {
+        let duration = started_at.elapsed();
+        centaur_telemetry::record_workflow_task_finished(
+            queue_name,
+            &workflow_name,
+            outcome,
+            duration,
+        );
+        info!(
+            workflow_name,
+            queue = queue_name,
+            outcome,
+            duration_seconds = duration.as_secs_f64(),
+            "workflow task attempt finished"
+        );
+    }
     if let Some(reason) = workflow_cleanup_reason(&result) {
         cleanup_guard.cleanup(reason).await;
     } else {
@@ -4246,6 +4387,23 @@ mod tests {
     }
 
     #[test]
+    fn workflow_output_outcome_preserves_semantics_and_rejects_empty_output() {
+        assert_eq!(
+            workflow_output_outcome(&json!({"outcome": "blocked"})).unwrap(),
+            "blocked"
+        );
+        assert_eq!(
+            workflow_output_outcome(&json!({"outcome": "unexpected"})).unwrap(),
+            "succeeded"
+        );
+        assert_eq!(
+            workflow_output_outcome(&json!({"status": "completed"})).unwrap(),
+            "succeeded"
+        );
+        assert!(workflow_output_outcome(&Value::Null).is_err());
+    }
+
+    #[test]
     fn parse_worker_concurrency_uses_override_or_default() {
         // Override wins.
         assert_eq!(parse_worker_concurrency(Some("16"), 4), 16);
@@ -4279,6 +4437,38 @@ mod tests {
         assert_eq!(
             schedule.input.pointer("/metadata/no_delivery"),
             Some(&json!(true))
+        );
+    }
+
+    #[test]
+    fn schedule_overlap_is_allowed_by_default() {
+        let schedule = normalize_schedule(json!({
+            "workflow_name": "slack_sync",
+            "schedule_id": "slack_sync",
+            "interval_seconds": 60,
+        }))
+        .unwrap();
+
+        assert!(schedule.allow_overlap);
+    }
+
+    #[test]
+    fn schedule_can_suppress_an_overlapping_workflow() {
+        let schedule = normalize_schedule(json!({
+            "workflow_name": "upstream_sync",
+            "schedule_id": "upstream_sync_watch_v2",
+            "cron": "*/15 * * * *",
+            "allow_overlap": false,
+        }))
+        .unwrap();
+        let active_tasks = [
+            ("other-task".to_owned(), "slack_sync".to_owned()),
+            ("sync-task".to_owned(), "upstream_sync".to_owned()),
+        ];
+
+        assert_eq!(
+            overlapping_workflow_task(&schedule, &active_tasks),
+            Some("sync-task")
         );
     }
 

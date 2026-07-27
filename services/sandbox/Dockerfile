@@ -76,6 +76,16 @@ RUN useradd -m -s /bin/bash -u 1001 agent \
 ARG CLAUDE_CODE_VERSION=2.1.154
 ARG CODEX_VERSION=0.144.0
 ARG PI_CODING_AGENT_VERSION=0.67.2
+ARG OMP_VERSION=17.0.5
+# Immutable fork release of @oh-my-pi/pi-coding-agent carrying native RPC
+# collaboration controls (collab_start/status/stop) on top of upstream v17.0.5.
+# Published at czxtm/oh-my-pi (fork of can1357/oh-my-pi); the upstream PR was
+# auto-closed because @czxtm is not vouched, so the sandbox pins the fork
+# release asset directly with SHA-256 verification rather than the npm registry.
+ARG OMP_RELEASE_TAG=v17.0.5-centaur.1
+ARG OMP_RELEASE_ASSET=https://github.com/czxtm/oh-my-pi/releases/download/${OMP_RELEASE_TAG}/oh-my-pi-pi-coding-agent-17.0.5.tgz
+ARG OMP_RELEASE_SHA256=8e19613db2b1427d22c8d661ccf9c6bc259c2426ea7c0485e340a4508f23136a
+ARG OMP_SOURCE_COMMIT=e88f1a8da324de76d3932b0c9a8141b6f32f0b2d
 ARG NUSHELL_VERSION=0.112.2
 ARG KUBECTL_VERSION=v1.34.2
 ARG KACHE_VERSION=v0.7.0
@@ -128,6 +138,19 @@ RUN --mount=type=cache,target=/root/.npm,sharing=locked \
     && codex --version | grep -F "${CODEX_VERSION}" \
     && pnpm --version | grep -F "${PNPM_VERSION}"
 
+# ── omp: immutable fork release asset (checksum-verified) ───────────────────
+# Downloads the czxtm/oh-my-pi fork release tarball, verifies its SHA-256
+# against the pinned digest, and installs it globally from the local file.
+# This pins an exact immutable artifact (not a mutable npm registry version)
+# carrying the native RPC collaboration controls on top of upstream v17.0.5.
+RUN --mount=type=cache,target=/root/.npm,sharing=locked \
+    set -eux; \
+    curl -fsSL "${OMP_RELEASE_ASSET}" -o /tmp/omp-fork.tgz; \
+    echo "${OMP_RELEASE_SHA256}  /tmp/omp-fork.tgz" | sha256sum -c -; \
+    npm install -g --prefer-online --force /tmp/omp-fork.tgz; \
+    rm -f /tmp/omp-fork.tgz; \
+    find /usr/lib/node_modules/@oh-my-pi/pi-coding-agent -type f \( -name '*.map' -o -name '*.tsbuildinfo' \) -delete
+
 # ── agent-browser system deps (must run as root before USER agent) ───────────
 # Chrome for Testing doesn't provide Linux ARM64 builds; fall back to system chromium
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
@@ -154,7 +177,9 @@ ENV PATH="/home/agent/.cargo/bin:/home/agent/.local/bin:/home/agent/.foundry/bin
 ARG FOUNDRY_VERSION=v1.7.0
 ARG AMP_CLI_VERSION=0.0.1774529752-g94f44d
 ARG MANIM_VERSION=0.20.1
-ARG BUN_VERSION=bun-v1.3.13
+# omp (@oh-my-pi/pi-coding-agent) requires bun >= 1.3.14 (its bin shim is a
+# `#!/usr/bin/env bun` script); keep this pin at or above that.
+ARG BUN_VERSION=bun-v1.3.14
 
 # ── Agent-scoped toolchains ─────────────────────────────────────────────────
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
@@ -174,6 +199,7 @@ RUN --mount=type=cache,target=/home/agent/.cargo/registry,uid=1001,gid=1001,shar
     && kache --version
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 RUN curl -fsSL https://bun.sh/install | bash -s "${BUN_VERSION}"
+RUN omp --version | grep -F "${OMP_VERSION}"
 RUN --mount=type=cache,target=/home/agent/.cache/uv,uid=1001,gid=1001,sharing=locked \
     uv tool install "manim==${MANIM_VERSION}" \
     && manim --version
@@ -208,7 +234,7 @@ RUN --mount=type=cache,target=/home/agent/.npm,uid=1001,gid=1001,sharing=locked 
     npx -y skills add vercel-labs/agent-browser
 # git-branch configures each writable clone with the publishing GitHub account.
 # A baked agent identity would reappear as a co-author when GitHub squash-merges its commits.
-RUN mkdir -p ~/.amp/bin ~/.config/amp ~/.codex ~/.pi/agent ~/github ~/workspace \
+RUN mkdir -p ~/.amp/bin ~/.config/amp ~/.codex ~/.pi/agent ~/.omp/agent ~/github ~/workspace \
     && git config --global init.defaultBranch main \
     && git config --global push.autoSetupRemote true \
     && git config --global core.hooksPath /opt/centaur/git-hooks \
@@ -225,6 +251,24 @@ FROM toolchain AS sandbox
 
 USER root
 RUN rm -f /etc/sudoers.d/agent
+# The fork release's npm bin points at src/cli.ts, whose filesystem fallback
+# cannot see the repository docs directory omitted from the release tarball.
+# Run the prepacked bundle so omp:// resolves its embedded documentation index.
+RUN set -eux; \
+    omp_bundle=/usr/lib/node_modules/@oh-my-pi/pi-coding-agent/dist/cli.js; \
+    test -f "$omp_bundle"; \
+    grep -Fq '"session-operations-export-share-fork-resume.md"' "$omp_bundle"; \
+    grep -Fq 'collab_start' "$omp_bundle"; \
+    ln -sf "$omp_bundle" /usr/bin/omp; \
+    test "$(readlink -f "$(command -v omp)")" = "$omp_bundle"; \
+    omp --version | grep -F "${OMP_VERSION}"; \
+    omp read omp:// >/tmp/omp-docs-index.md; \
+    omp read omp://session-operations-export-share-fork-resume.md >/tmp/omp-export-doc.md; \
+    omp read omp://user-facing-packages.md >/tmp/omp-packages-doc.md; \
+    grep -Fq '# Documentation' /tmp/omp-docs-index.md; \
+    grep -Fq '# Session Operations:' /tmp/omp-export-doc.md; \
+    grep -Fq '# User-Facing Packages' /tmp/omp-packages-doc.md; \
+    rm -f /tmp/omp-docs-index.md /tmp/omp-export-doc.md /tmp/omp-packages-doc.md
 # BuildKit's COPY --link creates parent directories without an explicit mode,
 # which can leave /etc/centaur without the execute bit for non-root users.
 # Pre-create it as 0755 so the agent user can traverse into it at runtime.
@@ -243,6 +287,10 @@ COPY --link --chmod=755 services/sandbox/centaur_tool_host.py /usr/local/bin/cen
 COPY --link --chmod=755 services/sandbox/compose_system_prompt.py /usr/local/bin/compose-system-prompt
 COPY --link --chmod=755 services/sandbox/repo_cache_sync.py /usr/local/bin/repo-cache-sync
 COPY --link --chmod=755 services/sandbox/repo_cache_watch.py /usr/local/bin/repo-cache-watch
+COPY --link --chmod=755 services/sandbox/mint-github-token.mjs /usr/local/bin/mint-github-token.mjs
+# Shadows apt's /usr/bin/gh on PATH: re-reads the background-refreshed
+# installation token per invocation (see entrypoint.sh github token section).
+COPY --link --chmod=755 services/sandbox/gh-wrapper.sh /usr/local/bin/gh
 COPY --link --chmod=755 services/sandbox/entrypoint.sh /entrypoint.sh
 COPY --link --chown=1001:1001 crates/harness-server/ /opt/centaur/harness-server-src/
 

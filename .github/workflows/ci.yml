@@ -3,7 +3,22 @@ name: CI
 on:
   pull_request:
     branches: [main]
+  # Direct pushes to main (cherry-pick landings) bypass PR CI entirely — the
+  # duplicate-migration boot panic (0045 here, 0043 before it on PR #7) got
+  # in that way. ci_changes already computes push diffs (event.before...HEAD),
+  # so path-gated jobs stay cheap: unrelated pushes run only the filter.
+  push:
+    branches: [main]
   merge_group:
+  # The overlay upstream_sync workflow opens/updates the sync PR through a
+  # token that suppresses pull_request events, then dispatches CI explicitly
+  # on the repaired sync branch head.
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch or SHA to run CI against (defaults to main)"
+        required: false
+        default: main
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}

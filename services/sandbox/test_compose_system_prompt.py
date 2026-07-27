@@ -109,5 +109,40 @@ class ComposeSystemPromptTest(unittest.TestCase):
             )
 
 
+    def test_configured_prompts_choose_last_existing_and_shadow_fallbacks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            home = root / "home"
+            workspace = root / "workspace"
+            home.mkdir()
+            workspace.mkdir()
+            (home / "AGENTS.md").write_text("base\n")
+            (home / "AGENTS_OVERLAY.md").write_text("home overlay\n")
+
+            repo_mount = home / "github"
+            first = root / "first.md"
+            second = root / "second.md"
+            first.write_text("first configured\n")
+            second.write_text("second configured\n")
+            legacy_overlay_dir = root / "legacy"
+            legacy_prompt = legacy_overlay_dir / "services" / "sandbox" / "SYSTEM_PROMPT.md"
+            legacy_prompt.parent.mkdir(parents=True)
+            legacy_prompt.write_text("legacy overlay\n")
+
+            target = workspace / "AGENTS.md"
+            compose_system_prompt.compose_system_prompt(
+                home_dir=home,
+                target_prompt=target,
+                repo_mount=repo_mount,
+                configured_prompt_files=[first, root / "missing.md", second],
+                legacy_overlay_dir=legacy_overlay_dir,
+            )
+
+            self.assertEqual(
+                target.read_text(),
+                "base\n\n\n---\n\nsecond configured\n",
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -214,3 +214,36 @@ IRON_CONTROL_API_KEY (their names are hardcoded in the Rust binaries); the URL
 {{- $console := include "centaur.consoleValues" . | fromYaml -}}
 {{- printf "http://%s:%v" (include "centaur.consoleHost" .) $console.service.httpPort -}}
 {{- end -}}
+
+{{- /*
+Derived per-release Postgres connection URLs (postgres.deriveDatabaseUrl).
+With several releases sharing one namespace, the shared infra Secret's
+DATABASE_URL can only name one release's Postgres; deriving the URL from
+postgres.auth.* + the release-prefixed Service name makes each release dial
+its own bundled Postgres. The password never enters the manifest: consumers
+render "centaur.postgresPasswordEnv" (a secretKeyRef) BEFORE the URL entry,
+and kubelet $(VAR) expansion — which only sees earlier env entries in the
+same container — splices it into the literal URL at container start. The
+explicit env entry shadows the same-named key injected via envFrom.
+*/ -}}
+{{- define "centaur.derivePostgresUrls" -}}
+{{- if and .Values.postgres.enabled .Values.postgres.deriveDatabaseUrl -}}true{{- end -}}
+{{- end -}}
+
+{{- define "centaur.postgresPasswordEnv" -}}
+- name: POSTGRES_PASSWORD
+  valueFrom:
+    secretKeyRef:
+      name: {{ required "postgres.auth.existingSecretName is required when postgres.deriveDatabaseUrl=true" .Values.postgres.auth.existingSecretName | quote }}
+      key: {{ required "postgres.auth.existingSecretKey is required when postgres.deriveDatabaseUrl=true" .Values.postgres.auth.existingSecretKey | quote }}
+{{- end -}}
+
+{{- /* Host-only URL (no database path): Rails resolves per-connection db
+names from database.yml, so IRON_CONTROL_DATABASE_URL must not pin one. */ -}}
+{{- define "centaur.postgresHostUrl" -}}
+{{- printf "postgres://%s:$(POSTGRES_PASSWORD)@%s:5432" .Values.postgres.auth.username (include "centaur.componentName" (dict "root" . "component" "postgres")) -}}
+{{- end -}}
+
+{{- define "centaur.postgresDatabaseUrl" -}}
+{{- printf "%s/%s" (include "centaur.postgresHostUrl" .) .Values.postgres.auth.database -}}
+{{- end -}}

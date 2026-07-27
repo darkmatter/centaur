@@ -1,5 +1,7 @@
 use axum::response::sse::Event;
-use centaur_session_core::{HarnessType, Session, SessionEvent, SessionMessageInput, ThreadKey};
+use centaur_session_core::{
+    CollabRoomState, HarnessType, Session, SessionEvent, SessionMessageInput, ThreadKey,
+};
 use centaur_session_runtime::SESSION_OUTPUT_LINE_EVENT;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -60,6 +62,35 @@ pub struct SessionContextResponse {
     pub linear: Option<LinearThreadContext>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub github: Option<GithubThreadContext>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct WorkspaceDiffRequest {
+    pub repo_path: String,
+    pub base_sha: String,
+}
+
+/// SHA-256 attestation of the omp config layers live at capture time,
+/// gathered by trusted exec inside the sandbox. `global` is
+/// /home/agent/.omp/agent/config.yml (installed at boot, overlay-owned when
+/// CENTAUR_OVERLAY_OMP_DIR is set); `project_*` are /home/agent/.omp/
+/// config.yml and settings.json — omp's project layer at its spawn cwd,
+/// which OUTRANKS the global file and is agent-writable. A value of
+/// "absent" means the file did not exist.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct HarnessConfigAttestation {
+    pub global_config_sha256: String,
+    pub project_config_sha256: String,
+    pub project_settings_sha256: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct WorkspaceDiffResponse {
+    pub base_sha: String,
+    pub patch: String,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub harness_config: Option<HarnessConfigAttestation>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -136,6 +167,39 @@ pub struct InterruptSessionExecutionResponse {
     pub interrupted: bool,
     pub execution_id: Option<String>,
     pub thread_key: ThreadKey,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct StartCollabRoomRequest {
+    pub relay_url: Option<String>,
+    pub web_url: Option<String>,
+    pub display_name: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct StartCollabRoomResponse {
+    pub ok: bool,
+    pub thread_key: ThreadKey,
+    pub room: Option<CollabRoomState>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct CollabRoomStatusResponse {
+    pub ok: bool,
+    pub thread_key: ThreadKey,
+    pub room: Option<CollabRoomState>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct StopCollabRoomRequest {
+    pub reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct StopCollabRoomResponse {
+    pub ok: bool,
+    pub thread_key: ThreadKey,
+    pub stopped: bool,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -254,4 +318,27 @@ pub enum SessionEventConversionError {
     OutputLinePayload { event_id: i64 },
     #[error("failed to serialize session event {event_id} payload as SSE JSON: {source}")]
     JsonData { event_id: i64, source: axum::Error },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn stop_collab_response_is_canonical() {
+        let response = StopCollabRoomResponse {
+            ok: true,
+            thread_key: ThreadKey::parse("test:room").unwrap(),
+            stopped: false,
+        };
+        assert_eq!(
+            serde_json::to_value(response).unwrap(),
+            json!({
+                "ok": true,
+                "thread_key": "test:room",
+                "stopped": false,
+            })
+        );
+    }
 }

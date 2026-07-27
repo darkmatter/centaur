@@ -1,3 +1,12 @@
+<% if omp_viewer_url %>
+  <a href="<%= omp_viewer_export_url(session.thread_key) %>"
+     class="console-thread-share-trigger"
+     aria-label="Open transcript export"
+     title="Open transcript export">
+    <%= console_icon("link", classes: "size-4") %>
+  </a>
+<% end %>
+
 <div class="console-thread-share-wrap"
      data-controller="thread-share"
      data-thread-share-url-value="<%= console_threads_url(thread: session.thread_key) %>">

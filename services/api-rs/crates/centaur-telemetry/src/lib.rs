@@ -436,6 +436,10 @@ pub fn record_workflow_task_finished(
     .record(duration.as_secs_f64());
 }
 
+fn schedule_tick_advances_freshness(outcome: &str) -> bool {
+    matches!(outcome, "spawned" | "deduped")
+}
+
 pub fn record_workflow_schedule_tick(
     schedule_id: &str,
     workflow_name: &str,
@@ -449,7 +453,7 @@ pub fn record_workflow_schedule_tick(
         "outcome" => outcome.to_owned(),
     )
     .increment(1);
-    if timestamp_seconds.is_finite() {
+    if timestamp_seconds.is_finite() && schedule_tick_advances_freshness(outcome) {
         metrics::gauge!(
             WORKFLOW_SCHEDULE_LAST_SUCCESS_TIMESTAMP_SECONDS,
             "schedule_id" => schedule_id.to_owned(),
@@ -1463,6 +1467,14 @@ mod tests {
     }
 
     #[test]
+    fn schedule_freshness_advances_only_after_a_dispatch() {
+        assert!(schedule_tick_advances_freshness("spawned"));
+        assert!(schedule_tick_advances_freshness("deduped"));
+        assert!(!schedule_tick_advances_freshness("overlap_skipped"));
+        assert!(!schedule_tick_advances_freshness("disabled"));
+    }
+
+    #[test]
     fn prometheus_metrics_render_workflow_metrics() {
         prometheus_handle().unwrap();
         record_workflow_counter(
@@ -1533,6 +1545,12 @@ mod tests {
             "overlap_skipped",
             1_784_915_200.0,
         );
+        record_workflow_schedule_tick(
+            "upstream_sync_watch_v2",
+            "upstream_sync",
+            "spawned",
+            1_784_915_201.0,
+        );
 
         let metrics = render_metrics().unwrap();
 
@@ -1554,6 +1572,7 @@ mod tests {
         assert!(metrics.contains(r#"queue="centaur_workflows_slack_live""#));
         assert!(metrics.contains(r#"workflow_name="slack_sync""#));
         assert!(metrics.contains(r#"outcome="blocked""#));
+        assert!(metrics.contains(r#"outcome="overlap_skipped""#));
         assert!(metrics.contains(r#"schedule_id="upstream_sync_watch_v2""#));
     }
 

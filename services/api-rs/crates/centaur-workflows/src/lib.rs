@@ -58,6 +58,7 @@ const WORKFLOW_ALLOWED_NAMES_ENV: &str = "WORKFLOW_ALLOWED_NAMES";
 const WORKFLOW_REAP_REMOVED_AFTER_TICKS_ENV: &str = "WORKFLOW_REAP_REMOVED_AFTER_TICKS";
 const DEFAULT_WORKFLOW_REAP_REMOVED_AFTER_TICKS: u32 = 3;
 const ABSURD_TERMINAL_TASK_STATES: &str = "('completed', 'failed', 'cancelled')";
+const ABSURD_ACTIVE_RUN_STATES: &str = "('pending', 'running', 'sleeping')";
 
 pub fn python_workflow_event_name(event_type: &str, correlation_id: &str) -> String {
     // JSON string encoding is unambiguous even when either component contains a delimiter.
@@ -68,11 +69,10 @@ pub fn python_workflow_event_name(event_type: &str, correlation_id: &str) -> Str
     )
 }
 
-/// Per-queue worker concurrency. The defaults preserve historical behavior; each
-/// can be overridden via its env var to scale a queue independently (e.g. raise
-/// the standard queue when webhook/agent workflows back up). A value that is
-/// unset, empty, non-numeric, or zero falls back to the default (absurd also
-/// clamps zero to one, since a queue at concurrency zero would never drain).
+/// Per-workflow-queue concurrency can be overridden to scale execution queues
+/// independently. Schedule dispatch stays serialized within this API process:
+/// overlap detection and target spawn are separate database operations, so
+/// concurrent schedule workers could both pass the active-task check.
 const WORKFLOW_WORKER_CONCURRENCY_ENV: &str = "WORKFLOW_WORKER_CONCURRENCY";
 const DEFAULT_WORKFLOW_WORKER_CONCURRENCY: usize = 4;
 const WORKFLOW_ETL_WORKER_CONCURRENCY_ENV: &str = "WORKFLOW_ETL_WORKER_CONCURRENCY";
@@ -80,8 +80,7 @@ const DEFAULT_WORKFLOW_ETL_WORKER_CONCURRENCY: usize = 1;
 const WORKFLOW_ETL_BACKFILL_WORKER_CONCURRENCY_ENV: &str =
     "WORKFLOW_ETL_BACKFILL_WORKER_CONCURRENCY";
 const DEFAULT_WORKFLOW_ETL_BACKFILL_WORKER_CONCURRENCY: usize = 1;
-const WORKFLOW_SCHEDULE_WORKER_CONCURRENCY_ENV: &str = "WORKFLOW_SCHEDULE_WORKER_CONCURRENCY";
-const DEFAULT_WORKFLOW_SCHEDULE_WORKER_CONCURRENCY: usize = 1;
+const WORKFLOW_SCHEDULE_WORKER_CONCURRENCY: usize = 1;
 
 struct WorkflowTaskHeartbeatGuard {
     task: JoinHandle<()>,
@@ -777,10 +776,7 @@ impl WorkflowRuntime {
         });
         let schedule_worker = schedule_client.start_worker(WorkerOptions {
             worker_id: Some("centaur-api-rs-workflow-schedule-worker".to_owned()),
-            concurrency: worker_concurrency(
-                WORKFLOW_SCHEDULE_WORKER_CONCURRENCY_ENV,
-                DEFAULT_WORKFLOW_SCHEDULE_WORKER_CONCURRENCY,
-            ),
+            concurrency: WORKFLOW_SCHEDULE_WORKER_CONCURRENCY,
             on_error: Some(Arc::new(|error| {
                 warn!(%error, "absurd workflow schedule worker error");
             })),
@@ -2285,13 +2281,14 @@ async fn fetch_active_named_tasks(
     task_name: &str,
     params_name_field: &str,
 ) -> Result<Vec<(String, String)>, WorkflowRuntimeError> {
-    let (task_table, _) = absurd_queue_tables(queue_name)?;
+    let (task_table, run_table) = absurd_queue_tables(queue_name)?;
     let rows = sqlx::query(&format!(
         r#"
-        select t.task_id::text as task_id, t.params->>'{params_name_field}' as name
-        from {task_table} t
-        where t.task_name = $1
-          and t.state not in {ABSURD_TERMINAL_TASK_STATES}
+        select distinct t.task_id::text as task_id, t.params->>'{params_name_field}' as name
+        from {run_table} r
+        join {task_table} t on t.task_id = r.task_id
+        where r.state in {ABSURD_ACTIVE_RUN_STATES}
+          and t.task_name = $1
         "#,
     ))
     .bind(task_name)
@@ -2677,6 +2674,17 @@ fn normalize_cron_expression(expr: &str) -> String {
     }
 }
 
+fn terminal_workflow_output(output: Value) -> Value {
+    if output.is_null() {
+        json!({
+            "outcome": "failed",
+            "error": "workflow completed without output",
+        })
+    } else {
+        output
+    }
+}
+
 fn workflow_output_outcome(output: &Value) -> Result<&'static str, WorkflowRuntimeError> {
     if output.is_null() {
         return Err(WorkflowRuntimeError::Internal(
@@ -2690,6 +2698,7 @@ fn workflow_output_outcome(output: &Value) -> Result<&'static str, WorkflowRunti
         Some("blocked") => "blocked",
         Some("degraded") => "degraded",
         Some("dry_run") => "dry_run",
+        Some("cancelled") => "cancelled",
         Some("failed") => "failed",
         _ => "succeeded",
     })
@@ -2724,10 +2733,9 @@ async fn run_centaur_workflow(
         workflow_clients,
     )
     .await
-    .and_then(|result| {
-        workflow_output_outcome(&result.output)
-            .map(|_| result)
-            .map_err(absurd_error)
+    .map(|mut result| {
+        result.output = terminal_workflow_output(result.output);
+        result
     });
     if let Some(outcome) = workflow_attempt_outcome(&result) {
         let duration = started_at.elapsed();
@@ -4387,7 +4395,7 @@ mod tests {
     }
 
     #[test]
-    fn workflow_output_outcome_preserves_semantics_and_rejects_empty_output() {
+    fn workflow_output_outcome_preserves_semantics_and_terminalizes_empty_output() {
         assert_eq!(
             workflow_output_outcome(&json!({"outcome": "blocked"})).unwrap(),
             "blocked"
@@ -4400,7 +4408,19 @@ mod tests {
             workflow_output_outcome(&json!({"status": "completed"})).unwrap(),
             "succeeded"
         );
-        assert!(workflow_output_outcome(&Value::Null).is_err());
+        assert_eq!(
+            workflow_output_outcome(&json!({"outcome": "cancelled"})).unwrap(),
+            "cancelled"
+        );
+        let terminal = terminal_workflow_output(Value::Null);
+        assert_eq!(
+            terminal,
+            json!({
+                "outcome": "failed",
+                "error": "workflow completed without output",
+            })
+        );
+        assert_eq!(workflow_output_outcome(&terminal).unwrap(), "failed");
     }
 
     #[test]
@@ -4441,6 +4461,11 @@ mod tests {
     }
 
     #[test]
+    fn schedule_dispatch_is_serialized() {
+        assert_eq!(WORKFLOW_SCHEDULE_WORKER_CONCURRENCY, 1);
+    }
+
+    #[test]
     fn schedule_overlap_is_allowed_by_default() {
         let schedule = normalize_schedule(json!({
             "workflow_name": "slack_sync",
@@ -4450,6 +4475,13 @@ mod tests {
         .unwrap();
 
         assert!(schedule.allow_overlap);
+        assert_eq!(
+            overlapping_workflow_task(
+                &schedule,
+                &[("active-task".to_owned(), "slack_sync".to_owned())],
+            ),
+            None,
+        );
     }
 
     #[test]
@@ -4469,6 +4501,13 @@ mod tests {
         assert_eq!(
             overlapping_workflow_task(&schedule, &active_tasks),
             Some("sync-task")
+        );
+        assert_eq!(
+            overlapping_workflow_task(
+                &schedule,
+                &[("other-task".to_owned(), "slack_sync".to_owned())],
+            ),
+            None,
         );
     }
 

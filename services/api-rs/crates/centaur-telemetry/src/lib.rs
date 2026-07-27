@@ -82,8 +82,8 @@ pub const WORKFLOW_QUEUE_OLDEST_TASK_AGE_BY_WORKFLOW_SECONDS: &str =
 pub const WORKFLOW_TASK_ATTEMPTS_TOTAL: &str = "centaur_workflow_task_attempts_total";
 pub const WORKFLOW_TASK_DURATION_SECONDS: &str = "centaur_workflow_task_duration_seconds";
 pub const WORKFLOW_SCHEDULE_TICKS_TOTAL: &str = "centaur_workflow_schedule_ticks_total";
-pub const WORKFLOW_SCHEDULE_LAST_SUCCESS_TIMESTAMP_SECONDS: &str =
-    "centaur_workflow_schedule_last_success_timestamp_seconds";
+pub const WORKFLOW_SCHEDULE_LAST_DISPATCH_TIMESTAMP_SECONDS: &str =
+    "centaur_workflow_schedule_last_dispatch_timestamp_seconds";
 pub const SLACK_ARCHIVE_IMPORT_RUNS_TOTAL: &str = "slack_archive_import_runs_total";
 pub const SLACK_ARCHIVE_IMPORT_DURATION_SECONDS: &str = "slack_archive_import_duration_seconds";
 pub const SLACK_ARCHIVE_IMPORT_BYTES_TOTAL: &str = "slack_archive_import_bytes_total";
@@ -436,7 +436,7 @@ pub fn record_workflow_task_finished(
     .record(duration.as_secs_f64());
 }
 
-fn schedule_tick_advances_freshness(outcome: &str) -> bool {
+fn schedule_tick_advances_dispatch_timestamp(outcome: &str) -> bool {
     matches!(outcome, "spawned" | "deduped")
 }
 
@@ -453,9 +453,9 @@ pub fn record_workflow_schedule_tick(
         "outcome" => outcome.to_owned(),
     )
     .increment(1);
-    if timestamp_seconds.is_finite() && schedule_tick_advances_freshness(outcome) {
+    if timestamp_seconds.is_finite() && schedule_tick_advances_dispatch_timestamp(outcome) {
         metrics::gauge!(
-            WORKFLOW_SCHEDULE_LAST_SUCCESS_TIMESTAMP_SECONDS,
+            WORKFLOW_SCHEDULE_LAST_DISPATCH_TIMESTAMP_SECONDS,
             "schedule_id" => schedule_id.to_owned(),
             "workflow_name" => workflow_name.to_owned(),
         )
@@ -1092,12 +1092,12 @@ fn describe_metrics() {
     );
     metrics::describe_counter!(
         WORKFLOW_SCHEDULE_TICKS_TOTAL,
-        "Successful workflow schedule ticks by schedule, workflow name, and tick outcome."
+        "Workflow schedule tick decisions by schedule, workflow name, and outcome."
     );
     metrics::describe_gauge!(
-        WORKFLOW_SCHEDULE_LAST_SUCCESS_TIMESTAMP_SECONDS,
+        WORKFLOW_SCHEDULE_LAST_DISPATCH_TIMESTAMP_SECONDS,
         metrics::Unit::Seconds,
-        "Unix timestamp of the last successful workflow schedule tick."
+        "Unix timestamp of the last workflow schedule dispatch or idempotent deduplication."
     );
     metrics::describe_counter!(
         SLACK_ARCHIVE_IMPORT_RUNS_TOTAL,
@@ -1467,11 +1467,13 @@ mod tests {
     }
 
     #[test]
-    fn schedule_freshness_advances_only_after_a_dispatch() {
-        assert!(schedule_tick_advances_freshness("spawned"));
-        assert!(schedule_tick_advances_freshness("deduped"));
-        assert!(!schedule_tick_advances_freshness("overlap_skipped"));
-        assert!(!schedule_tick_advances_freshness("disabled"));
+    fn schedule_dispatch_timestamp_advances_only_after_a_dispatch() {
+        assert!(schedule_tick_advances_dispatch_timestamp("spawned"));
+        assert!(schedule_tick_advances_dispatch_timestamp("deduped"));
+        assert!(!schedule_tick_advances_dispatch_timestamp(
+            "overlap_skipped"
+        ));
+        assert!(!schedule_tick_advances_dispatch_timestamp("disabled"));
     }
 
     #[test]
@@ -1565,7 +1567,7 @@ mod tests {
         assert!(metrics.contains("centaur_workflow_task_attempts_total{"));
         assert!(metrics.contains("centaur_workflow_task_duration_seconds_count{"));
         assert!(metrics.contains("centaur_workflow_schedule_ticks_total{"));
-        assert!(metrics.contains("centaur_workflow_schedule_last_success_timestamp_seconds{"));
+        assert!(metrics.contains("centaur_workflow_schedule_last_dispatch_timestamp_seconds{"));
         assert!(metrics.contains(r#"environment="production""#));
         assert!(metrics.contains(r#"namespace="centaur-system""#));
         assert!(metrics.contains(r#"source="slack""#));

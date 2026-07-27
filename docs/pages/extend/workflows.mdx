@@ -184,6 +184,11 @@ work or race an active run. The scheduler still advances the next tick, but
 records the overlap and does not start another task while that workflow has a
 non-terminal task in its queue.
 
+Schedule dispatch is intentionally serialized within one API process because
+the active-task check and target spawn are separate database operations;
+workflow execution queues remain independently concurrent. Multi-process
+deployments need a distributed fence before relying on overlap suppression.
+
 Overlap suppression is not a substitute for idempotency. Put writes and
 external API calls in named `ctx.step(...)` blocks, derive stable keys from the
 scheduled window, and have the handler detect already-processed periods.
@@ -204,8 +209,12 @@ continuous monitors such as "check every five minutes".
 ### Observe runs and schedules
 
 Workflow results should include a bounded semantic `outcome` such as
-`succeeded`, `noop`, `queued`, `waiting`, `blocked`, `degraded`, `dry_run`, or
-`failed`. The run API persists that result.
+`succeeded`, `noop`, `queued`, `waiting`, `blocked`, `degraded`, `dry_run`,
+`cancelled`, or `failed`. The run API persists that result.
+
+Handlers must return an object. A missing or `null` result is converted into an
+explicit terminal `failed` result rather than retried; use an explicit `failed`
+outcome for an intentional terminal business result.
 
 The Prometheus endpoint exports:
 
@@ -214,8 +223,9 @@ The Prometheus endpoint exports:
   and outcome;
 - `centaur_workflow_schedule_ticks_total`, labeled by schedule, workflow, and
   tick outcome (`spawned`, `deduped`, `overlap_skipped`, or `disabled`);
-- `centaur_workflow_schedule_last_success_timestamp_seconds`, which supports
-  per-schedule freshness alerts.
+- `centaur_workflow_schedule_last_dispatch_timestamp_seconds`, which supports
+  per-schedule dispatch-freshness alerts. This detects a stalled scheduler; use
+  task outcome metrics to alert on workflow completion health.
 
 ## Expose a workflow as a webhook
 

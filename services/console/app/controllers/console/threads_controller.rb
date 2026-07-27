@@ -90,14 +90,12 @@ class Console::ThreadsController < ApplicationController
   # Pseudo thread key that opens a new-chat composer pane in the split view.
   NEW_PANE_KEY = "new".freeze
 
-  # The composer's model selector, in display order. Every choice runs on the
-  # omp harness — the deployment standard (sandbox.harnessEngine, every
-  # workflow, slackbotv2) — and the pick rides omp's `--model` flag as a
-  # provider-prefixed model ref (harness/omp/config.yml modelRoles shape:
-  # litellm/..., anthropic/..., openai-codex/...), overriding the in-image
-  # default. `efforts` are reasoning efforts appended to the model ref as a
-  # `:effort` suffix (omp's native form, e.g. openai-codex/gpt-5.6-sol:xhigh);
-  # enum per crates/harness-server/src/codex.rs, `max` being 5.6-specific.
+  # The composer's model selector, in display order. OMP is the deployment
+  # standard; its choices use provider-prefixed model refs (harness/omp/config.yml
+  # modelRoles shape: litellm/..., anthropic/..., openai-codex/...). Nanocodex is
+  # an explicit specialized-harness entry. `efforts` are selectable modes:
+  # reasoning efforts append omp's native `:effort` suffix, while entries in
+  # MODEL_VARIANT_REFS replace the whole ref for provider-native variants.
   ComposerAgent = Struct.new(:value, :label, :harness, :model, :efforts, keyword_init: true)
   CODEX_EFFORTS = [
     %w[minimal Minimal],
@@ -106,6 +104,11 @@ class Console::ThreadsController < ApplicationController
     %w[high High],
     [ "xhigh", "Extra High" ]
   ].freeze
+  MODEL_VARIANT_REFS = {
+    "claude-opus-5" => {
+      "fast" => "openrouter/anthropic/claude-opus-5-fast"
+    }.freeze
+  }.freeze
   # First entry doubles as the default pick: the self-hosted gateway model the
   # deployment runs everywhere else (modelRoles.default).
   COMPOSER_AGENTS = [
@@ -119,6 +122,9 @@ class Console::ThreadsController < ApplicationController
     ComposerAgent.new(value: "gpt-5.5", label: "GPT-5.5",
                       harness: "omp", model: "openai-codex/gpt-5.5",
                       efforts: CODEX_EFFORTS),
+    ComposerAgent.new(value: "claude-opus-5", label: "Claude Opus 5",
+                      harness: "omp", model: "anthropic/claude-opus-5",
+                      efforts: [ %w[fast Fast] ]),
     ComposerAgent.new(value: "claude-opus-4-8", label: "Claude Opus 4.8",
                       harness: "omp", model: "anthropic/claude-opus-4-8", efforts: []),
     ComposerAgent.new(value: "claude-sonnet-4-6", label: "Claude Sonnet 4.6",
@@ -323,12 +329,13 @@ class Console::ThreadsController < ApplicationController
     agent.efforts.map(&:first).include?(effort) ? effort : nil
   end
 
-  # The omp model ref for this pick: reasoning effort rides the ref as omp's
-  # native `:effort` suffix (openai-codex/gpt-5.6-sol:max), not a separate
-  # wire field.
+  # Resolve a selected mode to the omp model ref. Provider-native variants
+  # replace the whole ref; reasoning efforts use omp's `:effort` suffix.
   def composer_model_ref(agent)
     effort = composer_effort_param(agent)
-    effort.present? ? "#{agent.model}:#{effort}" : agent.model
+    return agent.model if effort.blank?
+
+    MODEL_VARIANT_REFS.dig(agent.value, effort) || "#{agent.model}:#{effort}"
   end
 
   def composer_agent_for(raw)

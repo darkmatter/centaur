@@ -49,6 +49,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+use time::OffsetDateTime;
 use tokio::{
     io,
     sync::{Mutex, RwLock},
@@ -173,6 +174,52 @@ impl CollabRoomHandle {
 }
 
 type CollabRoomRegistry = Arc<DashMap<ThreadKey, CollabRoomHandle>>;
+
+/// Durable cross-replica sandbox reference lease backed by `PgSessionStore`.
+///
+/// The renewer task periodically re-ups the lease expiry. Drop aborts the
+/// renewer; a crash or cancellation leaves a TTL-bounded DB row that the
+/// cleanup worker purges once expired. Explicit completion via `release`
+/// owner-checked-deletes the row (best-effort, logs on failure).
+#[must_use = "the sandbox reference lease must be held for the owning task's lifetime"]
+pub struct SandboxReferenceLease {
+    store: PgSessionStore,
+    sandbox_id: Arc<str>,
+    owner_id: Arc<str>,
+    renewer: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl SandboxReferenceLease {
+    /// Aborts the renewer and owner-checked-deletes the lease row.
+    /// Deletion failures are warn-only and not returned.
+    pub async fn release(mut self) {
+        if let Some(renewer) = self.renewer.take() {
+            renewer.abort();
+            let _ = renewer.await;
+        }
+        if let Err(error) = self
+            .store
+            .delete_sandbox_lease(&self.sandbox_id, &self.owner_id)
+            .await
+        {
+            warn!(
+                sandbox_id = %self.sandbox_id,
+                owner_id = %self.owner_id,
+                %error,
+                "failed to delete sandbox reference lease on release; \
+                 cleanup worker will purge it once expired",
+            );
+        }
+    }
+}
+
+impl Drop for SandboxReferenceLease {
+    fn drop(&mut self) {
+        if let Some(renewer) = self.renewer.take() {
+            renewer.abort();
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct SessionRuntime {
@@ -910,6 +957,69 @@ impl SessionRuntime {
             collab_lifecycle_locks: Arc::new(DashMap::new()),
             collab_lifecycle_gate: Arc::new(RwLock::new(())),
         }
+    }
+
+    /// Acquire a durable sandbox reference shared by every api-rs replica.
+    pub async fn acquire_sandbox_reference_lease(
+        &self,
+        sandbox_id: &str,
+        owner_id: &str,
+    ) -> Result<SandboxReferenceLease, SessionRuntimeError> {
+        let sandbox_id: Arc<str> = Arc::from(sandbox_id);
+        let owner_id: Arc<str> = Arc::from(owner_id);
+        let lease_ttl = time::Duration::minutes(10);
+        let acquired = self
+            .store
+            .acquire_sandbox_lease(
+                &sandbox_id,
+                &owner_id,
+                OffsetDateTime::now_utc() + lease_ttl,
+            )
+            .await?;
+        if !acquired {
+            return Err(SessionRuntimeError::SandboxLeaseOwned {
+                sandbox_id: sandbox_id.to_string(),
+            });
+        }
+
+        let store = self.store.clone();
+        let renewer_sandbox_id = Arc::clone(&sandbox_id);
+        let renewer_owner_id = Arc::clone(&owner_id);
+        let renewer = tokio::spawn(async move {
+            loop {
+                sleep(Duration::from_secs(60)).await;
+                let expires_at = OffsetDateTime::now_utc() + lease_ttl;
+                match store
+                    .renew_sandbox_lease(&renewer_sandbox_id, &renewer_owner_id, expires_at)
+                    .await
+                {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        warn!(
+                            sandbox_id = %renewer_sandbox_id,
+                            owner_id = %renewer_owner_id,
+                            "sandbox reference lease was lost; stopping renewer",
+                        );
+                        break;
+                    }
+                    Err(error) => {
+                        warn!(
+                            sandbox_id = %renewer_sandbox_id,
+                            owner_id = %renewer_owner_id,
+                            %error,
+                            "failed to renew sandbox reference lease; retrying next interval",
+                        );
+                    }
+                }
+            }
+        });
+
+        Ok(SandboxReferenceLease {
+            store: self.store.clone(),
+            sandbox_id,
+            owner_id,
+            renewer: Some(renewer),
+        })
     }
 
     pub fn with_session_title_generator<F, Fut>(mut self, generator: F) -> Self
@@ -7964,6 +8074,7 @@ fn runtime_error_failure_class(error: &SessionRuntimeError) -> &'static str {
         SessionRuntimeError::Sandbox(SandboxError::Io { .. }) => "sandbox_io",
         SessionRuntimeError::Sandbox(SandboxError::Backend { .. }) => "sandbox_backend",
         SessionRuntimeError::Sandbox(SandboxError::InvalidSpec(_)) => "sandbox_invalid_spec",
+        SessionRuntimeError::SandboxLeaseOwned { .. } => "sandbox_lease_owned",
         SessionRuntimeError::IronControl(_) => "iron_control",
         SessionRuntimeError::WarmPool(_) => "warm_pool",
         SessionRuntimeError::CapacityExceeded { .. } => "capacity",
@@ -10056,6 +10167,8 @@ pub enum SessionRuntimeError {
     Store(#[from] SessionStoreError),
     #[error(transparent)]
     Sandbox(#[from] SandboxError),
+    #[error("sandbox {sandbox_id} reference lease is held by another owner")]
+    SandboxLeaseOwned { sandbox_id: String },
     #[error(transparent)]
     IronControl(#[from] centaur_iron_control::IronControlError),
     #[error(transparent)]

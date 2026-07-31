@@ -3204,6 +3204,22 @@ async fn run_python_workflow_host_in_sandbox(
         spec = spec.env("DATABASE_URL", database_url);
     }
     let (sandbox_id, io) = sandbox.runtime.create_running_io(spec).await?;
+    let lease = match session_runtime
+        .acquire_sandbox_reference_lease(sandbox_id.as_str(), ctx.run_id())
+        .await
+    {
+        Ok(lease) => lease,
+        Err(error) => {
+            if let Err(stop_error) = sandbox.runtime.stop_sandbox(&sandbox_id).await {
+                warn!(
+                    sandbox_id = %sandbox_id.as_str(),
+                    %stop_error,
+                    "failed to stop workflow host sandbox after lease acquisition failure"
+                );
+            }
+            return Err(error.into());
+        }
+    };
     let mut stdin = io.stdin;
     let stderr_task = tokio::spawn(async move {
         let _guard = io.guard;
@@ -3228,6 +3244,7 @@ async fn run_python_workflow_host_in_sandbox(
     if let Err(error) = sandbox.runtime.stop_sandbox(&sandbox_id).await {
         warn!(sandbox_id = %sandbox_id.as_str(), %error, "failed to stop workflow host sandbox");
     }
+    lease.release().await;
     result
 }
 

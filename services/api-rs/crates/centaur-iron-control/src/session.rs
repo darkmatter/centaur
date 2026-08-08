@@ -63,8 +63,6 @@ pub struct SessionRegistrar {
 }
 
 impl SessionRegistrar {
-    /// ``assign_role_ids`` are the iron-control role OIDs (from
-    /// [`crate::register_role`]) to assign to every session's principal.
     pub fn new(
         client: IronControlClient,
         namespace: impl Into<String>,
@@ -104,8 +102,8 @@ impl SessionRegistrar {
             metadata.slack_team_id,
             metadata.conversation_name,
         );
-        let mut input = principal.to_identity_input(&self.namespace);
-        apply_slack_dm_email_label(thread_key, metadata.slack_user_email, &mut input.labels);
+        let mut input = principal.to_principal_input(&self.namespace);
+        apply_slack_dm_email(thread_key, metadata.slack_user_email, &mut input);
         let existing = match self
             .client
             .get_principal(&self.namespace, &input.foreign_id)
@@ -118,6 +116,7 @@ impl SessionRegistrar {
         let exists = existing.is_some();
         if let Some(existing) = existing {
             let mut labels = existing.labels;
+            strip_compatibility_identity_labels(&mut labels);
             labels.extend(input.labels);
             input.labels = labels;
         }
@@ -127,7 +126,11 @@ impl SessionRegistrar {
                 .entry(key.clone())
                 .or_insert_with(|| value.clone());
         }
-        let slack_permission = slack_permission_for_thread(thread_key, &input.labels);
+        let slack_permission = slack_permission_for_thread(
+            thread_key,
+            input.slack_channel_id.as_deref(),
+            input.slack_user_id.as_deref(),
+        );
         let should_upsert_slack_permission = !exists
             || slack_permission
                 .as_ref()
@@ -182,25 +185,24 @@ impl SessionRegistrar {
 
 fn slack_permission_for_thread(
     thread_key: &str,
-    labels: &BTreeMap<String, String>,
+    slack_channel_id: Option<&str>,
+    slack_user_id: Option<&str>,
 ) -> Option<SlackChannelPermissionInput> {
-    if let Some(channel_id) = labels.get("slack_channel_id") {
+    if let Some(channel_id) = slack_channel_id {
         let channel_id = channel_id.trim();
         return (!is_direct_message(Some(channel_id)))
             .then(|| slack_permission(channel_id.to_owned()));
     }
 
-    if !labels.contains_key("slack_user_id") {
-        return None;
-    }
+    slack_user_id?;
     let conversation_id = slack_conversation_id(thread_key)?;
     is_direct_message(Some(conversation_id)).then(|| slack_permission(conversation_id.to_owned()))
 }
 
-fn apply_slack_dm_email_label(
+fn apply_slack_dm_email(
     thread_key: &str,
     slack_user_email: Option<&str>,
-    labels: &mut BTreeMap<String, String>,
+    input: &mut crate::models::PrincipalInput,
 ) {
     let Some(email) = slack_user_email
         .map(str::trim)
@@ -211,8 +213,20 @@ fn apply_slack_dm_email_label(
     let Some(conversation_id) = slack_conversation_id(thread_key) else {
         return;
     };
-    if is_direct_message(Some(conversation_id)) && labels.contains_key("slack_user_id") {
-        labels.insert("slack_email".to_owned(), email.to_owned());
+    if is_direct_message(Some(conversation_id)) && input.slack_user_id.is_some() {
+        input.slack_email = Some(email.to_owned());
+    }
+}
+
+fn strip_compatibility_identity_labels(labels: &mut BTreeMap<String, String>) {
+    for label in [
+        "kind",
+        "slack_user_id",
+        "slack_channel_id",
+        "slack_team_id",
+        "slack_email",
+    ] {
+        labels.remove(label);
     }
 }
 
@@ -235,6 +249,7 @@ mod tests {
 
     use parking_lot::Mutex;
 
+    use crate::derive_principal;
     use serde_json::json;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -302,27 +317,24 @@ mod tests {
     }
 
     #[test]
-    fn slack_dm_email_label_applies_only_to_dm_user_principals() {
-        let mut dm_labels = BTreeMap::new();
-        dm_labels.insert("slack_user_id".to_owned(), "U123".to_owned());
-        apply_slack_dm_email_label(
+    fn slack_dm_email_applies_only_to_dm_user_principals() {
+        let mut dm_input = derive_principal("slack:T123:D123:ts", Some("U123"), None)
+            .to_principal_input("default");
+        apply_slack_dm_email(
             "slack:T123:D123:1773364194.179929",
             Some(" ada@example.com "),
-            &mut dm_labels,
+            &mut dm_input,
         );
-        assert_eq!(
-            dm_labels.get("slack_email").map(String::as_str),
-            Some("ada@example.com")
-        );
+        assert_eq!(dm_input.slack_email.as_deref(), Some("ada@example.com"));
 
-        let mut channel_labels = BTreeMap::new();
-        channel_labels.insert("slack_channel_id".to_owned(), "C123".to_owned());
-        apply_slack_dm_email_label(
+        let mut channel_input = derive_principal("slack:T123:C123:ts", Some("U123"), None)
+            .to_principal_input("default");
+        apply_slack_dm_email(
             "slack:T123:C123:1773364194.179929",
             Some("ada@example.com"),
-            &mut channel_labels,
+            &mut channel_input,
         );
-        assert_eq!(channel_labels.get("slack_email"), None);
+        assert_eq!(channel_input.slack_email, None);
     }
 
     #[test]
@@ -339,12 +351,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn register_session_seeds_roles_for_new_principal() {
+    async fn register_session_leaves_default_roles_to_iron_control() {
         let (base_url, requests, server) = spawn_iron_control_stub(false).await;
         let registrar = SessionRegistrar::new(
             IronControlClient::new(base_url, "test-key"),
             "default",
-            vec!["role_infra".to_owned()],
+            Vec::new(),
         );
         let metadata = json!({
             "slack_user_id": "U123",
@@ -369,7 +381,12 @@ mod tests {
                 &"POST /api/v1/principals/prn_channel/slack_channel_permissions".to_owned()
             )
         );
-        assert!(requests.contains(&"POST /api/v1/principals/prn_channel/roles".to_owned()));
+        assert!(
+            !requests
+                .iter()
+                .any(|request| request == "POST /api/v1/principals/prn_channel/roles"),
+            "iron-control assigns configured default roles during principal creation"
+        );
         server.abort();
     }
 
@@ -379,7 +396,7 @@ mod tests {
         let registrar = SessionRegistrar::new(
             IronControlClient::new(base_url, "test-key"),
             "default",
-            vec!["role_infra".to_owned()],
+            Vec::new(),
         );
         let metadata = json!({
             "slack_user_id": "U123",
@@ -484,7 +501,7 @@ mod tests {
         let registrar = SessionRegistrar::new(
             IronControlClient::new(base_url, "test-key"),
             "default",
-            vec![],
+            Vec::new(),
         );
         let metadata = json!({
             "slack_user_id": "U123",
@@ -512,7 +529,7 @@ mod tests {
         let registrar = SessionRegistrar::new(
             IronControlClient::new(base_url, "test-key"),
             "default",
-            vec!["role_infra".to_owned()],
+            Vec::new(),
         );
         let metadata = json!({
             "slack_user_id": "U123",
@@ -573,10 +590,31 @@ mod tests {
 
     #[test]
     fn slack_permission_for_thread_skips_dm_channel_fallback_without_user() {
-        let mut labels = BTreeMap::new();
-        labels.insert("slack_channel_id".to_owned(), "D123".to_owned());
+        assert_eq!(
+            slack_permission_for_thread("slack:D123:ts", Some("D123"), None),
+            None
+        );
+    }
 
-        assert_eq!(slack_permission_for_thread("slack:D123:ts", &labels), None);
+    #[test]
+    fn compatibility_identity_labels_are_not_merged_back_into_writes() {
+        let mut labels = BTreeMap::from([
+            ("kind".to_owned(), "slack_dm".to_owned()),
+            ("slack_user_id".to_owned(), "U0123456789".to_owned()),
+            ("slack_team_id".to_owned(), "T0123456789".to_owned()),
+            ("managed-by".to_owned(), "centaur".to_owned()),
+            ("team".to_owned(), "platform".to_owned()),
+        ]);
+
+        strip_compatibility_identity_labels(&mut labels);
+
+        assert_eq!(
+            labels,
+            BTreeMap::from([
+                ("managed-by".to_owned(), "centaur".to_owned()),
+                ("team".to_owned(), "platform".to_owned()),
+            ])
+        );
     }
 
     #[derive(Clone, Copy)]

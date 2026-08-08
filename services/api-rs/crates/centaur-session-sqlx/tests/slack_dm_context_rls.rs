@@ -15,7 +15,7 @@ const SLACK_DM_CONVERSATION_CONTEXT_DOCUMENTS_SQL: &str =
 const READONLY_DM_RLS_SQL: &str =
     include_str!("../migrations/0042_centaur_readonly_slack_dm_rls.sql");
 const SLACK_PRIVATE_CONVERSATIONS_SQL: &str =
-    include_str!("../migrations/0045_slack_private_channel_oauth_sync.sql");
+    include_str!("../migrations/0046_slack_private_channel_oauth_sync.sql");
 
 const RLS_TABLES: &[&str] = &[
     "slack_dm_sync_conversations",

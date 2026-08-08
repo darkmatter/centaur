@@ -20,9 +20,9 @@ use aws_sdk_s3::{
 };
 use centaur_iron_control::SessionRegistrar;
 use centaur_sandbox_core::{
-    Mount, RepoCacheAccess, SandboxBackend, SandboxCapabilities as BackendSandboxCapabilities,
-    SandboxCommandOutput, SandboxError, SandboxId, SandboxIoGuard, SandboxRead, SandboxSpec,
-    SandboxStatus, SandboxWrite,
+    Mount, RepoCacheAccess, ResourceRequirements, SandboxBackend,
+    SandboxCapabilities as BackendSandboxCapabilities, SandboxCommandOutput, SandboxError,
+    SandboxId, SandboxIoGuard, SandboxRead, SandboxSpec, SandboxStatus, SandboxWrite,
 };
 use centaur_sandbox_manager::{
     SandboxManager, SandboxReaper, SandboxReaperConfig, WarmPoolConfig, WarmPoolError,
@@ -428,6 +428,8 @@ pub enum SandboxWorkloadMode {
         image: String,
         env: Vec<(String, String)>,
         mounts: Vec<Mount>,
+        /// Applied to every sandbox pod, per-session and warm.
+        resources: Option<ResourceRequirements>,
         /// The harness used for warm sandboxes and as the workload default.
         /// Per-session sandboxes run the session's own harness.
         harness: HarnessType,
@@ -1464,7 +1466,7 @@ impl SessionRuntime {
     }
 
     /// Attach an iron-control registrar so each new session upserts its
-    /// principal and assigns it the configured roles.
+    /// principal. Iron-control applies configured default roles on creation.
     pub fn with_iron_control(mut self, registrar: SessionRegistrar) -> Self {
         self.iron_control = Some(registrar);
         self
@@ -5583,6 +5585,7 @@ impl SandboxWorkloadMode {
             image: image.into(),
             env: env.into_iter().collect(),
             mounts: Vec::new(),
+            resources: None,
             harness,
         }
     }
@@ -5591,6 +5594,14 @@ impl SandboxWorkloadMode {
         match &mut self {
             Self::MockAppServer { .. } => {}
             Self::CodexAppServer { mounts, .. } => mounts.push(mount),
+        }
+        self
+    }
+
+    pub fn resources(mut self, requirements: ResourceRequirements) -> Self {
+        match &mut self {
+            Self::MockAppServer { .. } => {}
+            Self::CodexAppServer { resources, .. } => *resources = Some(requirements),
         }
         self
     }
@@ -5633,7 +5644,11 @@ impl SandboxWorkloadMode {
                 persona,
             ),
             Self::CodexAppServer {
-                image, env, mounts, ..
+                image,
+                env,
+                mounts,
+                resources,
+                ..
             } => {
                 // Pin the harness via container args (the image entrypoint is
                 // kept) so the sandbox runs the session's harness rather than
@@ -5644,6 +5659,9 @@ impl SandboxWorkloadMode {
                     .args(["harness-server", harness_server_subcommand(harness)]);
                 if let Some(thread_key) = thread_key {
                     spec = spec.env("CENTAUR_THREAD_KEY", thread_key.as_str());
+                }
+                if let Some(resources) = resources {
+                    spec = spec.resources(resources.clone());
                 }
                 for mount in mounts {
                     spec = spec.mount(mount.clone());
@@ -11414,6 +11432,32 @@ mod tests {
                 source_path: "/host/github".to_owned(),
             }
         );
+    }
+
+    #[test]
+    fn codex_workload_applies_resources_to_session_and_warm_specs() {
+        let resources = ResourceRequirements::new()
+            .request("cpu", "500m")
+            .limit("memory", "4Gi");
+        let workload = SandboxWorkloadMode::codex_app_server(
+            "centaur-agent:latest",
+            Vec::new(),
+            HarnessType::Codex,
+        )
+        .resources(resources.clone());
+        let thread_key = ThreadKey::parse("chat:C123:1780000000.000000").unwrap();
+
+        let spec = workload.spec(&thread_key, &HarnessType::Codex, None);
+        assert_eq!(spec.resources, Some(resources.clone()));
+        assert_eq!(workload.warm_spec().resources, Some(resources));
+
+        let unconstrained = SandboxWorkloadMode::codex_app_server(
+            "centaur-agent:latest",
+            Vec::new(),
+            HarnessType::Codex,
+        );
+        let spec = unconstrained.spec(&thread_key, &HarnessType::Codex, None);
+        assert_eq!(spec.resources, None);
     }
 
     #[test]

@@ -251,10 +251,11 @@ where
         &self,
         id: &SandboxId,
         principal_id: &str,
+        requester_principal_id: Option<&str>,
         labels: &BTreeMap<String, String>,
     ) -> SandboxResult<()> {
         self.backend
-            .assign_iron_control_proxy_principal(id, principal_id, labels)
+            .assign_iron_control_proxy_principal(id, principal_id, requester_principal_id, labels)
             .await
     }
 
@@ -262,10 +263,11 @@ where
         &self,
         id: &SandboxId,
         principal_id: &str,
+        requester_principal_id: Option<&str>,
         labels: &BTreeMap<String, String>,
     ) -> SandboxResult<()> {
         self.backend
-            .ensure_iron_control_proxy_resources(id, principal_id, labels)
+            .ensure_iron_control_proxy_resources(id, principal_id, requester_principal_id, labels)
             .await
     }
 

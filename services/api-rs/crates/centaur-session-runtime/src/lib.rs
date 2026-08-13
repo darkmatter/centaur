@@ -18,11 +18,11 @@ use aws_sdk_s3::{
     config::{Builder as S3ConfigBuilder, Region},
     primitives::ByteStream,
 };
-use centaur_iron_control::SessionRegistrar;
+use centaur_iron_control::{IronControlError, Principal, SessionRegistrar};
 use centaur_sandbox_core::{
-    Mount, RepoCacheAccess, SandboxBackend, SandboxCapabilities as BackendSandboxCapabilities,
-    SandboxCommandOutput, SandboxError, SandboxId, SandboxIoGuard, SandboxRead, SandboxSpec,
-    SandboxStatus, SandboxWrite,
+    Mount, RepoCacheAccess, ResourceRequirements, SandboxBackend,
+    SandboxCapabilities as BackendSandboxCapabilities, SandboxCommandOutput, SandboxError,
+    SandboxId, SandboxIoGuard, SandboxRead, SandboxSpec, SandboxStatus, SandboxWrite,
 };
 use centaur_sandbox_manager::{
     SandboxManager, SandboxReaper, SandboxReaperConfig, WarmPoolConfig, WarmPoolError,
@@ -221,6 +221,46 @@ impl Drop for SandboxReferenceLease {
     }
 }
 
+#[async_trait::async_trait]
+pub trait SessionPrincipalRegistrar: Send + Sync {
+    async fn register_session(
+        &self,
+        thread_key: &str,
+        metadata: Option<&Value>,
+    ) -> Result<Principal, IronControlError>;
+
+    async fn register_requester(
+        &self,
+        thread_key: &str,
+        metadata: Option<&Value>,
+    ) -> Result<Option<Principal>, IronControlError>;
+
+    async fn get_principal(&self, principal: &str) -> Result<Principal, IronControlError>;
+}
+
+#[async_trait::async_trait]
+impl SessionPrincipalRegistrar for SessionRegistrar {
+    async fn register_session(
+        &self,
+        thread_key: &str,
+        metadata: Option<&Value>,
+    ) -> Result<Principal, IronControlError> {
+        SessionRegistrar::register_session(self, thread_key, metadata).await
+    }
+
+    async fn register_requester(
+        &self,
+        thread_key: &str,
+        metadata: Option<&Value>,
+    ) -> Result<Option<Principal>, IronControlError> {
+        SessionRegistrar::register_requester(self, thread_key, metadata).await
+    }
+
+    async fn get_principal(&self, principal: &str) -> Result<Principal, IronControlError> {
+        SessionRegistrar::get_principal(self, principal).await
+    }
+}
+
 #[derive(Clone)]
 pub struct SessionRuntime {
     store: PgSessionStore,
@@ -230,7 +270,7 @@ pub struct SessionRuntime {
     tool_host_call_locks: ToolHostCallLocks,
     execution_spans: ExecutionSpanRegistry,
     session_ownership_generations: SessionOwnershipGenerationRegistry,
-    iron_control: Option<SessionRegistrar>,
+    iron_control: Arc<dyn SessionPrincipalRegistrar>,
     warm_pool: Option<Arc<WarmPoolManager>>,
     personas: Option<Arc<PersonaRegistry>>,
     session_title_generator: Option<SessionTitleGenerator>,
@@ -428,6 +468,8 @@ pub enum SandboxWorkloadMode {
         image: String,
         env: Vec<(String, String)>,
         mounts: Vec<Mount>,
+        /// Applied to every sandbox pod, per-session and warm.
+        resources: Option<ResourceRequirements>,
         /// The harness used for warm sandboxes and as the workload default.
         /// Per-session sandboxes run the session's own harness.
         harness: HarnessType,
@@ -904,6 +946,7 @@ struct EnsureSessionSandboxRequest<'a> {
     existing_sandbox_id: Option<&'a str>,
     existing_sandbox_capabilities: Option<&'a SessionSandboxCapabilities>,
     iron_control_principal: Option<&'a str>,
+    requester_principal: Option<&'a str>,
     proxy_labels: &'a BTreeMap<String, String>,
     desired_capabilities: &'a SessionSandboxCapabilities,
     execution_id: &'a str,
@@ -935,7 +978,11 @@ struct PersonaResolution {
 }
 
 impl SessionRuntime {
-    pub fn new(store: PgSessionStore, sandbox_runtime: SandboxRuntime) -> Self {
+    pub fn new(
+        store: PgSessionStore,
+        sandbox_runtime: SandboxRuntime,
+        iron_control: impl SessionPrincipalRegistrar + 'static,
+    ) -> Self {
         Self {
             store,
             sandbox_runtime,
@@ -944,7 +991,7 @@ impl SessionRuntime {
             session_ownership_generations: Arc::new(DashMap::new()),
             tool_host_call_locks: Arc::new(DashMap::new()),
             execution_spans: Arc::new(Mutex::new(HashMap::new())),
-            iron_control: None,
+            iron_control: Arc::new(iron_control),
             warm_pool: None,
             personas: None,
             session_title_generator: None,
@@ -1277,9 +1324,7 @@ impl SessionRuntime {
             .store
             .create_or_get_session(thread_key, &harness, None, metadata, BTreeMap::new())
             .await?;
-        if self.iron_control.is_some()
-            && session.iron_control_principal.as_deref() != Some(principal_id)
-        {
+        if session.iron_control_principal.as_deref() != Some(principal_id) {
             self.store
                 .set_iron_control_principal(thread_key, Some(principal_id))
                 .await?;
@@ -1463,16 +1508,9 @@ impl SessionRuntime {
         Ok(Some(ownership.generation))
     }
 
-    /// Attach an iron-control registrar so each new session upserts its
-    /// principal and assigns it the configured roles.
-    pub fn with_iron_control(mut self, registrar: SessionRegistrar) -> Self {
-        self.iron_control = Some(registrar);
-        self
-    }
-
-    /// Register the shared unauthenticated MCP tool-host principal when
-    /// iron-control is enabled, so proxy-backed tool calls can resolve an
-    /// effective config without minting per-user credentials in this layer.
+    /// Register the shared unauthenticated MCP tool-host principal so
+    /// proxy-backed tool calls can resolve an effective config without minting
+    /// per-user credentials in this layer.
     pub async fn register_mcp_tool_host_principal(
         &self,
         principal_id: &str,
@@ -1489,18 +1527,16 @@ impl SessionRuntime {
             ));
         }
         let thread_key = tool_host_thread_key(principal_id)?;
-        if let Some(registrar) = &self.iron_control {
-            // Serialize with run_tool_host_call so concurrent registrations
-            // for the same principal cannot interleave with session setup.
-            let call_lock = self.tool_host_call_lock(&thread_key);
-            let _call_guard = call_lock.lock().await;
-            let metadata = tool_host_session_metadata(principal_id);
-            let principal = registrar
-                .register_session(thread_key.as_str(), Some(&metadata))
-                .await?;
-            return Ok(principal.id);
-        }
-        Ok(principal_id.to_owned())
+        // Serialize with run_tool_host_call so concurrent registrations for the
+        // same principal cannot interleave with session setup.
+        let call_lock = self.tool_host_call_lock(&thread_key);
+        let _call_guard = call_lock.lock().await;
+        let metadata = tool_host_session_metadata(principal_id);
+        let principal = self
+            .iron_control
+            .register_session(thread_key.as_str(), Some(&metadata))
+            .await?;
+        Ok(principal.id)
     }
 
     pub fn with_warm_pool(mut self, config: WarmPoolConfig) -> Self {
@@ -1601,7 +1637,6 @@ impl SessionRuntime {
             "centaur.harness_type" = %harness_type,
             thread_key = %thread_key,
             harness_type = %harness_type,
-            iron_control_enabled = self.iron_control.is_some(),
         );
         set_span_parent_trace(
             &span,
@@ -1615,22 +1650,16 @@ impl SessionRuntime {
                 event = "session_create_or_get_started",
                 thread_key = %thread_key,
                 harness_type = %harness_type,
-                iron_control_enabled = self.iron_control.is_some(),
                 "creating or loading session"
             );
             let mut harness_switched = false;
             let mut session_metadata = default_metadata(metadata);
             let proxy_labels = proxy_labels_from_session_metadata(thread_key, &session_metadata);
-            let (registered_principal, desired_capabilities) =
-                if let Some(registrar) = &self.iron_control {
-                    let principal = registrar
-                        .register_session(thread_key.as_str(), Some(&session_metadata))
-                        .await?;
-                    let desired_capabilities = sandbox_capabilities_from_principal(&principal);
-                    (Some(principal), desired_capabilities)
-                } else {
-                    (None, SessionSandboxCapabilities::default_enabled())
-                };
+            let registered_principal = self
+                .iron_control
+                .register_session(thread_key.as_str(), Some(&session_metadata))
+                .await?;
+            let desired_capabilities = sandbox_capabilities_from_principal(&registered_principal);
             let persona_resolution =
                 self.resolve_persona_for_create(persona_id, &desired_capabilities)?;
             if let Some(context) = persona_resolution.context.as_ref() {
@@ -1690,35 +1719,19 @@ impl SessionRuntime {
                     )
                     .await?;
             }
-            if let Some(principal) = registered_principal {
-                // Persist the principal OID on the session row so a resumed session
-                // can recreate its sandbox after a restart without re-deriving it.
-                let session = self
-                    .store
-                    .set_iron_control_principal(thread_key, Some(&principal.id))
-                    .await?;
-                info!(
-                    component = COMPONENT_SESSION_RUNTIME,
-                    event = "session_create_or_get_completed",
-                    thread_key = %thread_key,
-                    harness_type = %harness_type,
-                    status = %session.status,
-                    iron_control_principal_persisted = true,
-                    harness_switched,
-                    "session ready"
-                );
-                return Ok(CreateOrGetSessionOutcome {
-                    session,
-                    harness_switched,
-                });
-            }
+            // Persist the principal OID on the session row so a resumed session
+            // can recreate its sandbox after a restart without re-deriving it.
+            let session = self
+                .store
+                .set_iron_control_principal(thread_key, Some(&registered_principal.id))
+                .await?;
             info!(
                 component = COMPONENT_SESSION_RUNTIME,
                 event = "session_create_or_get_completed",
                 thread_key = %thread_key,
                 harness_type = %harness_type,
                 status = %session.status,
-                iron_control_principal_persisted = session.iron_control_principal.is_some(),
+                iron_control_principal_persisted = true,
                 harness_switched,
                 "session ready"
             );
@@ -2109,6 +2122,7 @@ impl SessionRuntime {
             let harness_label = session.harness_type.to_string();
             validate_input_lines(&input_lines)?;
             let (idle_timeout, max_duration) = duration_options(idle_timeout_ms, max_duration_ms)?;
+            let requester_metadata = metadata.clone();
 
             // Resolve an exact idempotent retry before ownership acquisition.
             // This lets a caller attach to its existing execution while a
@@ -2249,6 +2263,9 @@ impl SessionRuntime {
                     }),
                 )
                 .await?;
+            let requester_principal_id = self
+                .resolve_requester_principal(thread_key, requester_metadata.as_ref())
+                .await;
             let desired_capabilities = self
                 .resolve_sandbox_capabilities(session.iron_control_principal.as_deref())
                 .await?;
@@ -2261,6 +2278,7 @@ impl SessionRuntime {
                     existing_sandbox_id: session.sandbox_id.as_deref(),
                     existing_sandbox_capabilities: session.sandbox_capabilities.as_ref(),
                     iron_control_principal: session.iron_control_principal.as_deref(),
+                    requester_principal: requester_principal_id.as_deref(),
                     proxy_labels: &session.proxy_labels,
                     desired_capabilities: &desired_capabilities,
                     execution_id: &execution.execution_id,
@@ -4040,6 +4058,7 @@ impl SessionRuntime {
             existing_sandbox_id,
             existing_sandbox_capabilities,
             iron_control_principal,
+            requester_principal,
             proxy_labels,
             desired_capabilities,
             execution_id,
@@ -4114,6 +4133,7 @@ impl SessionRuntime {
                                     .ensure_iron_control_proxy_resources(
                                         &id,
                                         principal_id,
+                                        requester_principal,
                                         proxy_labels,
                                     )
                                     .await?;
@@ -4169,6 +4189,7 @@ impl SessionRuntime {
                                             .ensure_iron_control_proxy_resources(
                                                 &id,
                                                 principal_id,
+                                                requester_principal,
                                                 proxy_labels,
                                             )
                                             .await?;
@@ -4293,7 +4314,12 @@ impl SessionRuntime {
                 })
             {
                 match warm_pool
-                    .claim(thread_key.as_str(), iron_control_principal, proxy_labels)
+                    .claim(
+                        thread_key.as_str(),
+                        iron_control_principal,
+                        requester_principal,
+                        proxy_labels,
+                    )
                     .await
                 {
                     Ok(Some(sandbox_id)) => {
@@ -4317,6 +4343,7 @@ impl SessionRuntime {
                                     "sandbox_id": sandbox_id.as_str(),
                                     "workload_key": warm_pool.workload_key(),
                                     "iron_control_principal": iron_control_principal,
+                                    "requester_principal": requester_principal,
                                     "sandbox_capabilities": desired_capabilities,
                                 }),
                             )
@@ -4361,6 +4388,7 @@ impl SessionRuntime {
             );
             if let Some(principal) = iron_control_principal {
                 spec.iron_control_principal = Some(principal.to_owned());
+                spec.iron_control_requester_principal = requester_principal.map(ToOwned::to_owned);
                 spec.iron_control_proxy_labels = proxy_labels.clone();
             }
             apply_sandbox_boot_mode(&mut spec, &boot_mode);
@@ -4423,6 +4451,34 @@ impl SessionRuntime {
         result
     }
 
+    /// Resolve and upsert the principal of the human requesting this turn from
+    /// the execute metadata. `None` for DM and non-Slack threads (the
+    /// registrar decides) and on registrar failure: a broken requester lookup
+    /// must degrade to today's requester-less turn, never fail the execution.
+    async fn resolve_requester_principal(
+        &self,
+        thread_key: &ThreadKey,
+        metadata: Option<&Value>,
+    ) -> Option<String> {
+        match self
+            .iron_control
+            .register_requester(thread_key.as_str(), metadata)
+            .await
+        {
+            Ok(principal) => principal.map(|principal| principal.id),
+            Err(error) => {
+                warn!(
+                    component = COMPONENT_SESSION_RUNTIME,
+                    event = "session_requester_registration_failed",
+                    thread_key = %thread_key,
+                    %error,
+                    "failed to register requester principal; proceeding without a requester"
+                );
+                None
+            }
+        }
+    }
+
     async fn resolve_sandbox_capabilities(
         &self,
         iron_control_principal: Option<&str>,
@@ -4430,10 +4486,7 @@ impl SessionRuntime {
         let Some(principal_id) = iron_control_principal else {
             return Ok(SessionSandboxCapabilities::default_enabled());
         };
-        let Some(registrar) = &self.iron_control else {
-            return Ok(SessionSandboxCapabilities::default_enabled());
-        };
-        let principal = registrar.get_principal(principal_id).await?;
+        let principal = self.iron_control.get_principal(principal_id).await?;
         Ok(sandbox_capabilities_from_principal(&principal))
     }
 
@@ -5583,6 +5636,7 @@ impl SandboxWorkloadMode {
             image: image.into(),
             env: env.into_iter().collect(),
             mounts: Vec::new(),
+            resources: None,
             harness,
         }
     }
@@ -5591,6 +5645,14 @@ impl SandboxWorkloadMode {
         match &mut self {
             Self::MockAppServer { .. } => {}
             Self::CodexAppServer { mounts, .. } => mounts.push(mount),
+        }
+        self
+    }
+
+    pub fn resources(mut self, requirements: ResourceRequirements) -> Self {
+        match &mut self {
+            Self::MockAppServer { .. } => {}
+            Self::CodexAppServer { resources, .. } => *resources = Some(requirements),
         }
         self
     }
@@ -5633,7 +5695,11 @@ impl SandboxWorkloadMode {
                 persona,
             ),
             Self::CodexAppServer {
-                image, env, mounts, ..
+                image,
+                env,
+                mounts,
+                resources,
+                ..
             } => {
                 // Pin the harness via container args (the image entrypoint is
                 // kept) so the sandbox runs the session's harness rather than
@@ -5644,6 +5710,9 @@ impl SandboxWorkloadMode {
                     .args(["harness-server", harness_server_subcommand(harness)]);
                 if let Some(thread_key) = thread_key {
                     spec = spec.env("CENTAUR_THREAD_KEY", thread_key.as_str());
+                }
+                if let Some(resources) = resources {
+                    spec = spec.resources(resources.clone());
                 }
                 for mount in mounts {
                     spec = spec.mount(mount.clone());
@@ -5666,6 +5735,7 @@ fn harness_server_subcommand(harness: &HarnessType) -> &'static str {
         HarnessType::Amp => "amp",
         HarnessType::Nanocodex => "nanocodex",
         HarnessType::Omp => "omp",
+        HarnessType::Hermes => "hermes",
     }
 }
 
@@ -10468,7 +10538,6 @@ mod tests {
     ) -> centaur_iron_control::Principal {
         centaur_iron_control::Principal {
             id: "prn_test".to_owned(),
-            namespace: "default".to_owned(),
             foreign_id: Some("slack-channel-t-c".to_owned()),
             name: "Test".to_owned(),
             labels,
@@ -11417,6 +11486,32 @@ mod tests {
     }
 
     #[test]
+    fn codex_workload_applies_resources_to_session_and_warm_specs() {
+        let resources = ResourceRequirements::new()
+            .request("cpu", "500m")
+            .limit("memory", "4Gi");
+        let workload = SandboxWorkloadMode::codex_app_server(
+            "centaur-agent:latest",
+            Vec::new(),
+            HarnessType::Codex,
+        )
+        .resources(resources.clone());
+        let thread_key = ThreadKey::parse("chat:C123:1780000000.000000").unwrap();
+
+        let spec = workload.spec(&thread_key, &HarnessType::Codex, None);
+        assert_eq!(spec.resources, Some(resources.clone()));
+        assert_eq!(workload.warm_spec().resources, Some(resources));
+
+        let unconstrained = SandboxWorkloadMode::codex_app_server(
+            "centaur-agent:latest",
+            Vec::new(),
+            HarnessType::Codex,
+        );
+        let spec = unconstrained.spec(&thread_key, &HarnessType::Codex, None);
+        assert_eq!(spec.resources, None);
+    }
+
+    #[test]
     fn codex_workload_reflects_resolved_persona_in_sandbox_spec() {
         let workload = SandboxWorkloadMode::codex_app_server(
             "centaur-agent:latest",
@@ -12028,7 +12123,44 @@ mod adoption_tests {
     /// fully terminalizes its own executions before releasing the lock.
     static TEST_LOCK: Mutex<()> = Mutex::const_new(());
 
-    type ProxyEnsure = (String, String, BTreeMap<String, String>);
+    #[derive(Clone, Copy)]
+    struct TestSessionPrincipalRegistrar;
+
+    #[async_trait::async_trait]
+    impl SessionPrincipalRegistrar for TestSessionPrincipalRegistrar {
+        async fn register_session(
+            &self,
+            _thread_key: &str,
+            _metadata: Option<&Value>,
+        ) -> Result<Principal, IronControlError> {
+            Ok(test_principal("prn_test"))
+        }
+
+        async fn register_requester(
+            &self,
+            _thread_key: &str,
+            _metadata: Option<&Value>,
+        ) -> Result<Option<Principal>, IronControlError> {
+            Ok(None)
+        }
+
+        async fn get_principal(&self, principal: &str) -> Result<Principal, IronControlError> {
+            Ok(test_principal(principal))
+        }
+    }
+
+    fn test_principal(id: &str) -> Principal {
+        Principal {
+            id: id.to_owned(),
+            foreign_id: Some("test".to_owned()),
+            name: "Test".to_owned(),
+            labels: BTreeMap::new(),
+            sandbox_observability_enabled: true,
+            sandbox_api_server_enabled: true,
+        }
+    }
+
+    type ProxyEnsure = (String, String, Option<String>, BTreeMap<String, String>);
 
     struct MockBackend {
         ios: Mutex<VecDeque<SandboxIo>>,
@@ -12183,11 +12315,13 @@ mod adoption_tests {
             &self,
             id: &SandboxId,
             principal_id: &str,
+            requester_principal_id: Option<&str>,
             labels: &BTreeMap<String, String>,
         ) -> SandboxResult<()> {
             self.proxy_ensures.lock().unwrap().push((
                 id.as_str().to_owned(),
                 principal_id.to_owned(),
+                requester_principal_id.map(ToOwned::to_owned),
                 labels.clone(),
             ));
             Ok(())
@@ -12464,6 +12598,7 @@ mod adoption_tests {
         SessionRuntime::new(
             store.clone(),
             SandboxRuntime::backend(backend, SandboxSpec::new("mock")),
+            TestSessionPrincipalRegistrar,
         )
     }
 
@@ -12704,6 +12839,7 @@ mod adoption_tests {
                 },
                 move || SandboxSpec::new("mock").env("WARM_POOL_TEST_MARKER", warm_marker.as_str()),
             ),
+            TestSessionPrincipalRegistrar,
         );
         let warm_pool = Arc::new(WarmPoolManager::new(
             runtime.sandbox_runtime.manager.clone(),
@@ -12713,7 +12849,7 @@ mod adoption_tests {
             WarmPoolConfig {
                 target_size: 1,
                 replenish_interval: Duration::from_secs(60),
-                bootstrap_iron_control_principal: None,
+                bootstrap_iron_control_principal: "prn_test_bootstrap".to_owned(),
                 max_running_sandboxes: None,
             },
         ));
@@ -12761,6 +12897,7 @@ mod adoption_tests {
                 existing_sandbox_id: session.sandbox_id.as_deref(),
                 existing_sandbox_capabilities: session.sandbox_capabilities.as_ref(),
                 iron_control_principal: None,
+                requester_principal: None,
                 proxy_labels: &BTreeMap::new(),
                 desired_capabilities: &restricted_capabilities(),
                 execution_id: &execution_id,
@@ -12852,6 +12989,7 @@ mod adoption_tests {
                 existing_sandbox_id: None,
                 existing_sandbox_capabilities: None,
                 iron_control_principal: None,
+                requester_principal: None,
                 proxy_labels: &BTreeMap::new(),
                 desired_capabilities: &restricted_capabilities(),
                 execution_id: &execution_id,
@@ -12915,6 +13053,7 @@ mod adoption_tests {
                 existing_sandbox_id: Some("sbx-existing"),
                 existing_sandbox_capabilities: None,
                 iron_control_principal: Some("principal-existing"),
+                requester_principal: None,
                 proxy_labels: &proxy_labels,
                 desired_capabilities: &SessionSandboxCapabilities::default_enabled(),
                 execution_id: &execution_id,
@@ -12928,9 +13067,501 @@ mod adoption_tests {
             vec![(
                 "sbx-existing".to_owned(),
                 "principal-existing".to_owned(),
+                None,
                 proxy_labels
             )]
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn existing_sandbox_ensure_swaps_and_clears_requester() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let thread_key =
+            ThreadKey::parse(format!("test:requester-swap-{}", uuid::Uuid::new_v4())).unwrap();
+        store
+            .create_or_get_session(
+                &thread_key,
+                &HarnessType::Codex,
+                None,
+                json!({}),
+                Default::default(),
+            )
+            .await
+            .expect("create session");
+        let execution_id = store
+            .create_execution(&thread_key, None, json!({}))
+            .await
+            .expect("create execution")
+            .execution
+            .execution_id;
+
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        let runtime = runtime_with(&store, backend.clone());
+        let proxy_labels = BTreeMap::new();
+        for requester in [Some("prn_a"), Some("prn_b"), None] {
+            runtime
+                .ensure_session_sandbox(EnsureSessionSandboxRequest {
+                    thread_key: &thread_key,
+                    harness_type: &HarnessType::Codex,
+                    persona_id: None,
+                    existing_sandbox_id: Some("sbx-existing"),
+                    existing_sandbox_capabilities: None,
+                    iron_control_principal: Some("prn_conv"),
+                    requester_principal: requester,
+                    proxy_labels: &proxy_labels,
+                    desired_capabilities: &SessionSandboxCapabilities::default_enabled(),
+                    execution_id: &execution_id,
+                })
+                .await
+                .expect("reuse existing sandbox");
+        }
+
+        assert_eq!(
+            backend.proxy_ensures(),
+            vec![
+                (
+                    "sbx-existing".to_owned(),
+                    "prn_conv".to_owned(),
+                    Some("prn_a".to_owned()),
+                    BTreeMap::new()
+                ),
+                (
+                    "sbx-existing".to_owned(),
+                    "prn_conv".to_owned(),
+                    Some("prn_b".to_owned()),
+                    BTreeMap::new()
+                ),
+                (
+                    "sbx-existing".to_owned(),
+                    "prn_conv".to_owned(),
+                    None,
+                    BTreeMap::new()
+                ),
+            ]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cold_create_carries_requester_on_spec() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let thread_key =
+            ThreadKey::parse(format!("test:requester-cold-{}", uuid::Uuid::new_v4())).unwrap();
+        store
+            .create_or_get_session(
+                &thread_key,
+                &HarnessType::Codex,
+                None,
+                json!({}),
+                Default::default(),
+            )
+            .await
+            .expect("create session");
+        let execution_id = store
+            .create_execution(&thread_key, None, json!({}))
+            .await
+            .expect("create execution")
+            .execution
+            .execution_id;
+
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        let runtime = runtime_with(&store, backend.clone());
+        runtime
+            .ensure_session_sandbox(EnsureSessionSandboxRequest {
+                thread_key: &thread_key,
+                harness_type: &HarnessType::Codex,
+                persona_id: None,
+                existing_sandbox_id: None,
+                existing_sandbox_capabilities: None,
+                iron_control_principal: Some("prn_conv"),
+                requester_principal: Some("prn_req"),
+                proxy_labels: &BTreeMap::new(),
+                desired_capabilities: &SessionSandboxCapabilities::default_enabled(),
+                execution_id: &execution_id,
+            })
+            .await
+            .expect("cold create sandbox");
+
+        let spec = backend.created_specs().pop().expect("created cold spec");
+        assert_eq!(spec.iron_control_principal.as_deref(), Some("prn_conv"));
+        assert_eq!(
+            spec.iron_control_requester_principal.as_deref(),
+            Some("prn_req")
+        );
+    }
+
+    fn requester_test_registrar(base_url: String) -> SessionRegistrar {
+        SessionRegistrar::new(centaur_iron_control::IronControlClient::new(
+            base_url, "test-key",
+        ))
+    }
+
+    fn runtime_with_registrar(
+        store: &PgSessionStore,
+        backend: Arc<MockBackend>,
+        registrar: SessionRegistrar,
+    ) -> SessionRuntime {
+        SessionRuntime::new(
+            store.clone(),
+            SandboxRuntime::backend(backend, SandboxSpec::new("mock")),
+            registrar,
+        )
+    }
+
+    async fn execute_with_metadata(
+        runtime: &SessionRuntime,
+        thread_key: &ThreadKey,
+        metadata: Value,
+    ) -> SessionExecution {
+        runtime
+            .execute_session(
+                thread_key,
+                ExecuteSessionInput {
+                    idempotency_key: None,
+                    metadata: Some(metadata),
+                    input_lines: vec![
+                        r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"hi"}]}}"#
+                            .to_owned(),
+                    ],
+                    idle_timeout_ms: None,
+                    max_duration_ms: None,
+                },
+            )
+            .await
+            .expect("execute session")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn channel_execute_binds_requester_and_second_user_swaps_it() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let (base_url, _requests, server) = spawn_execute_iron_control_stub().await;
+        let thread_key =
+            ThreadKey::parse(format!("slack:T123:C123:{}", uuid::Uuid::new_v4())).unwrap();
+
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        let (io, _stdout, _stdin) = mock_io();
+        backend.push_io(io).await;
+        let runtime =
+            runtime_with_registrar(&store, backend.clone(), requester_test_registrar(base_url));
+
+        runtime
+            .create_or_get_session(
+                &thread_key,
+                &HarnessType::Codex,
+                None,
+                Some(json!({"slack_team_id": "T123", "slack_channel_id": "C123"})),
+                HarnessConflictPolicy::Reject,
+            )
+            .await
+            .expect("create session");
+
+        let first = execute_with_metadata(
+            &runtime,
+            &thread_key,
+            json!({
+                "slack_user_id": "U1",
+                "slack_team_id": "T123",
+                "slack_home_team_id": "T123"
+            }),
+        )
+        .await;
+        store
+            .complete_execution(&first.execution_id)
+            .await
+            .expect("complete first execution");
+
+        // The thread's first turn binds the requester at sandbox creation.
+        let spec = backend.created_specs().pop().expect("created cold spec");
+        assert_eq!(
+            spec.iron_control_principal.as_deref(),
+            Some("prn_slack-channel-t123-c123")
+        );
+        assert_eq!(
+            spec.iron_control_requester_principal.as_deref(),
+            Some("prn_slack-user-t123-u1")
+        );
+
+        // A second turn by a different user swaps the requester on re-assign.
+        let second = execute_with_metadata(
+            &runtime,
+            &thread_key,
+            json!({
+                "slack_user_id": "U2",
+                "slack_team_id": "T123",
+                "slack_home_team_id": "T123"
+            }),
+        )
+        .await;
+        store
+            .complete_execution(&second.execution_id)
+            .await
+            .expect("complete second execution");
+
+        assert_eq!(
+            backend.proxy_ensures(),
+            vec![(
+                "mock-sbx".to_owned(),
+                "prn_slack-channel-t123-c123".to_owned(),
+                Some("prn_slack-user-t123-u2".to_owned()),
+                BTreeMap::from([
+                    ("centaur.slack_channel_id".to_owned(), "C123".to_owned()),
+                    ("centaur.slack_team_id".to_owned(), "T123".to_owned()),
+                ])
+            )]
+        );
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn slack_connect_channel_execute_binds_no_requester() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let (base_url, requests, server) = spawn_execute_iron_control_stub().await;
+        let thread_key =
+            ThreadKey::parse(format!("slack:T_HOME:C123:{}", uuid::Uuid::new_v4())).unwrap();
+
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        let (io, _stdout, _stdin) = mock_io();
+        backend.push_io(io).await;
+        let runtime =
+            runtime_with_registrar(&store, backend.clone(), requester_test_registrar(base_url));
+
+        runtime
+            .create_or_get_session(
+                &thread_key,
+                &HarnessType::Codex,
+                None,
+                Some(json!({
+                    "slack_team_id": "T_HOME",
+                    "slack_channel_id": "C123"
+                })),
+                HarnessConflictPolicy::Reject,
+            )
+            .await
+            .expect("create session");
+
+        let execution = execute_with_metadata(
+            &runtime,
+            &thread_key,
+            json!({
+                "slack_user_id": "U_EXTERNAL",
+                "slack_team_id": "T_EXTERNAL",
+                "slack_home_team_id": "T_HOME"
+            }),
+        )
+        .await;
+        store
+            .complete_execution(&execution.execution_id)
+            .await
+            .expect("complete execution");
+
+        let spec = backend.created_specs().pop().expect("created cold spec");
+        assert_eq!(spec.iron_control_requester_principal, None);
+        assert!(
+            !requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|request| request.contains("slack-user")),
+            "Slack Connect executes must not upsert a requester principal"
+        );
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dm_execute_binds_no_requester() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let (base_url, requests, server) = spawn_execute_iron_control_stub().await;
+        let thread_key =
+            ThreadKey::parse(format!("slack:T123:D123:{}", uuid::Uuid::new_v4())).unwrap();
+
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        let (io, _stdout, _stdin) = mock_io();
+        backend.push_io(io).await;
+        let runtime =
+            runtime_with_registrar(&store, backend.clone(), requester_test_registrar(base_url));
+
+        runtime
+            .create_or_get_session(
+                &thread_key,
+                &HarnessType::Codex,
+                None,
+                Some(json!({"slack_user_id": "U123", "slack_team_id": "T123"})),
+                HarnessConflictPolicy::Reject,
+            )
+            .await
+            .expect("create session");
+
+        let execution = execute_with_metadata(
+            &runtime,
+            &thread_key,
+            json!({"slack_user_id": "U123", "slack_team_id": "T123"}),
+        )
+        .await;
+        store
+            .complete_execution(&execution.execution_id)
+            .await
+            .expect("complete execution");
+
+        // In a DM the conversation principal already is the user's principal;
+        // the execute must not bind (or upsert) a separate requester.
+        let spec = backend.created_specs().pop().expect("created cold spec");
+        assert_eq!(
+            spec.iron_control_principal.as_deref(),
+            Some("prn_slack-user-t123-u123")
+        );
+        assert_eq!(spec.iron_control_requester_principal, None);
+        let user_upserts = requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| *request == "PUT /api/v1/principals/slack-user-t123-u123")
+            .count();
+        assert_eq!(user_upserts, 1, "only session create upserts the user");
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn non_slack_execute_binds_no_requester() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let (base_url, requests, server) = spawn_execute_iron_control_stub().await;
+        let thread_key = ThreadKey::parse(format!(
+            "linear:issue-{}:s:sess-1",
+            uuid::Uuid::new_v4().simple()
+        ))
+        .unwrap();
+
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        let (io, _stdout, _stdin) = mock_io();
+        backend.push_io(io).await;
+        let runtime =
+            runtime_with_registrar(&store, backend.clone(), requester_test_registrar(base_url));
+
+        runtime
+            .create_or_get_session(
+                &thread_key,
+                &HarnessType::Codex,
+                None,
+                None,
+                HarnessConflictPolicy::Reject,
+            )
+            .await
+            .expect("create session");
+
+        let execution = execute_with_metadata(
+            &runtime,
+            &thread_key,
+            json!({"slack_user_id": "U1", "slack_team_id": "T123"}),
+        )
+        .await;
+        store
+            .complete_execution(&execution.execution_id)
+            .await
+            .expect("complete execution");
+
+        let spec = backend.created_specs().pop().expect("created cold spec");
+        assert_eq!(spec.iron_control_requester_principal, None);
+        assert!(
+            !requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|request| request.contains("slack-user")),
+            "non-Slack executes must not upsert a Slack requester principal"
+        );
+        server.abort();
+    }
+
+    /// Minimal raw-TCP iron-control stub for execute-level requester tests:
+    /// principal lookups 404 (every upsert is a create), upserts return an OID
+    /// derived from the foreign id (``prn_<foreign_id>``) so assertions can
+    /// name the expected binding, and OID lookups echo the principal back.
+    async fn spawn_execute_iron_control_stub() -> (
+        String,
+        Arc<std::sync::Mutex<Vec<String>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use tokio::io::AsyncReadExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = requests.clone();
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut request = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    match stream.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(read) => request.extend_from_slice(&buf[..read]),
+                    }
+                }
+                let request = String::from_utf8_lossy(&request);
+                let first_line = request.lines().next().unwrap_or_default();
+                let mut parts = first_line.split_whitespace();
+                let method = parts.next().unwrap_or_default();
+                let path = parts.next().unwrap_or_default();
+                seen.lock().unwrap().push(format!("{method} {path}"));
+                let (status_line, body) = execute_iron_control_stub_response(method, path);
+                let response = format!(
+                    "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len(),
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+        (base_url, requests, handle)
+    }
+
+    fn execute_iron_control_stub_response(method: &str, path: &str) -> (&'static str, String) {
+        fn principal_body(id: &str, foreign_id: &str) -> String {
+            format!(
+                r#"{{"data":{{"id":"{id}","namespace":"default","foreign_id":"{foreign_id}","name":"stub","labels":{{}}}}}}"#
+            )
+        }
+        match method {
+            "GET" if path.starts_with("/api/v1/principals/lookup/") => {
+                ("404 Not Found", r#"{"error":"not found"}"#.to_owned())
+            }
+            "GET" if path.starts_with("/api/v1/principals/prn_") => {
+                let id = path.rsplit('/').next().unwrap_or_default();
+                ("200 OK", principal_body(id, "stub"))
+            }
+            "PUT" if path.starts_with("/api/v1/principals/") => {
+                let foreign_id = path.rsplit('/').next().unwrap_or_default();
+                (
+                    "200 OK",
+                    principal_body(&format!("prn_{foreign_id}"), foreign_id),
+                )
+            }
+            "POST" if path.ends_with("/slack_channel_permissions") => {
+                ("200 OK", r#"{"data":{"ok":true}}"#.to_owned())
+            }
+            _ => (
+                "500 Internal Server Error",
+                r#"{"error":"unexpected"}"#.to_owned(),
+            ),
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -13296,6 +13927,7 @@ mod adoption_tests {
                 existing_sandbox_id: Some("sbx-old"),
                 existing_sandbox_capabilities: None,
                 iron_control_principal: None,
+                requester_principal: None,
                 proxy_labels: &BTreeMap::new(),
                 desired_capabilities: &SessionSandboxCapabilities::default_enabled(),
                 execution_id: &execution_id,

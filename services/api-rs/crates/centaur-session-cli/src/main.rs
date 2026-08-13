@@ -577,6 +577,7 @@ enum HarnessTypeArg {
     ClaudeCode,
     Nanocodex,
     Omp,
+    Hermes,
 }
 
 impl From<HarnessTypeArg> for HarnessType {
@@ -587,6 +588,7 @@ impl From<HarnessTypeArg> for HarnessType {
             HarnessTypeArg::ClaudeCode => Self::ClaudeCode,
             HarnessTypeArg::Nanocodex => Self::Nanocodex,
             HarnessTypeArg::Omp => Self::Omp,
+            HarnessTypeArg::Hermes => Self::Hermes,
         }
     }
 }

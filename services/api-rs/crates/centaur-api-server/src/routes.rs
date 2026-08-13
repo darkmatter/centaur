@@ -31,8 +31,8 @@ use centaur_session_core::{
     ChatDestination, CollabStartInput, CollabStopInput, HarnessType, ThreadKey,
 };
 use centaur_session_runtime::{
-    ExecuteSessionInput, HarnessConflictPolicy, PersonaSummary, SandboxRuntime, SessionRuntime,
-    thread_trace_id, thread_trace_parent_span_id,
+    ExecuteSessionInput, HarnessConflictPolicy, PersonaSummary, SandboxRuntime,
+    SessionPrincipalRegistrar, SessionRuntime, thread_trace_id, thread_trace_parent_span_id,
 };
 use centaur_session_sqlx::PgSessionStore;
 use centaur_telemetry::{
@@ -187,10 +187,14 @@ const REDACTED_WEBHOOK_HEADERS: &[&str] = &[
     "stripe-signature",
 ];
 
-pub fn build_router_with_runtime(store: PgSessionStore, sandbox_runtime: SandboxRuntime) -> Router {
+pub fn build_router_with_runtime(
+    store: PgSessionStore,
+    sandbox_runtime: SandboxRuntime,
+    iron_control: impl SessionPrincipalRegistrar + 'static,
+) -> Router {
     let pool = store.pool().clone();
     build_router_with_app_state(AppState::ready_with_pool(
-        SessionRuntime::new(store, sandbox_runtime),
+        SessionRuntime::new(store, sandbox_runtime, iron_control),
         None,
         Some(pool),
     ))
@@ -2818,7 +2822,9 @@ async fn list_workflow_runs(
     Query(query): Query<ListWorkflowRunsQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let workflows = workflow_runtime(&state)?;
-    let runs = workflows.list_runs(query.limit.unwrap_or(50)).await?;
+    let runs = workflows
+        .list_runs(query.limit.unwrap_or(50), query.workflow_name.as_deref())
+        .await?;
     Ok(Json(json!({ "ok": true, "runs": runs })))
 }
 

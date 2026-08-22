@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { requestContext } from "../src/context";
 import { handleReviewRequest } from "../src/review";
 import type { GithubbotOptions } from "../src/types";
 
@@ -197,14 +198,20 @@ describe("review trigger message identity", () => {
       return new Response("{}", { status: 200 });
     }) as unknown as GithubbotOptions["fetch"];
     for (const deliveryId of deliveryIds) {
-      // handleReviewRequest returns the background run; awaiting it waits
-      // the turn out rather than sleeping on a guess.
-      await handleReviewRequest(reviewRequestedBody("review-bot"), {
-        ...input,
-        deliveryId,
-        options: { ...options, fetch: captureFetch } as never,
-        state: stubState(),
-      });
+      // The turn detaches via backgroundWaitUntil; run inside a request
+      // context so its waitUntil collects the promise, then drain it.
+      const pending: Promise<unknown>[] = [];
+      await requestContext.run(
+        { retryableErrors: [], waitUntil: (p) => void pending.push(p) },
+        async () =>
+          handleReviewRequest(reviewRequestedBody("review-bot"), {
+            ...input,
+            deliveryId,
+            options: { ...options, fetch: captureFetch } as never,
+            state: stubState(),
+          }),
+      );
+      await Promise.all(pending);
     }
     return keys;
   }

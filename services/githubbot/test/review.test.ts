@@ -181,7 +181,7 @@ describe("handleReviewRequest team requests", () => {
 describe("review trigger message identity", () => {
   async function captureExecutes(deliveryIds: string[]): Promise<string[]> {
     const bodies: string[] = [];
-    const captureFetch = ((_url: string, init?: RequestInit) => {
+    const captureFetch = (async (_url: string, init?: RequestInit) => {
       const body = init?.body;
       if (typeof body === "string" && body.includes("executeMessage")) {
         try {
@@ -191,7 +191,9 @@ describe("review trigger message identity", () => {
           /* not a forward payload */
         }
       }
-      return Promise.resolve(new Response("no", { status: 400 }));
+      // Everything succeeds: session create/forward must reach execute for
+      // the message id to be observable.
+      return new Response("{}", { status: 200 });
     }) as unknown as GithubbotOptions["fetch"];
     for (const deliveryId of deliveryIds) {
       handleReviewRequest(reviewRequestedBody("review-bot"), {
@@ -200,7 +202,7 @@ describe("review trigger message identity", () => {
         options: { ...options, fetch: captureFetch } as never,
         state: stubState(),
       });
-      await new Promise((resolve) => setTimeout(resolve, 10));
+      await new Promise((resolve) => setTimeout(resolve, 50));
     }
     return bodies;
   }

@@ -177,3 +177,39 @@ describe("handleReviewRequest team requests", () => {
     ).toBeNull();
   });
 });
+
+describe("review trigger message identity", () => {
+  async function captureExecutes(deliveryIds: string[]): Promise<string[]> {
+    const bodies: string[] = [];
+    const captureFetch = ((_url: string, init?: RequestInit) => {
+      const body = init?.body;
+      if (typeof body === "string" && body.includes("executeMessage")) {
+        try {
+          const parsed = JSON.parse(body) as { executeMessage?: { id?: string } };
+          if (parsed.executeMessage?.id) bodies.push(parsed.executeMessage.id);
+        } catch {
+          /* not a forward payload */
+        }
+      }
+      return Promise.resolve(new Response("no", { status: 400 }));
+    }) as unknown as GithubbotOptions["fetch"];
+    for (const deliveryId of deliveryIds) {
+      handleReviewRequest(reviewRequestedBody("review-bot"), {
+        ...input,
+        deliveryId,
+        options: { ...options, fetch: captureFetch } as never,
+        state: stubState(),
+      });
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    return bodies;
+  }
+
+  test("a re-request of the same head executes again with a distinct message id", async () => {
+    const ids = await captureExecutes(["delivery-a", "delivery-b"]);
+    expect(ids).toHaveLength(2);
+    expect(ids[0]).not.toBe(ids[1]);
+    expect(ids[0]).toContain("delivery-a");
+    expect(ids[1]).toContain("delivery-b");
+  });
+});

@@ -179,39 +179,41 @@ describe("handleReviewRequest team requests", () => {
 });
 
 describe("review trigger message identity", () => {
-  async function captureExecutes(deliveryIds: string[]): Promise<string[]> {
-    const bodies: string[] = [];
-    const captureFetch = (async (_url: string, init?: RequestInit) => {
-      const body = init?.body;
-      if (typeof body === "string" && body.includes("executeMessage")) {
-        try {
-          const parsed = JSON.parse(body) as { executeMessage?: { id?: string } };
-          if (parsed.executeMessage?.id) bodies.push(parsed.executeMessage.id);
-        } catch {
-          /* not a forward payload */
+  // executeSession serializes the message as the top-level idempotency_key
+  // of the /execute POST (session-api.ts), so that is the observable id.
+  async function captureExecuteKeys(deliveryIds: string[]): Promise<string[]> {
+    const keys: string[] = [];
+    const captureFetch = (async (url: string, init?: RequestInit) => {
+      if (typeof url === "string" && url.endsWith("/execute")) {
+        const body = init?.body;
+        if (typeof body === "string") {
+          const parsed = JSON.parse(body) as { idempotency_key?: string };
+          if (parsed.idempotency_key) keys.push(parsed.idempotency_key);
         }
+        return new Response(JSON.stringify({ execution_id: "exec-1" }), {
+          status: 200,
+        });
       }
-      // Everything succeeds: session create/forward must reach execute for
-      // the message id to be observable.
       return new Response("{}", { status: 200 });
     }) as unknown as GithubbotOptions["fetch"];
     for (const deliveryId of deliveryIds) {
-      handleReviewRequest(reviewRequestedBody("review-bot"), {
+      // handleReviewRequest returns the background run; awaiting it waits
+      // the turn out rather than sleeping on a guess.
+      await handleReviewRequest(reviewRequestedBody("review-bot"), {
         ...input,
         deliveryId,
         options: { ...options, fetch: captureFetch } as never,
         state: stubState(),
       });
-      await new Promise((resolve) => setTimeout(resolve, 50));
     }
-    return bodies;
+    return keys;
   }
 
-  test("a re-request of the same head executes again with a distinct message id", async () => {
-    const ids = await captureExecutes(["delivery-a", "delivery-b"]);
-    expect(ids).toHaveLength(2);
-    expect(ids[0]).not.toBe(ids[1]);
-    expect(ids[0]).toContain("delivery-a");
-    expect(ids[1]).toContain("delivery-b");
+  test("a re-request of the same head executes again with a distinct id", async () => {
+    const keys = await captureExecuteKeys(["delivery-a", "delivery-b"]);
+    expect(keys).toHaveLength(2);
+    expect(keys[0]).not.toBe(keys[1]);
+    expect(keys[0]).toContain("delivery-a");
+    expect(keys[1]).toContain("delivery-b");
   });
 });

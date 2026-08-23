@@ -44,6 +44,60 @@ use crate::wire::collab_state_wire_value;
 use crate::{HarnessServerError, Result};
 const DEFAULT_OMP_TURN_TIMEOUT: Duration = Duration::from_secs(300);
 const OMP_TURN_TIMEOUT_GRACE: Duration = Duration::from_secs(5);
+const OMP_CONFIG_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
+const OMP_THINKING_LEVELS: [&str; 8] = [
+    "inherit", "off", "minimal", "low", "medium", "high", "xhigh", "max",
+];
+
+#[derive(Debug, PartialEq, Eq)]
+struct OmpModelSelector<'a> {
+    provider: &'a str,
+    model_id: &'a str,
+    thinking_level: Option<&'a str>,
+}
+
+fn parse_omp_model_selector(selector: &str) -> Result<OmpModelSelector<'_>> {
+    let (provider, model_selector) =
+        selector
+            .split_once('/')
+            .ok_or_else(|| HarnessServerError::InvalidBlocksInput {
+                message: format!(
+                    "OMP RPC model override must use provider/model form, got {selector:?}"
+                ),
+            })?;
+    if provider.is_empty() || model_selector.is_empty() {
+        return Err(HarnessServerError::InvalidBlocksInput {
+            message: format!(
+                "OMP RPC model override must use provider/model form, got {selector:?}"
+            ),
+        });
+    }
+
+    let (model_id, thinking_level) = match model_selector.rsplit_once(':') {
+        Some((model_id, level)) if OMP_THINKING_LEVELS.contains(&level) => (model_id, Some(level)),
+        _ => (model_selector, None),
+    };
+    if model_id.is_empty() {
+        return Err(HarnessServerError::InvalidBlocksInput {
+            message: format!("OMP RPC model override has an empty model id: {selector:?}"),
+        });
+    }
+
+    Ok(OmpModelSelector {
+        provider,
+        model_id,
+        thinking_level,
+    })
+}
+
+fn validate_omp_thinking_level(level: &str) -> Result<()> {
+    if OMP_THINKING_LEVELS.contains(&level) {
+        return Ok(());
+    }
+    Err(HarnessServerError::InvalidBlocksInput {
+        message: format!("unsupported OMP thinking level: {level:?}"),
+    })
+}
 
 fn turn_timeout_from_trace_context(trace_context: &crate::otel::TraceContext) -> Duration {
     trace_context
@@ -434,6 +488,88 @@ fn omp_rpc_command() -> ProcessCommand {
         command.args(["--model", &model]);
     }
     command
+}
+
+fn set_model_command(id: &str, provider: &str, model_id: &str) -> Value {
+    json!({
+        "id": id,
+        "type": "set_model",
+        "provider": provider,
+        "modelId": model_id,
+    })
+}
+
+fn set_thinking_level_command(id: &str, level: &str) -> Value {
+    json!({
+        "id": id,
+        "type": "set_thinking_level",
+        "level": level,
+    })
+}
+
+fn drive_omp_config_response(
+    child: &mut OmpRpcChild,
+    expected_id: &str,
+    expected_command: &str,
+) -> Result<()> {
+    let deadline = std::time::Instant::now() + OMP_CONFIG_COMMAND_TIMEOUT;
+    while std::time::Instant::now() < deadline {
+        let Some(line) = child.read_line_timeout(Duration::from_millis(100))? else {
+            continue;
+        };
+        let frame = OmpRpcFrame::parse_json_line(&line)?;
+        if let OmpRpcFrame::Response {
+            id,
+            command,
+            success,
+            error,
+            ..
+        } = frame
+            && id.as_deref() == Some(expected_id)
+            && command == expected_command
+        {
+            if success {
+                return Ok(());
+            }
+            return Err(HarnessServerError::InvalidBlocksInput {
+                message: format!(
+                    "OMP RPC {expected_command} failed: {}",
+                    error.unwrap_or_default()
+                ),
+            });
+        }
+    }
+    Err(HarnessServerError::InvalidBlocksInput {
+        message: format!("OMP RPC {expected_command} timed out"),
+    })
+}
+
+fn apply_omp_turn_configuration(
+    child: &mut OmpRpcChild,
+    model: Option<&str>,
+    reasoning: Option<&str>,
+) -> Result<()> {
+    let model_thinking_level = if let Some(selector) = model {
+        let selection = parse_omp_model_selector(selector)?;
+        let id = child.next_request_id();
+        child.send_command(&set_model_command(
+            &id,
+            selection.provider,
+            selection.model_id,
+        ))?;
+        drive_omp_config_response(child, &id, "set_model")?;
+        selection.thinking_level
+    } else {
+        None
+    };
+
+    if let Some(level) = reasoning.or(model_thinking_level) {
+        validate_omp_thinking_level(level)?;
+        let id = child.next_request_id();
+        child.send_command(&set_thinking_level_command(&id, level))?;
+        drive_omp_config_response(child, &id, "set_thinking_level")?;
+    }
+    Ok(())
 }
 
 /// After ready, drain the initial frames to find the session_info_update
@@ -880,7 +1016,8 @@ pub fn run_omp_blocks_server() -> Result<()> {
             OmpBlocksInput::Command(BlocksCommand::User {
                 input,
                 client_user_message_id,
-                model: _,
+                model,
+                reasoning,
                 trace_context,
                 ..
             }) => {
@@ -952,6 +1089,18 @@ pub fn run_omp_blocks_server() -> Result<()> {
                         &mut stdout,
                         &thread_id,
                         &admitted_ownership,
+                    )?;
+                    turn_active.store(false, Ordering::SeqCst);
+                    continue;
+                }
+                if let Err(error) =
+                    apply_omp_turn_configuration(child, model.as_deref(), reasoning.as_deref())
+                {
+                    write_blocks_error(
+                        &mut stdout,
+                        &thread_id,
+                        "turn",
+                        &format!("OMP turn configuration failed: {error}"),
                     )?;
                     turn_active.store(false, Ordering::SeqCst);
                     continue;
@@ -2131,6 +2280,45 @@ mod tests {
     }
 
     // --- Command builders -------------------------------------------------
+
+    #[test]
+    fn model_selector_extracts_provider_model_and_thinking_level() {
+        assert_eq!(
+            parse_omp_model_selector("openai-codex/gpt-5.6-sol:max").unwrap(),
+            OmpModelSelector {
+                provider: "openai-codex",
+                model_id: "gpt-5.6-sol",
+                thinking_level: Some("max"),
+            }
+        );
+        assert_eq!(
+            parse_omp_model_selector("openrouter/vendor/model:free")
+                .unwrap()
+                .model_id,
+            "vendor/model:free"
+        );
+    }
+
+    #[test]
+    fn model_configuration_commands_match_omp_rpc_contract() {
+        assert_eq!(
+            set_model_command("model-1", "openai-codex", "gpt-5.6-sol"),
+            json!({
+                "id": "model-1",
+                "type": "set_model",
+                "provider": "openai-codex",
+                "modelId": "gpt-5.6-sol",
+            })
+        );
+        assert_eq!(
+            set_thinking_level_command("thinking-1", "max"),
+            json!({
+                "id": "thinking-1",
+                "type": "set_thinking_level",
+                "level": "max",
+            })
+        );
+    }
 
     #[test]
     fn prompt_command_carries_id_and_optional_streaming_behavior() {

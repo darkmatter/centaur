@@ -2451,9 +2451,16 @@ fi
 printf '%s\n' '{{"type":"ready"}}'
 TURN_COUNT=0
 while IFS= read -r line; do
+  printf '%s\n' "$line" >> '{pidfile}.commands'
   CMD=$(printf '%s' "$line" | sed -n 's/.*"type":"\([^"]*\)".*/\1/p')
   ID=$(printf '%s' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
   case "$CMD" in
+    set_model)
+      printf '{{"id":"%s","type":"response","command":"set_model","success":true,"data":{{"provider":"openai-codex","id":"gpt-5.6-sol"}}}}\n' "$ID"
+      ;;
+    set_thinking_level)
+      printf '{{"id":"%s","type":"response","command":"set_thinking_level","success":true}}\n' "$ID"
+      ;;
     prompt)
       TURN_COUNT=$((TURN_COUNT+1))
       printf '{{"id":"%s","type":"response","command":"prompt","success":true,"data":{{"agentInvoked":true}}}}\n' "$ID"
@@ -2588,6 +2595,48 @@ fn resident_omp_reuses_one_process_across_two_turns() {
                 .values()
                 .any(|t| t.contains("turn 2"))
     );
+}
+
+#[test]
+fn resident_omp_applies_model_and_thinking_before_prompt() {
+    let pidfile = temp_path("omp-rpc-pid-model");
+    let _ = std::fs::remove_file(&pidfile);
+    let script = fake_omp_rpc_script(&pidfile, false);
+    let mut bridge = spawn_omp_resident(script, &[]);
+    let ownership = omp_ownership_json("resident-host", 1);
+
+    let turn = bridge.run_blocks_user_line(
+        json!({
+            "type": "user",
+            "thread_key": "task:review",
+            "model": "openai-codex/gpt-5.6-sol:max",
+            "trace_metadata": ownership,
+            "message": {
+                "role": "user",
+                "content": [{"type": "text", "text": "review this"}],
+            },
+        }),
+        Duration::from_secs(30),
+    );
+    let _ = bridge.finish_successfully();
+
+    assert!(turn.terminal_status.is_some());
+    let commands_path = PathBuf::from(format!("{}.commands", pidfile.display()));
+    let commands = std::fs::read_to_string(commands_path)
+        .expect("read fake OMP commands")
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("parse fake OMP command"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        commands
+            .iter()
+            .map(|command| command["type"].as_str().unwrap_or_default())
+            .collect::<Vec<_>>(),
+        ["get_state", "set_model", "set_thinking_level", "prompt"]
+    );
+    assert_eq!(commands[1]["provider"], "openai-codex");
+    assert_eq!(commands[1]["modelId"], "gpt-5.6-sol");
+    assert_eq!(commands[2]["level"], "max");
 }
 
 #[test]

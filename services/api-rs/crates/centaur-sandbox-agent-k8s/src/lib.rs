@@ -1278,7 +1278,7 @@ mod tests {
     #[test]
     fn omits_runtime_class_when_unconfigured() {
         let spec = SandboxSpec::new("centaur-agent:latest");
-        let config = AgentSandboxConfig::new("centaur");
+        let config = AgentSandboxConfig::new("centaur", test_iron_control_settings());
 
         let sandbox = build_agent_sandbox(&SandboxId::new("asbx-test"), &spec, &config).unwrap();
 

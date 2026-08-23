@@ -1,5 +1,4 @@
 use std::{
-    borrow::Cow,
     env,
     error::Error,
     str::FromStr,

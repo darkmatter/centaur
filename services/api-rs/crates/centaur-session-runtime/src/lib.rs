@@ -2311,6 +2311,68 @@ impl SessionRuntime {
                 }
             };
 
+            // Allocation-only placeholder. The Flue hosts claim a sandbox by
+            // executing with the `allocate_sandbox` marker and no input: the
+            // pod claim above is the entire purpose of the call. Left open,
+            // nothing ever completes it — the harness has no child until a
+            // User command spawns one, so not even an interrupt can end it —
+            // and max_duration fails it a minute later, leaving an
+            // `execution exceeded` row on the thread and a one-minute wait
+            // on every cold claim. Complete it here instead: the sandbox is
+            // assigned, the one-shot lease is released, and no model turn is
+            // billed. Fenced to exactly this shape — the marker action AND
+            // no input — so no real execution can take the path.
+            if is_allocation_only_placeholder(requester_metadata.as_ref(), &input_lines) {
+                // Through the normal terminal machinery, not a bare store
+                // update: the completion event, transcript archive, lease
+                // release, activity touch, finished metric, and the idle
+                // pause the caller's own idle_timeout asked for all hang
+                // off `record_terminal_output`, and skipping them is how an
+                // abandoned allocation outlives its timeout until a sweep.
+                let terminal = record_terminal_output(
+                    &self.context(),
+                    thread_key,
+                    &sandbox_id,
+                    &execution.execution_id,
+                    TerminalOutput::Completed {
+                        reason: "allocation_only",
+                        result_text: None,
+                    },
+                )
+                .await?;
+                // `None` means another writer terminalized the row first;
+                // the in-memory `execution` still says running, and
+                // returning it would report a status the store has already
+                // replaced. Read the thread's terminal truth instead.
+                let terminal = match terminal {
+                    Some(terminal) => terminal,
+                    None => self
+                        .store
+                        .latest_execution_for_thread(thread_key)
+                        .await?
+                        .ok_or_else(|| {
+                            SessionRuntimeError::BadRequest(format!(
+                                "allocation-only execution {} disappeared from {}",
+                                execution.execution_id,
+                                thread_key.as_str(),
+                            ))
+                        })?,
+                };
+                info!(
+                    component = COMPONENT_SESSION_RUNTIME,
+                    event = "session_execute_allocation_only",
+                    thread_key = %thread_key,
+                    execution_id = %terminal.execution_id,
+                    sandbox_id = %sandbox_id,
+                    status = %terminal.status,
+                    completion_reason = "allocation_only",
+                    "allocation-only placeholder completed; sandbox claimed without a turn"
+                );
+                span.record("centaur.execution_id", terminal.execution_id.as_str());
+                span.record("execution_id", terminal.execution_id.as_str());
+                return Ok(terminal);
+            }
+
             let trace = SessionTraceContext::new(thread_key, Some(&execution_trace_span))
                 .with_max_duration_ms(max_duration_ms);
             // Inject the trusted ownership fence (acquired above) so the
@@ -7144,7 +7206,7 @@ async fn record_terminal_output(
     sandbox_id: &str,
     execution_id: &str,
     terminal: TerminalOutput,
-) -> Result<(), SessionRuntimeError> {
+) -> Result<Option<SessionExecution>, SessionRuntimeError> {
     let mut failure_class = None;
     let (terminal_execution, terminal_status) = match terminal {
         TerminalOutput::Completed {
@@ -7156,7 +7218,7 @@ async fn record_terminal_output(
                 .complete_execution_if_active_and_stdout_owner(execution_id, &ctx.stdout_owner_id)
                 .await?
             else {
-                return Ok(());
+                return Ok(None);
             };
             let mut payload = json!({
                 "execution_id": execution_id,
@@ -7188,7 +7250,7 @@ async fn record_terminal_output(
                 )
                 .await?
             else {
-                return Ok(());
+                return Ok(None);
             };
             ctx.store
                 .append_event(
@@ -7215,7 +7277,7 @@ async fn record_terminal_output(
                 )
                 .await?
             else {
-                return Ok(());
+                return Ok(None);
             };
             ctx.store
                 .append_event(
@@ -7269,12 +7331,12 @@ async fn record_terminal_output(
         spawn_idle_pause(
             ctx.clone(),
             thread_key.clone(),
-            terminal_execution.execution_id,
+            terminal_execution.execution_id.clone(),
             sandbox_id.to_owned(),
             idle_timeout,
         );
     }
-    Ok(())
+    Ok(Some(terminal_execution))
 }
 
 const TRANSCRIPTS_BUCKET_ENV: &str = "CENTAUR_TRANSCRIPTS_BUCKET";
@@ -10018,6 +10080,18 @@ fn validate_input_lines(lines: &[String]) -> Result<(), SessionRuntimeError> {
         }
     }
     Ok(())
+}
+
+/// True for the Flue sandbox-allocation placeholder: the marker action and
+/// no input lines. A host that wants only the pod an execution claims — not
+/// a turn in it — executes exactly this shape, and [`SessionRuntime::
+/// execute_session`] completes it as soon as the sandbox is assigned.
+fn is_allocation_only_placeholder(metadata: Option<&Value>, input_lines: &[String]) -> bool {
+    input_lines.is_empty()
+        && metadata
+            .and_then(|value| value.get("action"))
+            .and_then(Value::as_str)
+            == Some("allocate_sandbox")
 }
 
 fn stdout_pump_error_message(error: &LinesCodecError) -> String {
@@ -13234,6 +13308,107 @@ mod adoption_tests {
             )
             .await
             .expect("execute session")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn allocation_only_placeholder_claims_a_sandbox_and_completes() {
+        // The Flue hosts' sandbox claim: execute with the marker and no
+        // input. Before the allocation-only path this execution stayed open
+        // — nothing completes a harness with no child — until max_duration
+        // failed it, leaving an `execution exceeded` row and holding the
+        // one-shot lease for the full minute. It must now return completed
+        // with the sandbox assigned, and the released lease must admit the
+        // next execution on the same thread immediately.
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let (base_url, _requests, _server) = spawn_execute_iron_control_stub().await;
+        let thread_key =
+            ThreadKey::parse(format!("omp:test:alloc-{}", uuid::Uuid::new_v4())).unwrap();
+
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        let (io, _stdout, _stdin) = mock_io();
+        backend.push_io(io).await;
+        let runtime =
+            runtime_with_registrar(&store, backend.clone(), requester_test_registrar(base_url));
+
+        runtime
+            .create_or_get_session(
+                &thread_key,
+                &HarnessType::Omp,
+                None,
+                None,
+                HarnessConflictPolicy::Reject,
+            )
+            .await
+            .expect("create session");
+
+        let claimed = runtime
+            .execute_session(
+                &thread_key,
+                ExecuteSessionInput {
+                    idempotency_key: Some(format!("alloc-{}", uuid::Uuid::new_v4())),
+                    metadata: Some(json!({"source": "flue", "action": "allocate_sandbox"})),
+                    input_lines: vec![],
+                    idle_timeout_ms: Some(30_000),
+                    max_duration_ms: Some(60_000),
+                },
+            )
+            .await
+            .expect("allocation-only execute");
+
+        assert_eq!(
+            claimed.status,
+            ExecutionStatus::Completed,
+            "the placeholder completes as soon as the sandbox is assigned"
+        );
+        assert!(
+            store
+                .get_session(&thread_key)
+                .await
+                .expect("read session")
+                .sandbox_id
+                .is_some(),
+            "the pod claim is the point of the call"
+        );
+
+        // The completion went through the normal terminal machinery, so the
+        // thread carries a real `session.execution_completed` event — what
+        // the console and any event-stream consumer read — not just a row
+        // whose status quietly changed.
+        let events = store
+            .list_events_after(&thread_key, 0, Some(&claimed.execution_id), 100)
+            .await
+            .expect("list execution events");
+        let completed = events
+            .iter()
+            .find(|event| event.event_type == "session.execution_completed")
+            .expect("allocation-only completion event");
+        assert_eq!(
+            completed.payload["completion_reason"].as_str(),
+            Some("allocation_only")
+        );
+
+        // The lease is released with the completion, so a real turn on the
+        // same thread is admitted immediately — not 409'd out for a minute.
+        let turn = runtime
+            .execute_session(
+                &thread_key,
+                ExecuteSessionInput {
+                    idempotency_key: Some(format!("turn-{}", uuid::Uuid::new_v4())),
+                    metadata: None,
+                    input_lines: vec![r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"hi"}]}}"#.to_owned()],
+                    idle_timeout_ms: None,
+                    max_duration_ms: None,
+                },
+            )
+            .await
+            .expect("next execution admitted after allocation-only claim");
+        store
+            .complete_execution(&turn.execution_id)
+            .await
+            .expect("complete the follow-up turn");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

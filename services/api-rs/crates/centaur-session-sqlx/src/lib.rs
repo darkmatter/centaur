@@ -1,6 +1,6 @@
 //! SQLx-backed session repository.
 
-use std::{collections::BTreeMap, str::FromStr, time::Duration};
+use std::{borrow::Cow, collections::BTreeMap, str::FromStr, time::Duration};
 
 use centaur_session_core::{
     ExecutionStatus, HarnessType, MessageRole, SandboxCapabilities, SandboxRepoCacheAccess,
@@ -20,6 +20,41 @@ use uuid::Uuid;
 
 // The API binary embeds these migrations at compile time.
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
+
+const HERMES_HARNESS_MIGRATION_VERSION: i64 = 54;
+const UPSTREAM_HERMES_HARNESS_SET: &str = "'codex', 'amp', 'claudecode', 'nanocodex', 'hermes'";
+const FORK_HERMES_HARNESS_SET: &str = "'codex', 'amp', 'claudecode', 'nanocodex', 'omp', 'hermes'";
+
+fn session_migrator() -> Result<sqlx::migrate::Migrator, SessionStoreError> {
+    let mut migrations = MIGRATOR.iter().cloned().collect::<Vec<_>>();
+    let migration = migrations
+        .iter_mut()
+        .find(|migration| migration.version == HERMES_HARNESS_MIGRATION_VERSION)
+        .ok_or_else(|| {
+            SessionStoreError::InvalidMigration(format!(
+                "missing version {HERMES_HARNESS_MIGRATION_VERSION}"
+            ))
+        })?;
+    let patched_sql =
+        migration
+            .sql
+            .replacen(UPSTREAM_HERMES_HARNESS_SET, FORK_HERMES_HARNESS_SET, 1);
+    if patched_sql == migration.sql {
+        return Err(SessionStoreError::InvalidMigration(format!(
+            "version {HERMES_HARNESS_MIGRATION_VERSION} no longer contains the upstream harness constraint"
+        )));
+    }
+
+    // Version 54 came from upstream before the fork-only `omp` harness was
+    // upstreamed. Keep its immutable checksum, but preserve `omp` when SQLx
+    // applies that still-pending migration. Already-applied version 54 rows
+    // are checksum-validated and skipped by SQLx as usual.
+    migration.sql = Cow::Owned(patched_sql);
+
+    let mut migrator = sqlx::migrate::Migrator::DEFAULT;
+    migrator.migrations = Cow::Owned(migrations);
+    Ok(migrator)
+}
 
 pub const SESSION_EVENTS_CHANNEL: &str = "centaur_session_events";
 const DEFAULT_MAX_CONNECTIONS: u32 = 500;
@@ -139,7 +174,7 @@ impl PgSessionStore {
     }
 
     pub async fn run_migrations(&self) -> Result<(), SessionStoreError> {
-        MIGRATOR.run(&self.pool).await?;
+        session_migrator()?.run(&self.pool).await?;
         Ok(())
     }
 
@@ -2323,6 +2358,8 @@ pub enum SessionStoreError {
     },
     #[error("invalid persisted value: {0}")]
     InvalidPersistedValue(String),
+    #[error("invalid embedded migration: {0}")]
+    InvalidMigration(String),
     #[error("invalid notification payload on {channel}: {payload}: {error}")]
     InvalidNotification {
         channel: String,

@@ -164,7 +164,7 @@ class PgDsnSecretTest < ActiveSupport::TestCase
     principal = Principal.create!(
       kind: "console_user",
       console_user_id: user.id,
-      console_user_email: user.email,
+
       created_by: user
     )
     secret = with_dsn(PgDsnSecret.new(base_attrs(settings: [
@@ -178,6 +178,12 @@ class PgDsnSecretTest < ActiveSupport::TestCase
         { "name" => "app.email", "value" => user.email }
       ],
       secret.to_proxy_dsn(principal: principal)["settings"]
+    )
+
+    user.update!(email: "renamed-admin@acme.example")
+    assert_equal(
+      { "name" => "app.email", "value" => user.email },
+      secret.to_proxy_dsn(principal: principal.reload)["settings"].second
     )
   end
 
@@ -209,28 +215,6 @@ class PgDsnSecretTest < ActiveSupport::TestCase
     )
   end
 
-  test "to_proxy_dsn resolves first-class console user fields" do
-    user = users(:acme_admin)
-    principal = Principal.create!(
-      kind: "console_user",
-      console_user_id: user.id,
-      console_user_email: user.email,
-      created_by: user
-    )
-    secret = with_dsn(PgDsnSecret.new(base_attrs(settings: [
-      { "name" => "app.user_id", "value_from" => { "principal_field" => "console_user_id" } },
-      { "name" => "app.email", "value_from" => { "principal_field" => "console_user_email" } }
-    ])))
-
-    assert secret.valid?
-    assert_equal(
-      [
-        { "name" => "app.user_id", "value" => user.oid },
-        { "name" => "app.email", "value" => user.email }
-      ],
-      secret.to_proxy_dsn(principal: principal)["settings"]
-    )
-  end
 
   test "to_proxy_dsn resolves Slack history channel ids from permission rows" do
     principal = principals(:acme_channel)

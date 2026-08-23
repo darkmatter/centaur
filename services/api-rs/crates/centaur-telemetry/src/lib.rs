@@ -1,5 +1,4 @@
 //! Shared telemetry setup for the Rust Centaur control plane.
-
 use std::{
     collections::HashSet,
     env, fmt as std_fmt,
@@ -55,6 +54,7 @@ pub const FIELD_THREAD_KEY: &str = "thread_key";
 pub const HTTP_REQUESTS_TOTAL: &str = "http_server_requests_total";
 pub const HTTP_REQUEST_DURATION_SECONDS: &str = "http_server_request_duration_seconds";
 pub const HTTP_REQUESTS_IN_FLIGHT: &str = "http_server_requests_in_flight";
+pub const API_AUTHENTICATIONS_TOTAL: &str = "centaur_api_authentications_total";
 pub const SESSION_EXECUTIONS_TOTAL: &str = "centaur_session_executions_total";
 pub const SESSION_EXECUTION_DURATION_SECONDS: &str = "centaur_session_execution_duration_seconds";
 pub const SESSION_FIRST_TOKEN_LATENCY_SECONDS: &str = "centaur_session_first_token_latency_seconds";
@@ -322,6 +322,15 @@ pub fn record_http_request_finished(method: &str, route: &str, status: u16, dura
     .record(duration.as_secs_f64());
 }
 
+pub fn record_api_authentication(caller_class: &'static str, outcome: &'static str) {
+    metrics::counter!(
+        API_AUTHENTICATIONS_TOTAL,
+        "caller_class" => caller_class,
+        "outcome" => outcome,
+    )
+    .increment(1);
+}
+
 pub fn record_session_execution_started(harness: &str) {
     metrics::counter!(
         SESSION_EXECUTIONS_TOTAL,
@@ -545,8 +554,57 @@ pub fn traceparent_for_span(span: &tracing::Span) -> Option<String> {
     ))
 }
 
-/// Assign a remote parent trace to a not-yet-entered tracing span.
-///
+/// Assign a W3C `traceparent` as the remote parent of a not-yet-entered span.
+pub fn set_span_parent_from_traceparent(span: &tracing::Span, traceparent: &str) -> bool {
+    let mut parts = traceparent.trim().split('-');
+    let Some(version) = parts.next() else {
+        return false;
+    };
+    let (Some(trace_id), Some(parent_span_id), Some(flags)) =
+        (parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    if parts.next().is_some()
+        || version.len() != 2
+        || flags.len() != 2
+        || !version.chars().all(|ch| ch.is_ascii_hexdigit())
+        || !flags.chars().all(|ch| ch.is_ascii_hexdigit())
+    {
+        return false;
+    }
+    let Some(parent_context) = remote_parent_context(trace_id, parent_span_id) else {
+        return false;
+    };
+    span.set_parent(parent_context).is_ok()
+}
+
+fn remote_parent_context(trace_id: &str, parent_span_id: &str) -> Option<Context> {
+    let trace_id = normalize_trace_id_hex(trace_id)?;
+    let trace_id = TraceId::from_hex(&trace_id).ok()?;
+    let parent_span_id = SpanId::from_hex(parent_span_id).ok()?;
+    if trace_id == TraceId::INVALID || parent_span_id == SpanId::INVALID {
+        return None;
+    }
+    let span_context = SpanContext::new(
+        trace_id,
+        parent_span_id,
+        TraceFlags::SAMPLED,
+        true,
+        TraceState::default(),
+    );
+    Some(Context::new().with_remote_span_context(span_context))
+}
+
+fn normalize_trace_id_hex(trace_id: &str) -> Option<String> {
+    let hex: String = trace_id.chars().filter(|ch| *ch != '-').collect();
+    if hex.len() == 32 && hex.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        Some(hex)
+    } else {
+        None
+    }
+}
+
 /// `trace_id` may be a UUID string or 32-character W3C trace id. The parent
 /// span id is a deterministic thread-root span id; callers should export that
 /// root span so trace viewers have a parentless node to render.
@@ -908,32 +966,6 @@ fn unix_time_nanos(time: SystemTime) -> u64 {
         .min(u128::from(u64::MAX)) as u64
 }
 
-fn remote_parent_context(trace_id: &str, parent_span_id: &str) -> Option<Context> {
-    let trace_id = normalize_trace_id_hex(trace_id)?;
-    let trace_id = TraceId::from_hex(&trace_id).ok()?;
-    let parent_span_id = SpanId::from_hex(parent_span_id).ok()?;
-    if trace_id == TraceId::INVALID || parent_span_id == SpanId::INVALID {
-        return None;
-    }
-    let span_context = SpanContext::new(
-        trace_id,
-        parent_span_id,
-        TraceFlags::SAMPLED,
-        true,
-        TraceState::default(),
-    );
-    Some(Context::new().with_remote_span_context(span_context))
-}
-
-fn normalize_trace_id_hex(trace_id: &str) -> Option<String> {
-    let hex: String = trace_id.chars().filter(|ch| *ch != '-').collect();
-    if hex.len() == 32 && hex.chars().all(|ch| ch.is_ascii_hexdigit()) {
-        Some(hex)
-    } else {
-        None
-    }
-}
-
 pub fn init_telemetry(config: TelemetryConfig) -> Result<TelemetryGuard, TelemetryError> {
     let _metrics = prometheus_handle()?;
     let filter = EnvFilter::try_new(&config.rust_log).unwrap_or_else(|_| EnvFilter::new("info"));
@@ -986,6 +1018,10 @@ fn describe_metrics() {
     metrics::describe_gauge!(
         HTTP_REQUESTS_IN_FLIGHT,
         "Number of in-flight HTTP requests in the Rust API."
+    );
+    metrics::describe_counter!(
+        API_AUTHENTICATIONS_TOTAL,
+        "Protected API authentication decisions by bounded caller class and outcome."
     );
     metrics::describe_counter!(
         SESSION_EXECUTIONS_TOTAL,
@@ -1371,6 +1407,15 @@ mod tests {
     }
 
     #[test]
+    fn traceparent_parent_rejects_malformed_values() {
+        let span = tracing::info_span!("test");
+        assert!(!set_span_parent_from_traceparent(
+            &span,
+            "not-a-traceparent"
+        ));
+    }
+
+    #[test]
     fn thread_trace_root_export_request_uses_parentless_thread_root() {
         let request = thread_trace_root_export_request(
             "01234567-89ab-cdef-0123-456789abcdef",
@@ -1423,6 +1468,17 @@ mod tests {
             r#"http_server_request_duration_seconds_count{method="POST",route="/api/session/{thread_key}/execute_test",status_class="2xx"}"#
         ));
         assert!(metrics.contains("http_server_requests_in_flight 0"));
+    }
+
+    #[test]
+    fn prometheus_authentication_metrics_use_bounded_labels() {
+        prometheus_handle().unwrap();
+        record_api_authentication("principal", "forbidden");
+
+        let metrics = render_metrics().unwrap();
+        assert!(metrics.contains(
+            r#"centaur_api_authentications_total{caller_class="principal",outcome="forbidden"} 1"#
+        ));
     }
 
     #[test]

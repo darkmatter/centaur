@@ -12,17 +12,7 @@ module SlackDm
     CONVERSATIONS_MEMBERS_ENDPOINT = "https://slack.com/api/conversations.members"
     CONVERSATIONS_HISTORY_ENDPOINT = "https://slack.com/api/conversations.history"
     CONVERSATIONS_REPLIES_ENDPOINT = "https://slack.com/api/conversations.replies"
-
-    SlackApiError = Class.new(StandardError)
-    class RateLimitedError < SlackApiError
-      attr_reader :retry_after
-
-      def initialize(retry_after:)
-        @retry_after = retry_after
-        super("Slack API rate limited; retry after #{retry_after} seconds")
-      end
-    end
-
+    API_READ_TIMEOUT_SECONDS = 120
     class << self
       attr_accessor :slack_api_http
 
@@ -44,9 +34,9 @@ module SlackDm
       end
     end
 
-    def initialize(credential, api_client: CentaurApiClient.new, slack_api_http: nil, http_client: nil)
+    def initialize(credential, api_client: nil, slack_api_http: nil, http_client: nil)
       @credential = credential
-      @api_client = api_client
+      @api_client = api_client || CentaurApiClient.new(read_timeout: API_READ_TIMEOUT_SECONDS)
       @slack_api_http = slack_api_http || self.class.slack_api_http
       @http_client = http_client
       @run_id = "sdms_#{SecureRandom.hex(16)}"
@@ -70,7 +60,7 @@ module SlackDm
         sync_history(conversation, home_team_id, checkpoints[conversation.fetch("id")], batch)
         batch[:run][:conversations_synced] += 1
       rescue StandardError => e
-        raise if e.is_a?(RateLimitedError)
+        raise if e.is_a?(SlackApi::RetryableError)
         raise if Rails.env.test?
 
         batch[:run][:conversations_failed] += 1
@@ -132,7 +122,7 @@ module SlackDm
 
     def list_conversations
       types = self.class.supported_conversation_types(@credential.scopes)
-      raise SlackApiError, "Slack credential has no supported conversation scopes" if types.empty?
+      raise SlackApi::Error, "Slack credential has no supported conversation scopes" if types.empty?
 
       each_page(
         CONVERSATIONS_LIST_ENDPOINT,
@@ -183,7 +173,7 @@ module SlackDm
         complete = false if truncated
       end
       unless complete
-        raise SlackApiError,
+        raise SlackApi::Error,
               "Slack membership pagination truncated for #{conversation.fetch('id')}"
       end
 
@@ -197,7 +187,7 @@ module SlackDm
       return "im" if conversation["is_im"]
       return "private_channel" if conversation["is_private"]
 
-      raise SlackApiError, "Unsupported Slack conversation #{conversation['id']}"
+      raise SlackApi::Error, "Unsupported Slack conversation #{conversation['id']}"
     end
 
     def sync_history(conversation, home_team_id, checkpoint, batch)
@@ -338,17 +328,13 @@ module SlackDm
         params: params,
         headers: { "Authorization" => "Bearer #{@credential.access_token}" }
       )
-      if response.status == 429
-        retry_after = Float(response["retry-after"], exception: false)
-        retry_after = 1 unless retry_after&.positive?
-        raise RateLimitedError.new(retry_after: [ retry_after, rate_limit_max_wait ].min)
-      end
-
-      parsed = response.json
-      raise SlackApiError, "Slack API returned HTTP #{response.status}" unless response.success?
-      raise SlackApiError, "Slack API returned #{parsed['error']}" unless parsed["ok"] == true
-
-      parsed
+      SlackApi.parse_response!(response, max_rate_limit_wait: rate_limit_max_wait)
+    rescue Socket::ResolutionError => e
+      raise SlackApi::TransientError.new(
+        "Slack API hostname resolution failed: #{e.message}",
+        retry_after: SlackApi::DEFAULT_TRANSIENT_RETRY_AFTER_SECONDS,
+        code: "hostname_resolution_failed"
+      )
     end
 
     def max_slack_ts(left, right)

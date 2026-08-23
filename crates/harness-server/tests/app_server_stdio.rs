@@ -2905,6 +2905,7 @@ fn resident_omp_interrupt_with_stale_ownership_rejects() {
 }
 
 #[test]
+#[allow(clippy::useless_format)]
 fn resident_omp_drive_turn_settles_on_child_exit() {
     // If the omp process exits without sending agent_end, drive_omp_turn
     // must not poll forever. The settle timeout ensures the turn completes.
@@ -3298,11 +3299,11 @@ done
     let steer_deadline = Instant::now() + Duration::from_secs(5);
     let mut steer_msg = String::new();
     while Instant::now() < steer_deadline {
-        if let Ok(s) = std::fs::read_to_string(&steer_log) {
-            if !s.trim().is_empty() {
-                steer_msg = s.trim().to_string();
-                break;
-            }
+        if let Ok(s) = std::fs::read_to_string(&steer_log)
+            && !s.trim().is_empty()
+        {
+            steer_msg = s.trim().to_string();
+            break;
         }
         std::thread::sleep(Duration::from_millis(50));
     }

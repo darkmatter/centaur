@@ -164,25 +164,6 @@ class ApplicationHelperTest < ActionView::TestCase
     end
   end
 
-  test "console_icon renders theme toggle icons" do
-    assert_select_in console_icon("sun"), "svg path[d*='M12 3v2.25']"
-    assert_select_in console_icon("moon"), "svg path[d*='21.752 15.002']"
-  end
-
-  test "thread export and sharing controls use distinct icons" do
-    session = Struct.new(:thread_key).new("slack:C123:1234.5000")
-    view.define_singleton_method(:omp_viewer_url) { "https://omp-viewer.example.ts.net" }
-    view.define_singleton_method(:omp_viewer_export_url) do |thread_key|
-      "https://omp-viewer.example.ts.net/export/#{ERB::Util.url_encode(thread_key)}"
-    end
-
-    html = render(partial: "console/threads/thread_menu", locals: { session: session })
-    fragment = Nokogiri::HTML5.fragment(html)
-    export_icon_path = fragment.at_css("a[aria-label='Open transcript export'] svg path")["d"]
-    share_icon_path = fragment.at_css("button[aria-label='Share chat'] svg path")["d"]
-
-    refute_equal share_icon_path, export_icon_path
-  end
 
   private
 

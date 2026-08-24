@@ -1633,7 +1633,7 @@ fn drive_omp_steer_response(
 
 /// Emit a collab/state notification from a raw room JSON value (already
 /// parsed and re-projected to the API contract).
-
+///
 /// Stamp admitted ownership into a collab wire value's params so api-rs can
 /// require exact ownership match and reject missing echo on all collab outputs.
 fn stamp_ownership(value: &mut Value, admitted: &Option<OmpRpcOwnership>) {
@@ -1700,6 +1700,11 @@ struct TurnDriveResult {
     child_reusable: bool,
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    clippy::single_match,
+    clippy::collapsible_if
+)]
 fn drive_omp_turn(
     child: &mut OmpRpcChild,
     event_normalizer: &mut crate::omp::OmpEventNormalizer,

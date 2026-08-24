@@ -59,6 +59,22 @@ module SlackDm
       )
     end
 
+    test "uses an extended API read timeout by default" do
+      api_client = Object.new
+      client_created = false
+      factory = lambda do |read_timeout:|
+        assert_equal SlackDm::SyncCredential::API_READ_TIMEOUT_SECONDS, read_timeout
+        client_created = true
+        api_client
+      end
+
+      CentaurApiClient.stub(:new, factory) do
+        SlackDm::SyncCredential.new(Object.new)
+      end
+
+      assert client_created
+    end
+
     test "oauth_app_slug defaults to slack and honors console env prefix" do
       env_key = "CENTAUR_CONSOLE_SLACK_DM_SYNC_OAUTH_APP_SLUG"
       legacy_env_key = "IRON_CONTROL_SLACK_DM_SYNC_OAUTH_APP_SLUG"
@@ -278,7 +294,7 @@ module SlackDm
         end
       end
 
-      error = assert_raises(SlackDm::SyncCredential::SlackApiError) do
+      error = assert_raises(SlackApi::Error) do
         SlackDm::SyncCredential.new(
           credential,
           api_client: api_client,
@@ -303,7 +319,7 @@ module SlackDm
           headers: { "retry-after" => header }
         )
 
-        error = assert_raises(SlackDm::SyncCredential::RateLimitedError) do
+        error = assert_raises(SlackApi::RateLimitedError) do
           SlackDm::SyncCredential.new(
             credential,
             http_client: FakeHttpClient.new(response)
@@ -312,6 +328,40 @@ module SlackDm
 
         assert_equal expected, error.retry_after
       end
+    end
+
+    test "transient Slack API errors request deferred job execution" do
+      %w[fatal_error internal_error].each do |error_code|
+        response = HttpClient::Response.new(
+          status: 200,
+          body: { ok: false, error: error_code }.to_json,
+          headers: { "content-type" => "application/json" }
+        )
+
+        error = assert_raises(SlackApi::TransientError) do
+          SlackDm::SyncCredential.new(
+            credential,
+            http_client: FakeHttpClient.new(response)
+          ).call
+        end
+
+        assert_equal SlackApi::DEFAULT_TRANSIENT_RETRY_AFTER_SECONDS, error.retry_after
+      end
+    end
+
+    test "hostname resolution failures request deferred job execution" do
+      http_client = Object.new
+      http_client.define_singleton_method(:get) do |*|
+        raise Socket::ResolutionError, "Temporary failure in name resolution"
+      end
+
+      error = assert_raises(SlackApi::TransientError) do
+        SlackDm::SyncCredential.new(credential, http_client: http_client).call
+      end
+
+      assert_equal "hostname_resolution_failed", error.code
+      assert_equal SlackApi::DEFAULT_TRANSIENT_RETRY_AFTER_SECONDS, error.retry_after
+      assert_instance_of Socket::ResolutionError, error.cause
     end
   end
 end

@@ -251,6 +251,7 @@ impl AgentSandboxBackend {
         let pod = self.get_pod(id).await?;
         let status = sandbox_status_from_pod(replicas, pod.as_ref());
         Ok(ObservedSandbox::new(id.clone(), BACKEND_NAME, status)
+            .with_labels(sandbox.metadata.labels.clone().unwrap_or_default())
             .with_created_at(sandbox_creation_time(sandbox))
             .with_suspended_since(sandbox_paused_at(sandbox)))
     }
@@ -746,10 +747,6 @@ fn build_agent_sandbox(
     if spec.capabilities.observability_enabled {
         labels.insert(OBSERVABILITY_ENABLED_LABEL.to_owned(), "true".to_owned());
     }
-    if spec.capabilities.api_server_enabled {
-        labels.insert(API_SERVER_ENABLED_LABEL.to_owned(), "true".to_owned());
-    }
-
     let mut pod_labels = labels.clone();
     pod_labels.insert(
         "app.kubernetes.io/name".to_owned(),
@@ -1316,30 +1313,10 @@ mod tests {
                 .map(String::as_str),
             Some("true")
         );
-        assert_eq!(
-            sandbox
-                .metadata
-                .labels
-                .as_ref()
-                .and_then(|labels| labels.get(API_SERVER_ENABLED_LABEL))
-                .map(String::as_str),
-            Some("true")
-        );
-        assert_eq!(
-            sandbox
-                .spec
-                .pod_template
-                .metadata
-                .as_ref()
-                .and_then(|metadata| metadata.labels.as_ref())
-                .and_then(|labels| labels.get(API_SERVER_ENABLED_LABEL))
-                .map(String::as_str),
-            Some("true")
-        );
     }
 
     #[test]
-    fn omits_api_server_label_for_restricted_sandboxes() {
+    fn omits_observability_label_for_restricted_sandboxes() {
         let spec = SandboxSpec::new("centaur-agent:latest").capabilities(SandboxCapabilities {
             repo_cache: RepoCacheAccess::All,
             observability_enabled: false,
@@ -1365,31 +1342,14 @@ mod tests {
                 .and_then(|metadata| metadata.labels.as_ref())
                 .is_none_or(|labels| !labels.contains_key(OBSERVABILITY_ENABLED_LABEL))
         );
-        assert!(
-            sandbox
-                .metadata
-                .labels
-                .as_ref()
-                .is_none_or(|labels| !labels.contains_key(API_SERVER_ENABLED_LABEL))
-        );
-        assert!(
-            sandbox
-                .spec
-                .pod_template
-                .metadata
-                .as_ref()
-                .and_then(|metadata| metadata.labels.as_ref())
-                .is_none_or(|labels| !labels.contains_key(API_SERVER_ENABLED_LABEL))
-        );
     }
 
     /// A pod deleted out from under a sandbox (janitor, node pressure, manual
     /// reap) comes back through `resume`, which only has the sandbox id, not
     /// the original `SandboxSpec`. Regression test for the recreated agent
-    /// pod losing `centaur.ai/api-server-enabled` and
-    /// `centaur.ai/observability-enabled`: the resume patch must restore both
-    /// labels (derived from the sandbox's own recorded capability env, the
-    /// same durable source `resolve_iron_proxy_for_resume` already trusts)
+    /// pod losing `centaur.ai/observability-enabled`: the resume patch must
+    /// restore the label (derived from the sandbox's own recorded capability
+    /// env, the same durable source `resolve_iron_proxy_for_resume` already trusts)
     /// on the Sandbox and its pod template, matching what `build_agent_sandbox`
     /// would have applied for these capabilities.
     #[test]
@@ -1403,8 +1363,7 @@ mod tests {
                 observability_enabled: true,
                 api_server_enabled: true,
             })
-            .env("CENTAUR_SANDBOX_OBSERVABILITY_ENABLED", "true")
-            .env("CENTAUR_SANDBOX_API_SERVER_ENABLED", "true");
+            .env("CENTAUR_SANDBOX_OBSERVABILITY_ENABLED", "true");
         let config = AgentSandboxConfig::new("centaur", test_iron_control_settings());
         let mut sandbox =
             build_agent_sandbox(&SandboxId::new("asbx-test"), &spec, &config).unwrap();
@@ -1420,16 +1379,13 @@ mod tests {
             .and_then(|metadata| metadata.labels.as_mut())
         {
             labels.remove(OBSERVABILITY_ENABLED_LABEL);
-            labels.remove(API_SERVER_ENABLED_LABEL);
         }
         if let Some(labels) = sandbox.metadata.labels.as_mut() {
             labels.remove(OBSERVABILITY_ENABLED_LABEL);
-            labels.remove(API_SERVER_ENABLED_LABEL);
         }
 
         let labels = sandbox_capability_labels(&sandbox, DEFAULT_CONTAINER_NAME, "asbx-test");
         assert_eq!(labels.get(OBSERVABILITY_ENABLED_LABEL), Some(&true));
-        assert_eq!(labels.get(API_SERVER_ENABLED_LABEL), Some(&true));
 
         let patch = sandbox_resume_patch(&labels);
         assert_eq!(
@@ -1437,15 +1393,7 @@ mod tests {
             json!("true")
         );
         assert_eq!(
-            patch["metadata"]["labels"][API_SERVER_ENABLED_LABEL],
-            json!("true")
-        );
-        assert_eq!(
             patch["spec"]["podTemplate"]["metadata"]["labels"][OBSERVABILITY_ENABLED_LABEL],
-            json!("true")
-        );
-        assert_eq!(
-            patch["spec"]["podTemplate"]["metadata"]["labels"][API_SERVER_ENABLED_LABEL],
             json!("true")
         );
     }
@@ -1464,20 +1412,15 @@ mod tests {
 
         let labels = sandbox_capability_labels(&sandbox, DEFAULT_CONTAINER_NAME, "asbx-test");
         assert_eq!(labels.get(OBSERVABILITY_ENABLED_LABEL), Some(&false));
-        assert_eq!(labels.get(API_SERVER_ENABLED_LABEL), Some(&false));
 
         // A JSON merge patch null removes the key rather than writing
         // "false", matching how `build_agent_sandbox` omits (not falsifies)
         // the label for a disabled capability.
         let patch = sandbox_resume_patch(&labels);
         assert!(patch["metadata"]["labels"][OBSERVABILITY_ENABLED_LABEL].is_null());
-        assert!(patch["metadata"]["labels"][API_SERVER_ENABLED_LABEL].is_null());
         assert!(
             patch["spec"]["podTemplate"]["metadata"]["labels"][OBSERVABILITY_ENABLED_LABEL]
                 .is_null()
-        );
-        assert!(
-            patch["spec"]["podTemplate"]["metadata"]["labels"][API_SERVER_ENABLED_LABEL].is_null()
         );
     }
 

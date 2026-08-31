@@ -1370,6 +1370,7 @@ async def _recover_space_document(page, item: dict, row) -> dict:
     finally:
         await document_page.close()
 
+
 async def _fetch_space_item(
     browser,
     page,
@@ -1393,6 +1394,7 @@ async def _fetch_space_item(
         result = await _recover_space_document(page, item, row)
         result["item_id"] = item["id"]
         return result
+
     existing_downloads = await _browserbase_download_records(api_key, session_id)
     existing_ids = {
         download["id"] for download in existing_downloads if isinstance(download.get("id"), str)

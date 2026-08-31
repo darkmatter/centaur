@@ -92,7 +92,6 @@ encrypted records become unreadable without an explicit key-migration plan.
 `SLACKBOT_API_KEY` is not created with the admin API during initial boot, because
 the API process requires it before it can start. Generate a high-entropy value,
 store it in the infra Secret, and reuse the same value in Slackbot.
-
 Generate distinct high-entropy values for each enabled ingress service key.
 Store them in the infra Secret. api-rs rejects duplicate configured tokens at
 startup.

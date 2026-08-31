@@ -1843,7 +1843,6 @@ impl PgSessionStore {
         .bind(capabilities.repo_cache_enabled())
         .bind(capabilities.repo_cache.as_str())
         .bind(capabilities.observability_enabled)
-        .bind(capabilities.api_server_enabled)
         .fetch_one(&self.pool)
         .await?;
 

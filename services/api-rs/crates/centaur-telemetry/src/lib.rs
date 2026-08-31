@@ -965,7 +965,6 @@ fn unix_time_nanos(time: SystemTime) -> u64 {
         .as_nanos()
         .min(u128::from(u64::MAX)) as u64
 }
-
 pub fn init_telemetry(config: TelemetryConfig) -> Result<TelemetryGuard, TelemetryError> {
     let _metrics = prometheus_handle()?;
     let filter = EnvFilter::try_new(&config.rust_log).unwrap_or_else(|_| EnvFilter::new("info"));

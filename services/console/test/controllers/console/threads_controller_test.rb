@@ -1161,6 +1161,28 @@ class Console::ThreadsControllerTest < ActionDispatch::IntegrationTest
     assert_redirected_to console_threads_path(thread: create[:thread_key])
   end
 
+  test "starting a chat binds the Console user's principal as the turn requester" do
+    client = RecordingApiClient.new
+
+    assert_difference -> { Principal.where(kind: "console_user").count }, 1 do
+      with_composer(client: client) do
+        post console_threads_url,
+             params: { prompt: "Reply with PONG.", model: "claude-opus-4-8" }
+      end
+    end
+
+    principal = Principal.find_by!(kind: "console_user", console_user: @operator)
+    execute = client.calls[2].last
+    assert_equal principal.foreign_id, execute[:metadata][:requester_principal_foreign_id]
+
+    create = client.calls[0].last
+    append = client.calls[1].last
+    assert_nil create[:metadata][:requester_principal_foreign_id],
+               "the session's own principal stays thread-derived"
+    assert_nil append[:messages].first[:metadata][:requester_principal_foreign_id],
+               "the requester is per-turn, not persisted on the message"
+  end
+
   test "starting a chat prefers the Console user's connected GitHub login" do
     @operator.update!(name: "Goksu Toprak")
     client = RecordingApiClient.new
@@ -1223,6 +1245,34 @@ class Console::ThreadsControllerTest < ActionDispatch::IntegrationTest
     create = client.calls[0].last
     assert_equal "omp", create[:harness_type]
     assert_equal "openai-codex/gpt-5.5", create[:metadata][:model]
+  end
+
+  test "a configured custom inference model pick uses its codex provider" do
+    client = RecordingApiClient.new
+    config = {
+      private_responses: {
+        name: "Private Responses",
+        baseUrl: "https://inference.example.com/v1",
+        apiKeyEnv: "PRIVATE_RESPONSES_API_KEY",
+        defaultModel: "example-model"
+      }
+    }.to_json
+    with_env("CODEX_CUSTOM_PROVIDERS" => config) do
+      with_composer(client: client) do
+        post console_threads_url,
+             params: { prompt: "Reply with PONG.", model: "provider:private_responses" }
+      end
+    end
+
+    create = client.calls[0].last
+    assert_equal "codex", create[:harness_type]
+    assert_equal "example-model", create[:metadata][:model]
+    assert_equal "private_responses", create[:metadata][:provider]
+
+    execute = client.calls[2].last
+    assert_equal "private_responses", execute[:metadata][:provider]
+    line = JSON.parse(execute[:input_lines].first)
+    assert_equal "private_responses", line["provider"]
   end
 
   test "a configured custom inference model pick uses its codex provider" do
@@ -1367,6 +1417,9 @@ class Console::ThreadsControllerTest < ActionDispatch::IntegrationTest
 
     assert_equal %i[append_session_messages execute_session], client.calls.map(&:first)
     assert_equal thread_key, client.calls[0].last[:thread_key]
+    principal = Principal.find_by!(kind: "console_user", console_user: @operator)
+    assert_equal principal.foreign_id,
+                 client.calls[1].last[:metadata][:requester_principal_foreign_id]
     assert_redirected_to console_threads_path(thread: thread_key)
   end
 

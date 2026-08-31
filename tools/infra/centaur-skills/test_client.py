@@ -203,6 +203,7 @@ def test_editor_mutations_require_a_user(method):
     with pytest.raises(ValueError, match="must not be empty"):
         getattr(client, method)("skl_123", " ")
 
+
 def test_requests_wrap_http_errors_without_exposing_credentials():
     def handler(_request: httpx.Request) -> httpx.Response:
         return json_response({"error": {"message": "invalid sandbox token"}}, status_code=401)

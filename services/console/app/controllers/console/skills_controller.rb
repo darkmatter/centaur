@@ -94,6 +94,7 @@ class Console::SkillsController < ApplicationController
   def editable_skill
     Skill.editable_by(current_user).find_by_oid!(params[:id])
   end
+
   def moderation_skill
     return owned_skill unless acting_admin?
 

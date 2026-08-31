@@ -181,7 +181,6 @@ RUN --mount=type=cache,target=/root/.npm,sharing=locked \
     npm install -g --prefer-online --force /tmp/omp-fork.tgz; \
     rm -f /tmp/omp-fork.tgz; \
     find /usr/lib/node_modules/@oh-my-pi/pi-coding-agent -type f \( -name '*.map' -o -name '*.tsbuildinfo' \) -delete
-
 # ── Hermes Agent (own venv; exposes `hermes` + the tui_gateway module) ───────
 # The hermes harness drives `python -m tui_gateway.entry` (see
 # crates/harness-server/src/hermes.rs). HERMES_PYTHON points the harness at

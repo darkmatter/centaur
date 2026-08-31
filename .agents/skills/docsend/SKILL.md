@@ -99,7 +99,6 @@ docsend open-folder '<session-id>' --folder-id '<folder-item-id>'
 Both commands return only one directory level. Read each folder's ID from the preceding JSON response and call `open-folder` again to traverse deeper.
 
 Download the selected file using its returned item ID:
-
 For bulk downloads, inspect the returned `items`, traverse any folders, and call
 `fetch` once for each item whose `type` is `file`. Fetch files sequentially so
 the agent can choose output paths and report an individual failure without

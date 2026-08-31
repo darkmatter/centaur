@@ -136,22 +136,7 @@ module Api
         principal = Principal.find_by!(foreign_id: "namespace-label-create")
         assert_equal "prod", principal.labels["namespace"]
         assert_equal "prod", json_body.dig("data", "labels", "namespace")
-      end
 
-      test "POST preserves a label named namespace" do
-        post api_v1_principals_url,
-             params: {
-               data: {
-                 foreign_id: "namespace-label-create",
-                 labels: { "namespace" => "prod" }
-               }
-             }.to_json,
-             headers: auth_headers
-
-        assert_response :created
-        principal = Principal.find_by!(foreign_id: "namespace-label-create")
-        assert_equal "prod", principal.labels["namespace"]
-        assert_equal "prod", json_body.dig("data", "labels", "namespace")
       end
 
       test "POST applies system sandbox defaults when omitted" do
@@ -191,20 +176,7 @@ module Api
         principal = Principal.find_by!(foreign_id: "U-default-roles")
         expected = [ roles(:acme_infra), roles(:globex_infra) ].sort_by(&:id)
         assert_equal expected, principal.roles.order(:id).to_a
-      end
 
-      test "POST applies all configured default roles" do
-        Role.update_all(assign_by_default: false)
-        roles(:acme_infra).update!(assign_by_default: true)
-        roles(:globex_infra).update!(assign_by_default: true)
-        body = { data: { foreign_id: "U-default-roles" } }
-
-        post api_v1_principals_url, params: body.to_json, headers: auth_headers
-        assert_response :created
-
-        principal = Principal.find_by!(foreign_id: "U-default-roles")
-        expected = [ roles(:acme_infra), roles(:globex_infra) ].sort_by(&:id)
-        assert_equal expected, principal.roles.order(:id).to_a
       end
 
       test "POST keeps explicit sandbox capabilities over system defaults" do
@@ -527,6 +499,7 @@ module Api
         principal = Principal.find_by!(foreign_id: "channel-with-user-email")
         assert_nil principal.console_user
       end
+
       test "POST keeps identity-named labels separate from first-class fields" do
         user = users(:acme_admin)
 

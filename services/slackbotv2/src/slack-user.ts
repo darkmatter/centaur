@@ -3,7 +3,7 @@ import { isJsonObject, stringValue } from './utils'
 type ResolveSlackBotUserIdOptions = {
   botToken: string
   configuredBotUserId?: string
-  fetchFn?: typeof fetch
+  fetchFn?: (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>
   slackApiUrl?: string
   timeoutMs?: number
 }

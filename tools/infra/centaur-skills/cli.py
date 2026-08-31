@@ -192,5 +192,6 @@ def _resolve_instructions(
         raise typer.BadParameter("provide --instructions or --instructions-file")
     return None
 
+
 if __name__ == "__main__":
     app()

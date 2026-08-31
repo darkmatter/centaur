@@ -9,14 +9,16 @@ from pathlib import Path
 
 SEPARATOR = "\n\n---\n\n"
 OVERLAY_PROMPT = Path("services/sandbox/SYSTEM_PROMPT.md")
+PERSONA_PROMPT = Path("AGENTS_PERSONA.md")
+OBSERVABILITY_DISABLED_PROMPT = """[Observability access]
+This sandbox does not have Centaur observability access. Do not use vlogs, vmetrics, Grafana, or related internal logs/metrics tools.
+"""
 
 
-def _append_prompt(target: Path, source: Path) -> bool:
-    if not source.is_file() or not target.is_file():
+def _append_file_fragment(fragments: list[str], source: Path) -> bool:
+    if not source.is_file():
         return False
-    with target.open("a") as target_file:
-        target_file.write(SEPARATOR)
-        target_file.write(source.read_text())
+    fragments.append(source.read_text())
     return True
 
 
@@ -38,45 +40,54 @@ def compose_system_prompt(
     repo_mount: Path,
     configured_prompt_files: Sequence[Path] | None = None,
     legacy_overlay_dir: Path | None = None,
+    observability_enabled: bool = True,
 ) -> None:
     base_prompt = home_dir / "AGENTS_BASE.md"
     baked_prompt = home_dir / "AGENTS.md"
-    if base_prompt.is_file():
-        target_prompt.write_text(base_prompt.read_text())
-    elif baked_prompt.is_file():
-        target_prompt.write_text(baked_prompt.read_text())
-    else:
+    selected_base = base_prompt if base_prompt.is_file() else baked_prompt
+    if not selected_base.is_file():
         return
+
+    fragments = [selected_base.read_text()]
+    appended: set[Path] = set()
 
     home_overlay = home_dir / "AGENTS_OVERLAY.md"
     if configured_prompt_files is not None:
+        # Configured prompts shadow every fallback: the last existing file
+        # in the configured list wins, then the home overlay, then the legacy
+        # overlay directory. Repo-cache overlays are skipped entirely.
         for prompt_path in reversed(configured_prompt_files):
-            if _append_prompt(target_prompt, prompt_path):
-                return
-        if _append_prompt(target_prompt, home_overlay):
-            return
-        if legacy_overlay_dir is not None:
-            _append_prompt(target_prompt, legacy_overlay_dir / OVERLAY_PROMPT)
-        return
+            if _append_file_fragment(fragments, prompt_path):
+                break
+        else:
+            if not _append_file_fragment(fragments, home_overlay):
+                if legacy_overlay_dir is not None:
+                    _append_file_fragment(fragments, legacy_overlay_dir / OVERLAY_PROMPT)
+    elif legacy_overlay_dir is not None:
+        if not _append_file_fragment(fragments, home_overlay):
+            _append_file_fragment(fragments, legacy_overlay_dir / OVERLAY_PROMPT)
+    else:
+        if _append_file_fragment(fragments, home_overlay):
+            appended.add(home_overlay.resolve())
 
-    if legacy_overlay_dir is not None:
-        if _append_prompt(target_prompt, home_overlay):
-            return
-        _append_prompt(target_prompt, legacy_overlay_dir / OVERLAY_PROMPT)
-        return
+        for prompt_path in _mounted_overlay_prompts(repo_mount, baked_prompt):
+            if not prompt_path.is_file():
+                continue
+            resolved = prompt_path.resolve()
+            if resolved in appended:
+                continue
+            if _append_file_fragment(fragments, prompt_path):
+                appended.add(resolved)
 
-    appended: set[Path] = set()
-    if _append_prompt(target_prompt, home_overlay):
-        appended.add(home_overlay.resolve())
+    persona_prompt_path = home_dir / PERSONA_PROMPT
+    if persona_prompt_path.is_file():
+        fragments.append(persona_prompt_path.read_text())
 
-    for prompt_path in _mounted_overlay_prompts(repo_mount, baked_prompt):
-        if not prompt_path.is_file():
-            continue
-        resolved = prompt_path.resolve()
-        if resolved in appended:
-            continue
-        if _append_prompt(target_prompt, prompt_path):
-            appended.add(resolved)
+    if not observability_enabled:
+        fragments.append(OBSERVABILITY_DISABLED_PROMPT)
+
+    effective_prompt = SEPARATOR.join(fragments)
+    target_prompt.write_text(effective_prompt)
 
 
 def main() -> int:
@@ -98,6 +109,10 @@ def main() -> int:
         repo_mount=Path(args.repo_mount) if args.repo_mount else home_dir / "github",
         configured_prompt_files=configured_prompt_files,
         legacy_overlay_dir=Path(legacy_overlay_dir) if legacy_overlay_dir else None,
+        observability_enabled=os.environ.get(
+            "CENTAUR_SANDBOX_OBSERVABILITY_ENABLED", "true"
+        ).lower()
+        != "false",
     )
     return 0
 

@@ -562,7 +562,7 @@ export async function handleSlackMessageHandoff(
     mode: SlackbotV2MessageMode
     options: SlackbotV2Options
     state: StateAdapter
-    steeringReactions: SteeringReactionController
+    steeringReactions?: SteeringReactionController
     subscribe?: boolean
     trigger: string
   }
@@ -612,7 +612,7 @@ export async function handleSlackMessageHandoff(
       mode: input.mode,
       options: input.options,
       state: input.state,
-      steeringReactions: input.steeringReactions
+      steeringReactions: input.steeringReactions ?? createSteeringReactionController(input.options)
     })
     traceLog(input.options, 'slackbotv2_handoff_complete', trace, {
       trigger: input.trigger

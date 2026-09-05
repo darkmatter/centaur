@@ -2356,7 +2356,181 @@ impl SessionRuntime {
             let claim = if let Some(execution_id) = persisted_execution_id {
                 span.record("centaur.execution_id", execution_id);
                 span.record("execution_id", execution_id);
-                self.store.mark_execution_running(execution_id).await?
+                let claim = self.store.mark_execution_running(execution_id).await?;
+                // Queued/durable recovery path: the execution row was created by
+                // a previous process (or the enqueue handoff) without acquiring
+                // session ownership, so `acquired_session_ownership_generation` is
+                // still `None` here. Only the atomic claim winner acquires the
+                // one-shot ownership lease — a loser must not take (or release) a
+                // lease it does not own. Acquiring after the claim (rather than
+                // before) keeps the claim race-free: `mark_execution_running` is
+                // the single arbiter of which attempt drives the execution, and
+                // only that attempt may hold the session lease.
+                if claim.claimed {
+                    let ownership_generation = self
+                        .acquire_oneshot_session_ownership(thread_key, &session.harness_type)
+                        .await;
+                    match ownership_generation {
+                        Ok(generation) => {
+                            acquired_session_ownership_generation = generation;
+                            if let Some(generation) = generation {
+                                // Persist the durable ownership fence onto the
+                                // claimed row so terminal store paths
+                                // (`_session_owner_generation`) can fence a
+                                // stale writer, exactly as the direct path
+                                // does at creation time. The store update
+                                // itself is fenced by the live
+                                // `session_owners` row.
+                                let persisted = self
+                                    .store
+                                    .set_execution_owner_generation(
+                                        execution_id,
+                                        &self.stdout_owner_id,
+                                        generation,
+                                    )
+                                    .await;
+                                match persisted {
+                                    Ok(true) => {}
+                                    Ok(false) => {
+                                        // The fenced persist did not take: the
+                                        // live ownership row vanished or the
+                                        // execution left the active set between
+                                        // the claim and this update. Either
+                                        // way this attempt no longer holds a
+                                        // durable fence — driving on would
+                                        // leave an execution whose terminal
+                                        // completion the fenced store paths
+                                        // would reject. Requeue the row (if it
+                                        // is still an active running claim),
+                                        // release the acquired generation, and
+                                        // exit without driving. A terminal
+                                        // row stays terminal — cancellation
+                                        // is preserved.
+                                        let requeued = self
+                                            .store
+                                            .requeue_execution_if_running_without_stdout_owner(
+                                                execution_id,
+                                            )
+                                            .await;
+                                        match requeued {
+                                            Ok(Some(_)) => {
+                                                info!(
+                                                    component = COMPONENT_SESSION_RUNTIME,
+                                                    event = "session_execution_requeued",
+                                                    thread_key = %thread_key,
+                                                    execution_id,
+                                                    reason = "ownership_fence_persist_lost",
+                                                    "returned claimed execution to the durable queue"
+                                                );
+                                            }
+                                            Ok(None) => {
+                                                // The row is terminal or was
+                                                // claimed elsewhere: respect
+                                                // the store's terminal truth.
+                                                info!(
+                                                    component = COMPONENT_SESSION_RUNTIME,
+                                                    event = "session_execute_fence_lost_terminal",
+                                                    thread_key = %thread_key,
+                                                    execution_id,
+                                                    "ownership fence persist lost to a terminal or foreign claim"
+                                                );
+                                            }
+                                            Err(requeue_error) => {
+                                                warn!(
+                                                    component = COMPONENT_SESSION_RUNTIME,
+                                                    event = "session_execution_requeue_failed",
+                                                    thread_key = %thread_key,
+                                                    execution_id,
+                                                    error = %requeue_error,
+                                                    "failed to requeue claimed execution after fence persist loss"
+                                                );
+                                            }
+                                        }
+                                        release_session_ownership_generation(
+                                            &self.store,
+                                            thread_key,
+                                            &self.stdout_owner_id,
+                                            Some(generation),
+                                        )
+                                        .await;
+                                        return Err(SessionRuntimeError::SessionOwned {
+                                            thread_key: thread_key.as_str().to_owned(),
+                                            owner_id: self.stdout_owner_id.clone(),
+                                            mode: "oneshot",
+                                        });
+                                    }
+                                    Err(error) => {
+                                        // Persist failure: the claimed row must
+                                        // not stay `running` without the durable
+                                        // ownership fence — return it to the
+                                        // durable queue. The outer attempt error
+                                        // path releases the acquired generation.
+                                        if let Err(requeue_error) = self
+                                            .store
+                                            .requeue_execution_if_running_without_stdout_owner(
+                                                execution_id,
+                                            )
+                                            .await
+                                        {
+                                            warn!(
+                                                component = COMPONENT_SESSION_RUNTIME,
+                                                event = "session_execution_requeue_failed",
+                                                thread_key = %thread_key,
+                                                execution_id,
+                                                error = %requeue_error,
+                                                "failed to requeue claimed execution after ownership metadata persist failure"
+                                            );
+                                        } else {
+                                            info!(
+                                                component = COMPONENT_SESSION_RUNTIME,
+                                                event = "session_execution_requeued",
+                                                thread_key = %thread_key,
+                                                execution_id,
+                                                reason = "ownership_metadata_persist_failed",
+                                                "returned claimed execution to the durable queue"
+                                            );
+                                        }
+                                        return Err(SessionRuntimeError::Store(error));
+                                    }
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            // Ownership contention after the claim: the
+                            // session is held by a resident host (or another
+                            // owner). The claimed row must not stay `running`
+                            // under a foreign session owner — return it to
+                            // the durable queue so the owner's release (or
+                            // the adoption scan) re-drives it. Mirrors the
+                            // stdout-claim failure handling below.
+                            if let Err(requeue_error) = self
+                                .store
+                                .requeue_execution_if_running_without_stdout_owner(execution_id)
+                                .await
+                            {
+                                warn!(
+                                    component = COMPONENT_SESSION_RUNTIME,
+                                    event = "session_execution_requeue_failed",
+                                    thread_key = %thread_key,
+                                    execution_id,
+                                    error = %requeue_error,
+                                    "failed to requeue claimed execution after ownership contention"
+                                );
+                            } else {
+                                info!(
+                                    component = COMPONENT_SESSION_RUNTIME,
+                                    event = "session_execution_requeued",
+                                    thread_key = %thread_key,
+                                    execution_id,
+                                    reason = "session_ownership_contention",
+                                    "returned claimed execution to the durable queue"
+                                );
+                            }
+                            return Err(error);
+                        }
+                    }
+                }
+                claim
             } else {
                 // Resolve an exact idempotent retry before ownership acquisition.
                 // This lets a caller attach to its existing execution while a
@@ -13449,6 +13623,225 @@ mod adoption_tests {
             .expect("execution exists");
         assert_eq!(latest.execution_id, execution.execution_id);
         assert_eq!(latest.status, ExecutionStatus::Completed);
+    }
+
+    /// Regression (queued OMP ownership): an OMP execution driven from the
+    /// durable queue (enqueue → background driver → persisted claim) must
+    /// inject the trusted ownership fence — `owner_id` + `generation` in
+    /// `trace_metadata` — into the sandbox stdin line, exactly as the direct
+    /// path does. The harness-server rejects the line otherwise with
+    /// "invalid blocks-mode input: missing ownership (owner_id + generation)
+    /// in trace_metadata" (prod smoke exe_eb0059097e234692937c24d5f2cfcb96).
+    /// It also asserts the contention path: when a resident host holds the
+    /// session, the claimed execution is returned to the durable queue
+    /// instead of dangling in `running` under a foreign owner.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn queued_omp_execution_delivers_fenced_ownership_trace_metadata() {
+        let _serial = TEST_LOCK.lock().await;
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let thread_key =
+            ThreadKey::parse(format!("test:omp-queue-fence-{}", uuid::Uuid::new_v4())).unwrap();
+        store
+            .create_or_get_session(
+                &thread_key,
+                &HarnessType::Omp,
+                None,
+                json!({}),
+                std::collections::BTreeMap::new(),
+            )
+            .await
+            .expect("create OMP session");
+
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        let (io, mut stdout, stdin_far) = mock_io();
+        backend.push_io(io).await;
+        let runtime = runtime_with(&store, backend.clone());
+
+        // Enqueue (public route → durable queue → background driver).
+        let execution = runtime
+            .enqueue_session_execution(
+                &thread_key,
+                ExecuteSessionInput {
+                    idempotency_key: None,
+                    metadata: Some(json!({"source": "regression"})),
+                    input_lines: vec![
+                        json!({
+                            "type": "user",
+                            "message": {"content": [{"type": "text", "text": "queued fence"}]}
+                        })
+                        .to_string(),
+                    ],
+                    idle_timeout_ms: None,
+                    max_duration_ms: None,
+                },
+            )
+            .await
+            .expect("enqueue execution");
+        assert_eq!(execution.status, ExecutionStatus::Queued);
+
+        // Read the exact line api-rs wrote to the sandbox stdin and assert
+        // the trusted ownership fence is present and matches the live
+        // session_owners row for this runtime.
+        let mut stdin_far = stdin_far;
+        let line = tokio::time::timeout(Duration::from_secs(10), async {
+            let mut reader = BufReader::new(&mut stdin_far);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                let read = reader.read_line(&mut line).await.expect("read stdin line");
+                if read == 0 {
+                    panic!("sandbox stdin closed before the user line was written");
+                }
+                if line.contains("\"type\":\"user\"") {
+                    return line;
+                }
+            }
+        })
+        .await
+        .expect("background driver must deliver the queued user line");
+        let value: Value = serde_json::from_str(line.trim()).expect("stdin line is JSON");
+        let owner_id = value["trace_metadata"]["owner_id"]
+            .as_str()
+            .expect("queued OMP stdin line must carry owner_id");
+        let generation = value["trace_metadata"]["generation"]
+            .as_i64()
+            .expect("queued OMP stdin line must carry generation");
+        assert_eq!(owner_id, runtime.stdout_owner_id);
+        let row = store
+            .latest_execution_for_thread(&thread_key)
+            .await
+            .expect("load execution row")
+            .expect("execution exists");
+        assert_eq!(
+            row.metadata["_session_owner_generation"].as_i64(),
+            Some(generation),
+            "claimed queued execution must persist its ownership generation"
+        );
+
+        // Let the turn complete and confirm the fenced writer can complete.
+        stdout
+            .write_all(&completed_output_bytes("Queued OMP turn fenced."))
+            .await
+            .expect("write terminal output");
+        wait_for_event(&store, &thread_key, "session.execution_completed").await;
+        let latest = store
+            .latest_execution_for_thread(&thread_key)
+            .await
+            .expect("load latest execution")
+            .expect("execution exists");
+        assert_eq!(latest.execution_id, execution.execution_id);
+        assert_eq!(latest.status, ExecutionStatus::Completed);
+    }
+
+    /// Regression (contention after claim): when a resident host holds the
+    /// session, the queued driver's atomic claim must not leave the row
+    /// `running` under the foreign owner — it requeues the execution and
+    /// surfaces SessionOwned.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn queued_omp_execution_requeues_when_session_owned_after_claim() {
+        let _serial = TEST_LOCK.lock().await;
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let thread_key =
+            ThreadKey::parse(format!("test:omp-queue-requeue-{}", uuid::Uuid::new_v4())).unwrap();
+        store
+            .create_or_get_session(
+                &thread_key,
+                &HarnessType::Omp,
+                None,
+                json!({}),
+                std::collections::BTreeMap::new(),
+            )
+            .await
+            .expect("create OMP session");
+
+        // Simulate a resident collaboration host holding the session before
+        // the queued driver claims its row.
+        let ownership = store
+            .acquire_session_ownership(&thread_key, "resident-host", SessionOwnerMode::Resident)
+            .await
+            .expect("resident acquires");
+        assert!(ownership.acquired);
+
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        let runtime = runtime_with(&store, backend);
+
+        // Create a queued row and drive it through the persisted claim path
+        // directly (drive_session_execution is the same entry the orphan
+        // adoption scan and the enqueue driver use).
+        let input = ExecuteSessionInput {
+            idempotency_key: None,
+            metadata: Some(json!({"source": "regression"})),
+            input_lines: vec![
+                json!({
+                    "type": "user",
+                    "message": {"content": [{"type": "text", "text": "contended"}]}
+                })
+                .to_string(),
+            ],
+            idle_timeout_ms: None,
+            max_duration_ms: None,
+        };
+        let execution = runtime
+            .enqueue_session_execution(&thread_key, input)
+            .await
+            .expect("enqueue execution");
+
+        // The background driver hits SessionOwned after its atomic claim and
+        // must requeue the row: status returns to queued, not running, and
+        // the durable request survives for the next driver.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let row = store
+                .latest_execution_for_thread(&thread_key)
+                .await
+                .expect("load execution row")
+                .expect("execution exists");
+            if row.status == ExecutionStatus::Queued {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "contended queued execution must return to the durable queue, stayed {row:?}"
+            );
+            sleep(Duration::from_millis(25)).await;
+        }
+        assert_eq!(
+            store
+                .execution_request(&execution.execution_id)
+                .await
+                .expect("durable request survives the requeue")
+                .get("input_lines")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(1),
+            "the persisted request is intact for the next driver"
+        );
+
+        // The resident owner is untouched by the loser's claim.
+        let live = store
+            .active_session_ownership(&thread_key)
+            .await
+            .expect("load live ownership")
+            .expect("resident ownership remains");
+        assert_eq!(live.owner_id, "resident-host");
+        assert_eq!(live.generation, ownership.generation);
+
+        // Cleanup: terminalize the requeued row and drop the resident lease.
+        store
+            .fail_execution_if_active(&execution.execution_id, "test cleanup")
+            .await
+            .expect("terminalize execution");
+        assert!(
+            store
+                .release_session_ownership(&thread_key, "resident-host")
+                .await
+                .expect("release resident lease"),
+            "resident lease releases"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

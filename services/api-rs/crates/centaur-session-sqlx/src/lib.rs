@@ -538,6 +538,53 @@ impl PgSessionStore {
         Ok(())
     }
 
+    /// Persist the one-shot session ownership generation onto a claimed
+    /// execution row. The generation is the durable fence the terminal
+    /// store paths check (`metadata->>'_session_owner_generation'`) so a
+    /// stale writer cannot terminalize an execution owned by a successor.
+    /// Used by the queued/durable path, which claims the execution before it
+    /// can acquire session ownership (unlike the direct path, which creates
+    /// the row with the generation already in its metadata).
+    pub async fn set_execution_owner_generation(
+        &self,
+        execution_id: &str,
+        owner_id: &str,
+        generation: i64,
+    ) -> Result<bool, SessionStoreError> {
+        let updated = sqlx::query_scalar::<_, String>(
+            r#"
+            update session_executions
+            set metadata = metadata
+                    || jsonb_build_object('_session_owner_generation', $3::bigint),
+                updated_at = now()
+            where execution_id = $1
+              and status in ($4, $5)
+              and (
+                  not exists (
+                      select 1 from session_owners
+                      where thread_key = session_executions.thread_key
+                  )
+                  or exists (
+                      select 1 from session_owners owner
+                      where owner.thread_key = session_executions.thread_key
+                        and owner.owner_id = $2
+                        and owner.lease_expires_at > now()
+                        and owner.generation = $3
+                  )
+              )
+            returning execution_id
+            "#,
+        )
+        .bind(execution_id)
+        .bind(owner_id)
+        .bind(generation)
+        .bind(ExecutionStatus::Queued.as_ref())
+        .bind(ExecutionStatus::Running.as_ref())
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(updated.is_some())
+    }
+
     pub async fn active_execution_for_thread(
         &self,
         thread_key: &ThreadKey,

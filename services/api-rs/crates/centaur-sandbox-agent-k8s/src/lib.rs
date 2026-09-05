@@ -3,7 +3,7 @@
 //! The Agent Sandbox CRD types are generated from the upstream CRD with
 //! `just codegen-agent-sandbox-crd`.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -15,11 +15,12 @@ use centaur_sandbox_core::{
     MountKind, ObservedSandbox, SandboxBackend, SandboxCommandOutput, SandboxError, SandboxHandle,
     SandboxId, SandboxIo, SandboxResult, SandboxSpec, SandboxStatus,
 };
-use k8s_openapi::api::core::v1::{PersistentVolumeClaim, Pod};
+use k8s_openapi::api::core::v1::{ConfigMap, PersistentVolumeClaim, Pod};
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use kube::api::{
     AttachParams, DeleteParams, ListParams, LogParams, Patch, PatchParams, PostParams,
 };
-use kube::{Api, Client, Error};
+use kube::{Api, Client, Error, Resource};
 use serde_json::{Map, Value, json};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::sync::Mutex;
@@ -41,6 +42,7 @@ const SANDBOX_ID_LABEL: &str = "centaur.ai/sandbox-id";
 const OBSERVABILITY_ENABLED_LABEL: &str = "centaur.ai/observability-enabled";
 const API_SERVER_ENABLED_LABEL: &str = "centaur.ai/api-server-enabled";
 const MANAGED_BY_VALUE: &str = "api-rs";
+const SANDBOX_FILES_VOLUME: &str = "sandbox-files";
 // iron-control principal OID the sandbox's proxy binds to, stamped at create
 // so resume (which has only the sandbox id) can rebind without the spec or any
 // in-memory state. Survives pause and api-rs restarts.
@@ -75,6 +77,15 @@ pub struct AgentSandboxConfig {
     pub tolerations: Vec<Toleration>,
     /// RuntimeClass for sandbox and iron-proxy pods (e.g. `gvisor`).
     pub runtime_class_name: Option<String>,
+    /// ServiceAccount for sandbox pods (session, warm, and workflow-host),
+    /// e.g. for cloud workload identity (EKS IRSA). Not applied to iron-proxy
+    /// pods; `automountServiceAccountToken` stays `false`.
+    pub service_account_name: Option<String>,
+    /// PriorityClass for sandbox and iron-proxy pods. A dedicated (low)
+    /// class lets the cluster scope a ResourceQuota to sandbox workloads and
+    /// makes the kubelet/scheduler sacrifice them before the control plane
+    /// under node pressure. Empty leaves the cluster default untouched.
+    pub priority_class_name: Option<String>,
     pub state_volume: Option<StateVolumeConfig>,
     pub iron_proxy: Option<IronProxyConfig>,
     pub iron_control: IronControlSettings,
@@ -131,6 +142,8 @@ impl AgentSandboxConfig {
             node_selector: BTreeMap::new(),
             tolerations: Vec::new(),
             runtime_class_name: None,
+            service_account_name: None,
+            priority_class_name: None,
             state_volume: None,
             iron_proxy: None,
             iron_control,
@@ -226,11 +239,28 @@ impl AgentSandboxBackend {
         Api::namespaced(self.client.clone(), &self.config.namespace)
     }
 
+    fn config_maps(&self) -> Api<ConfigMap> {
+        Api::namespaced(self.client.clone(), &self.config.namespace)
+    }
+
     async fn get_sandbox(&self, id: &SandboxId) -> SandboxResult<Option<crd::Sandbox>> {
         match self.sandboxes().get(id.as_str()).await {
             Ok(sandbox) => Ok(Some(sandbox)),
             Err(err) if is_not_found(&err) => Ok(None),
             Err(err) => Err(map_kube_error("get sandbox", err)),
+        }
+    }
+
+    /// Delete leaked iron-proxy resources on a failure path, surfacing the
+    /// result instead of discarding it. The primary error is what the caller
+    /// returns; a failed unwind is a leak the operator must see.
+    async fn unwind_iron_proxy_resources(&self, id: &SandboxId) {
+        if let Err(error) = self.delete_iron_proxy_resources(id).await {
+            tracing::warn!(
+                sandbox_id = id.as_str(),
+                %error,
+                "failed to unwind leaked iron-proxy resources"
+            );
         }
     }
 
@@ -240,6 +270,44 @@ impl AgentSandboxBackend {
             Err(err) if is_not_found(&err) => Ok(None),
             Err(err) => Err(map_kube_error("get sandbox pod", err)),
         }
+    }
+
+    /// Stop every retained sandbox whose immutable pod service account does
+    /// not match the current backend configuration. This runs before api-rs
+    /// enables session reuse or warm-pool claims, so a rollout cannot keep an
+    /// old workload identity alive or assign it to a new session.
+    pub async fn drain_service_account_mismatches(&self) -> SandboxResult<Vec<SandboxId>> {
+        let params =
+            ListParams::default().labels(&format!("{MANAGED_BY_LABEL}={MANAGED_BY_VALUE}"));
+        let sandboxes = self.sandboxes().list(&params).await.map_err(|err| {
+            map_kube_error("list sandboxes for service account reconciliation", err)
+        })?;
+        let mut stopped = Vec::new();
+
+        for sandbox in sandboxes.items {
+            if sandbox_service_account_matches(
+                &sandbox,
+                self.config.service_account_name.as_deref(),
+            ) {
+                continue;
+            }
+            let Some(name) = sandbox.metadata.name.as_deref() else {
+                continue;
+            };
+            let id = SandboxId::new(name);
+            tracing::warn!(
+                sandbox_id = id.as_str(),
+                configured_service_account = ?normalized_name(self.config.service_account_name.as_deref()),
+                existing_service_account = ?normalized_name(
+                    sandbox.spec.pod_template.spec.service_account_name.as_deref()
+                ),
+                "stopping sandbox whose service account does not match configuration"
+            );
+            SandboxBackend::stop(self, &id).await?;
+            stopped.push(id);
+        }
+
+        Ok(stopped)
     }
 
     async fn observed_from_sandbox(
@@ -253,7 +321,8 @@ impl AgentSandboxBackend {
         Ok(ObservedSandbox::new(id.clone(), BACKEND_NAME, status)
             .with_labels(sandbox.metadata.labels.clone().unwrap_or_default())
             .with_created_at(sandbox_creation_time(sandbox))
-            .with_suspended_since(sandbox_paused_at(sandbox)))
+            .with_suspended_since(sandbox_paused_at(sandbox))
+            .with_reason(pod.as_ref().and_then(pod_termination_reason)))
     }
 
     async fn patch_sandbox_merge(&self, id: &SandboxId, patch: Value) -> SandboxResult<()> {
@@ -277,6 +346,59 @@ impl AgentSandboxBackend {
             Ok(_) => Ok(()),
             Err(err) if is_not_found(&err) => Ok(()),
             Err(err) => Err(map_kube_error("delete sandbox state pvc", err)),
+        }
+    }
+
+    async fn create_sandbox_files_config_map(
+        &self,
+        id: &SandboxId,
+        spec: &SandboxSpec,
+    ) -> SandboxResult<()> {
+        let Some(config_map) = build_sandbox_files_config_map(id, spec)? else {
+            return Ok(());
+        };
+        self.config_maps()
+            .create(&PostParams::default(), &config_map)
+            .await
+            .map(|_| ())
+            .map_err(|error| map_kube_error("create sandbox files config map", error))
+    }
+
+    async fn adopt_sandbox_files_config_map(
+        &self,
+        id: &SandboxId,
+        sandbox: &crd::Sandbox,
+    ) -> SandboxResult<()> {
+        let Some(owner_reference) = sandbox_owner_reference(sandbox) else {
+            return Ok(());
+        };
+        let patch = Patch::Merge(json!({
+            "metadata": { "ownerReferences": [owner_reference] },
+        }));
+        match self
+            .config_maps()
+            .patch(
+                &sandbox_files_config_map_name(id),
+                &PatchParams::default(),
+                &patch,
+            )
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(error) if is_not_found(&error) => Ok(()),
+            Err(error) => Err(map_kube_error("adopt sandbox files config map", error)),
+        }
+    }
+
+    async fn delete_sandbox_files_config_map(&self, id: &SandboxId) -> SandboxResult<()> {
+        match self
+            .config_maps()
+            .delete(&sandbox_files_config_map_name(id), &DeleteParams::default())
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(error) if is_not_found(&error) => Ok(()),
+            Err(error) => Err(map_kube_error("delete sandbox files config map", error)),
         }
     }
 
@@ -354,10 +476,21 @@ impl SandboxBackend for AgentSandboxBackend {
             .create_iron_proxy_resources(&id, resolved_iron_proxy.as_ref())
             .await
         {
-            let _ = self.delete_iron_proxy_resources(&id).await;
+            self.unwind_iron_proxy_resources(&id).await;
             return Err(err);
         }
-        let sandbox = build_agent_sandbox(&id, &spec, &self.config)?;
+        if let Err(error) = self.create_sandbox_files_config_map(&id, &spec).await {
+            self.unwind_iron_proxy_resources(&id).await;
+            return Err(error);
+        }
+        let sandbox = match build_agent_sandbox(&id, &spec, &self.config) {
+            Ok(sandbox) => sandbox,
+            Err(error) => {
+                let _ = self.delete_sandbox_files_config_map(&id).await;
+                self.unwind_iron_proxy_resources(&id).await;
+                return Err(error);
+            }
+        };
         let created = match self
             .sandboxes()
             .create(&PostParams::default(), &sandbox)
@@ -365,7 +498,8 @@ impl SandboxBackend for AgentSandboxBackend {
         {
             Ok(created) => created,
             Err(err) => {
-                let _ = self.delete_iron_proxy_resources(&id).await;
+                let _ = self.delete_sandbox_files_config_map(&id).await;
+                self.unwind_iron_proxy_resources(&id).await;
                 return Err(map_kube_error("create sandbox", err));
             }
         };
@@ -377,6 +511,13 @@ impl SandboxBackend for AgentSandboxBackend {
                 sandbox_id = id.as_str(),
                 %error,
                 "failed to set ownerReferences on iron-proxy resources"
+            );
+        }
+        if let Err(error) = self.adopt_sandbox_files_config_map(&id, &created).await {
+            tracing::warn!(
+                sandbox_id = id.as_str(),
+                %error,
+                "failed to set ownerReference on sandbox files config map"
             );
         }
         if let Err(err) = self.wait_until_running(&id).await {
@@ -520,6 +661,7 @@ impl SandboxBackend for AgentSandboxBackend {
 
     async fn stop(&self, id: &SandboxId) -> SandboxResult<()> {
         let proxy_result = self.delete_iron_proxy_resources(id).await;
+        let files_result = self.delete_sandbox_files_config_map(id).await;
         match self
             .sandboxes()
             .delete(id.as_str(), &DeleteParams::default())
@@ -527,10 +669,12 @@ impl SandboxBackend for AgentSandboxBackend {
         {
             Ok(_) => {
                 proxy_result?;
+                files_result?;
                 self.delete_state_pvc(id).await
             }
             Err(err) if is_not_found(&err) => {
                 proxy_result?;
+                files_result?;
                 self.delete_state_pvc(id).await
             }
             Err(err) => Err(map_kube_error("delete sandbox", err)),
@@ -548,6 +692,13 @@ impl SandboxBackend for AgentSandboxBackend {
             .await
     }
 
+    async fn reap_orphan_iron_proxy_resources(
+        &self,
+        grace: Duration,
+    ) -> SandboxResult<BTreeMap<String, u32>> {
+        self.sweep_orphan_iron_proxy_resources(grace).await
+    }
+
     async fn ensure_iron_control_proxy_resources(
         &self,
         id: &SandboxId,
@@ -561,7 +712,15 @@ impl SandboxBackend for AgentSandboxBackend {
 
     async fn pause(&self, id: &SandboxId) -> SandboxResult<()> {
         self.patch_sandbox_merge(id, sandbox_pause_patch(jiff::Timestamp::now()))
-            .await
+            .await?;
+        // A paused sandbox has no agent pod, so its egress proxy is idle;
+        // keeping it running holds a node pod slot per suspended sandbox for
+        // the whole retention window (at ~500 pods per kubelet that starves
+        // the cluster of schedulable slots). Delete the proxy resources here:
+        // `resume()` unconditionally recreates them from the principal
+        // recorded at create, and already handles proxies deleted out from
+        // under a suspended sandbox.
+        self.delete_iron_proxy_resources(id).await
     }
 
     async fn resume(&self, id: &SandboxId) -> SandboxResult<()> {
@@ -572,20 +731,26 @@ impl SandboxBackend for AgentSandboxBackend {
             .create_iron_proxy_resources(id, resolved_iron_proxy.as_ref())
             .await
         {
-            let _ = self.delete_iron_proxy_resources(id).await;
+            self.unwind_iron_proxy_resources(id).await;
             return Err(err);
         }
         // The proxy resources were recreated, so re-bind them to the sandbox
         // for cascade deletion.
         let sandbox = self.get_sandbox(id).await?;
-        if let Some(sandbox) = &sandbox
-            && let Err(error) = self.adopt_iron_proxy_resources(id, sandbox).await
-        {
-            tracing::warn!(
+        match &sandbox {
+            Some(sandbox) => {
+                if let Err(error) = self.adopt_iron_proxy_resources(id, sandbox).await {
+                    tracing::warn!(
+                        sandbox_id = id.as_str(),
+                        %error,
+                        "failed to set ownerReferences on resumed iron-proxy resources"
+                    );
+                }
+            }
+            None => tracing::warn!(
                 sandbox_id = id.as_str(),
-                %error,
-                "failed to set ownerReferences on resumed iron-proxy resources"
-            );
+                "sandbox CR missing during resume; recreated iron-proxy resources are unowned"
+            ),
         }
         // A pod that was deleted out from under a `Suspended`/`Created`
         // sandbox (janitor, node pressure, manual reap) comes back through
@@ -724,6 +889,41 @@ fn sandbox_status_from_pod(replicas: i32, pod: Option<&Pod>) -> SandboxStatus {
     }
 }
 
+/// Why the sandbox's container died, when the pod still records it.
+///
+/// A sandbox killed by the kubelet reports the same "stdout closed" symptom as
+/// every other death, so without this the cause is invisible unless an operator
+/// reads pod status before the pod is collected. `OOMKilled` and `Evicted` are
+/// the ones worth naming: they are capacity problems, not harness problems, and
+/// they are actionable in a way a generic io failure is not.
+///
+/// A pod-level `Evicted` reason takes precedence because the container may
+/// later report only the generic `Error` reason. Otherwise, the current
+/// `state` is preferred over `last_state`: a container that has just
+/// terminated carries the reason there, and `last_state` holds the previous
+/// run once the kubelet restarts it. Other pod-level reasons are used only when
+/// no container termination reason is available.
+fn pod_termination_reason(pod: &Pod) -> Option<String> {
+    let status = pod.status.as_ref()?;
+    if status.reason.as_deref() == Some("Evicted") {
+        return status.reason.clone();
+    }
+    let from_container = status
+        .container_statuses
+        .iter()
+        .flatten()
+        .find_map(|container| {
+            let terminated = |state: &Option<k8s_openapi::api::core::v1::ContainerState>| {
+                state
+                    .as_ref()
+                    .and_then(|state| state.terminated.as_ref())
+                    .and_then(|terminated| terminated.reason.clone())
+            };
+            terminated(&container.state).or_else(|| terminated(&container.last_state))
+        });
+    from_container.or_else(|| status.reason.clone())
+}
+
 fn pod_ready(pod: &Pod) -> bool {
     pod.status
         .as_ref()
@@ -811,6 +1011,24 @@ fn build_agent_sandbox(
     insert_optional(&mut container, "resources", resources_json(spec));
 
     let (mut volumes, mut volume_mounts) = mount_json(spec);
+    if !spec.files.is_empty() {
+        volumes.push(json!({
+            "name": SANDBOX_FILES_VOLUME,
+            "configMap": {
+                "name": sandbox_files_config_map_name(id),
+                "defaultMode": 0o444,
+            },
+        }));
+        for (index, file) in spec.files.iter().enumerate() {
+            validate_sandbox_file_target_path(&file.target_path)?;
+            volume_mounts.push(json!({
+                "name": SANDBOX_FILES_VOLUME,
+                "mountPath": file.target_path,
+                "subPath": sandbox_file_key(index),
+                "readOnly": true,
+            }));
+        }
+    }
     let mut init_containers = Vec::new();
     if let Some(state_volume) = &config.state_volume {
         volume_mounts.push(json!({
@@ -913,6 +1131,24 @@ fn build_agent_sandbox(
             .map(str::trim)
             .filter(|name| !name.is_empty()),
     );
+    insert_optional(
+        &mut pod_spec,
+        "serviceAccountName",
+        config
+            .service_account_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty()),
+    );
+    insert_optional(
+        &mut pod_spec,
+        "priorityClassName",
+        config
+            .priority_class_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty()),
+    );
 
     let mut agent_spec = json!({
         "replicas": 1,
@@ -992,6 +1228,78 @@ fn mount_json(spec: &SandboxSpec) -> (Vec<Value>, Vec<Value>) {
     (volumes, mounts)
 }
 
+fn sandbox_files_config_map_name(id: &SandboxId) -> String {
+    format!("{}-files", id.as_str())
+}
+
+fn sandbox_file_key(index: usize) -> String {
+    format!("file-{index}")
+}
+
+fn validate_sandbox_file_target_path(path: &str) -> SandboxResult<()> {
+    let path = std::path::Path::new(path);
+    if path.as_os_str().is_empty()
+        || !path.is_absolute()
+        || path.file_name().is_none()
+        || path.components().any(|component| {
+            !matches!(
+                component,
+                std::path::Component::RootDir | std::path::Component::Normal(_)
+            )
+        })
+    {
+        return Err(SandboxError::InvalidSpec(format!(
+            "invalid sandbox file target path {path:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn build_sandbox_files_config_map(
+    id: &SandboxId,
+    spec: &SandboxSpec,
+) -> SandboxResult<Option<ConfigMap>> {
+    if spec.files.is_empty() {
+        return Ok(None);
+    }
+    let mut paths = BTreeSet::new();
+    let mut data = BTreeMap::new();
+    for (index, file) in spec.files.iter().enumerate() {
+        validate_sandbox_file_target_path(&file.target_path)?;
+        if !paths.insert(file.target_path.as_str()) {
+            return Err(SandboxError::InvalidSpec(format!(
+                "duplicate sandbox file target path {:?}",
+                file.target_path
+            )));
+        }
+        data.insert(sandbox_file_key(index), file.contents.clone());
+    }
+    Ok(Some(ConfigMap {
+        metadata: ObjectMeta {
+            name: Some(sandbox_files_config_map_name(id)),
+            labels: Some(BTreeMap::from([
+                (MANAGED_BY_LABEL.to_owned(), MANAGED_BY_VALUE.to_owned()),
+                (SANDBOX_ID_LABEL.to_owned(), id.as_str().to_owned()),
+            ])),
+            ..ObjectMeta::default()
+        },
+        data: Some(data),
+        immutable: Some(true),
+        ..ConfigMap::default()
+    }))
+}
+
+fn sandbox_owner_reference(sandbox: &crd::Sandbox) -> Option<Value> {
+    let name = sandbox.metadata.name.as_ref()?;
+    let uid = sandbox.metadata.uid.as_ref()?;
+    Some(json!({
+        "apiVersion": crd::Sandbox::api_version(&()),
+        "kind": crd::Sandbox::kind(&()),
+        "name": name,
+        "uid": uid,
+    }))
+}
+
 fn resources_json(spec: &SandboxSpec) -> Option<Value> {
     let resources = spec.resources.as_ref()?;
     (!resources.is_empty()).then(|| json!(resources))
@@ -1030,6 +1338,24 @@ where
     if let Some(value) = value {
         target[key] = json!(value);
     }
+}
+
+fn normalized_name(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
+}
+
+fn sandbox_service_account_matches(
+    sandbox: &crd::Sandbox,
+    configured_service_account: Option<&str>,
+) -> bool {
+    normalized_name(
+        sandbox
+            .spec
+            .pod_template
+            .spec
+            .service_account_name
+            .as_deref(),
+    ) == normalized_name(configured_service_account)
 }
 
 /// Override-or-append an env entry, so the agent container never emits a
@@ -1153,6 +1479,65 @@ mod tests {
     }
 
     #[test]
+    fn mounts_large_sandbox_files_without_putting_contents_in_env() {
+        let prompt = "p".repeat(256 * 1024);
+        let spec = SandboxSpec::new("centaur-agent:latest")
+            .file("/home/agent/AGENTS_PERSONA.md", prompt.clone())
+            .file("/tmp/runtime-config", "runtime config");
+        let id = SandboxId::new("asbx-test");
+        let config_map = build_sandbox_files_config_map(&id, &spec)
+            .unwrap()
+            .expect("sandbox files config map");
+
+        assert_eq!(
+            config_map.data.as_ref().and_then(|data| data.get("file-0")),
+            Some(&prompt)
+        );
+        assert_eq!(
+            config_map
+                .data
+                .as_ref()
+                .and_then(|data| data.get("file-1"))
+                .map(String::as_str),
+            Some("runtime config")
+        );
+
+        let config = AgentSandboxConfig::new("centaur", test_iron_control_settings());
+        let sandbox = build_agent_sandbox(&id, &spec, &config).unwrap();
+        let sandbox = serde_json::to_value(sandbox).unwrap();
+        let container = &sandbox["spec"]["podTemplate"]["spec"]["containers"][0];
+        assert!(
+            container["env"]
+                .as_array()
+                .is_none_or(|env| { env.iter().all(|entry| entry["value"] != prompt) })
+        );
+        assert!(
+            container["volumeMounts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|mount| {
+                    mount["name"] == SANDBOX_FILES_VOLUME
+                        && mount["mountPath"] == "/home/agent/AGENTS_PERSONA.md"
+                        && mount["subPath"] == "file-0"
+                        && mount["readOnly"] == true
+                })
+        );
+        assert!(
+            container["volumeMounts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|mount| {
+                    mount["name"] == SANDBOX_FILES_VOLUME
+                        && mount["mountPath"] == "/tmp/runtime-config"
+                        && mount["subPath"] == "file-1"
+                        && mount["readOnly"] == true
+                })
+        );
+    }
+
+    #[test]
     fn renders_partial_sandbox_resources() {
         let spec = SandboxSpec::new("centaur-agent:latest").resources(
             ResourceRequirements::new()
@@ -1207,6 +1592,7 @@ mod tests {
             ..Default::default()
         }];
         config.runtime_class_name = Some("gvisor".to_owned());
+        config.priority_class_name = Some("centaur-sandbox".to_owned());
 
         let sandbox = build_agent_sandbox(&SandboxId::new("asbx-test"), &spec, &config).unwrap();
         let pod_spec = &sandbox.spec.pod_template.spec;
@@ -1227,6 +1613,10 @@ mod tests {
         assert_eq!(tolerations[0].key.as_deref(), Some("example.com/sandbox"));
         assert_eq!(tolerations[0].effect.as_deref(), Some("NoSchedule"));
         assert_eq!(pod_spec.runtime_class_name.as_deref(), Some("gvisor"));
+        assert_eq!(
+            pod_spec.priority_class_name.as_deref(),
+            Some("centaur-sandbox")
+        );
     }
 
     #[test]
@@ -1240,6 +1630,71 @@ mod tests {
         assert!(pod_spec.node_selector.is_none());
         assert!(pod_spec.tolerations.is_none());
         assert!(pod_spec.runtime_class_name.is_none());
+        assert!(pod_spec.service_account_name.is_none());
+        assert!(pod_spec.priority_class_name.is_none());
+    }
+
+    #[test]
+    fn service_account_name_reaches_the_sandbox_pod_template() {
+        let spec = SandboxSpec::new("centaur-agent:latest");
+        let mut config = AgentSandboxConfig::new("centaur", test_iron_control_settings());
+        config.service_account_name = Some("centaur-sandbox".to_owned());
+
+        let sandbox = build_agent_sandbox(&SandboxId::new("asbx-test"), &spec, &config).unwrap();
+        let pod_spec = &sandbox.spec.pod_template.spec;
+
+        assert_eq!(
+            pod_spec.service_account_name.as_deref(),
+            Some("centaur-sandbox")
+        );
+        // The Kubernetes API token stays unmounted even with an account set.
+        assert_eq!(pod_spec.automount_service_account_token, Some(false));
+    }
+
+    #[test]
+    fn blank_service_account_name_is_omitted() {
+        let spec = SandboxSpec::new("centaur-agent:latest");
+        let mut config = AgentSandboxConfig::new("centaur", test_iron_control_settings());
+        config.service_account_name = Some("  ".to_owned());
+
+        let sandbox = build_agent_sandbox(&SandboxId::new("asbx-test"), &spec, &config).unwrap();
+
+        assert!(
+            sandbox
+                .spec
+                .pod_template
+                .spec
+                .service_account_name
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn service_account_reconciliation_detects_identity_changes() {
+        let spec = SandboxSpec::new("centaur-agent:latest");
+        let mut config = AgentSandboxConfig::new("centaur", test_iron_control_settings());
+        config.service_account_name = Some("old-sandbox".to_owned());
+        let sandbox = build_agent_sandbox(&SandboxId::new("asbx-test"), &spec, &config).unwrap();
+
+        assert!(sandbox_service_account_matches(
+            &sandbox,
+            Some("old-sandbox")
+        ));
+        assert!(!sandbox_service_account_matches(
+            &sandbox,
+            Some("new-sandbox")
+        ));
+        assert!(!sandbox_service_account_matches(&sandbox, None));
+    }
+
+    #[test]
+    fn service_account_reconciliation_treats_blank_as_unset() {
+        let spec = SandboxSpec::new("centaur-agent:latest");
+        let config = AgentSandboxConfig::new("centaur", test_iron_control_settings());
+        let sandbox = build_agent_sandbox(&SandboxId::new("asbx-test"), &spec, &config).unwrap();
+
+        assert!(sandbox_service_account_matches(&sandbox, None));
+        assert!(sandbox_service_account_matches(&sandbox, Some("  ")));
     }
 
     #[test]
@@ -1580,5 +2035,76 @@ mod tests {
             }),
             ..Pod::default()
         }
+    }
+
+    fn terminated_pod(
+        state: Option<&str>,
+        last_state: Option<&str>,
+        pod_reason: Option<&str>,
+    ) -> Pod {
+        use k8s_openapi::api::core::v1::{
+            ContainerState, ContainerStateTerminated, ContainerStatus,
+        };
+        let terminated = |reason: Option<&str>| {
+            reason.map(|reason| ContainerState {
+                terminated: Some(ContainerStateTerminated {
+                    reason: Some(reason.to_owned()),
+                    ..ContainerStateTerminated::default()
+                }),
+                ..ContainerState::default()
+            })
+        };
+        Pod {
+            status: Some(PodStatus {
+                phase: Some("Failed".to_owned()),
+                reason: pod_reason.map(str::to_owned),
+                container_statuses: Some(vec![ContainerStatus {
+                    name: "agent".to_owned(),
+                    state: terminated(state),
+                    last_state: terminated(last_state),
+                    ..ContainerStatus::default()
+                }]),
+                ..PodStatus::default()
+            }),
+            ..Pod::default()
+        }
+    }
+
+    #[test]
+    fn termination_reason_reads_the_current_terminated_state() {
+        let pod = terminated_pod(Some("OOMKilled"), None, None);
+        assert_eq!(pod_termination_reason(&pod).as_deref(), Some("OOMKilled"));
+    }
+
+    /// Once the kubelet restarts a container the cause moves to `last_state`,
+    /// so a restarted OOM must still name itself.
+    #[test]
+    fn termination_reason_falls_back_to_last_state() {
+        let pod = terminated_pod(None, Some("OOMKilled"), None);
+        assert_eq!(pod_termination_reason(&pod).as_deref(), Some("OOMKilled"));
+    }
+
+    /// An evicted pod may carry no container state at all; the reason is on
+    /// the pod.
+    #[test]
+    fn termination_reason_falls_back_to_the_pod_reason() {
+        let pod = terminated_pod(None, None, Some("Evicted"));
+        assert_eq!(pod_termination_reason(&pod).as_deref(), Some("Evicted"));
+    }
+
+    /// The kubelet records eviction on the pod while the terminated container
+    /// may carry only a generic `Error`, so the pod-level cause must win.
+    #[test]
+    fn termination_reason_prefers_eviction_over_generic_container_error() {
+        let pod = terminated_pod(Some("Error"), None, Some("Evicted"));
+        assert_eq!(pod_termination_reason(&pod).as_deref(), Some("Evicted"));
+    }
+
+    #[test]
+    fn termination_reason_is_absent_for_a_healthy_pod() {
+        assert_eq!(
+            pod_termination_reason(&pod_with_phase_and_ready("Running", true)),
+            None
+        );
     }
 }

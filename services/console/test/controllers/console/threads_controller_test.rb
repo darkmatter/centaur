@@ -20,6 +20,25 @@ class Console::ThreadsControllerTest < ActionDispatch::IntegrationTest
     post login_url, params: { email: @operator.email, password: "password123456" }
   end
 
+  test "threads page shows the October removal banner" do
+    with_recent_first_error do
+      get console_threads_url
+    end
+
+    assert_response :ok
+    assert_select ".console-amber-note[role=status]", text: /Console chat app will be removed in October/
+  end
+
+  test "threads endpoints are unavailable when console chat is disabled" do
+    with_env("CENTAUR_CONSOLE_CHAT_ENABLED" => "false") do
+      get console_threads_url
+      assert_response :not_found
+
+      post console_threads_url, params: { prompt: "Do not send this" }
+      assert_response :not_found
+    end
+  end
+
   test "an admin sees the Control and Data Sync nav items" do
     with_recent_first_error do
       get console_threads_url
@@ -934,6 +953,7 @@ class Console::ThreadsControllerTest < ActionDispatch::IntegrationTest
       # through a hidden field, not a native select.
       assert_select "input[type=hidden][name=model]", count: 1
       assert_select "[data-console-model-option][data-value=?]", "glm-5.2"
+      assert_select "[data-console-model-option][data-value=?]", "gpt-6-astra"
       assert_select "[data-console-model-option][data-value=?]", "claude-opus-5"
       assert_select "select", count: 0
     end
@@ -942,6 +962,13 @@ class Console::ThreadsControllerTest < ActionDispatch::IntegrationTest
     assert_equal(
       { "label" => "Claude Opus 5", "efforts" => [ %w[fast Fast] ] },
       agents["claude-opus-5"]
+    )
+    assert_equal(
+      { "label" => "GPT-6-Astra", "efforts" => [
+        %w[low Low], %w[medium Medium], %w[high High],
+        [ "xhigh", "Extra High" ], %w[max Max], %w[ultra Ultra]
+      ] },
+      agents["gpt-6-astra"]
     )
     # Submitting replaces the centered empty state with a full-height,
     # bottom-aligned optimistic transcript while the request is in flight.
@@ -1126,12 +1153,12 @@ class Console::ThreadsControllerTest < ActionDispatch::IntegrationTest
 
     create = client.calls[0].last
     assert create[:thread_key].start_with?("console:"), "expected a console:-namespaced thread key"
-    assert_equal "omp", create[:harness_type]
+    assert_equal "claudecode", create[:harness_type]
     assert_equal "console", create[:metadata][:platform]
     assert_equal "console", create[:metadata][:source]
     assert_equal @operator.email, create[:metadata][:actor_email]
     assert_equal "@ada", create[:metadata][:github_handle]
-    assert_equal "anthropic/claude-opus-4-8", create[:metadata][:model]
+    assert_equal "claude-opus-4-8", create[:metadata][:model]
 
     append = client.calls[1].last
     assert_equal create[:thread_key], append[:thread_key]
@@ -1144,12 +1171,12 @@ class Console::ThreadsControllerTest < ActionDispatch::IntegrationTest
     execute = client.calls[2].last
     assert_equal create[:thread_key], execute[:thread_key]
     assert execute[:idempotency_key].present?
-    assert_equal "anthropic/claude-opus-4-8", execute[:metadata][:model]
+    assert_equal "claude-opus-4-8", execute[:metadata][:model]
     assert_equal "@ada", execute[:metadata][:github_handle]
     line = JSON.parse(execute[:input_lines].first)
     assert_equal "user", line["type"]
     assert_equal create[:thread_key], line["thread_key"]
-    assert_equal "anthropic/claude-opus-4-8", line["model"]
+    assert_equal "claude-opus-4-8", line["model"]
     assert_equal message[:client_message_id], line["client_user_message_id"]
     requester_context = line.dig("message", "content", 0, "text")
     assert_includes requester_context, "# Requester Context"
@@ -1159,6 +1186,28 @@ class Console::ThreadsControllerTest < ActionDispatch::IntegrationTest
     assert_equal "Reply with PONG.", line.dig("message", "content", 1, "text")
 
     assert_redirected_to console_threads_path(thread: create[:thread_key])
+  end
+
+  test "starting a chat binds the Console user's principal as the turn requester" do
+    client = RecordingApiClient.new
+
+    assert_difference -> { Principal.where(kind: "console_user").count }, 1 do
+      with_composer(client: client) do
+        post console_threads_url,
+             params: { prompt: "Reply with PONG.", model: "claude-opus-4-8" }
+      end
+    end
+
+    principal = Principal.find_by!(kind: "console_user", console_user: @operator)
+    execute = client.calls[2].last
+    assert_equal principal.foreign_id, execute[:metadata][:requester_principal_foreign_id]
+
+    create = client.calls[0].last
+    append = client.calls[1].last
+    assert_nil create[:metadata][:requester_principal_foreign_id],
+               "the session's own principal stays thread-derived"
+    assert_nil append[:messages].first[:metadata][:requester_principal_foreign_id],
+               "the requester is per-turn, not persisted on the message"
   end
 
   test "starting a chat prefers the Console user's connected GitHub login" do
@@ -1214,15 +1263,15 @@ class Console::ThreadsControllerTest < ActionDispatch::IntegrationTest
     assert_match(/Unknown model/, flash[:alert])
   end
 
-  test "a gpt pick starts an omp chat on the provider-prefixed ref" do
+  test "a gpt model pick starts a codex chat" do
     client = RecordingApiClient.new
     with_composer(client: client) do
       post console_threads_url, params: { prompt: "Reply with PONG.", model: "gpt-5.5" }
     end
 
     create = client.calls[0].last
-    assert_equal "omp", create[:harness_type]
-    assert_equal "openai-codex/gpt-5.5", create[:metadata][:model]
+    assert_equal "codex", create[:harness_type]
+    assert_equal "gpt-5.5", create[:metadata][:model]
   end
 
   test "a configured custom inference model pick uses its codex provider" do
@@ -1261,11 +1310,9 @@ class Console::ThreadsControllerTest < ActionDispatch::IntegrationTest
     end
 
     execute = client.calls[2].last
-    assert_equal "openai-codex/gpt-5.6-sol:max", execute[:metadata][:model]
-    assert_not execute[:metadata].key?(:reasoning)
+    assert_equal "max", execute[:metadata][:reasoning]
     line = JSON.parse(execute[:input_lines].first)
-    assert_equal "openai-codex/gpt-5.6-sol:max", line["model"]
-    assert_not line.key?("reasoning")
+    assert_equal "max", line["reasoning"]
   end
 
   test "Claude Opus 5 Fast selects the native fast model variant" do
@@ -1276,14 +1323,14 @@ class Console::ThreadsControllerTest < ActionDispatch::IntegrationTest
     end
 
     create = client.calls[0].last
-    assert_equal "omp", create[:harness_type]
-    assert_equal "openrouter/anthropic/claude-opus-5-fast", create[:metadata][:model]
+    assert_equal "claudecode", create[:harness_type]
+    assert_equal "claude-opus-5-fast", create[:metadata][:model]
 
     execute = client.calls[2].last
-    assert_equal "openrouter/anthropic/claude-opus-5-fast", execute[:metadata][:model]
+    assert_equal "claude-opus-5-fast", execute[:metadata][:model]
     assert_not execute[:metadata].key?(:reasoning)
     line = JSON.parse(execute[:input_lines].first)
-    assert_equal "openrouter/anthropic/claude-opus-5-fast", line["model"]
+    assert_equal "claude-opus-5-fast", line["model"]
     assert_not line.key?("reasoning")
   end
 
@@ -1295,16 +1342,16 @@ class Console::ThreadsControllerTest < ActionDispatch::IntegrationTest
     end
 
     create = client.calls[0].last
-    assert_equal "omp", create[:harness_type]
-    assert_equal "anthropic/claude-opus-5", create[:metadata][:model]
+    assert_equal "claudecode", create[:harness_type]
+    assert_equal "claude-opus-5", create[:metadata][:model]
 
     execute = client.calls[2].last
-    assert_equal "anthropic/claude-opus-5", execute[:metadata][:model]
+    assert_equal "claude-opus-5", execute[:metadata][:model]
     line = JSON.parse(execute[:input_lines].first)
-    assert_equal "anthropic/claude-opus-5", line["model"]
+    assert_equal "claude-opus-5", line["model"]
   end
 
-  test "an effort the model does not offer is dropped from the ref" do
+  test "an effort the model does not offer is dropped" do
     client = RecordingApiClient.new
     with_composer(client: client) do
       # max is 5.6-only; Opus 4.8 does not offer model-variant efforts.
@@ -1314,8 +1361,11 @@ class Console::ThreadsControllerTest < ActionDispatch::IntegrationTest
            params: { prompt: "Reply with PONG.", model: "claude-opus-4-8", effort: "high" }
     end
 
-    assert_equal "openai-codex/gpt-5.5", client.calls[2].last[:metadata][:model]
-    assert_equal "anthropic/claude-opus-4-8", client.calls[5].last[:metadata][:model]
+    [ 2, 5 ].each do |index|
+      execute = client.calls[index].last
+      assert_not execute[:metadata].key?(:reasoning)
+      assert_not JSON.parse(execute[:input_lines].first).key?("reasoning")
+    end
   end
 
   test "a blank prompt asks for a message" do
@@ -1367,6 +1417,9 @@ class Console::ThreadsControllerTest < ActionDispatch::IntegrationTest
 
     assert_equal %i[append_session_messages execute_session], client.calls.map(&:first)
     assert_equal thread_key, client.calls[0].last[:thread_key]
+    principal = Principal.find_by!(kind: "console_user", console_user: @operator)
+    assert_equal principal.foreign_id,
+                 client.calls[1].last[:metadata][:requester_principal_foreign_id]
     assert_redirected_to console_threads_path(thread: thread_key)
   end
 

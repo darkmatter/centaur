@@ -226,38 +226,6 @@ class PrincipalTest < ActiveSupport::TestCase
     assert_empty principal.reload.roles
   end
 
-  test "new principals with no roles receive all configured defaults" do
-    Role.update_all(assign_by_default: false)
-    [ roles(:acme_infra), roles(:acme_admin_role), roles(:globex_infra) ].each do |role|
-      role.update!(assign_by_default: true)
-    end
-
-    principal = Principal.create!(default_attrs(foreign_id: "U-default-roles"))
-
-    expected = [ roles(:acme_infra), roles(:acme_admin_role), roles(:globex_infra) ].sort_by(&:id)
-    assert_equal expected, principal.roles.order(:id).to_a
-  end
-
-  test "preassigned roles suppress configured defaults" do
-    roles(:acme_infra).update!(assign_by_default: true)
-    principal = Principal.new(default_attrs(foreign_id: "U-explicit-role"))
-    principal.roles = [ roles(:acme_admin_role) ]
-
-    principal.save!
-
-    assert_equal [ roles(:acme_admin_role) ], principal.reload.roles
-  end
-
-  test "configured defaults are not applied to existing roleless principals" do
-    principal = principals(:acme_user_bob)
-    principal.principal_roles.destroy_all
-    roles(:acme_infra).update!(assign_by_default: true)
-
-    principal.update!(name: "Still roleless")
-
-    assert_empty principal.reload.roles
-  end
-
   test "default sandbox repo-cache overwrites explicit label assignment" do
     principal = Principal.new(default_attrs(foreign_id: "C-explicit-repo-cache-label"))
 

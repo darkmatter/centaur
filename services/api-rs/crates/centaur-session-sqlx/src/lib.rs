@@ -538,6 +538,47 @@ impl PgSessionStore {
         Ok(())
     }
 
+    /// Persist the one-shot session ownership generation onto a claimed
+    /// execution row. The generation is the durable fence the terminal
+    /// store paths check (`metadata->>'_session_owner_generation'`) so a
+    /// stale writer cannot terminalize an execution owned by a successor.
+    /// Used by the queued/durable path, which claims the execution before it
+    /// can acquire session ownership (unlike the direct path, which creates
+    /// the row with the generation already in its metadata).
+    pub async fn set_execution_owner_generation(
+        &self,
+        execution_id: &str,
+        owner_id: &str,
+        generation: i64,
+    ) -> Result<bool, SessionStoreError> {
+        let updated = sqlx::query_scalar::<_, String>(
+            r#"
+            update session_executions
+            set metadata = metadata
+                    || jsonb_build_object('_session_owner_generation', $3::bigint),
+                updated_at = now()
+            where execution_id = $1
+              and status in ($4, $5)
+              and exists (
+                  select 1 from session_owners owner
+                  where owner.thread_key = session_executions.thread_key
+                    and owner.owner_id = $2
+                    and owner.lease_expires_at > now()
+                    and owner.generation = $3
+              )
+            returning execution_id
+            "#,
+        )
+        .bind(execution_id)
+        .bind(owner_id)
+        .bind(generation)
+        .bind(ExecutionStatus::Queued.as_ref())
+        .bind(ExecutionStatus::Running.as_ref())
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(updated.is_some())
+    }
+
     pub async fn active_execution_for_thread(
         &self,
         thread_key: &ThreadKey,
@@ -3851,6 +3892,114 @@ mod tests {
                 .await
                 .expect("correct release"),
             "holding owner releases"
+        );
+    }
+
+    /// The one-shot ownership fence persist requires a live, matching
+    /// `session_owners` row. With no owner row at all (or one that does not
+    /// match the caller), the persist returns `false` and the execution
+    /// metadata is left untouched — the strict fence; a missing owner is
+    /// never treated as implicitly owned. Regression for the permissive
+    /// `not exists(session_owners) OR …` arm, which let a claimed execution
+    /// record a durable fence while the session had no live owner.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn execution_owner_generation_persist_requires_live_matching_owner() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let thread_key = ThreadKey::parse(format!("test:own-fence-{}", Uuid::new_v4())).unwrap();
+        store
+            .create_or_get_session(
+                &thread_key,
+                &HarnessType::Omp,
+                None,
+                json!({}),
+                BTreeMap::new(),
+            )
+            .await
+            .expect("create session");
+        let execution = store
+            .create_execution_with_request(
+                &thread_key,
+                None,
+                json!({"source": "strict-fence-regression"}),
+                json!({"input_lines": []}),
+            )
+            .await
+            .expect("create execution");
+        assert!(execution.created);
+
+        // No session_owners row exists: the persist must not take.
+        assert!(
+            !store
+                .set_execution_owner_generation(
+                    &execution.execution.execution_id,
+                    "api-rs-runtime",
+                    7,
+                )
+                .await
+                .expect("persist without owner row"),
+            "missing owner row must fail the fence persist"
+        );
+        assert_eq!(
+            store
+                .latest_execution_for_thread(&thread_key)
+                .await
+                .expect("load execution")
+                .expect("execution exists")
+                .metadata,
+            json!({"source": "strict-fence-regression"}),
+            "metadata must be untouched when no owner row exists"
+        );
+
+        // A live but non-matching owner row must not satisfy the fence.
+        let ownership = store
+            .acquire_session_ownership(&thread_key, "resident-a", SessionOwnerMode::Resident)
+            .await
+            .expect("resident acquires");
+        assert!(ownership.acquired);
+        assert!(
+            !store
+                .set_execution_owner_generation(
+                    &execution.execution.execution_id,
+                    "api-rs-runtime",
+                    7,
+                )
+                .await
+                .expect("persist against foreign owner"),
+            "a foreign live owner must fail the fence persist"
+        );
+        assert_eq!(
+            store
+                .latest_execution_for_thread(&thread_key)
+                .await
+                .expect("load execution")
+                .expect("execution exists")
+                .metadata,
+            json!({"source": "strict-fence-regression"}),
+            "metadata must be untouched under a foreign owner"
+        );
+
+        // Sanity of the positive arm: the live matching owner persists.
+        assert!(
+            store
+                .set_execution_owner_generation(
+                    &execution.execution.execution_id,
+                    "resident-a",
+                    ownership.generation,
+                )
+                .await
+                .expect("persist as holding owner"),
+            "the live matching owner persists the fence"
+        );
+        assert_eq!(
+            store
+                .latest_execution_for_thread(&thread_key)
+                .await
+                .expect("load execution")
+                .expect("execution exists")
+                .metadata["_session_owner_generation"],
+            json!(ownership.generation)
         );
     }
 

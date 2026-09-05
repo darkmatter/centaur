@@ -181,6 +181,16 @@ struct ActivitySummaryArgs {
         value_parser = clap::value_parser!(u64).range(1..)
     )]
     max_output_tokens: u64,
+    /// Reasoning effort for the summary call. Empty omits the parameter, for a
+    /// server that rejects it. Left unset, a server that resolves an absent
+    /// effort to its highest level burns the whole output budget reasoning and
+    /// returns no message.
+    #[arg(
+        long = "session-activity-summary-reasoning-effort",
+        env = "SESSION_ACTIVITY_SUMMARY_REASONING_EFFORT",
+        default_value = "low"
+    )]
+    reasoning_effort: String,
 }
 
 impl ActivitySummaryArgs {
@@ -205,6 +215,7 @@ impl ActivitySummaryArgs {
             max_output_tokens: u16::try_from(self.max_output_tokens).unwrap_or(u16::MAX),
             min_interval: Duration::from_secs(self.min_interval_secs),
             model: self.model.clone(),
+            reasoning_effort: clean_optional_value(Some(self.reasoning_effort.as_str())),
             timeout: Duration::from_secs(self.timeout_secs),
         })
     }
@@ -536,11 +547,6 @@ struct SandboxArgs {
     )]
     k8s_namespace: String,
     #[arg(
-        long = "session-sandbox-runtime-class-name",
-        env = "SESSION_SANDBOX_RUNTIME_CLASS_NAME"
-    )]
-    runtime_class_name: Option<String>,
-    #[arg(
         long = "session-sandbox-image",
         alias = "kubernetes-agent-image",
         env = "SESSION_SANDBOX_IMAGE"
@@ -615,6 +621,15 @@ struct SandboxArgs {
         value_parser = clap::value_parser!(u64).range(1..)
     )]
     sandbox_reap_interval_secs: u64,
+    /// Minimum age of an iron-proxy resource whose Sandbox no longer exists
+    /// before the orphan sweep may delete it.
+    #[arg(
+        long = "session-sandbox-orphan-sweep-grace-secs",
+        env = "SESSION_SANDBOX_ORPHAN_SWEEP_GRACE_SECS",
+        default_value_t = 600,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    sandbox_orphan_sweep_grace_secs: u64,
     #[arg(
         long = "session-sandbox-cleanup-interval-secs",
         env = "SESSION_SANDBOX_CLEANUP_INTERVAL_SECS",
@@ -678,6 +693,29 @@ struct SandboxArgs {
         env = "SESSION_SANDBOX_TOLERATIONS"
     )]
     tolerations_json: Option<String>,
+    /// `runtimeClassName` for sandbox and iron-proxy pods, e.g. a gVisor class.
+    /// The chart renders `sandbox.runtimeClassName` into this.
+    #[arg(
+        long = "session-sandbox-runtime-class-name",
+        env = "SESSION_SANDBOX_RUNTIME_CLASS_NAME"
+    )]
+    runtime_class_name: Option<String>,
+    /// `serviceAccountName` for sandbox pods, e.g. for cloud workload
+    /// identity. The chart renders `sandbox.serviceAccountName` into this.
+    #[arg(
+        long = "session-sandbox-service-account-name",
+        env = "SESSION_SANDBOX_SERVICE_ACCOUNT_NAME"
+    )]
+    service_account_name: Option<String>,
+    /// `priorityClassName` for sandbox and iron-proxy pods. Giving sandbox
+    /// workloads a dedicated (low) PriorityClass lets the cluster scope a
+    /// ResourceQuota to them and evict/preempt them before the control plane.
+    /// The chart renders `sandbox.priorityClassName` into this.
+    #[arg(
+        long = "session-sandbox-priority-class-name",
+        env = "SESSION_SANDBOX_PRIORITY_CLASS_NAME"
+    )]
+    priority_class_name: Option<String>,
     #[command(flatten)]
     tools: ToolDiscoveryArgs,
     #[command(flatten)]
@@ -799,6 +837,13 @@ impl SandboxArgs {
                     self.kube_client().await?,
                     AgentSandboxConfig::try_from(self)?,
                 );
+                let stopped = backend.drain_service_account_mismatches().await?;
+                if !stopped.is_empty() {
+                    info!(
+                        stopped_count = stopped.len(),
+                        "drained sandboxes with stale service accounts before enabling reuse"
+                    );
+                }
                 Ok(SandboxRuntime::backend_with_workload(
                     Arc::new(backend),
                     self.container_workload_mode()?,
@@ -1237,6 +1282,10 @@ impl SandboxArgs {
     fn workflow_host_env_template(&self) -> Result<Vec<(String, String)>, ServerError> {
         let mut envs = vec![("CENTAUR_API_URL".to_owned(), self.centaur_api_url())];
 
+        if let Some(value) = clean_optional_value(env::var("OPENAI_BASE_URL").ok().as_deref()) {
+            envs.push(("OPENAI_BASE_URL".to_owned(), value));
+        }
+
         for (name, value) in self.iron_proxy.sandbox_placeholder_env()? {
             envs.push((name, value));
         }
@@ -1351,6 +1400,7 @@ impl SandboxArgs {
         let ttl = |secs: u64| (secs > 0).then(|| Duration::from_secs(secs));
         SandboxReaperConfig {
             interval: Duration::from_secs(self.sandbox_reap_interval_secs),
+            orphan_sweep_grace: Duration::from_secs(self.sandbox_orphan_sweep_grace_secs),
             max_lifetime: ttl(self.sandbox_max_lifetime_secs),
         }
     }
@@ -1459,7 +1509,6 @@ impl TryFrom<&SandboxArgs> for AgentSandboxConfig {
         let mut config =
             AgentSandboxConfig::new(args.k8s_namespace.clone(), args.iron_control.settings()?);
         config.image_pull_policy = args.agent_image_pull_policy.clone();
-        config.runtime_class_name = args.runtime_class_name.clone();
         config.image_pull_secrets = args
             .image_pull_secrets
             .iter()
@@ -1471,6 +1520,18 @@ impl TryFrom<&SandboxArgs> for AgentSandboxConfig {
         config.tolerations = args.tolerations()?;
         config.runtime_class_name = args
             .runtime_class_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_owned);
+        config.service_account_name = args
+            .service_account_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_owned);
+        config.priority_class_name = args
+            .priority_class_name
             .as_deref()
             .map(str::trim)
             .filter(|name| !name.is_empty())
@@ -2380,6 +2441,24 @@ mod tests {
 
         let config = args.sandbox_reaper_config();
         assert_eq!(config.max_lifetime, Some(Duration::from_secs(259_200)));
+        assert_eq!(config.orphan_sweep_grace, Duration::from_secs(600));
+    }
+
+    #[test]
+    fn sandbox_orphan_sweep_grace_is_configurable() {
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+            "--session-sandbox-orphan-sweep-grace-secs",
+            "1200",
+        ])
+        .unwrap();
+
+        assert_eq!(
+            args.sandbox_reaper_config().orphan_sweep_grace,
+            Duration::from_secs(1200)
+        );
     }
 
     #[test]
@@ -2636,6 +2715,7 @@ mod tests {
             ),
             ("SLACK_ETL_ENABLED", "true"),
             ("SLACK_BACKFILL_ENABLED", "true"),
+            ("OPENAI_BASE_URL", "https://openai.example.test/v1"),
         ]);
         let args = Args::try_parse_from([
             "centaur-api-server",
@@ -2663,6 +2743,13 @@ mod tests {
                 .find(|env| env.name == "SLACK_ETL_ENABLED")
                 .map(|env| env.value.as_str()),
             Some("true")
+        );
+        assert_eq!(
+            spec.env
+                .iter()
+                .find(|env| env.name == "OPENAI_BASE_URL")
+                .map(|env| env.value.as_str()),
+            Some("https://openai.example.test/v1")
         );
         assert_eq!(
             spec.env
@@ -2853,6 +2940,10 @@ mod tests {
             r#"[{"key":"example.com/sandbox","operator":"Exists","effect":"NoSchedule"}]"#,
             "--session-sandbox-runtime-class-name",
             "gvisor",
+            "--session-sandbox-service-account-name",
+            "centaur-sandbox",
+            "--session-sandbox-priority-class-name",
+            "centaur-sandbox",
         ])
         .unwrap();
 
@@ -2862,6 +2953,14 @@ mod tests {
         );
         assert_eq!(args.sandbox.tolerations().unwrap().len(), 1);
         assert_eq!(args.sandbox.runtime_class_name.as_deref(), Some("gvisor"));
+        assert_eq!(
+            args.sandbox.service_account_name.as_deref(),
+            Some("centaur-sandbox")
+        );
+        assert_eq!(
+            args.sandbox.priority_class_name.as_deref(),
+            Some("centaur-sandbox")
+        );
     }
 
     #[test]
@@ -2875,6 +2974,8 @@ mod tests {
 
         assert!(args.sandbox.node_selector().unwrap().is_empty());
         assert!(args.sandbox.tolerations().unwrap().is_empty());
+        assert!(args.sandbox.service_account_name.is_none());
+        assert!(args.sandbox.priority_class_name.is_none());
     }
 
     /// Unlike `SESSION_SANDBOX_EXTRA_ENV`, bad node steering fails startup:

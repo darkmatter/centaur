@@ -64,6 +64,7 @@ impl IntoResponse for ApiError {
             Self::Runtime(SessionRuntimeError::Store(SessionStoreError::HarnessConflict {
                 ..
             })) => StatusCode::CONFLICT,
+            Self::Runtime(SessionRuntimeError::SessionOwned { .. }) => StatusCode::CONFLICT,
             Self::Runtime(SessionRuntimeError::CollabNotSupported { .. }) => {
                 StatusCode::BAD_REQUEST
             }

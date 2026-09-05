@@ -573,8 +573,20 @@ export async function handleSlackMessageHandoff(
     subscribe: input.subscribe === true,
     trigger: input.trigger
   })
+  // Assistant status is thread-wide. A mentioned follow-up that steers an
+  // active execution must not clear or replace the status owned by that run.
+  const assistantStatusRequested =
+    input.assistantStatusRequested && ((await thread.state)?.activeExecution !== true)
   let initialAssistantStatusVisible = false
-  let assistantStatus = Promise.resolve(false)
+  const assistantStatus = assistantStatusRequested
+    ? setInitialAssistantStatus(thread, input.options, trace).then(visible => {
+        initialAssistantStatusVisible = visible
+        return visible
+      })
+    : Promise.resolve(false)
+  if (assistantStatusRequested) {
+    backgroundWaitUntil(assistantStatus.then(() => undefined).catch(() => undefined))
+  }
   try {
     if (await handleStopCommand(thread, message, input.options, input.trigger)) {
       return
@@ -584,19 +596,6 @@ export async function handleSlackMessageHandoff(
     }
     if (await handleExportCommand(thread, message, input.options, input.trigger)) {
       return
-    }
-    // Assistant status is thread-wide. A mentioned follow-up that steers an
-    // active execution must not clear or replace the status owned by that run.
-    const assistantStatusRequested =
-      input.assistantStatusRequested && ((await thread.state)?.activeExecution !== true)
-    assistantStatus = assistantStatusRequested
-      ? setInitialAssistantStatus(thread, input.options, trace).then(visible => {
-          initialAssistantStatusVisible = visible
-          return visible
-        })
-      : Promise.resolve(false)
-    if (assistantStatusRequested) {
-      backgroundWaitUntil(assistantStatus.then(() => undefined).catch(() => undefined))
     }
     if (input.subscribe) {
       await subscribeSlackThreadForHandoff(thread, input.options, trace, input.trigger)

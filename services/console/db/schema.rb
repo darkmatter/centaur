@@ -473,6 +473,7 @@ ActiveRecord::Schema[8.1].define(version: 2026_08_23_054500) do
     t.index ["team_id", "active", "name"], name: "index_slack_bot_channels_for_catalog_search"
     t.index ["team_id", "channel_id"], name: "index_slack_bot_channels_on_team_id_and_channel_id", unique: true
   end
+
   create_table "slack_channel_permissions", force: :cascade do |t|
     t.string "channel_id", null: false
     t.datetime "created_at", null: false

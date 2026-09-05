@@ -189,148 +189,78 @@ pub struct SessionRuntime {
     session_title_generator: Option<SessionTitleGenerator>,
     session_title_in_flight: SessionTitleThreadSet,
     session_title_rerun_requested: SessionTitleThreadSet,
-    capacity: Option<Arc<SandboxCapacityController>>,
-    stdout_owner_id: String,
-    /// Set once a shutdown handoff begins; fences new stdout-owner claims
-    /// so an execution cannot start on a control plane that is about to
-    /// exit and release its leases.
-    shutting_down: Arc<AtomicBool>,
-    /// Active collaboration rooms keyed by thread_key. An active room
-    /// prevents idle sandbox suspension and holds a keepalive task that
-    /// renews the session ownership lease. Removal on stop/loss/termination
-    /// releases the keepalive and permits normal idle cleanup.
-    collab_rooms: CollabRoomRegistry,
-    /// Serializes start, status, stop, loss, and shutdown cleanup per
-    /// session so route responses and keepalive teardown are atomic.
-    collab_lifecycle_locks: CollabLifecycleLocks,
-    /// Global lifecycle gate: start/status/stop/loss hold a read lock for the
-    /// whole operation; handoff takes the write lock under the aggregate
-    /// deadline so in-flight starts cannot insert after the room snapshot.
-    collab_lifecycle_gate: Arc<RwLock<()>>,
+#[derive(Clone, Debug, Default)]
+pub struct EphemeralSandboxRefRegistry {
+    counts: Arc<dashmap::DashMap<String, u64>>,
 }
 
-#[derive(Clone, Copy, Debug)]
-pub struct SandboxCapacityConfig {
-    pub max_running: usize,
-    pub hot_idle_grace: Duration,
-}
-
-impl SandboxCapacityConfig {
-    pub fn is_enabled(&self) -> bool {
-        self.max_running > 0
-    }
-}
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct PersonaRegistry {
-    personas: BTreeMap<String, PersonaDefinition>,
-    default_persona_id: Option<String>,
-    overlay_chain: Vec<String>,
-    public_source_roots: BTreeSet<String>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct PersonaDefinition {
-    pub id: String,
-    pub source_root: String,
-    pub source_path: String,
-    pub source_ref: Option<String>,
-    pub prompt_hash: String,
-    #[serde(skip_serializing)]
-    pub prompt: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct PersonaSummary {
-    pub id: String,
-    pub source_root: String,
-    pub source_path: String,
-    pub source_ref: Option<String>,
-    pub prompt_hash: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct PersonaContext {
-    pub persona_id: String,
-    pub source_root: String,
-    pub source_path: String,
-    pub source_ref: Option<String>,
-    pub prompt_hash: String,
-    pub defaulted: bool,
-    pub overlay_chain: Vec<String>,
-}
-
-impl PersonaRegistry {
-    pub fn new(
-        personas: impl IntoIterator<Item = PersonaDefinition>,
-        default_persona_id: Option<String>,
-        overlay_chain: Vec<String>,
-    ) -> Result<Self, String> {
-        let personas = personas
-            .into_iter()
-            .map(|persona| (persona.id.clone(), persona))
-            .collect::<BTreeMap<_, _>>();
-        if let Some(default_persona_id) = default_persona_id.as_deref()
-            && !personas.contains_key(default_persona_id)
-        {
-            return Err(format!(
-                "CENTAUR_DEFAULT_PERSONA {default_persona_id:?} is not in the deployed persona registry"
-            ));
-        }
-        Ok(Self {
-            personas,
-            default_persona_id,
-            overlay_chain,
-            public_source_roots: BTreeSet::new(),
-        })
-    }
-
-    pub fn with_public_source_roots(
-        mut self,
-        public_source_roots: impl IntoIterator<Item = String>,
-    ) -> Self {
-        self.public_source_roots = public_source_roots.into_iter().collect();
-        self
-    }
-
-    pub fn summaries(&self) -> Vec<PersonaSummary> {
-        self.personas
-            .values()
-            .map(|persona| PersonaSummary {
-                id: persona.id.clone(),
-                source_root: persona.source_root.clone(),
-                source_path: persona.source_path.clone(),
-                source_ref: persona.source_ref.clone(),
-                prompt_hash: persona.prompt_hash.clone(),
-            })
-            .collect()
-    }
-
-    fn default_persona_id(&self) -> Option<&str> {
-        self.default_persona_id.as_deref()
-    }
-
-    fn default_persona_id_for_access(&self, access: &SessionRepoCacheAccess) -> Option<&str> {
-        let default_persona_id = self.default_persona_id()?;
-        let persona = self.get(default_persona_id)?;
-        if self.persona_allowed_for_access(persona, access) {
-            Some(default_persona_id)
-        } else {
-            None
+impl EphemeralSandboxRefRegistry {
+    /// Create an empty registry. Owned by [`SessionRuntime`]; cloning a
+    /// runtime shares the same backing map.
+    pub fn new() -> Self {
+        Self {
+            counts: Arc::new(dashmap::DashMap::new()),
         }
     }
 
-    fn get(&self, persona_id: &str) -> Option<&PersonaDefinition> {
-        self.personas.get(persona_id)
+    /// Register an ephemeral reference for `sandbox_id` and return a guard
+    /// that releases it on drop. Call immediately after the sandbox is
+    /// created (e.g. right after [`SessionRuntime::create_running_io`])
+    /// and hold the guard for the lifetime of the owning task; dropping it
+    /// (or cancelling the task that owns it) decrements the refcount and,
+    /// when the last outstanding guard is released, removes the id.
+    ///
+    /// Re-registering an already-held id bumps its refcount; the id stays
+    /// live until the *last* outstanding guard is dropped.
+    pub fn acquire(&self, sandbox_id: impl AsRef<str>) -> EphemeralSandboxRef {
+        let id = sandbox_id.as_ref().to_owned();
+        *self.counts.entry(id.clone()).or_insert(0) += 1;
+        EphemeralSandboxRef {
+            counts: Arc::clone(&self.counts),
+            id,
+        }
     }
 
-    fn persona_allowed_for_access(
-        &self,
-        persona: &PersonaDefinition,
-        access: &SessionRepoCacheAccess,
-    ) -> bool {
-        !matches!(access, SessionRepoCacheAccess::Public)
-            || self.public_source_roots.contains(&persona.source_root)
+    /// All sandbox ids currently holding at least one outstanding ephemeral
+    /// reference. The cleanup worker unions this with the DB-referenced
+    /// set before orphan selection.
+    pub(crate) fn live_ids(&self) -> BTreeSet<String> {
+        self.counts.iter().map(|kv| kv.key().clone()).collect()
+    }
+}
+
+/// RAII guard for one ephemeral sandbox reference acquired from
+/// [`EphemeralSandboxRefRegistry::acquire`]. Dropping the guard (or
+/// cancelling the task that owns it) decrements the refcount; the id is
+/// removed only when the last outstanding guard is released, so the
+/// sandbox becomes eligible for the normal two-sweep cleanup again.
+///
+/// `#[must_use]` because silently dropping an unbound guard would mask a
+/// missing reference hold. Clone is intentionally omitted: each acquire
+/// represents exactly one outstanding reference and must be balanced by
+/// exactly one release.
+#[derive(Debug)]
+#[must_use = "an ephemeral sandbox ref must be held until the owning task ends"]
+pub struct EphemeralSandboxRef {
+    counts: Arc<dashmap::DashMap<String, u64>>,
+    id: String,
+}
+
+impl Drop for EphemeralSandboxRef {
+    fn drop(&mut self) {
+        let remove = {
+            if let Some(mut count) = self.counts.get_mut(&self.id) {
+                *count = count.saturating_sub(1);
+                *count == 0
+            } else {
+                false
+            }
+        };
+        if remove {
+            self.counts.remove(&self.id);
+        }
+    }
+}
     }
 
     fn context_for_access(
@@ -1089,36 +1019,6 @@ impl SessionRuntime {
         &self,
         thread_key: &ThreadKey,
         input: ToolHostCallInput,
-    ) -> Result<ToolHostCallOutput, SessionRuntimeError> {
-        let ToolHostCallInput {
-            principal_id,
-            token_id,
-            tool_name,
-            method,
-            arguments,
-            timeout,
-        } = input;
-        self.create_or_get_tool_host_session(thread_key, &principal_id)
-            .await?;
-
-        let request_id = format!("mcp-call-{}", Uuid::new_v4().simple());
-        let request = ToolHostRequest {
-            id: request_id.clone(),
-            tool: tool_name.clone(),
-            method: method.clone(),
-            arguments,
-            principal_id,
-            token_id,
-            timeout_seconds: timeout.as_secs().max(1),
-        };
-        let input_line = serde_json::to_string(&request).map_err(|error| {
-            SessionRuntimeError::Sandbox(SandboxError::io_source("encode tool host request", error))
-        })?;
-        let response_timeout = timeout.saturating_add(Duration::from_secs(5));
-        let execution = self
-            .execute_session(
-                thread_key,
-                ExecuteSessionInput {
                     idempotency_key: Some(request_id.clone()),
                     metadata: Some(json!({
                         "mcp_tool_host_call": true,
@@ -1153,167 +1053,6 @@ impl SessionRuntime {
             .create_or_get_session(thread_key, &harness, None, metadata)
             .await?;
         if self.iron_control.is_some()
-            && session.iron_control_principal.as_deref() != Some(principal_id)
-        {
-            self.store
-                .set_iron_control_principal(thread_key, Some(principal_id))
-                .await?;
-        }
-        Ok(())
-    }
-
-    async fn wait_for_tool_host_call(
-        &self,
-        thread_key: &ThreadKey,
-        execution_id: &str,
-        response_timeout: Duration,
-    ) -> Result<ToolHostCallOutput, SessionRuntimeError> {
-        let events = self
-            .stream_events(thread_key, 0, Some(execution_id))
-            .await?;
-        futures_util::pin_mut!(events);
-        match timeout(response_timeout, async {
-            while let Some(event) = events.next().await {
-                let event = event?;
-                match event.event_type.as_str() {
-                    "session.execution_completed" => {
-                        return self.tool_host_completed_output(thread_key, &event).await;
-                    }
-                    "session.execution_failed" => {
-                        return self.tool_host_failed_output(thread_key, &event).await;
-                    }
-                    _ => {}
-                }
-            }
-            Err(SessionRuntimeError::Sandbox(SandboxError::io(
-                "session event stream ended before tool host call completed",
-            )))
-        })
-        .await
-        {
-            Ok(output) => output,
-            // Best-effort sandbox id: a store error must not replace the
-            // timeout result with an internal error.
-            Err(_) => Ok(ToolHostCallOutput {
-                sandbox_id: self
-                    .current_sandbox_id(thread_key)
-                    .await
-                    .unwrap_or_default(),
-                stdout: String::new(),
-                stderr: format!(
-                    "tool host call timed out after {} ms",
-                    response_timeout.as_millis()
-                ),
-                exit_status: None,
-                timed_out: true,
-            }),
-        }
-    }
-
-    async fn tool_host_completed_output(
-        &self,
-        thread_key: &ThreadKey,
-        event: &SessionEvent,
-    ) -> Result<ToolHostCallOutput, SessionRuntimeError> {
-        let sandbox_id = self.current_sandbox_id(thread_key).await?;
-        let Some(result_text) = event.payload.get("result_text").and_then(Value::as_str) else {
-            return Ok(ToolHostCallOutput {
-                sandbox_id,
-                stdout: String::new(),
-                stderr: String::new(),
-                exit_status: Some(0),
-                timed_out: false,
-            });
-        };
-        let response = serde_json::from_str::<ToolHostResponse>(result_text).map_err(|error| {
-            SessionRuntimeError::Sandbox(SandboxError::io_source(
-                "decode tool host response",
-                error,
-            ))
-        })?;
-        Ok(ToolHostCallOutput {
-            sandbox_id,
-            stdout: response.stdout,
-            stderr: response.stderr,
-            exit_status: response.status,
-            timed_out: response.timed_out,
-        })
-    }
-
-    async fn tool_host_failed_output(
-        &self,
-        thread_key: &ThreadKey,
-        event: &SessionEvent,
-    ) -> Result<ToolHostCallOutput, SessionRuntimeError> {
-        let error = event
-            .payload
-            .get("error")
-            .and_then(Value::as_str)
-            .unwrap_or("tool host execution failed")
-            .to_owned();
-        let timed_out = event
-            .payload
-            .get("reason")
-            .and_then(Value::as_str)
-            .is_some_and(|reason| reason == "max_duration_exceeded");
-        Ok(ToolHostCallOutput {
-            sandbox_id: self.current_sandbox_id(thread_key).await?,
-            stdout: String::new(),
-            stderr: error,
-            exit_status: None,
-            timed_out,
-        })
-    }
-
-    async fn current_sandbox_id(
-        &self,
-        thread_key: &ThreadKey,
-    ) -> Result<String, SessionRuntimeError> {
-        Ok(self
-            .store
-            .get_session(thread_key)
-            .await?
-            .sandbox_id
-            .unwrap_or_default())
-    }
-
-    async fn claim_stdout_owner(&self, execution_id: &str) -> Result<(), SessionRuntimeError> {
-        if self.shutting_down.load(Ordering::SeqCst) {
-            return Err(SessionRuntimeError::ShuttingDown);
-        }
-        let claimed = self
-            .store
-            .claim_stdout_owner(execution_id, &self.stdout_owner_id, STDOUT_OWNER_LEASE)
-            .await?;
-        if !claimed {
-            return Err(SessionRuntimeError::BadRequest(format!(
-                "execution {execution_id} stdout is owned by another control plane process"
-            )));
-        }
-        spawn_stdout_owner_renewer(self.context(), execution_id.to_owned());
-        Ok(())
-    }
-
-    async fn claim_expired_stdout_owner(
-        &self,
-        execution_id: &str,
-    ) -> Result<bool, SessionRuntimeError> {
-        let claimed = self
-            .store
-            .claim_expired_stdout_owner(execution_id, &self.stdout_owner_id, STDOUT_OWNER_LEASE)
-            .await?;
-        if claimed {
-            spawn_stdout_owner_renewer(self.context(), execution_id.to_owned());
-        }
-        Ok(claimed)
-    }
-
-    /// Acquires a one-shot session ownership lease for an OMP session before a
-    /// normal execution starts. A resident collaboration host holding the
-    /// session blocks this acquisition; the caller surfaces the conflict.
-    /// Non-OMP harnesses are unaffected — they skip the boundary entirely.
-    async fn acquire_oneshot_session_ownership(
-        &self,
         thread_key: &ThreadKey,
         harness_type: &HarnessType,
     ) -> Result<Option<i64>, SessionRuntimeError> {

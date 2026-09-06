@@ -122,8 +122,12 @@ class Console::ThreadsController < ApplicationController
   }.freeze
   # First entry doubles as the default pick (unless the deploy's default-model
   # resolution for its harness names another listed model). Operator-configured
-  # Codex providers are appended by .composer_agents at runtime.
+  # Codex providers are appended by .composer_agents at runtime. GLM-5.2 is the
+  # self-hosted gateway model this deployment runs everywhere else, kept first
+  # so it remains the default pick.
   BASE_COMPOSER_AGENTS = [
+    ComposerAgent.new(value: "glm-5.2", label: "GLM-5.2",
+                      harness: "omp", model: "litellm/glm-5.2-fp8", efforts: []),
     ComposerAgent.new(value: "gpt-5.6-sol", label: "GPT-5.6 Sol",
                       harness: "codex", model: "gpt-5.6-sol",
                       efforts: CODEX_EFFORTS + [ %w[max Max] ]),
@@ -757,6 +761,12 @@ class Console::ThreadsController < ApplicationController
   end
 
   def visible_thread_scope
+    # Admins see every thread, including unowned system threads (workflow:*,
+    # gh executor jobs, warm-pool smokes) that carry no owner metadata and
+    # would otherwise be invisible to every user. Non-admins remain scoped to
+    # threads they own.
+    return CentaurSession.all if acting_admin?
+
     thread_scope(include_public_slack: true)
   end
 
@@ -1543,6 +1553,7 @@ class Console::ThreadsController < ApplicationController
 
   def thread_harness_label(session)
     case session.harness_type.to_s
+    when "omp" then "omp"
     when "codex" then "Codex"
     when "claudecode" then "Claude Code"
     when "amp" then "Amp"

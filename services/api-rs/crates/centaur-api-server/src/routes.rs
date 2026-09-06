@@ -61,10 +61,10 @@ use crate::{
     types::{
         AppendMessagesRequest, AppendMessagesResponse, CreateSessionRequest, CreateSessionResponse,
         DiscordThreadContext, EmitWorkflowEventRequest, EventsQuery, ExecuteSessionRequest,
-        ExecuteSessionResponse, GithubThreadContext, InterruptSessionExecutionRequest,
-        InterruptSessionExecutionResponse, LinearThreadContext, ListWorkflowRunsQuery,
-        OnHarnessConflict, SessionContextResponse, SessionSseEvent, SlackThreadContext,
-        stream_error_sse,
+        ExecuteSessionResponse, GithubThreadContext, HarnessConfigAttestation,
+        InterruptSessionExecutionRequest, InterruptSessionExecutionResponse, LinearThreadContext,
+        ListWorkflowRunsQuery, OnHarnessConflict, SessionContextResponse, SessionSseEvent,
+        SlackThreadContext, WorkspaceDiffRequest, WorkspaceDiffResponse, stream_error_sse,
     },
 };
 
@@ -258,6 +258,10 @@ pub fn build_router_with_app_state(state: AppState) -> Router {
             post(interrupt_session_execution),
         )
         .route("/api/session/{thread_key}/events", get(stream_events))
+        .route(
+            "/api/session/{thread_key}/workspace-diff",
+            post(capture_workspace_diff),
+        )
         .route("/api/sandboxes/drain", post(drain_sandboxes))
         .merge(slack_proxy_router())
         .route("/api/workflows/schedules", get(list_workflow_schedules))
@@ -789,6 +793,176 @@ async fn execute_session(
     }))
 }
 
+const SANDBOX_GITHUB_ROOT: &str = "/home/agent/github";
+/// Writable eval checkouts; `/home/agent/github` is the read-only repo-cache mirror.
+const SANDBOX_WORKSPACE_EVAL_ROOT: &str = "/home/agent/workspace/eval";
+const MAX_WORKSPACE_ARTIFACT_BYTES: usize = 10 * 1024 * 1024;
+
+fn validate_workspace_diff_request(request: &WorkspaceDiffRequest) -> Result<(), ApiError> {
+    let path = FsPath::new(&request.repo_path);
+    let relative = path
+        .strip_prefix(SANDBOX_GITHUB_ROOT)
+        .or_else(|_| path.strip_prefix(SANDBOX_WORKSPACE_EVAL_ROOT))
+        .map_err(|_| {
+            ApiError::BadRequest(format!(
+                "repo_path must be under {SANDBOX_GITHUB_ROOT} or {SANDBOX_WORKSPACE_EVAL_ROOT}"
+            ))
+        })?;
+    if !path.is_absolute()
+        || relative.as_os_str().is_empty()
+        || relative
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err(ApiError::BadRequest(
+            "repo_path must be a normalized sandbox repository path".to_owned(),
+        ));
+    }
+    if request.base_sha.len() != 40
+        || !request
+            .base_sha
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(ApiError::BadRequest(
+            "base_sha must be a full 40-character hexadecimal commit SHA".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+async fn capture_workspace_diff(
+    State(state): State<AppState>,
+    Path(raw_thread_key): Path<String>,
+    Json(request): Json<WorkspaceDiffRequest>,
+) -> Result<Json<WorkspaceDiffResponse>, ApiError> {
+    validate_workspace_diff_request(&request)?;
+    let thread_key = ThreadKey::try_from(raw_thread_key)?;
+    let runtime = state.runtime()?;
+
+    let intent_to_add = vec![
+        "git".to_owned(),
+        "-C".to_owned(),
+        request.repo_path.clone(),
+        "add".to_owned(),
+        "-N".to_owned(),
+        "--".to_owned(),
+        ".".to_owned(),
+    ];
+    let added = runtime
+        .exec_in_session_sandbox(&thread_key, &intent_to_add)
+        .await?;
+    if !added.success {
+        return Err(ApiError::BadRequest(format!(
+            "failed to prepare workspace diff: {}",
+            String::from_utf8_lossy(&added.stderr).trim()
+        )));
+    }
+
+    let diff = vec![
+        "git".to_owned(),
+        "-C".to_owned(),
+        request.repo_path.clone(),
+        "diff".to_owned(),
+        "--binary".to_owned(),
+        "--full-index".to_owned(),
+        request.base_sha.clone(),
+        "--".to_owned(),
+        ".".to_owned(),
+    ];
+    let patch = runtime.exec_in_session_sandbox(&thread_key, &diff).await?;
+    if !patch.success {
+        return Err(ApiError::BadRequest(format!(
+            "failed to capture workspace diff: {}",
+            String::from_utf8_lossy(&patch.stderr).trim()
+        )));
+    }
+    if patch.stdout.len() > MAX_WORKSPACE_ARTIFACT_BYTES {
+        return Err(ApiError::BadRequest(format!(
+            "workspace diff exceeds {MAX_WORKSPACE_ARTIFACT_BYTES} bytes"
+        )));
+    }
+
+    let status_command = vec![
+        "git".to_owned(),
+        "-C".to_owned(),
+        request.repo_path,
+        "status".to_owned(),
+        "--porcelain=v1".to_owned(),
+        "--untracked-files=all".to_owned(),
+    ];
+    let status = runtime
+        .exec_in_session_sandbox(&thread_key, &status_command)
+        .await?;
+    if !status.success {
+        return Err(ApiError::BadRequest(format!(
+            "failed to capture workspace status: {}",
+            String::from_utf8_lossy(&status.stderr).trim()
+        )));
+    }
+
+    // Attest the harness config that was live at capture time. The overlay
+    // installs the global omp config at boot, but omp's project settings
+    // layer (<cwd>/.omp, cwd = /home/agent) OUTRANKS it and the workspace is
+    // agent-writable — so record hashes from trusted exec rather than trusting
+    // static lock/overlay consistency. Output is keyed (`name=value`), never
+    // positional: an empty substitution (file readable-bit races, sha256sum
+    // failure) must not shift later fields onto earlier names. Absent files
+    // report "absent"; hash failures report "error".
+    let attest_command = vec![
+        "sh".to_owned(),
+        "-c".to_owned(),
+        "attest() { \
+           if [ -f \"$2\" ]; then \
+             h=$(sha256sum \"$2\" 2>/dev/null | cut -d' ' -f1); \
+             [ -n \"$h\" ] || h=error; \
+           else h=absent; fi; \
+           printf '%s=%s\\n' \"$1\" \"$h\"; \
+         }; \
+         attest global /home/agent/.omp/agent/config.yml; \
+         attest project_config /home/agent/.omp/config.yml; \
+         attest project_settings /home/agent/.omp/settings.json"
+            .to_owned(),
+    ];
+    let attest = runtime
+        .exec_in_session_sandbox(&thread_key, &attest_command)
+        .await?;
+    let harness_config =
+        parse_harness_config_attestation(&String::from_utf8_lossy(&attest.stdout), attest.success);
+
+    Ok(Json(WorkspaceDiffResponse {
+        base_sha: request.base_sha,
+        patch: String::from_utf8_lossy(&patch.stdout).into_owned(),
+        status: String::from_utf8_lossy(&status.stdout).into_owned(),
+        harness_config,
+    }))
+}
+
+/// Parse the keyed attest output. Any missing or empty field reads as
+/// "error" — never silently absent — so a truncated or shifted exec output
+/// can only make the suite's integrity gate MORE suspicious, not less.
+fn parse_harness_config_attestation(
+    stdout: &str,
+    success: bool,
+) -> Option<HarnessConfigAttestation> {
+    if !success {
+        return None;
+    }
+    let keyed = |key: &str| -> String {
+        stdout
+            .lines()
+            .find_map(|line| line.strip_prefix(&format!("{key}=")))
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("error")
+            .to_owned()
+    };
+    Some(HarnessConfigAttestation {
+        global_config_sha256: keyed("global"),
+        project_config_sha256: keyed("project_config"),
+        project_settings_sha256: keyed("project_settings"),
+    })
+}
 /// `requester_principal_foreign_id` is an identity assertion made by the
 /// authenticated Console service, not ordinary caller-controlled metadata.
 /// Strip it from every other caller class before the execution is persisted so
@@ -4170,6 +4344,93 @@ mod granola_sync_tests {
     }
 }
 
+#[cfg(test)]
+mod workspace_diff_tests {
+    use super::*;
+
+    fn request(repo_path: &str, base_sha: &str) -> WorkspaceDiffRequest {
+        WorkspaceDiffRequest {
+            repo_path: repo_path.to_owned(),
+            base_sha: base_sha.to_owned(),
+        }
+    }
+
+    #[test]
+    fn accepts_pinned_repo_under_sandbox_github_root() {
+        assert!(
+            validate_workspace_diff_request(&request(
+                "/home/agent/github/darkmatter/eval-sandbox",
+                "0123456789abcdef0123456789abcdef01234567",
+            ))
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn accepts_pinned_repo_under_writable_eval_root() {
+        assert!(
+            validate_workspace_diff_request(&request(
+                "/home/agent/workspace/eval/darkmatter/eval-sandbox",
+                "0123456789abcdef0123456789abcdef01234567",
+            ))
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn rejects_paths_outside_sandbox_github_root_or_with_traversal() {
+        for path in [
+            "/workspace/eval-sandbox",
+            "/home/agent/github/../../etc",
+            "home/agent/github/darkmatter/eval-sandbox",
+        ] {
+            let error = validate_workspace_diff_request(&request(
+                path,
+                "0123456789abcdef0123456789abcdef01234567",
+            ))
+            .unwrap_err();
+            assert!(matches!(error, ApiError::BadRequest(_)), "{path}: {error}");
+        }
+    }
+
+    #[test]
+    fn attestation_parses_keyed_fields_and_never_shifts() {
+        let parsed = parse_harness_config_attestation(
+            "global=abc123\nproject_config=absent\nproject_settings=absent\n",
+            true,
+        )
+        .unwrap();
+        assert_eq!(parsed.global_config_sha256, "abc123");
+        assert_eq!(parsed.project_config_sha256, "absent");
+        assert_eq!(parsed.project_settings_sha256, "absent");
+
+        // An empty value or a missing line reads as "error" — a degraded
+        // exec must make the integrity gate more suspicious, never less.
+        let degraded =
+            parse_harness_config_attestation("global=\nproject_settings=absent\n", true).unwrap();
+        assert_eq!(degraded.global_config_sha256, "error");
+        assert_eq!(degraded.project_config_sha256, "error");
+        assert_eq!(degraded.project_settings_sha256, "absent");
+
+        assert!(parse_harness_config_attestation("global=abc\n", false).is_none());
+    }
+
+    #[test]
+    fn rejects_non_sha_base_revisions() {
+        for sha in [
+            "main",
+            "deadbeef",
+            "g123456789abcdef0123456789abcdef01234567",
+        ] {
+            let error = validate_workspace_diff_request(&request(
+                "/home/agent/github/darkmatter/eval-sandbox",
+                sha,
+            ))
+            .unwrap_err();
+            assert!(matches!(error, ApiError::BadRequest(_)), "{sha}: {error}");
+        }
+    }
+}
 #[cfg(test)]
 mod slack_archive_import_tests {
     use super::*;

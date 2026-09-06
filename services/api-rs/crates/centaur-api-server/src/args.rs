@@ -730,6 +730,12 @@ struct SandboxArgs {
     )]
     iron_control_sync_infra_secrets: bool,
     #[arg(
+        long = "session-sandbox-default-repo-cache-access",
+        env = "SESSION_SANDBOX_DEFAULT_REPO_CACHE_ACCESS",
+        default_value = ""
+    )]
+    default_repo_cache_access: String,
+    #[arg(
         long = "workflow-host-sandbox",
         env = "WORKFLOW_HOST_SANDBOX",
         default_value_t = true

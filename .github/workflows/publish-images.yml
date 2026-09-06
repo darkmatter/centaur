@@ -45,7 +45,13 @@ jobs:
   # dispatch builds stay amd64-only to keep iteration fast. Fork PRs skip both
   # jobs so untrusted changes do not run on the hosted image builders.
   build:
-    if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork }}
+    # Upstream's Depot builders + registry token don't exist in the darkmatter
+    # fork (every build fails "permission_denied: Invalid token" — a permanent
+    # red on all fork PRs and mains). The fork ships its images via
+    # darkmatter-images.yml instead; `merge` follows via needs.
+    # The fork-PR guard from upstream is kept so untrusted changes do not run
+    # on the hosted image builders when this workflow runs outside darkmatter.
+    if: ${{ github.repository_owner != 'darkmatter' && (github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork) }}
     runs-on: ${{ matrix.platform == 'linux/arm64' && 'depot-ubuntu-24.04-arm-16' || 'depot-ubuntu-24.04-16' }}
     strategy:
       fail-fast: false

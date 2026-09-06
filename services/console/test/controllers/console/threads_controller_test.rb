@@ -953,6 +953,8 @@ class Console::ThreadsControllerTest < ActionDispatch::IntegrationTest
       # through a hidden field, not a native select.
       assert_select "input[type=hidden][name=model]", count: 1
       assert_select "[data-console-model-option][data-value=?]", "glm-5.2"
+      assert_select "[data-console-model-option][data-value=?]", "omp-gpt-5.6-sol"
+      assert_select "[data-console-model-option][data-value=?]", "omp-claude-fable-5"
       assert_select "[data-console-model-option][data-value=?]", "gpt-6-astra"
       assert_select "[data-console-model-option][data-value=?]", "claude-opus-5"
       assert_select "select", count: 0
@@ -1250,6 +1252,50 @@ class Console::ThreadsControllerTest < ActionDispatch::IntegrationTest
 
     line = JSON.parse(client.calls[2].last[:input_lines].first)
     assert_equal "litellm/glm-5.2-fp8", line["model"]
+  end
+
+  test "a Codex subscription pick runs on omp with the thinking level in the selector" do
+    client = RecordingApiClient.new
+    with_composer(client: client) do
+      post console_threads_url,
+           params: { prompt: "Reply with PONG.", model: "omp-gpt-5.6-sol", effort: "high" }
+    end
+
+    create = client.calls[0].last
+    assert_equal "omp", create[:harness_type]
+    assert_equal "openai-codex/gpt-5.6-sol:high", create[:metadata][:model]
+    assert_nil create[:metadata][:provider]
+
+    execute = client.calls[2].last
+    assert_nil execute[:metadata][:reasoning]
+    line = JSON.parse(execute[:input_lines].first)
+    assert_equal "openai-codex/gpt-5.6-sol:high", line["model"]
+    assert_nil line["reasoning"]
+  end
+
+  test "a Claude subscription pick without an effort keeps the bare selector" do
+    client = RecordingApiClient.new
+    with_composer(client: client) do
+      post console_threads_url,
+           params: { prompt: "Reply with PONG.", model: "omp-claude-fable-5" }
+    end
+
+    create = client.calls[0].last
+    assert_equal "omp", create[:harness_type]
+    assert_equal "anthropic/claude-fable-5", create[:metadata][:model]
+
+    line = JSON.parse(client.calls[2].last[:input_lines].first)
+    assert_equal "anthropic/claude-fable-5", line["model"]
+  end
+
+  test "an omp pick ignores an effort the model does not offer" do
+    client = RecordingApiClient.new
+    with_composer(client: client) do
+      post console_threads_url,
+           params: { prompt: "Reply with PONG.", model: "omp-claude-sonnet-5", effort: "ultra" }
+    end
+
+    assert_equal "anthropic/claude-sonnet-5", client.calls[0].last[:metadata][:model]
   end
 
   test "starting a chat with an unknown model is rejected" do

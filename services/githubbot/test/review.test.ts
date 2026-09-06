@@ -1,5 +1,4 @@
 import { describe, expect, test } from "bun:test";
-import { requestContext } from "../src/context";
 import { handleReviewRequest } from "../src/review";
 import type { GithubbotOptions } from "../src/types";
 
@@ -176,51 +175,5 @@ describe("handleReviewRequest team requests", () => {
     expect(
       handleReviewRequest(teamRequestBody(null), teamInput(true, { n: 0 })),
     ).toBeNull();
-  });
-});
-
-describe("review trigger message identity", () => {
-  // executeSession serializes the message as the top-level idempotency_key
-  // of the /execute POST (session-api.ts), so that is the observable id.
-  async function captureExecuteKeys(deliveryIds: string[]): Promise<string[]> {
-    const keys: string[] = [];
-    const captureFetch = (async (url: string, init?: RequestInit) => {
-      if (typeof url === "string" && url.endsWith("/execute")) {
-        const body = init?.body;
-        if (typeof body === "string") {
-          const parsed = JSON.parse(body) as { idempotency_key?: string };
-          if (parsed.idempotency_key) keys.push(parsed.idempotency_key);
-        }
-        return new Response(JSON.stringify({ execution_id: "exec-1" }), {
-          status: 200,
-        });
-      }
-      return new Response("{}", { status: 200 });
-    }) as unknown as GithubbotOptions["fetch"];
-    for (const deliveryId of deliveryIds) {
-      // The turn detaches via backgroundWaitUntil; run inside a request
-      // context so its waitUntil collects the promise, then drain it.
-      const pending: Promise<unknown>[] = [];
-      await requestContext.run(
-        { retryableErrors: [], waitUntil: (p) => void pending.push(p) },
-        async () =>
-          handleReviewRequest(reviewRequestedBody("review-bot"), {
-            ...input,
-            deliveryId,
-            options: { ...options, fetch: captureFetch } as never,
-            state: stubState(),
-          }),
-      );
-      await Promise.all(pending);
-    }
-    return keys;
-  }
-
-  test("a re-request of the same head executes again with a distinct id", async () => {
-    const keys = await captureExecuteKeys(["delivery-a", "delivery-b"]);
-    expect(keys).toHaveLength(2);
-    expect(keys[0]).not.toBe(keys[1]);
-    expect(keys[0]).toContain("delivery-a");
-    expect(keys[1]).toContain("delivery-b");
   });
 });

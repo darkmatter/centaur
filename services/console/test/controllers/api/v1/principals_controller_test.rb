@@ -497,6 +497,7 @@ module Api
         principal = Principal.find_by!(foreign_id: "channel-with-user-email")
         assert_nil principal.console_user
       end
+
       test "POST keeps identity-named labels separate from first-class fields" do
         user = users(:acme_admin)
 
@@ -506,7 +507,6 @@ module Api
                  foreign_id: "matching-console-user-identity",
                  kind: "console_user",
                  console_user_id: user.id,
-
                  labels: {
                    "kind" => "custom",
                    "console-user-id" => "custom-user",
@@ -520,7 +520,6 @@ module Api
         assert_response :created
         principal = Principal.find_by!(foreign_id: "matching-console-user-identity")
         assert_equal user.id, principal.console_user_id
-
         assert_equal "centaur", principal.labels["managed-by"]
         assert_equal "custom", principal.labels["kind"]
         assert_equal "custom-user", principal.labels["console-user-id"]
@@ -1118,7 +1117,6 @@ module Api
           foreign_id: "console-user-admin",
           kind: "console_user",
           console_user_id: user.id,
-
           labels: {
             "kind" => "custom",
             "console-user-id" => "custom-user",

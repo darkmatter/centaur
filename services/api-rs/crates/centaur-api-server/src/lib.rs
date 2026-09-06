@@ -136,7 +136,6 @@ mod tests {
             name: "Test".to_owned(),
             labels: Default::default(),
             sandbox_observability_enabled: true,
-            sandbox_api_server_enabled: true,
         }
     }
 

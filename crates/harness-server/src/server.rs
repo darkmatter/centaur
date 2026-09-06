@@ -38,9 +38,7 @@ use crate::traits::{
 };
 use crate::turn::{BridgeConfig, CodexTurnNormalizer};
 use crate::util::{absolute_path, default_codex_home, write_value};
-use crate::wire::{
-    collab_state_wire_value, is_known_untyped_server_notification, notification_to_wire_value,
-};
+use crate::wire::{is_known_untyped_server_notification, notification_to_wire_value};
 use crate::{HarnessServerError, Result};
 
 pub fn server_for(kind: HarnessKind) -> Box<dyn AppServerRuntime> {
@@ -1364,17 +1362,6 @@ fn run_harness_turn<H: HarnessServer, W: Write>(
                         }
                         last_session_id = Some(session_id.to_string());
                         state.harness_session_id = Some(session_id.to_string());
-                    }
-                    if let NormalizedEvent::CollabState {
-                        state,
-                        reason,
-                        room,
-                    } = &normalized
-                    {
-                        write_value(
-                            stdout,
-                            &collab_state_wire_value(state, reason.as_deref(), room),
-                        )?;
                     }
                     for notification in normalizer.process_event(&normalized)? {
                         let value = notification_to_wire_value(&notification)?;

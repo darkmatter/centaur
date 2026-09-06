@@ -189,6 +189,7 @@ class SkillsClient:
 
         if not response.content:
             return None
+
         payload = response.json()
         data = payload.get("data")
         if not isinstance(data, (dict, list)):

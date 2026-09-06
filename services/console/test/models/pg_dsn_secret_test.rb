@@ -164,7 +164,6 @@ class PgDsnSecretTest < ActiveSupport::TestCase
     principal = Principal.create!(
       kind: "console_user",
       console_user_id: user.id,
-
       created_by: user
     )
     secret = with_dsn(PgDsnSecret.new(base_attrs(settings: [
@@ -214,7 +213,6 @@ class PgDsnSecretTest < ActiveSupport::TestCase
       secret.to_proxy_dsn(principal: principal)["settings"]
     )
   end
-
 
   test "to_proxy_dsn resolves Slack history channel ids from permission rows" do
     principal = principals(:acme_channel)

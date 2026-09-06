@@ -7,7 +7,6 @@ class Api::V1::SandboxSkillsControllerTest < ActionDispatch::IntegrationTest
       name: "Member User",
       kind: :console_user,
       console_user: users(:member_user),
-
       labels: {},
       created_by: users(:member_user)
     )
@@ -293,6 +292,7 @@ class Api::V1::SandboxSkillsControllerTest < ActionDispatch::IntegrationTest
     assert_response :not_found
     assert_empty skill.reload.editors
   end
+
   test "non-user principal cannot mutate skills" do
     assert_no_difference("Skill.count") do
       with_token(@channel_proxy) do |headers|

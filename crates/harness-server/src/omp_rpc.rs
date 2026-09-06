@@ -1,17 +1,12 @@
 //! Resident OMP RPC host adapter.
 //!
-//! One `omp --mode rpc` process per owned Centaur session, reused across
+//! One `omp --mode rpc` process per Centaur session, reused across
 //! sequential turns. The process continuously drains unsolicited
-//! session/agent/collaboration lifecycle frames from its stdout while ordinary
-//! commands (prompt/steer/abort/collab_*) are correlated by request id. This
+//! session/agent lifecycle frames from its stdout while ordinary
+//! commands (prompt/steer/abort) are correlated by request id. This
 //! mirrors the Codex App Server V2 resident pattern (`codex::run_codex_blocks_server`,
 //! `CodexJsonRpcChild`) but against the OMP RPC wire contract rather than the
 //! Codex JSON-RPC app-server protocol.
-//!
-//! Ownership: admission requires the current resident session ownership
-//! (`owner_id` + `generation`) and the adapter carries it for the process
-//! lifetime. A stale or missing ownership fence rejects every command and
-//! prevents durable frame publication. See `OmpRpcOwnership`.
 //!
 //! # Process lifetime vs session resume
 //! Process reuse is within one resident host lifetime (one `OmpRpcChild`).
@@ -19,11 +14,16 @@
 //! `CENTAUR_OMP_SESSION_NAME` so respawn passes `--resume <name>` and the
 //! prior JSONL session is continued instead of starting an anonymous one.
 //!
-//! # Ownership lease recovery
-//! This adapter does not release the DB ownership row — api-rs owns the
-//! lease (acquire/release around executions). If api-rs crashes without
-//! releasing, recovery is the DB row's lease-expiry timeout. See
-//! `acquire_oneshot_session_ownership` / `release_session_ownership`.
+//! # Slash commands
+//! In RPC mode omp executes its builtin slash commands locally and streams
+//! their output as `command_output` frames instead of starting a model turn.
+//! The host forwards only [`OMP_SLASH_COMMAND_ALLOWLIST`] (commands with no
+//! effect beyond the current omp session) and surfaces that output as the
+//! turn's agent message; every other `/command` is answered by the host
+//! without reaching omp. The command is read from the user's own text block
+//! (the last one): api-rs prepends a chat-surface note for console and Slack
+//! threads, and forwarding that note along would hide the leading `/` from
+//! omp's parser, so an allowed command is sent to omp alone.
 
 use std::env;
 use std::io::{self, BufRead, Write};
@@ -33,14 +33,12 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread;
 use std::time::Duration;
 
-use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::omp::OmpStreamEvent;
 use crate::server::BlocksCommand;
-use crate::turn::CodexTurnNormalizer;
+use crate::turn::{BridgeConfig, CodexTurnNormalizer};
 use crate::util::write_value;
-use crate::wire::collab_state_wire_value;
 use crate::{HarnessServerError, Result};
 const DEFAULT_OMP_TURN_TIMEOUT: Duration = Duration::from_secs(300);
 const OMP_TURN_TIMEOUT_GRACE: Duration = Duration::from_secs(5);
@@ -110,31 +108,9 @@ fn turn_timeout_from_trace_context(trace_context: &crate::otel::TraceContext) ->
         .unwrap_or(DEFAULT_OMP_TURN_TIMEOUT)
 }
 
-/// The resident session ownership fence. Admission requires both fields; a
-/// stale generation (one that no longer matches the current owner) or a
-/// missing owner rejects every command and prevents durable frame publication.
-///
-/// Lease recovery: the fence is process-local. Durable ownership lives in
-/// api-rs's DB row; if the API process dies without release, the lease
-/// expires on its timeout and a new owner can re-acquire.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OmpRpcOwnership {
-    pub owner_id: String,
-    pub generation: i64,
-}
-
-impl OmpRpcOwnership {
-    /// `true` when `other` is the same owner at the same generation. Used to
-    /// fence a stale owner: after a loss/reacquire the generation bumps, so a
-    /// stale owner's commands no longer match and are rejected.
-    pub fn matches(&self, other: &OmpRpcOwnership) -> bool {
-        self.owner_id == other.owner_id && self.generation == other.generation
-    }
-}
-
 /// One frame demultiplexed from the resident `omp --mode rpc` stdout stream.
 /// The adapter distinguishes correlated command responses (matched by `id`)
-/// from unsolicited session/agent/collaboration lifecycle frames.
+/// from unsolicited session/agent lifecycle frames.
 #[derive(Debug, Clone)]
 pub enum OmpRpcFrame {
     /// Emitted once at startup before any command is accepted.
@@ -152,12 +128,6 @@ pub enum OmpRpcFrame {
     /// …). Reuses the one-shot parser so the normalized event surface is
     /// identical across the one-shot and resident paths.
     Event(OmpStreamEvent),
-    /// An unsolicited collaboration lifecycle frame.
-    CollabState {
-        state: String,
-        reason: Option<String>,
-        room: Value,
-    },
     /// A prompt that was accepted immediately but later resolves as local-only
     /// (no agent turn). `agent_invoked == false` is a completion signal.
     PromptResult {
@@ -165,6 +135,8 @@ pub enum OmpRpcFrame {
         id: Option<String>,
         agent_invoked: bool,
     },
+    /// Output of a builtin slash command omp ran locally (no model turn).
+    CommandOutput { text: String },
     /// Any other unsolicited frame the adapter does not demultiplex into a
     /// normalized event (extension_error, available_commands_update,
     /// host_tool_*, subagent_*). Forwarded verbatim to the host log.
@@ -210,23 +182,6 @@ impl OmpRpcFrame {
                     error,
                 })
             }
-            "collab_state" => {
-                let state = value
-                    .get("state")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_owned();
-                let reason = value
-                    .get("reason")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned);
-                let room = value.get("room").cloned().unwrap_or(Value::Null);
-                Ok(Self::CollabState {
-                    state,
-                    reason,
-                    room,
-                })
-            }
             "prompt_result" => {
                 let id = value.get("id").and_then(Value::as_str).map(str::to_owned);
                 let agent_invoked = value
@@ -235,6 +190,13 @@ impl OmpRpcFrame {
                     .unwrap_or(false);
                 Ok(Self::PromptResult { id, agent_invoked })
             }
+            "command_output" => Ok(Self::CommandOutput {
+                text: value
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+            }),
             // AgentSessionEvent frames reuse the one-shot stream parser so the
             // normalized event surface is identical across paths.
             "session"
@@ -422,36 +384,7 @@ impl OmpRpcChild {
     }
 }
 
-impl OmpRpcChild {
-    /// Force-kill the resident process. Used when a collab command hits the
-    /// absolute deadline (or is otherwise unrecoverable): the OMP command
-    /// queue may still be hung inside the child, so the process must not be
-    /// reused for a subsequent status/stop.
-    fn kill_now(&mut self) {
-        let _ = self.stdin.take();
-        let _ = self.child.kill();
-        // Reap promptly so callers observe a dead process and cannot reuse a
-        // hung OMP command queue. Bound the wait so a stuck kill cannot hang.
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        loop {
-            match self.child.try_wait() {
-                Ok(Some(_)) => return,
-                Ok(None) if std::time::Instant::now() >= deadline => {
-                    let _ = self.child.kill();
-                    let _ = self.child.wait();
-                    return;
-                }
-                Ok(None) => thread::sleep(Duration::from_millis(10)),
-                Err(_) => return,
-            }
-        }
-    }
-
-    #[cfg(test)]
-    fn process_id(&self) -> u32 {
-        self.child.id()
-    }
-}
+impl OmpRpcChild {}
 
 impl Drop for OmpRpcChild {
     fn drop(&mut self) {
@@ -584,8 +517,6 @@ fn apply_omp_turn_configuration(
 fn query_and_persist_session_state(
     child: &mut OmpRpcChild,
     event_normalizer: &mut crate::omp::OmpEventNormalizer,
-    stdout: &mut impl Write,
-    admitted: &Option<OmpRpcOwnership>,
 ) -> Result<String> {
     let id = child.next_request_id();
     child.send_command(&json!({ "id": id, "type": "get_state" }))?;
@@ -633,21 +564,7 @@ fn query_and_persist_session_state(
             OmpRpcFrame::Response { .. } => {}
             OmpRpcFrame::Event(event) => {
                 use crate::traits::HarnessServer;
-                let events = crate::omp::OmpHarness.normalize_events(event_normalizer, event)?;
-                use crate::traits::NormalizedEvent;
-                for normalized in events {
-                    if let NormalizedEvent::CollabState {
-                        state,
-                        reason,
-                        room,
-                    } = &normalized
-                    {
-                        let mut val = collab_state_wire_value(state, reason.as_deref(), room);
-                        stamp_ownership(&mut val, admitted);
-                        let _ = write_value(stdout, &val);
-                    }
-                    let _ = normalized;
-                }
+                let _events = crate::omp::OmpHarness.normalize_events(event_normalizer, event)?;
             }
             _ => {}
         }
@@ -677,229 +594,203 @@ pub fn abort_command(id: &str) -> Value {
     json!({ "id": id, "type": "abort" })
 }
 
-/// Build a `collab_start` command.
-pub fn collab_start_command(
-    id: &str,
-    relay_url: Option<&str>,
-    display_name: Option<&str>,
-    web_url: Option<&str>,
-) -> Value {
-    let mut cmd = json!({ "id": id, "type": "collab_start" });
-    if let Some(relay) = relay_url {
-        cmd["relayUrl"] = Value::String(relay.to_owned());
-    }
-    if let Some(name) = display_name {
-        cmd["displayName"] = Value::String(name.to_owned());
-    }
-    if let Some(web) = web_url {
-        cmd["webUrl"] = Value::String(web.to_owned());
-    }
-    cmd
+/// Slash commands the resident host forwards to omp. omp runs its builtin
+/// slash commands locally in RPC mode, so every entry must leave no trace
+/// beyond the current omp session: no settings, plugin, MCP, SSH, or memory
+/// writes, no session rename, move, or delete, no upload. `None` admits every
+/// first argument; `Some(list)` admits only those (`""` is the bare command).
+const OMP_SLASH_COMMAND_ALLOWLIST: &[(&str, Option<&[&str]>)] = &[
+    ("changelog", None),
+    ("compact", None),
+    ("context", None),
+    ("dump", None),
+    ("export", None),
+    ("fast", None),
+    ("force", None),
+    ("fresh", None),
+    ("jobs", None),
+    ("model", None),
+    ("prewalk", None),
+    ("reload-plugins", None),
+    ("shake", None),
+    ("todo", None),
+    ("tools", None),
+    (
+        "advisor",
+        Some(&["", "toggle", "on", "off", "status", "dump"]),
+    ),
+    ("browser", Some(&["status"])),
+    (
+        "marketplace",
+        Some(&["list", "installed", "discover", "help"]),
+    ),
+    ("mcp", Some(&["list", "test", "reconnect"])),
+    ("memory", Some(&["", "view", "stats", "diagnose"])),
+    ("plugins", Some(&["", "list"])),
+    ("session", Some(&["", "info"])),
+    ("ssh", Some(&["list"])),
+    ("usage", Some(&["", "show"])),
+];
+
+/// A prompt omp would execute as a slash command rather than send to the model.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SlashCommand<'a> {
+    name: &'a str,
+    /// First argument token, empty when the command is bare.
+    first_arg: &'a str,
 }
 
-/// Build a `collab_status` command.
-pub fn collab_status_command(id: &str) -> Value {
-    json!({ "id": id, "type": "collab_status" })
-}
-
-/// Build a `collab_stop` command.
-pub fn collab_stop_command(id: &str) -> Value {
-    json!({ "id": id, "type": "collab_stop" })
-}
-
-/// Normalized collaboration room state extracted from a `collab_state` frame
-/// or a `collab_*` response `data` payload. Mirrors the fork's
-/// `RpcCollabRoomState` so downstream consumers (api-rs durable event
-/// projection) never touch the raw JSON.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-pub struct OmpCollabRoomState {
-    pub active: bool,
-    #[serde(default, rename = "joinUrl")]
-    pub join_url: Option<String>,
-    #[serde(default, rename = "viewUrl")]
-    pub view_url: Option<String>,
-    #[serde(default, rename = "webUrl")]
-    pub web_url: Option<String>,
-    #[serde(default, rename = "webViewUrl")]
-    pub web_view_url: Option<String>,
-    #[serde(default)]
-    pub participants: Vec<OmpCollabParticipant>,
-}
-
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-pub struct OmpCollabParticipant {
-    pub name: String,
-    pub role: String,
-    #[serde(default, rename = "readOnly")]
-    pub read_only: Option<bool>,
-}
-
-/// Extract the room state from a `collab_*` response `data` payload or a
-/// `collab_state` frame's `room` field.
-pub fn parse_room_state(value: &Value) -> Result<OmpCollabRoomState> {
-    Ok(serde_json::from_value(value.clone())?)
-}
-
-/// Project the room state into the api-rs canonical snake_case contract:
-/// `{active, join_url?, view_url?, web_url?, participants:[{name, role,
-/// read_only?}]}`. The resident host uses upstream camelCase only at the RPC
-/// boundary and normalizes to this shape for api-rs.
-pub fn room_state_to_api(room: &OmpCollabRoomState) -> Value {
-    let mut obj = json!({
-        "active": room.active,
-        "participants": room.participants.iter().map(|p| {
-            let mut participant = json!({ "name": p.name, "role": p.role });
-            if let Some(read_only) = p.read_only {
-                participant["read_only"] = json!(read_only);
-            }
-            participant
-        }).collect::<Vec<_>>(),
-    });
-    if let Some(url) = &room.join_url {
-        obj["join_url"] = json!(url);
+/// Recognizes a prompt that starts with `/name`, where `name` is a bare word
+/// (letters, digits, `-`) terminated by whitespace, `:` (omp's name/argument
+/// separator), or the end of the text. Paths such as `/etc/hosts` are not
+/// commands and flow to the model unchanged.
+fn parse_slash_command(text: &str) -> Option<SlashCommand<'_>> {
+    let rest = text.trim_start().strip_prefix('/')?;
+    let name_end = rest
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '-'))
+        .unwrap_or(rest.len());
+    let name = &rest[..name_end];
+    if !name.starts_with(|c: char| c.is_ascii_alphabetic()) {
+        return None;
     }
-    if let Some(url) = &room.view_url {
-        obj["view_url"] = json!(url);
+    let tail = &rest[name_end..];
+    if !(tail.is_empty() || tail.starts_with(char::is_whitespace) || tail.starts_with(':')) {
+        return None;
     }
-    if let Some(url) = &room.web_url {
-        obj["web_url"] = json!(url);
-    }
-    if let Some(url) = &room.web_view_url {
-        obj["web_view_url"] = json!(url);
-    }
-    obj
-}
-/// Blocks-mode control commands the resident OMP host accepts in addition to
-/// the shared `user`/`interrupt`/`attachment.chunk` commands. Each carries
-/// the ownership fence so a stale owner cannot control the room.
-#[derive(Debug)]
-pub enum OmpBlocksControl {
-    CollabStart {
-        /// Optional caller-supplied request id for correlation. When present
-        /// the adapter uses it as the omp RPC request id and echoes it as
-        /// `request_id` on the normalized collab/state notification.
-        request_id: Option<String>,
-        relay_url: Option<String>,
-        display_name: Option<String>,
-        web_url: Option<String>,
-        ownership: OmpRpcOwnership,
-    },
-    CollabStatus {
-        request_id: Option<String>,
-        ownership: OmpRpcOwnership,
-    },
-    CollabStop {
-        request_id: Option<String>,
-        ownership: OmpRpcOwnership,
-    },
-    /// Interrupt the active turn. Carries ownership so the adapter can fence
-    /// stale/missing owners before sending abort to the resident process.
-    Interrupt {
-        request_id: Option<String>,
-        ownership: OmpRpcOwnership,
-    },
+    let first_arg = tail
+        .trim_start_matches(':')
+        .split_whitespace()
+        .next()
+        .unwrap_or("");
+    Some(SlashCommand { name, first_arg })
 }
 
-/// Parse a blocks line for an OMP-specific control command. Returns `None`
-/// when the line is a shared command (`user`/`interrupt`/`attachment.chunk`)
-/// handled by the generic blocks reader.
-pub fn parse_omp_control_line(line: &str) -> Result<Option<OmpBlocksControl>> {
-    let value: Value =
-        serde_json::from_str(line).map_err(|source| HarnessServerError::InvalidBlocksInput {
-            message: source.to_string(),
-        })?;
-    let kind = value
-        .get("type")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    // Read ownership from trusted trace_metadata (where api-rs injects it),
-    // falling back to a top-level ownership field for legacy callers.
-    let ownership = value
-        .get("trace_metadata")
-        .or_else(|| value.get("ownership"))
-        .and_then(|o| {
-            let owner_id = o.get("owner_id").and_then(Value::as_str)?;
-            let generation = o.get("generation").and_then(Value::as_i64)?;
-            Some(OmpRpcOwnership {
-                owner_id: owner_id.to_owned(),
-                generation,
+fn slash_command_allowed(command: &SlashCommand<'_>) -> bool {
+    let name = command.name.to_ascii_lowercase();
+    let first_arg = command.first_arg.to_ascii_lowercase();
+    OMP_SLASH_COMMAND_ALLOWLIST.iter().any(|(allowed, args)| {
+        *allowed == name && args.is_none_or(|args| args.contains(&first_arg.as_str()))
+    })
+}
+
+/// The host's reply for a slash command it refuses to forward.
+fn slash_command_rejection(command: &SlashCommand<'_>) -> String {
+    let name = command.name.to_ascii_lowercase();
+    if let Some((_, Some(args))) = OMP_SLASH_COMMAND_ALLOWLIST
+        .iter()
+        .find(|(allowed, args)| *allowed == name && args.is_some())
+    {
+        let accepted = args
+            .iter()
+            .map(|arg| {
+                if arg.is_empty() {
+                    format!("`/{name}`")
+                } else {
+                    format!("`/{name} {arg}`")
+                }
             })
-        })
-        .ok_or_else(|| HarnessServerError::InvalidBlocksInput {
-            message: "missing ownership (owner_id + generation) in trace_metadata".to_string(),
-        })?;
-    let request_id = value
-        .get("id")
-        .or_else(|| value.get("request_id"))
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
-        .map(str::to_owned);
-    match kind {
-        "collab_start" => Ok(Some(OmpBlocksControl::CollabStart {
-            request_id,
-            relay_url: value
-                .get("relayUrl")
-                .or_else(|| value.get("relay_url"))
-                .and_then(Value::as_str)
-                .map(str::to_owned),
-            display_name: value
-                .get("displayName")
-                .or_else(|| value.get("display_name"))
-                .and_then(Value::as_str)
-                .map(str::to_owned),
-            web_url: value
-                .get("webUrl")
-                .or_else(|| value.get("web_url"))
-                .and_then(Value::as_str)
-                .map(str::to_owned),
-            ownership,
-        })),
-        "collab_status" => Ok(Some(OmpBlocksControl::CollabStatus {
-            request_id,
-            ownership,
-        })),
-        "collab_stop" => Ok(Some(OmpBlocksControl::CollabStop {
-            request_id,
-            ownership,
-        })),
-        "interrupt" => Ok(Some(OmpBlocksControl::Interrupt {
-            request_id,
-            ownership,
-        })),
-        _ => Ok(None),
+            .collect::<Vec<_>>()
+            .join(", ");
+        return format!(
+            "`/{name} {}` is not available through Centaur because it changes state beyond this omp session. Available: {accepted}.",
+            command.first_arg
+        );
     }
+    let mut names: Vec<&str> = OMP_SLASH_COMMAND_ALLOWLIST
+        .iter()
+        .map(|(name, _)| *name)
+        .collect();
+    names.sort_unstable();
+    let available = names
+        .iter()
+        .map(|name| format!("`/{name}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "`/{}` is not available through Centaur. Slash commands run inside this thread's omp session, so only commands with no effect beyond it are forwarded: {available}.",
+        command.name
+    )
 }
 
-/// Combined input for the resident OMP blocks server. Shared blocks commands
-/// (user/interrupt/attachment) and OMP-specific controls (collab_*) flow
-/// through a single channel so the main loop can select on one receiver.
-enum OmpBlocksInput {
-    Command(BlocksCommand),
-    Control(OmpBlocksControl),
-    /// A control line that failed to parse (e.g. missing ownership).
-    /// Carries the error message, optional request id, and command kind
-    /// so the error frame can be correlated by the api-rs dispatcher.
-    ParseError {
-        message: String,
-        request_id: Option<String>,
-        command: String,
-    },
+/// Drop ANSI CSI and OSC escape sequences from terminal-oriented command output.
+fn strip_ansi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c != '\u{1b}' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('[') => {
+                for c in chars.by_ref() {
+                    if ('\u{40}'..='\u{7e}').contains(&c) {
+                        break;
+                    }
+                }
+            }
+            Some(']') => {
+                let mut previous = '\0';
+                for c in chars.by_ref() {
+                    if c == '\u{07}' || (previous == '\u{1b}' && c == '\\') {
+                        break;
+                    }
+                    previous = c;
+                }
+            }
+            _ => {}
+        }
+    }
+    out
 }
 
-/// The resident OMP blocks server. One `omp --mode rpc` process per owned
-/// session, reused across sequential turns. Continuously drains unsolicited
-/// session/agent/collaboration lifecycle frames while ordinary commands are
-/// correlated by id. Requires current resident ownership on admission and
-/// fences stale/missing ownership.
-///
-/// Ownership lease recovery: this process does not touch the DB ownership
-/// row. api-rs acquires/releases the lease around executions; if api-rs dies
-/// without release, the DB lease-expiry timeout is the recovery path. On
-/// clean stdin EOF this server waits (bounded) for the child then exits.
+fn omp_bridge_config(thread_id: &str, turn_id: &str) -> BridgeConfig {
+    let mut config = BridgeConfig::new(thread_id.to_owned(), turn_id.to_owned());
+    config.cli_version = "omp".to_string();
+    config.model_provider = "omp".to_string();
+    config
+}
+
+/// Emit a complete turn whose only agent output is `text`, without touching
+/// the resident process. Used for slash commands the host refuses to forward.
+fn write_local_turn(
+    stdout: &mut impl Write,
+    thread_id: &str,
+    client_user_message_id: Option<String>,
+    input: Vec<codex_app_server_protocol::UserInput>,
+    text: &str,
+) -> Result<()> {
+    use crate::traits::{NormalizedContent, NormalizedEvent};
+
+    let turn_id = format!("turn-{}", uuid::Uuid::new_v4().simple());
+    let mut normalizer = CodexTurnNormalizer::new(omp_bridge_config(thread_id, &turn_id));
+    let mut notifications = normalizer.start_notifications(true)?;
+    notifications.extend(normalizer.emit_user_message(client_user_message_id, input)?);
+    notifications.extend(
+        normalizer.process_event(&NormalizedEvent::AssistantMessage {
+            partial: false,
+            stop_reason: Some("end_turn".to_string()),
+            content: vec![NormalizedContent::AgentText {
+                item_id: format!("{turn_id}-host"),
+                text: text.to_string(),
+            }],
+        })?,
+    );
+    notifications.extend(normalizer.finish_turn(None)?);
+    for notification in notifications {
+        write_value(stdout, &notification_to_wire_value(&notification)?)?;
+    }
+    Ok(())
+}
+
+/// The resident OMP blocks server. One `omp --mode rpc` process per sandbox,
+/// reused across sequential turns. Continuously drains unsolicited
+/// session/agent lifecycle frames while ordinary commands are
+/// correlated by id. On clean stdin EOF this server waits (bounded) for the
+/// child then exits.
 pub fn run_omp_blocks_server() -> Result<()> {
     use crate::omp::OmpEventNormalizer;
     use crate::server::{BlocksState, parse_blocks_line_with_state};
-    use crate::turn::BridgeConfig;
     use crate::wire::notification_to_wire_value;
     use std::io::{self, BufRead};
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -907,12 +798,11 @@ pub fn run_omp_blocks_server() -> Result<()> {
     use std::thread;
 
     let mut stdout = io::stdout().lock();
-    let (input_tx, input_rx) = mpsc::channel::<OmpBlocksInput>();
+    let (input_tx, input_rx) = mpsc::channel::<BlocksCommand>();
     let turn_active = Arc::new(AtomicBool::new(false));
 
-    // stdin reader: separates shared blocks commands (user/interrupt) from
-    // OMP-specific control commands (collab_*), sending both through one
-    // channel so the main loop selects on a single receiver.
+    // stdin reader: parses shared blocks commands (user/interrupt) and sends
+    // them through one channel the main loop receives on.
     {
         let turn_active = Arc::clone(&turn_active);
         thread::spawn(move || {
@@ -924,65 +814,22 @@ pub fn run_omp_blocks_server() -> Result<()> {
                 if trimmed.is_empty() {
                     continue;
                 }
-                // Try OMP-specific control first; fall through to shared.
-                match parse_omp_control_line(trimmed) {
-                    Ok(Some(control)) => {
-                        if input_tx.send(OmpBlocksInput::Control(control)).is_err() {
-                            break;
-                        }
-                        continue;
-                    }
-                    Ok(None) => {}
-                    Err(error) => {
-                        // Surface parse errors (e.g. missing ownership)
-                        // with request_id and command kind for correlation.
-                        let (kind, rid) = match serde_json::from_str::<Value>(trimmed) {
-                            Ok(v) => (
-                                v.get("type")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or("input")
-                                    .to_owned(),
-                                v.get("id")
-                                    .or_else(|| v.get("request_id"))
-                                    .and_then(Value::as_str)
-                                    .filter(|s| !s.is_empty())
-                                    .map(str::to_owned),
-                            ),
-                            Err(_) => ("input".to_string(), None),
-                        };
-                        eprintln!("invalid OMP control input: {error}");
-                        if input_tx
-                            .send(OmpBlocksInput::ParseError {
-                                message: error.to_string(),
-                                request_id: rid,
-                                command: kind,
-                            })
-                            .is_err()
-                        {
-                            break;
-                        }
-                        continue;
-                    }
-                }
                 match parse_blocks_line_with_state(trimmed, &mut blocks_state) {
                     Ok(BlocksCommand::Interrupt) if turn_active.load(Ordering::SeqCst) => {
                         // Interrupt during an active turn: send as a control
                         // so the turn driver can abort the resident process.
-                        if input_tx
-                            .send(OmpBlocksInput::Command(BlocksCommand::Interrupt))
-                            .is_err()
-                        {
+                        if input_tx.send(BlocksCommand::Interrupt).is_err() {
                             break;
                         }
                     }
                     Ok(command @ BlocksCommand::User { .. }) => {
                         turn_active.store(true, Ordering::SeqCst);
-                        if input_tx.send(OmpBlocksInput::Command(command)).is_err() {
+                        if input_tx.send(command).is_err() {
                             break;
                         }
                     }
                     Ok(command) => {
-                        if input_tx.send(OmpBlocksInput::Command(command)).is_err() {
+                        if input_tx.send(command).is_err() {
                             break;
                         }
                     }
@@ -996,12 +843,11 @@ pub fn run_omp_blocks_server() -> Result<()> {
 
     let mut child: Option<OmpRpcChild> = None;
     let mut event_normalizer = OmpEventNormalizer;
-    let mut admitted_ownership: Option<OmpRpcOwnership> = None;
     let thread_id = format!("omp-{}", uuid::Uuid::new_v4().simple());
     let mut harness_session_id: Option<String> = None;
 
     let mut respawn_child = false;
-    let mut outer_pending: std::collections::VecDeque<OmpBlocksInput> =
+    let mut outer_pending: std::collections::VecDeque<BlocksCommand> =
         std::collections::VecDeque::new();
     loop {
         let input = if let Some(pending) = outer_pending.pop_front() {
@@ -1013,47 +859,52 @@ pub fn run_omp_blocks_server() -> Result<()> {
             }
         };
         match input {
-            OmpBlocksInput::Command(BlocksCommand::User {
+            BlocksCommand::User {
                 input,
                 client_user_message_id,
                 model,
                 reasoning,
                 trace_context,
                 ..
-            }) => {
+            } => {
                 // Set turn_active at actual dispatch so concurrent
                 // interrupt/steer gates work for pending Users that start
                 // after a prior turn cleared the flag.
                 turn_active.store(true, Ordering::SeqCst);
-                // Admission: require ownership on first turn. The ownership
-                // is carried in trace_metadata. A stale or missing fence
-                // rejects.
-                let ownership = ownership_from_trace(&trace_context);
-                // Require ownership on EVERY user command (not just first).
-                // A stale or missing fence is rejected; None after admission
-                // is also rejected (a non-object trace_metadata cannot bypass).
-                let Some(incoming) = &ownership else {
-                    write_blocks_error(
-                        &mut stdout,
-                        &thread_id,
-                        "turn",
-                        "missing ownership: resident host requires owner_id + generation",
-                    )?;
-                    continue;
-                };
-                if let Some(admitted) = &admitted_ownership {
-                    if !admitted.matches(incoming) {
-                        write_blocks_error(
+
+                let parts = prompt_text_parts(&input);
+                let message = parts.join("\n\n");
+
+                // Detect steering: api-rs sends a user line with
+                // trace_metadata.action == "steer_active_execution" to queue
+                // additional context during an active turn. Route it as a
+                // steer command rather than a new prompt.
+                let is_steer = trace_context.metadata.get("action").and_then(Value::as_str)
+                    == Some("steer_active_execution");
+
+                // Slash commands execute inside omp itself, so refuse the ones
+                // that would outlive this session before the process is even
+                // spawned. The refusal is the turn's (or steer's) only output.
+                // The user's own text is the last block; api-rs prepends a
+                // chat-surface note for console and Slack threads.
+                let slash_command = parts.last().and_then(|text| parse_slash_command(text));
+                if let Some(command) = &slash_command
+                    && !slash_command_allowed(command)
+                {
+                    let rejection = slash_command_rejection(command);
+                    if is_steer {
+                        write_blocks_error(&mut stdout, &thread_id, "steer", &rejection)?;
+                    } else {
+                        write_local_turn(
                             &mut stdout,
                             &thread_id,
-                            "turn",
-                            "ownership fence mismatch: stale owner",
+                            client_user_message_id,
+                            input,
+                            &rejection,
                         )?;
-                        continue;
                     }
-                } else {
-                    // First admission: pin the ownership fence.
-                    admitted_ownership = Some(incoming.clone());
+                    turn_active.store(false, Ordering::SeqCst);
+                    continue;
                 }
 
                 // Spawn or reuse the resident process.
@@ -1063,33 +914,16 @@ pub fn run_omp_blocks_server() -> Result<()> {
                     query_and_persist_session_state(
                         child.as_mut().unwrap(),
                         &mut event_normalizer,
-                        &mut stdout,
-                        &admitted_ownership,
                     )?;
                 }
                 let child = child.as_mut().unwrap();
-
-                let message = prompt_text(&input);
-
-                // Detect steering: api-rs sends a user line with
-                // trace_metadata.action == "steer_active_execution" to queue
-                // additional context during an active turn. Route it as a
-                // steer command rather than a new prompt.
-                let is_steer = trace_context.metadata.get("action").and_then(Value::as_str)
-                    == Some("steer_active_execution");
 
                 if is_steer {
                     // Steer: send the steer command and wait for its response.
                     // No turn lifecycle — the active turn continues.
                     let id = child.next_request_id();
                     child.send_command(&steer_command(&id, &message))?;
-                    drive_omp_steer_response(
-                        child,
-                        &id,
-                        &mut stdout,
-                        &thread_id,
-                        &admitted_ownership,
-                    )?;
+                    drive_omp_steer_response(child, &id, &mut stdout, &thread_id)?;
                     turn_active.store(false, Ordering::SeqCst);
                     continue;
                 }
@@ -1106,15 +940,19 @@ pub fn run_omp_blocks_server() -> Result<()> {
                     continue;
                 }
 
-                // Prompt: send and drive the turn to completion.
+                // Prompt: send and drive the turn to completion. An allowed
+                // slash command goes to omp alone: with the chat-surface note
+                // in front of it omp's parser would never see the leading `/`.
+                let prompt = match (&slash_command, parts.last()) {
+                    (Some(_), Some(text)) => text.clone(),
+                    _ => message.clone(),
+                };
                 let id = child.next_request_id();
-                child.send_command(&prompt_command(&id, &message, None))?;
+                child.send_command(&prompt_command(&id, &prompt, None))?;
 
                 let turn_id = format!("turn-{}", uuid::Uuid::new_v4().simple());
-                let mut config = BridgeConfig::new(thread_id.clone(), turn_id.clone());
-                config.cli_version = "omp".to_string();
-                config.model_provider = "omp".to_string();
-                let mut normalizer = CodexTurnNormalizer::new(config);
+                let mut normalizer =
+                    CodexTurnNormalizer::new(omp_bridge_config(&thread_id, &turn_id));
 
                 for notification in normalizer.start_notifications(true)? {
                     write_value(&mut stdout, &notification_to_wire_value(&notification)?)?;
@@ -1137,7 +975,6 @@ pub fn run_omp_blocks_server() -> Result<()> {
                     &turn_id,
                     &thread_id,
                     &input_rx,
-                    &admitted_ownership,
                     turn_timeout,
                 )?;
 
@@ -1157,231 +994,15 @@ pub fn run_omp_blocks_server() -> Result<()> {
                     respawn_child = true;
                 }
             }
-            OmpBlocksInput::Command(BlocksCommand::Interrupt) => {
-                // Interrupt without ownership: reject if ownership has been
-                // admitted (the process exists and a stale owner must not
-                // abort it). If no process exists, there is nothing to abort.
-                if admitted_ownership.is_some() {
-                    write_blocks_error(
-                        &mut stdout,
-                        &thread_id,
-                        "interrupt",
-                        "missing ownership: interrupt requires owner_id + generation",
-                    )?;
-                    continue;
-                }
+            BlocksCommand::Interrupt => {
+                // No turn is active: abort whatever the resident process may still be
+                // doing. Without a process there is nothing to abort.
                 if let Some(child) = child.as_mut() {
                     let id = child.next_request_id();
                     child.send_command(&abort_command(&id))?;
                 }
             }
-            OmpBlocksInput::Control(OmpBlocksControl::Interrupt {
-                request_id,
-                ownership,
-            }) => {
-                if !check_ownership_with_request_id(
-                    &mut admitted_ownership,
-                    &ownership,
-                    &mut stdout,
-                    &thread_id,
-                    request_id.as_deref(),
-                    "interrupt",
-                ) {
-                    continue;
-                }
-                if let Some(child) = child.as_mut() {
-                    let id = resolve_request_id(child, request_id);
-                    child.send_command(&abort_command(&id))?;
-                }
-            }
-            OmpBlocksInput::Command(BlocksCommand::AttachmentChunk) => {}
-            OmpBlocksInput::ParseError {
-                message,
-                request_id,
-                command,
-            } => {
-                // Stamp ownership only for collab-* parse errors; interrupt
-                // and other non-collab parse errors keep the prior shape.
-                let own = if command.starts_with("collab") {
-                    admitted_ownership.as_ref()
-                } else {
-                    None
-                };
-                write_blocks_error_with_request_id(
-                    &mut stdout,
-                    &thread_id,
-                    &command,
-                    &message,
-                    request_id.as_deref(),
-                    own,
-                )?;
-            }
-            OmpBlocksInput::Control(OmpBlocksControl::CollabStart {
-                request_id,
-                relay_url,
-                display_name,
-                web_url,
-                ownership,
-            }) => {
-                if !check_ownership_with_request_id(
-                    &mut admitted_ownership,
-                    &ownership,
-                    &mut stdout,
-                    &thread_id,
-                    request_id.as_deref(),
-                    "collab_start",
-                ) {
-                    continue;
-                }
-                if child.is_none() {
-                    child = Some(OmpRpcChild::spawn()?);
-                    drain_ready(child.as_mut().unwrap())?;
-                    query_and_persist_session_state(
-                        child.as_mut().unwrap(),
-                        &mut event_normalizer,
-                        &mut stdout,
-                        &admitted_ownership,
-                    )?;
-                }
-                {
-                    let child_ref = child.as_mut().unwrap();
-                    let id = resolve_request_id(child_ref, request_id);
-                    child_ref.send_command(&collab_start_command(
-                        &id,
-                        relay_url.as_deref(),
-                        display_name.as_deref(),
-                        web_url.as_deref(),
-                    ))?;
-                    let drive = drive_collab_command(
-                        child_ref,
-                        &id,
-                        "collab_start",
-                        &mut stdout,
-                        &thread_id,
-                        &admitted_ownership,
-                    )?;
-                    if !drive.child_reusable {
-                        respawn_child = true;
-                    } else if let Some(room) = drive.room {
-                        emit_collab_state(
-                            &mut stdout,
-                            "started",
-                            None,
-                            &room,
-                            Some(&id),
-                            &admitted_ownership,
-                        )?;
-                    }
-                }
-            }
-            OmpBlocksInput::Control(OmpBlocksControl::CollabStatus {
-                request_id,
-                ownership,
-            }) => {
-                if !check_ownership_with_request_id(
-                    &mut admitted_ownership,
-                    &ownership,
-                    &mut stdout,
-                    &thread_id,
-                    request_id.as_deref(),
-                    "collab_status",
-                ) {
-                    continue;
-                }
-                if child.is_none() {
-                    write_blocks_error_with_request_id(
-                        &mut stdout,
-                        &thread_id,
-                        "collab_status",
-                        "no resident process",
-                        request_id.as_deref(),
-                        Some(&ownership),
-                    )?;
-                    continue;
-                }
-                {
-                    let child_ref = child.as_mut().unwrap();
-                    let id = resolve_request_id(child_ref, request_id);
-                    child_ref.send_command(&collab_status_command(&id))?;
-                    let drive = drive_collab_command(
-                        child_ref,
-                        &id,
-                        "collab_status",
-                        &mut stdout,
-                        &thread_id,
-                        &admitted_ownership,
-                    )?;
-                    if !drive.child_reusable {
-                        respawn_child = true;
-                    } else if let Some(room) = drive.room {
-                        // Snapshot shape: same room contract as collab/state, plus
-                        // state derived from room.active and request_id for wait
-                        // correlation. Distinct method (collab/status) so api-rs
-                        // can tell a query snapshot from a lifecycle event.
-                        let parsed = parse_room_state(&room)?;
-                        let api_room = room_state_to_api(&parsed);
-                        let state = if parsed.active { "started" } else { "stopped" };
-                        let mut value = collab_state_wire_value(state, None, &api_room);
-                        value["method"] = Value::String("collab/status".to_owned());
-                        if let Some(params) = value.get_mut("params") {
-                            params["request_id"] = Value::String(id.clone());
-                        }
-                        stamp_ownership(&mut value, &admitted_ownership);
-                        write_value(&mut stdout, &value)?;
-                    }
-                }
-            }
-            OmpBlocksInput::Control(OmpBlocksControl::CollabStop {
-                request_id,
-                ownership,
-            }) => {
-                if !check_ownership_with_request_id(
-                    &mut admitted_ownership,
-                    &ownership,
-                    &mut stdout,
-                    &thread_id,
-                    request_id.as_deref(),
-                    "collab_stop",
-                ) {
-                    continue;
-                }
-                if child.is_none() {
-                    write_blocks_error_with_request_id(
-                        &mut stdout,
-                        &thread_id,
-                        "collab_stop",
-                        "no resident process",
-                        request_id.as_deref(),
-                        Some(&ownership),
-                    )?;
-                    continue;
-                }
-                {
-                    let child_ref = child.as_mut().unwrap();
-                    let id = resolve_request_id(child_ref, request_id);
-                    child_ref.send_command(&collab_stop_command(&id))?;
-                    let drive = drive_collab_command(
-                        child_ref,
-                        &id,
-                        "collab_stop",
-                        &mut stdout,
-                        &thread_id,
-                        &admitted_ownership,
-                    )?;
-                    if !drive.child_reusable {
-                        respawn_child = true;
-                    } else if let Some(room) = drive.room {
-                        emit_collab_state(
-                            &mut stdout,
-                            "stopped",
-                            None,
-                            &room,
-                            Some(&id),
-                            &admitted_ownership,
-                        )?;
-                    }
-                }
-            }
+            BlocksCommand::AttachmentChunk => {}
         }
 
         // Handle child respawn after a non-reusable turn.
@@ -1400,184 +1021,8 @@ pub fn run_omp_blocks_server() -> Result<()> {
     Ok(())
 }
 
-/// Check ownership against the admitted fence. Returns `false` (and writes a
-/// blocks error) when stale or missing.
-/// Prefer a caller-supplied request id; otherwise allocate from the child.
-fn resolve_request_id(child: &mut OmpRpcChild, supplied: Option<String>) -> String {
-    supplied.unwrap_or_else(|| child.next_request_id())
-}
-
-#[allow(dead_code)]
-fn check_ownership(
-    admitted: &mut Option<OmpRpcOwnership>,
-    incoming: &OmpRpcOwnership,
-    stdout: &mut impl Write,
-    thread_id: &str,
-) -> bool {
-    check_ownership_with_request_id(admitted, incoming, stdout, thread_id, None, "collab")
-}
-
-fn check_ownership_with_request_id(
-    admitted: &mut Option<OmpRpcOwnership>,
-    incoming: &OmpRpcOwnership,
-    stdout: &mut impl Write,
-    thread_id: &str,
-    request_id: Option<&str>,
-    command: &str,
-) -> bool {
-    match admitted {
-        Some(admitted) => {
-            if !admitted.matches(incoming) {
-                // Ownership stamp only for collab-* control rejections.
-                // Interrupt ownership rejections keep the prior error shape.
-                let own = if command.starts_with("collab") {
-                    Some(incoming)
-                } else {
-                    None
-                };
-                let _ = write_blocks_error_with_request_id(
-                    stdout,
-                    thread_id,
-                    command,
-                    "ownership fence mismatch: stale owner",
-                    request_id,
-                    own,
-                );
-                return false;
-            }
-            true
-        }
-        None => {
-            *admitted = Some(incoming.clone());
-            true
-        }
-    }
-}
-
-/// Drive a collab command to its correlated response, draining unsolicited
-/// frames in the meantime. Returns the response `data` (room state) on
-/// success, `None` at failure (error already written).
-/// Absolute wall budget for one collab_start/status/stop RPC. Must stay under
-/// the api-rs lifecycle deadline (15s) so the resident can surface a correlated
-/// error and return instead of looping forever on 30s read timeouts.
-const COLLAB_COMMAND_DEADLINE: Duration = Duration::from_secs(12);
-
-/// Outcome of a single collab RPC wait. `child_reusable` is false when the
-/// absolute command deadline fired (or the child is otherwise unrecoverable):
-/// callers must kill/drop the child before accepting the next control input
-/// so a hung OMP command tail cannot block stop/status forever.
-struct CollabDriveResult {
-    room: Option<Value>,
-    child_reusable: bool,
-}
-
-fn drive_collab_command(
-    child: &mut OmpRpcChild,
-    expected_id: &str,
-    command: &str,
-    stdout: &mut impl Write,
-    thread_id: &str,
-    admitted: &Option<OmpRpcOwnership>,
-) -> Result<CollabDriveResult> {
-    drive_collab_command_within(
-        child,
-        expected_id,
-        command,
-        stdout,
-        thread_id,
-        admitted,
-        std::time::Instant::now() + COLLAB_COMMAND_DEADLINE,
-    )
-}
-
-fn drive_collab_command_within(
-    child: &mut OmpRpcChild,
-    expected_id: &str,
-    command: &str,
-    stdout: &mut impl Write,
-    thread_id: &str,
-    admitted: &Option<OmpRpcOwnership>,
-    deadline: std::time::Instant,
-) -> Result<CollabDriveResult> {
-    loop {
-        if std::time::Instant::now() >= deadline {
-            write_blocks_error_with_request_id(
-                stdout,
-                thread_id,
-                command,
-                &format!("{command} exceeded resident command deadline"),
-                Some(expected_id),
-                admitted.as_ref(),
-            )?;
-            // Kill before returning so the hung OMP command queue cannot
-            // serialize forever behind this process. Drop/respawn follows.
-            child.kill_now();
-            return Ok(CollabDriveResult {
-                room: None,
-                child_reusable: false,
-            });
-        }
-        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        let slice = remaining.min(Duration::from_secs(2));
-        let line = match child.read_line_timeout(slice)? {
-            Some(line) => line,
-            None => continue,
-        };
-        let frame = OmpRpcFrame::parse_json_line(&line)?;
-        match frame {
-            OmpRpcFrame::Response {
-                id,
-                command: resp_command,
-                success,
-                data,
-                error,
-                ..
-            } if id.as_deref() == Some(expected_id) => {
-                if !success {
-                    let cmd = resp_command.as_str();
-                    let msg = error.unwrap_or_else(|| format!("{cmd} failed"));
-                    write_blocks_error_with_request_id(
-                        stdout,
-                        thread_id,
-                        cmd,
-                        &msg,
-                        Some(expected_id),
-                        admitted.as_ref(),
-                    )?;
-                    // Correlated failure from a live child — process is still
-                    // healthy and reusable for stop/status.
-                    return Ok(CollabDriveResult {
-                        room: None,
-                        child_reusable: true,
-                    });
-                }
-                return Ok(CollabDriveResult {
-                    room: data,
-                    child_reusable: true,
-                });
-            }
-            OmpRpcFrame::Response { .. } => {}
-            OmpRpcFrame::CollabState {
-                state,
-                reason,
-                room,
-            } => {
-                let parsed = parse_room_state(&room)?;
-                let api_room = room_state_to_api(&parsed);
-                let mut val = collab_state_wire_value(&state, reason.as_deref(), &api_room);
-                stamp_ownership(&mut val, admitted);
-                let _ = write_value(stdout, &val);
-            }
-            OmpRpcFrame::Event(_)
-            | OmpRpcFrame::PromptResult { .. }
-            | OmpRpcFrame::Ready
-            | OmpRpcFrame::Other(_) => {}
-        }
-    }
-}
-
 /// Drive a steer command to its correlated response, draining unsolicited
-/// frames (collab_state, agent events) in the meantime. The steer response
+/// frames (agent events) in the meantime. The steer response
 /// is an ack; the active turn continues and its events flow through the
 /// turn driver's drain loop.
 fn drive_omp_steer_response(
@@ -1585,7 +1030,6 @@ fn drive_omp_steer_response(
     expected_id: &str,
     stdout: &mut impl Write,
     thread_id: &str,
-    admitted: &Option<OmpRpcOwnership>,
 ) -> Result<()> {
     loop {
         let line = match child.read_line_timeout(Duration::from_secs(30))? {
@@ -1599,82 +1043,24 @@ fn drive_omp_steer_response(
             } if id.as_deref() == Some(expected_id) => {
                 if !success {
                     let msg = error.unwrap_or_else(|| "steer failed".to_owned());
-                    // Normal steer errors unchanged: no ownership stamp.
                     write_blocks_error_with_request_id(
                         stdout,
                         thread_id,
                         "steer",
                         &msg,
                         Some(expected_id),
-                        None,
                     )?;
                 }
                 return Ok(());
             }
             OmpRpcFrame::Response { .. } => {}
-            OmpRpcFrame::CollabState {
-                state,
-                reason,
-                room,
-            } => {
-                let parsed = parse_room_state(&room)?;
-                let api_room = room_state_to_api(&parsed);
-                let mut val = collab_state_wire_value(&state, reason.as_deref(), &api_room);
-                stamp_ownership(&mut val, admitted);
-                write_value(stdout, &val)?;
-            }
             OmpRpcFrame::Event(_)
             | OmpRpcFrame::PromptResult { .. }
+            | OmpRpcFrame::CommandOutput { .. }
             | OmpRpcFrame::Ready
             | OmpRpcFrame::Other(_) => {}
         }
     }
-}
-
-/// Emit a collab/state notification from a raw room JSON value (already
-/// parsed and re-projected to the API contract).
-///
-/// Stamp admitted ownership into a collab wire value's params so api-rs can
-/// require exact ownership match and reject missing echo on all collab outputs.
-fn stamp_ownership(value: &mut Value, admitted: &Option<OmpRpcOwnership>) {
-    if let Some(own) = admitted
-        && let Some(params) = value.get_mut("params")
-    {
-        params["ownership"] = json!({
-            "owner_id": own.owner_id,
-            "generation": own.generation,
-        });
-    }
-}
-
-fn emit_collab_state(
-    stdout: &mut impl Write,
-    state: &str,
-    reason: Option<&str>,
-    room: &Value,
-    request_id: Option<&str>,
-    admitted: &Option<OmpRpcOwnership>,
-) -> Result<()> {
-    let parsed = parse_room_state(room)?;
-    let api_room = room_state_to_api(&parsed);
-    let mut value = collab_state_wire_value(state, reason, &api_room);
-    if let Some(request_id) = request_id
-        && let Some(params) = value.get_mut("params")
-    {
-        params["request_id"] = Value::String(request_id.to_owned());
-    }
-    stamp_ownership(&mut value, admitted);
-    write_value(stdout, &value)
-}
-
-fn ownership_from_trace(trace_context: &crate::otel::TraceContext) -> Option<OmpRpcOwnership> {
-    let metadata = &trace_context.metadata;
-    let owner_id = metadata.get("owner_id").and_then(Value::as_str)?;
-    let generation = metadata.get("generation").and_then(Value::as_i64)?;
-    Some(OmpRpcOwnership {
-        owner_id: owner_id.to_owned(),
-        generation,
-    })
 }
 
 fn drain_ready(child: &mut OmpRpcChild) -> Result<()> {
@@ -1684,8 +1070,8 @@ fn drain_ready(child: &mut OmpRpcChild) -> Result<()> {
         match frame {
             OmpRpcFrame::Ready => return Ok(()),
             OmpRpcFrame::Event(_)
-            | OmpRpcFrame::CollabState { .. }
             | OmpRpcFrame::PromptResult { .. }
+            | OmpRpcFrame::CommandOutput { .. }
             | OmpRpcFrame::Other(_) => {}
             OmpRpcFrame::Response { .. } => {}
         }
@@ -1696,7 +1082,7 @@ fn drain_ready(child: &mut OmpRpcChild) -> Result<()> {
 /// loop for FIFO processing. `child_reusable` is false when the child process
 /// is in an unrecoverable state (e.g. timeout abort without clean drain).
 struct TurnDriveResult {
-    pending: std::collections::VecDeque<OmpBlocksInput>,
+    pending: std::collections::VecDeque<BlocksCommand>,
     child_reusable: bool,
 }
 
@@ -1714,12 +1100,11 @@ fn drive_omp_turn(
     expected_prompt_id: &str,
     turn_id: &str,
     thread_id: &str,
-    active_rx: &mpsc::Receiver<OmpBlocksInput>,
-    admitted_ownership: &Option<OmpRpcOwnership>,
+    active_rx: &mpsc::Receiver<BlocksCommand>,
     turn_timeout: Duration,
 ) -> Result<TurnDriveResult> {
     use crate::omp::OmpHarness;
-    use crate::traits::{HarnessServer, NormalizedEvent};
+    use crate::traits::{HarnessServer, NormalizedContent, NormalizedEvent};
 
     let mut pending = std::collections::VecDeque::new();
     let mut terminal = false;
@@ -1727,6 +1112,8 @@ fn drive_omp_turn(
     let mut aborted = false;
     let mut child_reusable = true;
     let mut prompt_error: Option<String> = None;
+    // Output of a builtin slash command omp ran locally: (item id, text so far).
+    let mut command_item: Option<(String, String)> = None;
     // Settle window: arm only after a terminal assistant stop.
     let mut settle_deadline: Option<std::time::Instant> = None;
     let absolute_deadline = std::time::Instant::now().checked_add(turn_timeout);
@@ -1787,90 +1174,31 @@ fn drive_omp_turn(
             break;
         }
 
-        // #2,#3,#4: drain active_rx with ownership checks, preserve unmatched.
+        // Drain concurrent controls: an interrupt aborts the turn, a steer line
+        // queues its text on the active turn, and anything else is preserved in
+        // FIFO order for the outer loop.
         loop {
             match active_rx.try_recv() {
-                Ok(OmpBlocksInput::Command(BlocksCommand::Interrupt)) => {
-                    // #3: missing ownership with admitted → surface error.
-                    if admitted_ownership.is_some() {
-                        write_blocks_error_with_request_id(
-                            stdout,
-                            thread_id,
-                            turn_id,
-                            "missing ownership: interrupt requires owner_id + generation",
-                            None,
-                            None,
-                        )?;
-                    } else {
-                        let id = child.next_request_id();
-                        child.send_command(&abort_command(&id))?;
-                        aborted = true;
-                    }
+                Ok(BlocksCommand::Interrupt) => {
+                    let id = child.next_request_id();
+                    child.send_command(&abort_command(&id))?;
+                    aborted = true;
                 }
-                Ok(OmpBlocksInput::Control(OmpBlocksControl::Interrupt { ownership, .. })) => {
-                    // #3: stale/missing interrupt → surface error.
-                    match admitted_ownership {
-                        Some(admitted) if admitted.matches(&ownership) => {
-                            let id = child.next_request_id();
-                            child.send_command(&abort_command(&id))?;
-                            aborted = true;
-                        }
-                        Some(_) => {
-                            // Interrupt ownership errors: no ownership stamp.
-                            write_blocks_error_with_request_id(
-                                stdout,
-                                thread_id,
-                                turn_id,
-                                "ownership fence mismatch: stale owner",
-                                None,
-                                None,
-                            )?;
-                        }
-                        None => {
-                            write_blocks_error_with_request_id(
-                                stdout,
-                                thread_id,
-                                turn_id,
-                                "missing ownership: no admitted owner",
-                                None,
-                                None,
-                            )?;
-                        }
-                    }
-                }
-                Ok(OmpBlocksInput::Command(BlocksCommand::User {
+                Ok(BlocksCommand::User {
                     input,
                     trace_context,
                     ..
-                })) if trace_context.metadata.get("action").and_then(Value::as_str)
+                }) if trace_context.metadata.get("action").and_then(Value::as_str)
                     == Some("steer_active_execution") =>
                 {
-                    // #2: exact-check trace ownership before steer.
-                    let steer_ownership = ownership_from_trace(&trace_context);
-                    let can_steer = match (&admitted_ownership, &steer_ownership) {
-                        (Some(admitted), Some(incoming)) => admitted.matches(incoming),
-                        (None, _) => true,
-                        _ => false,
-                    };
-                    if can_steer {
-                        let steer_msg = prompt_text(&input);
-                        if !steer_msg.is_empty() {
-                            let id = child.next_request_id();
-                            child.send_command(&steer_command(&id, &steer_msg))?;
-                        }
-                    } else {
-                        write_blocks_error_with_request_id(
-                            stdout,
-                            thread_id,
-                            turn_id,
-                            "ownership fence mismatch: stale owner",
-                            None,
-                            None,
-                        )?;
+                    let steer_msg = prompt_text(&input);
+                    if !steer_msg.is_empty() {
+                        let id = child.next_request_id();
+                        child.send_command(&steer_command(&id, &steer_msg))?;
                     }
                 }
                 Ok(other) => {
-                    // #4: preserve unmatched in FIFO order.
+                    // Preserve unmatched input in FIFO order.
                     pending.push_back(other);
                 }
                 Err(_) => break,
@@ -1922,17 +1250,6 @@ fn drive_omp_turn(
             OmpRpcFrame::Event(event) => {
                 let events = OmpHarness.normalize_events(event_normalizer, event)?;
                 for normalized in events {
-                    if let NormalizedEvent::CollabState {
-                        state,
-                        reason,
-                        room,
-                    } = &normalized
-                    {
-                        let mut val = collab_state_wire_value(state, reason.as_deref(), room);
-                        stamp_ownership(&mut val, admitted_ownership);
-                        write_value(stdout, &val)?;
-                        continue;
-                    }
                     if let Some(sid) = normalized.session_id() {
                         *harness_session_id = Some(sid.to_string());
                     }
@@ -1950,16 +1267,23 @@ fn drive_omp_turn(
                     }
                 }
             }
-            OmpRpcFrame::CollabState {
-                state,
-                reason,
-                room,
-            } => {
-                let parsed = parse_room_state(&room)?;
-                let api_room = room_state_to_api(&parsed);
-                let mut val = collab_state_wire_value(&state, reason.as_deref(), &api_room);
-                stamp_ownership(&mut val, admitted_ownership);
-                write_value(stdout, &val)?;
+            OmpRpcFrame::CommandOutput { text } => {
+                let text = strip_ansi(&text);
+                let (item_id, buffer) = command_item
+                    .get_or_insert_with(|| (format!("{turn_id}-command"), String::new()));
+                let delta = if buffer.is_empty() || buffer.ends_with('\n') {
+                    text
+                } else {
+                    format!("\n{text}")
+                };
+                buffer.push_str(&delta);
+                let event = NormalizedEvent::AgentTextDelta {
+                    item_id: item_id.clone(),
+                    delta,
+                };
+                for notification in normalizer.process_event(&event)? {
+                    write_value(stdout, &notification_to_wire_value(&notification)?)?;
+                }
             }
             OmpRpcFrame::PromptResult { agent_invoked, .. } if !agent_invoked => {
                 terminal = true;
@@ -1971,6 +1295,18 @@ fn drive_omp_turn(
                     eprintln!("omp rpc: unsolicited {kind} frame");
                 }
             }
+        }
+    }
+
+    // Close the slash-command output item before the turn ends.
+    if let Some((item_id, text)) = command_item.take() {
+        let event = NormalizedEvent::AssistantMessage {
+            partial: false,
+            stop_reason: Some("end_turn".to_string()),
+            content: vec![NormalizedContent::AgentText { item_id, text }],
+        };
+        for notification in normalizer.process_event(&event)? {
+            write_value(stdout, &notification_to_wire_value(&notification)?)?;
         }
     }
 
@@ -1994,13 +1330,16 @@ fn drive_omp_turn(
     })
 }
 
-fn prompt_text(input: &[codex_app_server_protocol::UserInput]) -> String {
-    let parts = crate::util::user_input_to_anthropic_content(input);
-    parts
+/// The text blocks of a user line, one per content block, in order.
+fn prompt_text_parts(input: &[codex_app_server_protocol::UserInput]) -> Vec<String> {
+    crate::util::user_input_to_anthropic_content(input)
         .into_iter()
         .filter_map(|p| p.get("text").and_then(Value::as_str).map(str::to_owned))
-        .collect::<Vec<_>>()
-        .join("\n\n")
+        .collect()
+}
+
+fn prompt_text(input: &[codex_app_server_protocol::UserInput]) -> String {
+    prompt_text_parts(input).join("\n\n")
 }
 
 fn write_blocks_error(
@@ -2009,7 +1348,7 @@ fn write_blocks_error(
     turn_id: &str,
     message: &str,
 ) -> Result<()> {
-    write_blocks_error_with_request_id(stdout, thread_id, turn_id, message, None, None)
+    write_blocks_error_with_request_id(stdout, thread_id, turn_id, message, None)
 }
 
 fn write_blocks_error_with_request_id(
@@ -2018,7 +1357,6 @@ fn write_blocks_error_with_request_id(
     turn_id: &str,
     message: &str,
     request_id: Option<&str>,
-    admitted: Option<&OmpRpcOwnership>,
 ) -> Result<()> {
     let mut params = serde_json::json!({
         "error": { "message": message, "codexErrorInfo": null, "additionalDetails": null },
@@ -2028,12 +1366,6 @@ fn write_blocks_error_with_request_id(
     });
     if let Some(rid) = request_id {
         params["request_id"] = Value::String(rid.to_owned());
-    }
-    if let Some(own) = admitted {
-        params["ownership"] = json!({
-            "owner_id": own.owner_id,
-            "generation": own.generation,
-        });
     }
     write_value(
         stdout,
@@ -2160,56 +1492,6 @@ mod tests {
     }
 
     #[test]
-    fn collab_state_frame_demultiplexes_into_lifecycle() {
-        let frame = OmpRpcFrame::parse_json_line(
-            r#"{"type":"collab_state","state":"started","room":{"active":true,"joinUrl":"relay.example/r/room.key-and-write-token","viewUrl":"relay.example/r/room.key","participants":[{"name":"host","role":"host"}]}}"#,
-        )
-        .unwrap();
-        match frame {
-            OmpRpcFrame::CollabState {
-                state,
-                reason,
-                room,
-            } => {
-                assert_eq!(state, "started");
-                assert!(reason.is_none());
-                let parsed = parse_room_state(&room).unwrap();
-                assert!(parsed.active);
-                assert_eq!(
-                    parsed.join_url.as_deref(),
-                    Some("relay.example/r/room.key-and-write-token")
-                );
-                assert_eq!(parsed.view_url.as_deref(), Some("relay.example/r/room.key"));
-                assert_eq!(parsed.participants.len(), 1);
-                assert_eq!(parsed.participants[0].name, "host");
-                assert_eq!(parsed.participants[0].role, "host");
-            }
-            other => panic!("expected CollabState, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn collab_state_failed_frame_carries_reason() {
-        let frame = OmpRpcFrame::parse_json_line(
-            r#"{"type":"collab_state","state":"failed","reason":"relay unreachable","room":{"active":false,"participants":[]}}"#,
-        )
-        .unwrap();
-        match frame {
-            OmpRpcFrame::CollabState {
-                state,
-                reason,
-                room,
-            } => {
-                assert_eq!(state, "failed");
-                assert_eq!(reason.as_deref(), Some("relay unreachable"));
-                let parsed = parse_room_state(&room).unwrap();
-                assert!(!parsed.active);
-            }
-            other => panic!("expected CollabState, got {other:?}"),
-        }
-    }
-
-    #[test]
     fn prompt_result_frame_demultiplexes() {
         let frame = OmpRpcFrame::parse_json_line(
             r#"{"type":"prompt_result","id":"req_1","agentInvoked":false}"#,
@@ -2239,49 +1521,6 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(frame, OmpRpcFrame::Other(_)));
-    }
-
-    // --- Ownership fence --------------------------------------------------
-
-    #[test]
-    fn ownership_matches_same_owner_and_generation() {
-        let a = OmpRpcOwnership {
-            owner_id: "resident-host".to_string(),
-            generation: 3,
-        };
-        let b = OmpRpcOwnership {
-            owner_id: "resident-host".to_string(),
-            generation: 3,
-        };
-        assert!(a.matches(&b));
-    }
-
-    #[test]
-    fn ownership_rejects_different_owner_same_generation() {
-        let a = OmpRpcOwnership {
-            owner_id: "resident-host".to_string(),
-            generation: 3,
-        };
-        let b = OmpRpcOwnership {
-            owner_id: "resident-other".to_string(),
-            generation: 3,
-        };
-        assert!(!a.matches(&b));
-    }
-
-    #[test]
-    fn ownership_rejects_stale_generation_after_reacquire() {
-        // After a loss/reacquire the generation bumps; the stale owner's
-        // fence no longer matches and its commands are rejected.
-        let stale = OmpRpcOwnership {
-            owner_id: "resident-host".to_string(),
-            generation: 2,
-        };
-        let current = OmpRpcOwnership {
-            owner_id: "resident-host".to_string(),
-            generation: 3,
-        };
-        assert!(!stale.matches(&current));
     }
 
     // --- Command builders -------------------------------------------------
@@ -2352,241 +1591,7 @@ mod tests {
         assert_eq!(cmd["id"], "req_3");
     }
 
-    #[test]
-    fn collab_commands_build() {
-        let start = collab_start_command(
-            "c1",
-            Some("wss://relay"),
-            Some("host"),
-            Some("https://collab.example"),
-        );
-        assert_eq!(start["type"], "collab_start");
-        assert_eq!(start["relayUrl"], "wss://relay");
-        assert_eq!(start["displayName"], "host");
-        assert_eq!(start["webUrl"], "https://collab.example");
-
-        let status = collab_status_command("c2");
-        assert_eq!(status["type"], "collab_status");
-
-        let stop = collab_stop_command("c3");
-        assert_eq!(stop["type"], "collab_stop");
-    }
-
     // --- Room state parsing and API projection ----------------------------
-
-    #[test]
-    fn parse_room_state_accepts_camelcase_wire_keys() {
-        let room = serde_json::json!({
-            "active": true,
-            "joinUrl": "relay.example/r/room.key-and-write-token",
-            "viewUrl": "relay.example/r/room.key",
-            "webUrl": "https://collab.example/#relay.example/r/room.key-and-write-token",
-            "webViewUrl": "https://collab.example/#relay.example/r/room.key",
-            "participants": [
-                { "name": "host", "role": "host" },
-                { "name": "alice", "role": "guest", "readOnly": true }
-            ]
-        });
-        let parsed = parse_room_state(&room).unwrap();
-        assert!(parsed.active);
-        assert_eq!(
-            parsed.join_url.as_deref(),
-            Some("relay.example/r/room.key-and-write-token")
-        );
-        assert_eq!(parsed.view_url.as_deref(), Some("relay.example/r/room.key"));
-        assert_eq!(
-            parsed.web_url.as_deref(),
-            Some("https://collab.example/#relay.example/r/room.key-and-write-token")
-        );
-        assert_eq!(parsed.participants.len(), 2);
-        assert_eq!(parsed.participants[1].role, "guest");
-        assert_eq!(parsed.participants[1].read_only, Some(true));
-    }
-
-    #[test]
-    fn parse_room_state_inactive_with_no_participants() {
-        let room = serde_json::json!({ "active": false, "participants": [] });
-        let parsed = parse_room_state(&room).unwrap();
-        assert!(!parsed.active);
-        assert!(parsed.join_url.is_none());
-        assert!(parsed.participants.is_empty());
-    }
-
-    #[test]
-    fn room_state_to_api_uses_snake_case_contract() {
-        let room = OmpCollabRoomState {
-            active: true,
-            join_url: Some("relay.example/r/room.key-and-write-token".to_string()),
-            view_url: Some("relay.example/r/room.key".to_string()),
-            web_url: Some(
-                "https://collab.example/#relay.example/r/room.key-and-write-token".to_string(),
-            ),
-            web_view_url: None,
-            participants: vec![
-                OmpCollabParticipant {
-                    name: "host".to_string(),
-                    role: "host".to_string(),
-                    read_only: None,
-                },
-                OmpCollabParticipant {
-                    name: "alice".to_string(),
-                    role: "guest".to_string(),
-                    read_only: Some(true),
-                },
-            ],
-        };
-        let api = room_state_to_api(&room);
-        assert_eq!(api["active"], true);
-        assert_eq!(api["join_url"], "relay.example/r/room.key-and-write-token");
-        assert_eq!(api["view_url"], "relay.example/r/room.key");
-        assert_eq!(
-            api["web_url"],
-            "https://collab.example/#relay.example/r/room.key-and-write-token"
-        );
-        assert!(api.get("web_view_url").is_none());
-        // snake_case contract: no camelCase keys leak through.
-        assert!(api.get("joinUrl").is_none());
-        assert!(api.get("viewUrl").is_none());
-        assert!(api.get("webUrl").is_none());
-        assert_eq!(api["participants"][0]["name"], "host");
-        assert_eq!(api["participants"][0]["role"], "host");
-        assert!(api["participants"][0].get("read_only").is_none());
-        assert_eq!(api["participants"][1]["read_only"], true);
-    }
-
-    #[test]
-    fn room_state_to_api_inactive_omits_optional_urls() {
-        let room = OmpCollabRoomState {
-            active: false,
-            join_url: None,
-            view_url: None,
-            web_url: None,
-            web_view_url: None,
-            participants: vec![],
-        };
-        let api = room_state_to_api(&room);
-        assert_eq!(api["active"], false);
-        assert!(api.get("join_url").is_none());
-        assert!(api.get("view_url").is_none());
-        assert_eq!(api["participants"].as_array().unwrap().len(), 0);
-    }
-
-    #[test]
-    fn collab_command_deadline_is_strictly_below_api_lifecycle() {
-        assert!(
-            COLLAB_COMMAND_DEADLINE < Duration::from_secs(15),
-            "resident command deadline {:?} must be < API lifecycle 15s",
-            COLLAB_COMMAND_DEADLINE
-        );
-        assert!(
-            COLLAB_COMMAND_DEADLINE >= Duration::from_secs(5),
-            "deadline too aggressive: {:?}",
-            COLLAB_COMMAND_DEADLINE
-        );
-    }
-
-    #[test]
-    fn collab_drive_deadline_kills_child_and_marks_non_reusable() {
-        // Bridge: ready then never answers — hung OMP collab command tail.
-        let bridge =
-            std::env::temp_dir().join(format!("omp-hung-bridge-{}.sh", std::process::id()));
-        std::fs::write(
-            &bridge,
-            r#"#!/bin/sh
-printf '%s\n' '{"type":"ready"}'
-while IFS= read -r _; do
-  sleep 3600
-done
-"#,
-        )
-        .expect("write bridge");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&bridge).unwrap().permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&bridge, perms).unwrap();
-        }
-        let prev = std::env::var_os("CENTAUR_OMP_RPC_BRIDGE_COMMAND");
-        // SAFETY: test-only process-local env override.
-        unsafe {
-            std::env::set_var("CENTAUR_OMP_RPC_BRIDGE_COMMAND", &bridge);
-        }
-        let mut child = OmpRpcChild::spawn().expect("spawn hung bridge");
-        drain_ready(&mut child).expect("ready");
-        let hung_pid = child.process_id();
-        // Poison: a late response that must not be consumed by a replacement.
-        // (Hung bridge never writes it; kill ensures the pipe dies.)
-        let mut out = Vec::new();
-        let admitted = Some(OmpRpcOwnership {
-            owner_id: "owner-a".to_owned(),
-            generation: 1,
-        });
-        let drive = drive_collab_command_within(
-            &mut child,
-            "req-hung",
-            "collab_stop",
-            &mut out,
-            "thread-1",
-            &admitted,
-            std::time::Instant::now() + Duration::from_millis(80),
-        )
-        .expect("deadline path returns Ok");
-        assert!(drive.room.is_none(), "deadline yields no room");
-        assert!(
-            !drive.child_reusable,
-            "deadline must mark child non-reusable so callers respawn"
-        );
-        let line = String::from_utf8_lossy(&out);
-        assert!(
-            line.contains("deadline") || line.contains("error"),
-            "correlated error written: {line}"
-        );
-        assert!(
-            line.contains("owner-a"),
-            "ownership stamped on deadline error: {line}"
-        );
-        // Hung process must be reaped — next control cannot queue behind it.
-        assert!(
-            matches!(child.child.try_wait(), Ok(Some(_))),
-            "hung child pid {hung_pid} must be killed and reaped after deadline"
-        );
-
-        // Replacement child is a new process; old capability/output cannot
-        // poison it (old pid is gone, fresh ready handshake).
-        let mut child2 = OmpRpcChild::spawn().expect("spawn replacement");
-        drain_ready(&mut child2).expect("replacement ready");
-        let new_pid = child2.process_id();
-        assert_ne!(new_pid, hung_pid, "replacement must be a new OS process");
-        // Immediate next command on the new child must not hang behind the
-        // old queue: hang bridge still never answers, but we only prove
-        // process replacement + dead old pid here; production callers drop
-        // the non-reusable child before the next input.
-        drop(child);
-        drop(child2);
-        let _ = std::fs::remove_file(&bridge);
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("CENTAUR_OMP_RPC_BRIDGE_COMMAND", v),
-                None => std::env::remove_var("CENTAUR_OMP_RPC_BRIDGE_COMMAND"),
-            }
-        }
-    }
-
-    #[test]
-    fn collab_drive_success_keeps_child_reusable() {
-        let ok = CollabDriveResult {
-            room: Some(json!({"active": true})),
-            child_reusable: true,
-        };
-        assert!(ok.child_reusable);
-        assert!(ok.room.is_some());
-        let deadline = CollabDriveResult {
-            room: None,
-            child_reusable: false,
-        };
-        assert!(!deadline.child_reusable);
-    }
 
     #[test]
     fn configured_max_duration_extends_the_omp_turn_deadline() {
@@ -2686,6 +1691,90 @@ done
                 Some(v) => std::env::set_var("CENTAUR_OMP_RPC_BRIDGE_COMMAND", v),
                 None => std::env::remove_var("CENTAUR_OMP_RPC_BRIDGE_COMMAND"),
             }
+        }
+    }
+
+    // --- Slash commands -----------------------------------------------------
+
+    #[test]
+    fn slash_command_parses_bare_word_names_only() {
+        assert_eq!(
+            parse_slash_command("/context"),
+            Some(SlashCommand {
+                name: "context",
+                first_arg: ""
+            })
+        );
+        assert_eq!(
+            parse_slash_command("  /usage reset now"),
+            Some(SlashCommand {
+                name: "usage",
+                first_arg: "reset"
+            })
+        );
+        assert_eq!(
+            parse_slash_command("/model:litellm/glm"),
+            Some(SlashCommand {
+                name: "model",
+                first_arg: "litellm/glm"
+            })
+        );
+        assert_eq!(parse_slash_command("/etc/hosts is empty"), None);
+        assert_eq!(parse_slash_command("/ context"), None);
+        assert_eq!(parse_slash_command("/2fast"), None);
+        assert_eq!(parse_slash_command("look at /context"), None);
+    }
+
+    #[test]
+    fn slash_command_allowlist_admits_session_scoped_commands_only() {
+        let allowed = |text: &str| slash_command_allowed(&parse_slash_command(text).unwrap());
+        assert!(allowed("/context"));
+        assert!(allowed("/compact safe"));
+        assert!(allowed("/model litellm/glm-5.2-fp8"));
+        assert!(allowed("/mcp list"));
+        assert!(allowed("/session"));
+        assert!(allowed("/Usage show"));
+        assert!(!allowed("/share"));
+        assert!(!allowed("/mcp add foo"));
+        assert!(!allowed("/session delete"));
+        assert!(!allowed("/usage reset"));
+        assert!(!allowed("/browser"));
+        assert!(!allowed("/rename x"));
+        assert!(!allowed("/move /tmp"));
+        assert!(!allowed("/new"));
+    }
+
+    #[test]
+    fn slash_command_rejection_names_the_alternatives() {
+        let unknown = slash_command_rejection(&parse_slash_command("/share").unwrap());
+        assert!(unknown.starts_with("`/share` is not available through Centaur"));
+        assert!(unknown.contains("`/context`") && unknown.contains("`/compact`"));
+        assert!(!unknown.contains("`/share`,"));
+
+        let subcommand = slash_command_rejection(&parse_slash_command("/mcp add foo").unwrap());
+        assert!(subcommand.starts_with("`/mcp add` is not available through Centaur"));
+        assert!(subcommand.contains("`/mcp list`") && subcommand.contains("`/mcp test`"));
+    }
+
+    #[test]
+    fn strip_ansi_removes_csi_and_osc_sequences() {
+        assert_eq!(
+            strip_ansi(
+                "\u{1b}[1mContext\u{1b}[0m: 12k \u{1b}]8;;https://x\u{7}link\u{1b}]8;;\u{7}"
+            ),
+            "Context: 12k link"
+        );
+        assert_eq!(strip_ansi("plain"), "plain");
+    }
+
+    #[test]
+    fn command_output_frames_are_demultiplexed() {
+        let frame =
+            OmpRpcFrame::parse_json_line(r#"{"type":"command_output","text":"Context: 12k"}"#)
+                .unwrap();
+        match frame {
+            OmpRpcFrame::CommandOutput { text } => assert_eq!(text, "Context: 12k"),
+            other => panic!("expected CommandOutput, got {other:?}"),
         }
     }
 }

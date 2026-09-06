@@ -55,7 +55,6 @@ RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
     httplib2>=0.20.0 \
     httpx>=0.28.0 \
     "openai>=2.53.0" \
-    opentelemetry-proto==1.42.1 \
     "psycopg[binary]>=3.2.0" \
     "githubkit>=0.16.1" \
     pysocks>=1.7.1 \
@@ -95,15 +94,6 @@ ARG CODEX_VERSION=0.153.2
 ARG HERMES_AGENT_REF=e5e2fb8b2dbe1cae85aa5ad6ce45aef376016e43
 ARG PI_CODING_AGENT_VERSION=0.67.2
 ARG OMP_VERSION=17.0.5
-# Immutable fork release of @oh-my-pi/pi-coding-agent carrying native RPC
-# collaboration controls (collab_start/status/stop) on top of upstream v17.0.5.
-# Published at czxtm/oh-my-pi (fork of can1357/oh-my-pi); the upstream PR was
-# auto-closed because @czxtm is not vouched, so the sandbox pins the fork
-# release asset directly with SHA-256 verification rather than the npm registry.
-ARG OMP_RELEASE_TAG=v17.0.5-centaur.1
-ARG OMP_RELEASE_ASSET=https://github.com/czxtm/oh-my-pi/releases/download/${OMP_RELEASE_TAG}/oh-my-pi-pi-coding-agent-17.0.5.tgz
-ARG OMP_RELEASE_SHA256=8e19613db2b1427d22c8d661ccf9c6bc259c2426ea7c0485e340a4508f23136a
-ARG OMP_SOURCE_COMMIT=e88f1a8da324de76d3932b0c9a8141b6f32f0b2d
 ARG NUSHELL_VERSION=0.112.2
 ARG KUBECTL_VERSION=v1.34.2
 ARG KACHE_VERSION=v0.7.0
@@ -162,25 +152,13 @@ RUN --mount=type=cache,target=/root/.npm,sharing=locked \
       "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
       "@openai/codex@${CODEX_VERSION}" \
       "@mariozechner/pi-coding-agent@${PI_CODING_AGENT_VERSION}" \
+      "@oh-my-pi/pi-coding-agent@${OMP_VERSION}" \
       "pnpm@${PNPM_VERSION}" \
       agent-browser@0.26.0 \
     && find /usr/lib/node_modules -type f \( -name '*.map' -o -name '*.tsbuildinfo' \) -delete \
     && claude --version | grep -F "${CLAUDE_CODE_VERSION}" \
     && codex --version | grep -F "${CODEX_VERSION}" \
     && pnpm --version | grep -F "${PNPM_VERSION}"
-
-# ── omp: immutable fork release asset (checksum-verified) ───────────────────
-# Downloads the czxtm/oh-my-pi fork release tarball, verifies its SHA-256
-# against the pinned digest, and installs it globally from the local file.
-# This pins an exact immutable artifact (not a mutable npm registry version)
-# carrying the native RPC collaboration controls on top of upstream v17.0.5.
-RUN --mount=type=cache,target=/root/.npm,sharing=locked \
-    set -eux; \
-    curl -fsSL "${OMP_RELEASE_ASSET}" -o /tmp/omp-fork.tgz; \
-    echo "${OMP_RELEASE_SHA256}  /tmp/omp-fork.tgz" | sha256sum -c -; \
-    npm install -g --prefer-online --force /tmp/omp-fork.tgz; \
-    rm -f /tmp/omp-fork.tgz; \
-    find /usr/lib/node_modules/@oh-my-pi/pi-coding-agent -type f \( -name '*.map' -o -name '*.tsbuildinfo' \) -delete
 
 # ── Hermes Agent (own venv; exposes `hermes` + the tui_gateway module) ───────
 # The hermes harness drives `python -m tui_gateway.entry` (see
@@ -247,6 +225,8 @@ RUN --mount=type=cache,target=/home/agent/.cargo/registry,uid=1001,gid=1001,shar
     && kache --version
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 RUN curl -fsSL https://bun.sh/install | bash -s "${BUN_VERSION}"
+# omp's npm bin shim runs under bun (shebang), so it can only be verified once
+# bun is on PATH — not in the root npm install layer above.
 RUN omp --version | grep -F "${OMP_VERSION}"
 RUN --mount=type=cache,target=/home/agent/.cache/uv,uid=1001,gid=1001,sharing=locked \
     uv tool install "manim==${MANIM_VERSION}" \
@@ -306,24 +286,6 @@ FROM toolchain AS sandbox
 
 USER root
 RUN rm -f /etc/sudoers.d/agent
-# The fork release's npm bin points at src/cli.ts, whose filesystem fallback
-# cannot see the repository docs directory omitted from the release tarball.
-# Run the prepacked bundle so omp:// resolves its embedded documentation index.
-RUN set -eux; \
-    omp_bundle=/usr/lib/node_modules/@oh-my-pi/pi-coding-agent/dist/cli.js; \
-    test -f "$omp_bundle"; \
-    grep -Fq '"session-operations-export-share-fork-resume.md"' "$omp_bundle"; \
-    grep -Fq 'collab_start' "$omp_bundle"; \
-    ln -sf "$omp_bundle" /usr/bin/omp; \
-    test "$(readlink -f "$(command -v omp)")" = "$omp_bundle"; \
-    omp --version | grep -F "${OMP_VERSION}"; \
-    omp read omp:// >/tmp/omp-docs-index.md; \
-    omp read omp://session-operations-export-share-fork-resume.md >/tmp/omp-export-doc.md; \
-    omp read omp://user-facing-packages.md >/tmp/omp-packages-doc.md; \
-    grep -Fq '# Documentation' /tmp/omp-docs-index.md; \
-    grep -Fq '# Session Operations:' /tmp/omp-export-doc.md; \
-    grep -Fq '# User-Facing Packages' /tmp/omp-packages-doc.md; \
-    rm -f /tmp/omp-docs-index.md /tmp/omp-export-doc.md /tmp/omp-packages-doc.md
 # BuildKit's COPY --link creates parent directories without an explicit mode,
 # which can leave /etc/centaur without the execute bit for non-root users.
 # Pre-create it as 0755 so the agent user can traverse into it at runtime.

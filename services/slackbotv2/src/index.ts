@@ -51,9 +51,6 @@ import {
   serializeMessageLinks,
   serializeMessage,
   sessionStreamError,
-  startCollabRoom,
-  statusCollabRoom,
-  stopCollabRoom,
   slackApiTimeoutMs,
   withSlackApiTimeout
 } from './session-api'
@@ -80,7 +77,6 @@ import {
 } from './slack-events'
 import { isSlackStopCommand } from './stop-command'
 import { exportLinkForThread, isSlackExportCommand } from './export-command'
-import { hasMalformedCollabArgs, parseCollabCommand, renderCollabJoinCommand } from './collab-command'
 import {
   createSteeringReactionController,
   type SteeringReactionAck,
@@ -554,7 +550,7 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
   return { app, chat }
 }
 
-export async function handleSlackMessageHandoff(
+async function handleSlackMessageHandoff(
   thread: Thread<SlackbotV2ThreadState>,
   message: ChatMessage,
   input: {
@@ -562,7 +558,7 @@ export async function handleSlackMessageHandoff(
     mode: SlackbotV2MessageMode
     options: SlackbotV2Options
     state: StateAdapter
-    steeringReactions?: SteeringReactionController
+    steeringReactions: SteeringReactionController
     subscribe?: boolean
     trigger: string
   }
@@ -573,29 +569,27 @@ export async function handleSlackMessageHandoff(
     subscribe: input.subscribe === true,
     trigger: input.trigger
   })
-  // Assistant status is thread-wide. A mentioned follow-up that steers an
-  // active execution must not clear or replace the status owned by that run.
-  const assistantStatusRequested =
-    input.assistantStatusRequested && ((await thread.state)?.activeExecution !== true)
   let initialAssistantStatusVisible = false
-  const assistantStatus = assistantStatusRequested
-    ? setInitialAssistantStatus(thread, input.options, trace).then(visible => {
-        initialAssistantStatusVisible = visible
-        return visible
-      })
-    : Promise.resolve(false)
-  if (assistantStatusRequested) {
-    backgroundWaitUntil(assistantStatus.then(() => undefined).catch(() => undefined))
-  }
+  let assistantStatus = Promise.resolve(false)
   try {
     if (await handleStopCommand(thread, message, input.options, input.trigger)) {
       return
     }
-    if (await handleCollabCommand(thread, message, input.options, input.trigger)) {
-      return
-    }
     if (await handleExportCommand(thread, message, input.options, input.trigger)) {
       return
+    }
+    // Assistant status is thread-wide. A mentioned follow-up that steers an
+    // active execution must not clear or replace the status owned by that run.
+    const assistantStatusRequested =
+      input.assistantStatusRequested && ((await thread.state)?.activeExecution !== true)
+    assistantStatus = assistantStatusRequested
+      ? setInitialAssistantStatus(thread, input.options, trace).then(visible => {
+          initialAssistantStatusVisible = visible
+          return visible
+        })
+      : Promise.resolve(false)
+    if (assistantStatusRequested) {
+      backgroundWaitUntil(assistantStatus.then(() => undefined).catch(() => undefined))
     }
     if (input.subscribe) {
       await subscribeSlackThreadForHandoff(thread, input.options, trace, input.trigger)
@@ -612,7 +606,7 @@ export async function handleSlackMessageHandoff(
       mode: input.mode,
       options: input.options,
       state: input.state,
-      steeringReactions: input.steeringReactions ?? createSteeringReactionController(input.options)
+      steeringReactions: input.steeringReactions
     })
     traceLog(input.options, 'slackbotv2_handoff_complete', trace, {
       trigger: input.trigger
@@ -666,95 +660,6 @@ async function handleStopCommand(
       trigger
     })
     throw error
-  }
-}
-
-/**
- * Thin Slack-side interception for the `/collab` command family. Starts or
- * reuses the session's native OMP room, queries its status, or closes it —
- * without appending a normal agent turn. The capability URL (`join_url`) comes
- * straight from the resident OMP host via api-rs; ingress never spawns OMP or
- * synthesises the tailnet relay prefix. Exactly one copyable shell command is
- * posted for start: `omp join '<join_url>'` with POSIX single-quote escaping.
- */
-export async function handleCollabCommand(
-  thread: Thread<SlackbotV2ThreadState>,
-  message: ChatMessage,
-  options: SlackbotV2Options,
-  trigger: string
-): Promise<boolean> {
-  const parsed = parseCollabCommand(message)
-  if (!parsed) return false
-  const trace = createHandoffTrace(thread, message, 'append')
-  traceLog(options, 'slackbotv2_collab_command_started', trace, {
-    subcommand: parsed.subcommand,
-    trigger
-  })
-  // Clear any initial "Thinking…" status set by the handoff before this
-  // command was recognised. Like the stop command, /collab short-circuits
-  // without an agent turn — leaving the thinking indicator up would hang.
-  await setAssistantStatus(thread, '', options, trace)
-  try {
-    if (hasMalformedCollabArgs(parsed)) {
-      await thread.post(
-        `Unknown /collab arguments: \`${parsed.args.join(' ')}\`. `
-        + 'Usage: `/collab` (start), `/collab status`, or `/collab stop`.'
-      )
-      return true
-    }
-    if (parsed.subcommand === 'start') {
-      const response = await startCollabRoom(options, thread.id)
-      const joinUrl = response.room?.join_url
-      if (!joinUrl) {
-        await thread.post('Collaboration room started but no join URL was returned.')
-      } else {
-        await thread.post(renderCollabJoinCommand(joinUrl))
-      }
-      traceLog(options, 'slackbotv2_collab_command_complete', trace, {
-        active: response.room?.active,
-        subcommand: 'start',
-        trigger
-      })
-      return true
-    }
-    if (parsed.subcommand === 'status') {
-      const response = await statusCollabRoom(options, thread.id)
-      if (!response.room || !response.room.active) {
-        await thread.post('No active collaboration room.')
-      } else if (response.room.join_url) {
-        await thread.post(renderCollabJoinCommand(response.room.join_url))
-      } else {
-        await thread.post('Collaboration room is active but no join URL is available.')
-      }
-      traceLog(options, 'slackbotv2_collab_command_complete', trace, {
-        active: response.room?.active,
-        subcommand: 'status',
-        trigger
-      })
-      return true
-    }
-    // subcommand === 'stop'
-    const response = await stopCollabRoom(options, thread.id)
-    await thread.post(
-      response.stopped
-        ? 'Collaboration room closed.'
-        : 'No active collaboration room to close.'
-    )
-    traceLog(options, 'slackbotv2_collab_command_complete', trace, {
-      stopped: response.stopped,
-      subcommand: 'stop',
-      trigger
-    })
-    return true
-  } catch (error) {
-    const detail = errorMessage(error)
-    await thread.post(`Collaboration command failed: ${detail}`)
-    traceWarn(options, 'slackbotv2_collab_command_failed', trace, {
-      error: detail,
-      subcommand: parsed.subcommand,
-      trigger
-    })
-    return true
   }
 }
 

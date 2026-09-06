@@ -328,6 +328,7 @@ class AttioClient:
             if len(page) < page_size:
                 return notes
             offset += page_size
+
     def upload_file(
         self,
         object_slug: str,

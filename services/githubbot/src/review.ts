@@ -158,7 +158,6 @@ export function handleReviewRequest(
       contextPreamble: options.reviewPrompt ?? DEFAULT_REVIEW_PROMPT,
       conversationName: `${owner}/${repo}#${number}: ${title}`,
       executeMessage: reviewTriggerMessage({
-        deliveryId: input.deliveryId,
         headSha,
         number,
         owner,
@@ -263,7 +262,6 @@ async function isBotOnTeam(
  * commit re-executes (the session idempotency key dedupes the same commit).
  */
 function reviewTriggerMessage(input: {
-  deliveryId: string;
   headSha: string;
   number: number;
   owner: string;
@@ -288,11 +286,7 @@ function reviewTriggerMessage(input: {
       userId: "github-review",
       userName: "github-review",
     },
-    // Delivery-keyed, not head-keyed: a re-request of the same head is a
-    // NEW delivery and must run — like a human reviewer asked again. The
-    // delivery-level dedup (review-delivery:<thread>:<deliveryId>) already
-    // absorbs webhook redeliveries.
-    id: `review-${input.threadKey}-${input.deliveryId}`,
+    id: `review-${input.threadKey}-${input.headSha}`,
     isMention: true,
     raw: { githubbotReviewRequest: true, url: input.url },
     text,

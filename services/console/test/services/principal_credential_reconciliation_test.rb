@@ -298,7 +298,6 @@ class PrincipalCredentialReconciliationTest < ActiveSupport::TestCase
   test "console user creation grants but does not sync malformed Slack credential identity" do
     credential = create_credential(oauth_apps(:acme_slack), "U12345", "member@acme.example")
     credential.update!(labels: { "slack_team_id" => "T0123456789" })
-
     secret = wrap(credential)
 
     principal = create_console_user_principal(
@@ -745,7 +744,6 @@ class PrincipalCredentialReconciliationTest < ActiveSupport::TestCase
       name: user.name.presence || user.email,
       kind: "console_user",
       console_user_id: user.id,
-
       labels: {
         "managed-by" => "centaur"
       }.merge(extra_labels),

@@ -72,13 +72,11 @@ class PrincipalTest < ActiveSupport::TestCase
     principal = Principal.create!(default_attrs(
       kind: "console_user",
       console_user_id: user.id,
-
       labels: { "managed-by" => "centaur" }
     ))
 
     principal.reload
     assert_equal user.id, principal.console_user_id
-
     assert_empty principal.labels.slice("console-user-id", "email")
     assert_nil principal.labels_with_sandbox_capabilities["console-user-id"]
     assert_nil principal.labels_with_sandbox_capabilities["email"]
@@ -520,6 +518,7 @@ class PrincipalTest < ActiveSupport::TestCase
 
     assert_equal previous_version + 1, principal.reload.sync_config_cache_version
   end
+
   test "declares prn as its oid prefix" do
     assert_equal "prn", Principal.oid_prefix
   end

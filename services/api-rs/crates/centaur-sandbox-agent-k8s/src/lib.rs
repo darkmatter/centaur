@@ -40,7 +40,6 @@ const DEFAULT_CONTAINER_NAME: &str = "agent";
 const MANAGED_BY_LABEL: &str = "centaur.ai/managed-by";
 const SANDBOX_ID_LABEL: &str = "centaur.ai/sandbox-id";
 const OBSERVABILITY_ENABLED_LABEL: &str = "centaur.ai/observability-enabled";
-const API_SERVER_ENABLED_LABEL: &str = "centaur.ai/api-server-enabled";
 const MANAGED_BY_VALUE: &str = "api-rs";
 const SANDBOX_FILES_VOLUME: &str = "sandbox-files";
 // iron-control principal OID the sandbox's proxy binds to, stamped at create
@@ -151,11 +150,6 @@ impl AgentSandboxConfig {
             otlp_egress: None,
             ready_timeout: Duration::from_secs(60),
         }
-    }
-
-    pub fn runtime_class_name(mut self, runtime_class_name: impl Into<String>) -> Self {
-        self.runtime_class_name = Some(runtime_class_name.into());
-        self
     }
 
     pub fn state_volume(mut self, state_volume: StateVolumeConfig) -> Self {
@@ -758,10 +752,8 @@ impl SandboxBackend for AgentSandboxBackend {
         // sandbox's own recorded env (the durable source of truth `resolve_
         // iron_proxy_for_resume` already reads for the same purpose) and
         // reassert them on both the Sandbox and its pod template, so the
-        // recreated agent pod keeps the labels the create path applied —
-        // otherwise it loses `centaur.ai/api-server-enabled` /
-        // `observability-enabled` and the chart's NetworkPolicy stops
-        // routing its model-proxy egress.
+        // recreated agent pod keeps the observability label the create path
+        // applied.
         let capability_labels = sandbox
             .as_ref()
             .map(|sandbox| {
@@ -827,16 +819,6 @@ fn sandbox_capability_labels(
             sandbox.metadata.labels.as_ref(),
             OBSERVABILITY_ENABLED_LABEL,
             "observability",
-            sandbox_id,
-        ),
-    );
-    labels.insert(
-        API_SERVER_ENABLED_LABEL,
-        iron_proxy::resolve_resume_capability(
-            iron_proxy::sandbox_api_server_enabled(sandbox, container_name),
-            sandbox.metadata.labels.as_ref(),
-            API_SERVER_ENABLED_LABEL,
-            "api_server",
             sandbox_id,
         ),
     );
@@ -1081,11 +1063,6 @@ fn build_agent_sandbox(
         "automountServiceAccountToken": false,
         "enableServiceLinks": false,
     });
-    insert_optional(
-        &mut pod_spec,
-        "runtimeClassName",
-        config.runtime_class_name.clone(),
-    );
     if repo_cache_tools.is_some() {
         pod_spec["securityContext"] = tools::pod_security_context_json();
     }
@@ -1419,7 +1396,6 @@ mod tests {
                     .limit("example.com/gpu", "1"),
             );
         let config = AgentSandboxConfig::new("centaur", test_iron_control_settings())
-            .runtime_class_name("voytravel")
             .state_volume(StateVolumeConfig::new("/home/agent/state", "10Gi"));
 
         let sandbox = build_agent_sandbox(&SandboxId::new("asbx-test"), &spec, &config).unwrap();
@@ -1438,10 +1414,6 @@ mod tests {
         assert_eq!(
             sandbox.spec.pod_template.spec.enable_service_links,
             Some(false)
-        );
-        assert_eq!(
-            sandbox.spec.pod_template.spec.runtime_class_name.as_deref(),
-            Some("voytravel")
         );
         assert_eq!(container.image.as_deref(), Some("centaur-agent:latest"));
         assert_eq!(container.stdin, Some(true));
@@ -1728,21 +1700,10 @@ mod tests {
     }
 
     #[test]
-    fn omits_runtime_class_when_unconfigured() {
-        let spec = SandboxSpec::new("centaur-agent:latest");
-        let config = AgentSandboxConfig::new("centaur", test_iron_control_settings());
-
-        let sandbox = build_agent_sandbox(&SandboxId::new("asbx-test"), &spec, &config).unwrap();
-
-        assert!(sandbox.spec.pod_template.spec.runtime_class_name.is_none());
-    }
-
-    #[test]
     fn labels_observability_enabled_sandboxes_for_chart_policy() {
         let spec = SandboxSpec::new("centaur-agent:latest").capabilities(SandboxCapabilities {
             repo_cache: RepoCacheAccess::All,
             observability_enabled: true,
-            api_server_enabled: true,
         });
         let config = AgentSandboxConfig::new("centaur", test_iron_control_settings());
 
@@ -1775,7 +1736,6 @@ mod tests {
         let spec = SandboxSpec::new("centaur-agent:latest").capabilities(SandboxCapabilities {
             repo_cache: RepoCacheAccess::All,
             observability_enabled: false,
-            api_server_enabled: false,
         });
         let config = AgentSandboxConfig::new("centaur", test_iron_control_settings());
 
@@ -1816,7 +1776,6 @@ mod tests {
             .capabilities(SandboxCapabilities {
                 repo_cache: RepoCacheAccess::All,
                 observability_enabled: true,
-                api_server_enabled: true,
             })
             .env("CENTAUR_SANDBOX_OBSERVABILITY_ENABLED", "true");
         let config = AgentSandboxConfig::new("centaur", test_iron_control_settings());
@@ -1860,7 +1819,6 @@ mod tests {
         let spec = SandboxSpec::new("centaur-agent:latest").capabilities(SandboxCapabilities {
             repo_cache: RepoCacheAccess::All,
             observability_enabled: false,
-            api_server_enabled: false,
         });
         let config = AgentSandboxConfig::new("centaur", test_iron_control_settings());
         let sandbox = build_agent_sandbox(&SandboxId::new("asbx-test"), &spec, &config).unwrap();
@@ -1934,7 +1892,6 @@ mod tests {
         let spec = SandboxSpec::new("centaur-agent:latest").capabilities(SandboxCapabilities {
             repo_cache: RepoCacheAccess::None,
             observability_enabled: true,
-            api_server_enabled: true,
         });
         let mut tools = ToolsConfig::new("paradigmxyz/centaur", "api:test");
         tools.repo_cache_path = Some("/var/lib/centaur/repos".to_owned());

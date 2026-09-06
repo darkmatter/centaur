@@ -83,6 +83,7 @@ module Api
 
           render json: { data: editor_management_payload(skill) }
         end
+
         private
 
         def require_authoring_user!
@@ -117,6 +118,7 @@ module Api
         def editable_skill
           Skill.editable_by(authoring_user).find_by_oid!(params[:id])
         end
+
         def skill_params
           submitted = params.require(:data).permit(:name, :description, :instructions, :lock_version)
           submitted[:content] = submitted.delete(:instructions) if submitted.key?(:instructions)
@@ -150,6 +152,7 @@ module Api
 
           scope.find_by!(email: reference.downcase)
         end
+
         def limit
           value = Integer(params.fetch(:limit, 10).to_s, 10)
           value.clamp(1, MAX_LIMIT)

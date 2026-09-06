@@ -25,8 +25,7 @@ codex-utils-absolute-path = { git = "https://github.com/openai/codex", rev = "e9
 # provider's per-image caps (Bedrock/mantle rejects images past ~5 MB / 8000 px).
 # Scoped to the formats chat clients actually paste to keep the build lean.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
-# The next revision raises its MSRV to unreleased Rust 1.97.
-nanocodex = { git = "https://github.com/gakonst/nanocodex", rev = "6c7ea78cf41b262e7c70c95a1eb742f04e4b00a6" }
+nanocodex = { git = "https://github.com/gakonst/nanocodex", rev = "bf022728c6d36501bdb1c380c7092743db3d5dae" }
 opentelemetry = "0.32.0"
 opentelemetry-otlp = { version = "0.32.0", default-features = false, features = ["http-proto", "reqwest-blocking-client", "trace"] }
 opentelemetry_sdk = { version = "0.32.1", features = ["testing", "trace"] }

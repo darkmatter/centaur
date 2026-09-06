@@ -417,7 +417,6 @@ pub struct SandboxCapabilities {
     #[serde(default)]
     pub repo_cache: SandboxRepoCacheAccess,
     pub observability_enabled: bool,
-    pub api_server_enabled: bool,
 }
 
 impl SandboxCapabilities {
@@ -425,14 +424,11 @@ impl SandboxCapabilities {
         Self {
             repo_cache: SandboxRepoCacheAccess::All,
             observability_enabled: true,
-            api_server_enabled: true,
         }
     }
 
     pub const fn is_default_enabled(&self) -> bool {
-        matches!(self.repo_cache, SandboxRepoCacheAccess::All)
-            && self.observability_enabled
-            && self.api_server_enabled
+        matches!(self.repo_cache, SandboxRepoCacheAccess::All) && self.observability_enabled
     }
 
     pub const fn repo_cache_enabled(&self) -> bool {
@@ -544,62 +540,6 @@ pub struct SessionEvent {
 
 pub fn empty_object() -> Value {
     Value::Object(serde_json::Map::new())
-}
-/// A participant in a collaboration room, projected from the OMP
-/// `CollabParticipant` wire type.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct CollabParticipant {
-    pub name: String,
-    pub role: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub read_only: Option<bool>,
-}
-
-/// Durable projection of the OMP `RpcCollabRoomState`. This is the
-/// control-plane view of a native collaboration room: whether it is active,
-/// the capability/join URL guests use, and the current participant roster.
-/// Serialized as JSON in `session_events` payloads and returned by the
-/// collab control endpoints. Field names are snake_case to match api-rs
-/// JSON conventions; the OMP wire type's camelCase is normalized at the
-/// harness-server boundary.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub struct CollabRoomState {
-    pub active: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub join_url: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub view_url: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub web_url: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub web_view_url: Option<String>,
-    #[serde(default)]
-    pub participants: Vec<CollabParticipant>,
-}
-
-/// Input for starting a collaboration room on a session.
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
-pub struct CollabStartInput {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub relay_url: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub web_url: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub display_name: Option<String>,
-}
-
-/// Input for stopping a collaboration room on a session.
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
-pub struct CollabStopInput {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reason: Option<String>,
-}
-#[derive(Clone, Debug, Serialize)]
-pub struct CollabRoomOutcome {
-    pub ok: bool,
-    pub thread_key: ThreadKey,
-    pub room: Option<CollabRoomState>,
-    pub stopped: bool,
 }
 
 #[cfg(test)]

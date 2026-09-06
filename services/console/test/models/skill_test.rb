@@ -102,6 +102,7 @@ class SkillTest < ActiveSupport::TestCase
     assert_not assignment.valid?
     assert_includes assignment.errors[:user], "is already the skill owner"
   end
+
   test "search boosts names over descriptions and instructions" do
     name_match = users(:member_user).skills.create!(
       attributes(name: "deploy-runbook").merge(description: "Check release readiness.", content: "# Steps\n\nReview the checklist.")

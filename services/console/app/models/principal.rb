@@ -55,7 +55,6 @@ class Principal < ApplicationRecord
   validates :slack_email, format: { with: URI::MailTo::EMAIL_REGEXP, message: "is not a valid email address" },
                           allow_nil: true, if: :will_save_change_to_slack_email?
 
-
   # Stand-in for an inline secret value in redacted config: operator inspection
   # reports that a control_plane source carries a value without revealing it.
   REDACTED = "[redacted]".freeze
@@ -265,6 +264,7 @@ class Principal < ApplicationRecord
   def enqueue_slack_channel_catalog_refresh
     SlackChannelCatalogMembershipRefreshJob.perform_later(slack_channel_id)
   end
+
   def roles_blank_for_defaulting?
     association(:roles).target.empty? && !roles.exists?
   end

@@ -1977,18 +1977,6 @@ pub(crate) fn sandbox_observability_enabled(
     .and_then(|value| value.parse().ok())
 }
 
-pub(crate) fn sandbox_api_server_enabled(
-    sandbox: &crate::crd::Sandbox,
-    container_name: &str,
-) -> Option<bool> {
-    sandbox_env_value(
-        sandbox,
-        "CENTAUR_SANDBOX_API_SERVER_ENABLED",
-        container_name,
-    )
-    .and_then(|value| value.parse().ok())
-}
-
 /// Prefer a present, parseable capability env. When env is missing/invalid,
 /// fall back to the sandbox CR label (`"true"` => enabled; absent => disabled).
 /// Never default missing state to enabled (fail closed).
@@ -2351,7 +2339,6 @@ fn unique_suffix() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::API_SERVER_ENABLED_LABEL;
 
     fn no_scheduling() -> ProxyPodScheduling<'static> {
         static EMPTY_SELECTOR: BTreeMap<String, String> = BTreeMap::new();
@@ -2826,7 +2813,6 @@ mod tests {
     fn resume_capability_prefers_valid_env_and_fails_closed_without_it() {
         let mut labels = BTreeMap::new();
         labels.insert(OBSERVABILITY_ENABLED_LABEL.to_owned(), "true".to_owned());
-        labels.insert(API_SERVER_ENABLED_LABEL.to_owned(), "true".to_owned());
 
         assert!(resolve_resume_capability(
             Some(true),
@@ -2854,27 +2840,6 @@ mod tests {
             Some(&BTreeMap::new()),
             OBSERVABILITY_ENABLED_LABEL,
             "observability",
-            "asbx-test",
-        ));
-        assert!(!resolve_resume_capability(
-            None,
-            None,
-            API_SERVER_ENABLED_LABEL,
-            "api_server",
-            "asbx-test",
-        ));
-        assert!(!resolve_resume_capability(
-            Some(false),
-            None,
-            API_SERVER_ENABLED_LABEL,
-            "api_server",
-            "asbx-test",
-        ));
-        assert!(resolve_resume_capability(
-            Some(true),
-            None,
-            API_SERVER_ENABLED_LABEL,
-            "api_server",
             "asbx-test",
         ));
     }

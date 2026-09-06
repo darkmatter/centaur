@@ -78,6 +78,7 @@ class Skill < ApplicationRecord
   def editable_by?(candidate)
     candidate && (user_id == candidate.id || editors.exists?(candidate.id))
   end
+
   def unshare!
     update!(visibility: :private, shared_at: nil)
   end

@@ -258,6 +258,7 @@ class PrincipalCredentialReconciliation
       return (credentials_for_console_user(principal, provider, console_user_index) +
         credentials_for_emails(principal, emails, email_index, provider)).uniq
     end
+
     native = credentials_for_subject_labels(principal, provider, subject_index)
     return native if native.any?
 

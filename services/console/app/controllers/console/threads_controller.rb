@@ -120,14 +120,35 @@ class Console::ThreadsController < ApplicationController
   MODEL_EFFORT_OVERRIDES = {
     [ "claude-opus-5", "fast" ] => "claude-opus-5-fast"
   }.freeze
+  # omp thinking levels (crates/harness-server/src/omp_rpc.rs OMP_THINKING_LEVELS);
+  # the pick rides the model selector as `provider/model:level`.
+  OMP_EFFORTS = [
+    %w[low Low],
+    %w[medium Medium],
+    %w[high High],
+    [ "xhigh", "Extra High" ],
+    %w[max Max]
+  ].freeze
   # First entry doubles as the default pick (unless the deploy's default-model
   # resolution for its harness names another listed model). Operator-configured
   # Codex providers are appended by .composer_agents at runtime. GLM-5.2 is the
   # self-hosted gateway model this deployment runs everywhere else, kept first
-  # so it remains the default pick.
+  # so it remains the default pick. The subscription entries also run on omp
+  # but resolve credentials through the omp auth broker (family B of the
+  # agent@drkmttr.dev ChatGPT and Claude subscriptions) via omp's native
+  # `openai-codex` and `anthropic` providers; the ids are ones omp 17.0.5
+  # resolves for those providers (the overlay's model roles use the same refs).
   BASE_COMPOSER_AGENTS = [
     ComposerAgent.new(value: "glm-5.2", label: "GLM-5.2",
                       harness: "omp", model: "litellm/glm-5.2-fp8", efforts: []),
+    ComposerAgent.new(value: "omp-gpt-5.6-sol", label: "GPT-5.6 Sol (Codex subscription)",
+                      harness: "omp", model: "openai-codex/gpt-5.6-sol", efforts: OMP_EFFORTS),
+    ComposerAgent.new(value: "omp-gpt-5.6-luna", label: "GPT-5.6 Luna (Codex subscription)",
+                      harness: "omp", model: "openai-codex/gpt-5.6-luna", efforts: OMP_EFFORTS),
+    ComposerAgent.new(value: "omp-claude-fable-5", label: "Claude Fable 5 (Claude subscription)",
+                      harness: "omp", model: "anthropic/claude-fable-5", efforts: OMP_EFFORTS),
+    ComposerAgent.new(value: "omp-claude-sonnet-5", label: "Claude Sonnet 5 (Claude subscription)",
+                      harness: "omp", model: "anthropic/claude-sonnet-5", efforts: OMP_EFFORTS),
     ComposerAgent.new(value: "gpt-5.6-sol", label: "GPT-5.6 Sol",
                       harness: "codex", model: "gpt-5.6-sol",
                       efforts: CODEX_EFFORTS + [ %w[max Max] ]),
@@ -376,6 +397,10 @@ class Console::ThreadsController < ApplicationController
   end
 
   def composer_model_for(agent, effort)
+    # omp takes the thinking level as a selector suffix (`provider/model:level`),
+    # which is what the resident host's set_thinking_level runs on.
+    return "#{agent.model}:#{effort}" if agent.harness == "omp" && effort.present?
+
     MODEL_EFFORT_OVERRIDES.fetch([ agent.model, effort ], agent.model)
   end
 
@@ -399,8 +424,9 @@ class Console::ThreadsController < ApplicationController
 
     effort = composer_effort_param(agent)
     model = composer_model_for(agent, effort)
-    # A model-variant effort is already encoded in the model slug. Only Codex
-    # consumes the blocks protocol's reasoning field.
+    # A model-variant effort is already encoded in the model slug (Claude fast
+    # variants, omp thinking levels). Only Codex consumes the blocks protocol's
+    # reasoning field.
     reasoning = agent.harness == "codex" ? effort : nil
     thread_key = "console:#{SecureRandom.uuid}"
     api_client.create_session(

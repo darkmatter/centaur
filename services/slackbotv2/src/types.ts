@@ -148,6 +148,8 @@ export type SlackbotV2Options = {
    * link; response metadata renders independently according to its configured mode.
    */
   consolePublicUrl?: string
+  /** Tailnet-only OMP viewer origin. Unset leaves export requests to the agent. */
+  ompViewerUrl?: string
   /** Controls whether response metadata renders on the first, every, or no live responses. */
   responseMetadataMode?: 'first' | 'always' | 'never'
   /** Include the Codex service tier in response metadata footers when they render. */

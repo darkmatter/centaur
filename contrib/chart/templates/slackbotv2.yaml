@@ -67,7 +67,7 @@ spec:
               valueFrom:
                 secretKeyRef:
                   name: {{ include "centaur.secretEnvName" . }}
-                  key: {{ printf "%sDATABASE_URL" .Values.secretManager.envPrefix }}
+                  key: {{ printf "%s%s" .Values.secretManager.envPrefix .Values.slackbotv2.databaseUrlSecretKey }}
             - name: OPENAI_API_KEY
               valueFrom:
                 secretKeyRef:
@@ -127,6 +127,10 @@ spec:
             # so it takes effect.
             - name: SLACKBOTV2_CHANNEL_DEFAULTS
               value: {{ .Values.slackbotv2.channelDefaults | toJson | quote }}
+{{- end }}
+{{- if .Values.ompViewerUrl }}
+            - name: CENTAUR_OMP_VIEWER_URL
+              value: {{ .Values.ompViewerUrl | quote }}
 {{- end }}
 {{- if .Values.codex.customProviders }}
             - name: CODEX_CUSTOM_PROVIDERS

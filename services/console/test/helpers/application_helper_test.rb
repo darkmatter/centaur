@@ -164,6 +164,7 @@ class ApplicationHelperTest < ActionView::TestCase
     end
   end
 
+
   private
 
   def assert_select_in(html, *args, &block)

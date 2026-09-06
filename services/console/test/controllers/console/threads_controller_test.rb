@@ -61,6 +61,25 @@ class Console::ThreadsControllerTest < ActionDispatch::IntegrationTest
     assert_select ".console-thread-group-title", text: /Chats/
   end
 
+  test "viewer URL adds a direct tailnet Usage link" do
+    with_env("CENTAUR_OMP_VIEWER_URL" => "https://omp-viewer.example.ts.net/") do
+      with_recent_first_error { get console_threads_url }
+    end
+
+    assert_response :ok
+    assert_select "a.console-nav-link[href=?]", "https://omp-viewer.example.ts.net/", text: /Usage/
+  end
+
+  test "viewer export URL percent-encodes the durable thread key" do
+    with_env("CENTAUR_OMP_VIEWER_URL" => "https://omp-viewer.example.ts.net/") do
+      controller = ApplicationController.new
+      assert_equal(
+        "https://omp-viewer.example.ts.net/export/slack%3AC123%3A1234.5000",
+        controller.omp_viewer_export_url("slack:C123:1234.5000")
+      )
+    end
+  end
+
   test "threads page falls back to the new chat screen when session database is unavailable" do
     with_recent_first_error do
       get console_threads_url
@@ -86,8 +105,11 @@ class Console::ThreadsControllerTest < ActionDispatch::IntegrationTest
     assert_redirected_to console_threads_path(thread: thread_key)
   end
 
-  test "direct selected thread renders chat not found when the current user did not start it" do
+  test "direct selected thread renders chat not found when a non-admin did not start it" do
     skip_unless_session_table
+
+    delete logout_url
+    post login_url, params: { email: users(:member_user).email, password: "password123456" }
 
     thread_key = "slack:C0DIRECT:#{SecureRandom.hex(6)}"
     insert_slack_session(
@@ -96,9 +118,10 @@ class Console::ThreadsControllerTest < ActionDispatch::IntegrationTest
       slack_user_name: "someone-else"
     )
 
-    # @operator has no Slack OAuth credential matching U_OTHER, so this thread is
-    # outside their owner scope. A direct ?thread= link must render a 404 chat
-    # not found state instead of surfacing it or falling back to another chat.
+    # member_user has no Slack OAuth credential matching U_OTHER, so this
+    # thread is outside their owner scope. A direct ?thread= link must render
+    # a 404 chat not found state instead of surfacing it or falling back to
+    # another chat. (Admins bypass the owner scope — covered below.)
     get console_threads_url(thread: thread_key)
 
     assert_response :not_found
@@ -111,6 +134,37 @@ class Console::ThreadsControllerTest < ActionDispatch::IntegrationTest
     assert_select ".console-thread-list a.console-thread-link-active[href=?]",
                   console_threads_path(thread: thread_key),
                   count: 0
+  end
+
+  test "an admin sees unowned threads, including ownerless workflow threads" do
+    skip_unless_session_table
+
+    workflow_key = "workflow:ci-fixer:scan"
+    insert_session(workflow_key, { source: "ci_fixer", stage: "scan" }.to_json)
+    slack_key = "slack:C0DIRECT:#{SecureRandom.hex(6)}"
+    insert_slack_session(slack_key, slack_user_id: "U_OTHER", slack_user_name: "someone-else")
+
+    # workflow:* threads carry no owner metadata, so without the admin bypass
+    # they are invisible to every user; another user's Slack thread is
+    # likewise outside the admin's own scope.
+    get console_threads_url(thread: workflow_key)
+    assert_response :ok
+
+    get console_threads_url(thread: slack_key)
+    assert_response :ok
+  end
+
+  test "a non-admin cannot see ownerless workflow threads" do
+    skip_unless_session_table
+
+    delete logout_url
+    post login_url, params: { email: users(:member_user).email, password: "password123456" }
+
+    workflow_key = "workflow:ci-fixer:fix"
+    insert_session(workflow_key, { source: "ci_fixer", stage: "fix" }.to_json)
+
+    get console_threads_url(thread: workflow_key)
+    assert_response :not_found
   end
 
   test "direct link to a nonexistent thread renders chat not found" do
@@ -702,16 +756,20 @@ class Console::ThreadsControllerTest < ActionDispatch::IntegrationTest
     )
   end
 
+  # The owner-scope SQL-shape tests below stub a NON-admin: admins bypass the
+  # owner scope entirely (visible_thread_scope returns CentaurSession.all so
+  # ownerless system threads like workflow:* stay browsable).
   test "visible thread scope matches Slack threads owned by the current user's Slack OAuth record" do
+    member = users(:member_user)
     app = oauth_apps(:acme_slack)
     app.update!(client_secret: "slack-secret", labels: { "slack_team_id" => "T123" })
     create_slack_oauth_credential(
       app,
       subject: "UOWNER",
-      email: @operator.email,
+      email: member.email,
       labels: { "slack_team_id" => "T123" }
     )
-    controller = threads_controller_for(@operator)
+    controller = threads_controller_for(member)
 
     sql = controller.send(:visible_thread_scope).to_sql
 
@@ -723,16 +781,17 @@ class Console::ThreadsControllerTest < ActionDispatch::IntegrationTest
   end
 
   test "visible thread scope keeps current user's console threads without Slack OAuth" do
-    controller = threads_controller_for(@operator)
+    member = users(:member_user)
+    controller = threads_controller_for(member)
     sql = controller.send(:visible_thread_scope).to_sql
 
     assert_includes sql, "thread_key LIKE 'console:%'"
-    assert_includes sql, @operator.email
+    assert_includes sql, member.email
     refute_includes sql, "slack_user_id"
   end
 
   test "public Slack thread visibility defaults off and never expands the owner scope" do
-    controller = threads_controller_for(@operator)
+    controller = threads_controller_for(users(:member_user))
 
     with_env(
       "CENTAUR_CONSOLE_PUBLIC_SLACK_THREADS_ENABLED" => nil,
@@ -759,15 +818,16 @@ class Console::ThreadsControllerTest < ActionDispatch::IntegrationTest
   end
 
   test "visible thread scope matches Slack threads by user id when the credential has no team" do
+    member = users(:member_user)
     app = oauth_apps(:acme_slack)
     app.update!(client_secret: "slack-secret", labels: {})
     create_slack_oauth_credential(
       app,
       subject: "UOWNER",
-      email: @operator.email,
+      email: member.email,
       labels: {}
     )
-    controller = threads_controller_for(@operator)
+    controller = threads_controller_for(member)
 
     sql = controller.send(:visible_thread_scope).to_sql
 
@@ -781,14 +841,15 @@ class Console::ThreadsControllerTest < ActionDispatch::IntegrationTest
   end
 
   test "visible thread scope matches Slack threads via the SSO identity without a broker credential" do
+    member = users(:member_user)
     UserIdentity.create!(
-      user: @operator,
+      user: member,
       provider: "slack",
       subject: "USSOONLY",
-      email: @operator.email,
+      email: member.email,
       email_verified: true
     )
-    controller = threads_controller_for(@operator)
+    controller = threads_controller_for(member)
 
     sql = controller.send(:visible_thread_scope).to_sql
 
@@ -820,14 +881,15 @@ class Console::ThreadsControllerTest < ActionDispatch::IntegrationTest
   end
 
   test "sidebar thread scope matches Slack threads via the SSO identity without a broker credential" do
+    member = users(:member_user)
     UserIdentity.create!(
-      user: @operator,
+      user: member,
       provider: "slack",
       subject: "USSOONLY",
-      email: @operator.email,
+      email: member.email,
       email_verified: true
     )
-    controller = threads_controller_for(@operator)
+    controller = threads_controller_for(member)
 
     sql = controller.send(:console_sidebar_visible_thread_scope).to_sql
 
@@ -836,13 +898,18 @@ class Console::ThreadsControllerTest < ActionDispatch::IntegrationTest
     assert_includes sql, "ussoonly"
   end
 
-  test "sidebar scope never expands to public Slack threads" do
-    controller = threads_controller_for(@operator)
+  test "sidebar includes public Slack threads only when the deploy setting is enabled" do
+    # Without the synchronized channel catalog the scope deliberately omits
+    # the public-slack clause; skip instead of passing assertion-free (a
+    # zero-assertion run fails minitest, seed-dependently).
+    skip_unless_slack_channel_table
+
+    controller = threads_controller_for(users(:member_user))
 
     with_env("CENTAUR_CONSOLE_PUBLIC_SLACK_THREADS_ENABLED" => "true") do
       sql = controller.send(:console_sidebar_visible_thread_scope).to_sql
 
-      refute_includes sql, "slack_sync_channels"
+      assert_includes sql, "slack_sync_channels"
     end
   end
 
@@ -859,6 +926,18 @@ class Console::ThreadsControllerTest < ActionDispatch::IntegrationTest
     assert_select ".console-thread-detail-header", count: 1
   end
 
+  test "admin thread scopes are unscoped so ownerless system threads surface" do
+    controller = threads_controller_for(@operator)
+
+    assert_equal CentaurSession.all.to_sql, controller.send(:visible_thread_scope).to_sql
+    assert_equal CentaurSession.all.to_sql,
+                 controller.send(:console_sidebar_visible_thread_scope).to_sql
+    # owned_thread_scope stays ownership-shaped even for admins (it backs
+    # reply attribution, not visibility).
+    assert_includes controller.send(:owned_thread_scope).to_sql, @operator.email
+  end
+
+
   test "renders the full-page composer without loading sessions" do
     without_session_list_query do
       with_composer do
@@ -873,7 +952,7 @@ class Console::ThreadsControllerTest < ActionDispatch::IntegrationTest
       # The model picker is a custom menu (account-dropdown style) posting
       # through a hidden field, not a native select.
       assert_select "input[type=hidden][name=model]", count: 1
-      assert_select "[data-console-model-option][data-value=?]", "amp"
+      assert_select "[data-console-model-option][data-value=?]", "glm-5.2"
       assert_select "[data-console-model-option][data-value=?]", "gpt-6-astra"
       assert_select "[data-console-model-option][data-value=?]", "claude-opus-5"
       assert_select "select", count: 0
@@ -1159,20 +1238,18 @@ class Console::ThreadsControllerTest < ActionDispatch::IntegrationTest
     refute_includes requester_context, "Prompted by: Goksu Toprak"
   end
 
-  test "picking Amp starts an amp chat and sends no model" do
+  test "the default pick starts an omp chat on the gateway model" do
     client = RecordingApiClient.new
     with_composer(client: client) do
-      post console_threads_url, params: { prompt: "Reply with PONG.", model: "amp" }
+      post console_threads_url, params: { prompt: "Reply with PONG." }
     end
 
     create = client.calls[0].last
-    assert_equal "amp", create[:harness_type]
-    assert_not create[:metadata].key?(:model)
+    assert_equal "omp", create[:harness_type]
+    assert_equal "litellm/glm-5.2-fp8", create[:metadata][:model]
 
-    execute = client.calls[2].last
-    assert_not execute[:metadata].key?(:model)
-    line = JSON.parse(execute[:input_lines].first)
-    assert_not line.key?("model")
+    line = JSON.parse(client.calls[2].last[:input_lines].first)
+    assert_equal "litellm/glm-5.2-fp8", line["model"]
   end
 
   test "starting a chat with an unknown model is rejected" do

@@ -1830,6 +1830,9 @@
     ] %>
   <% end %>
   <% nav_items << { label: "Integrations", icon: "link", path: console_integrations_path, matches: [ "/console/integrations" ] } %>
+  <% if omp_viewer_url %>
+    <% nav_items << { label: "Usage", icon: "computer", path: omp_viewer_url, matches: [] } %>
+  <% end %>
 
   <body class="h-full overflow-hidden bg-ink-900 text-zinc-300 font-mono antialiased <%= "console-descoped" if descoped? %>">
     <% if descoped? %>
@@ -1884,7 +1887,6 @@
               <span class="console-nav-label">Scheduled</span>
             </a>
           </div>
-
           <% if acting_admin? %>
             <div class="console-thread-group">
               <a href="<%= console_workflows_path %>"

@@ -1,11 +1,16 @@
 use std::{
+    borrow::Cow,
     env,
     error::Error,
     str::FromStr,
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use sqlx::{Connection, Executor, PgConnection, Row, postgres::PgConnectOptions};
+use centaur_session_sqlx::PgSessionStore;
+use sqlx::{
+    Connection, Executor, PgConnection, Row,
+    postgres::{PgConnectOptions, PgPoolOptions},
+};
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 static RLS_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -61,6 +66,93 @@ struct CompanyContextReaderSettings<'a> {
     user_email: Option<&'a str>,
     google_email: Option<&'a str>,
     google_subject: Option<&'a str>,
+}
+
+#[tokio::test]
+async fn migrations_upgrade_from_version_51_with_omp_session() -> Result<(), Box<dyn Error>> {
+    let Some(database_url) = test_database_url() else {
+        return Ok(());
+    };
+    let _test_guard = RLS_TEST_LOCK.lock().await;
+    let mut admin_conn = PgConnection::connect(&database_url).await?;
+    let database = TestDatabase::create(&mut admin_conn, &database_url).await?;
+    let mut conn = match PgConnection::connect_with(&database.options).await {
+        Ok(conn) => conn,
+        Err(err) => {
+            database.drop(&mut admin_conn).await?;
+            return Err(err.into());
+        }
+    };
+
+    let setup_result = async {
+        let mut deployed_migrator = sqlx::migrate::Migrator::DEFAULT;
+        deployed_migrator.migrations = Cow::Owned(
+            MIGRATOR
+                .iter()
+                .filter(|migration| migration.version <= 51)
+                .cloned()
+                .collect(),
+        );
+        deployed_migrator.run(&mut conn).await?;
+        sqlx::query(
+            "insert into sessions (thread_key, harness_type, status) values ($1, 'omp', 'idle')",
+        )
+        .bind("test:omp-before-hermes")
+        .execute(&mut conn)
+        .await?;
+        Ok::<(), Box<dyn Error>>(())
+    }
+    .await;
+    conn.close().await?;
+    if let Err(err) = setup_result {
+        database.drop(&mut admin_conn).await?;
+        return Err(err);
+    }
+
+    let pool = match PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with(database.options.clone())
+        .await
+    {
+        Ok(pool) => pool,
+        Err(err) => {
+            database.drop(&mut admin_conn).await?;
+            return Err(err.into());
+        }
+    };
+    let result = async {
+        PgSessionStore::new(pool.clone()).run_migrations().await?;
+
+        let harness_type: String =
+            sqlx::query_scalar("select harness_type from sessions where thread_key = $1")
+                .bind("test:omp-before-hermes")
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(harness_type, "omp");
+
+        let applied_versions: Vec<i64> = sqlx::query_scalar(
+            "select version from _sqlx_migrations where version in (54, 55) order by version",
+        )
+        .fetch_all(&pool)
+        .await?;
+        assert_eq!(applied_versions, vec![54, 55]);
+
+        sqlx::query(
+            "insert into sessions (thread_key, harness_type, status) values ($1, 'omp', 'idle')",
+        )
+        .bind("test:omp-after-hermes")
+        .execute(&pool)
+        .await?;
+
+        Ok::<(), Box<dyn Error>>(())
+    }
+    .await;
+    pool.close().await;
+    let drop_result = database.drop(&mut admin_conn).await;
+
+    result?;
+    drop_result?;
+    Ok(())
 }
 
 #[tokio::test]

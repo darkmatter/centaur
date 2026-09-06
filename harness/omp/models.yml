@@ -3,11 +3,12 @@
 #
 # The gateway model is defined STATICALLY, not via discovery, for two reasons:
 # (1) omp resolves model roles once per process and cold-cache discovery races
-#     that resolution (silent fallback to the built-in default provider);
+#     that resolution (silent fallback to the built-in default provider — the
+#     github-executor's warm-models.mjs exists solely to work around it);
 # (2) discovery fuzzy-merges gateway ids against the live models.dev catalog,
-#     where e.g. glm-5.2-fp8 collides with a differently spelled entry and gets
-#     a wire id the gateway rejects. Static definitions bypass the merge — the
-#     id goes on the wire unchanged.
+#     where glm-5.2-fp8 collides with fireworks glm-5p2-fp8 and gets a wire id
+#     the gateway 400s. Static definitions bypass the merge — the id goes on
+#     the wire unchanged (verified 2026-07-07).
 providers:
   litellm:
     baseUrl: __OMP_LITELLM_BASE_URL__
@@ -15,9 +16,10 @@ providers:
     api: openai-completions
     models:
       - id: glm-5.2-fp8
-        name: GLM 5.2 fp8 (LiteLLM gateway)
-        # Declare native tool calling explicitly: without this, discovery may
-        # mark the model tool-less and omp falls back to its in-band dialect.
+        name: GLM 5.2 fp8 (darkmatter gateway)
+        # The vLLM deployment exposes native GLM tool calls through its glm47
+        # parser. Without this override, LiteLLM discovery marks the model as
+        # tool-less and omp auto-selects its less reliable in-band GLM dialect.
         supportsTools: true
         reasoning: true
         contextWindow: 1048576

@@ -78,6 +78,9 @@ beforeAll(async () => {
             'channels:join',
             'channels:read',
             'chat:write',
+            'im:read',
+            'im:write',
+            'im:history',
             'users:read'
           ]
         },
@@ -125,6 +128,61 @@ afterAll(async () => {
 })
 
 describe('slackbotv2', () => {
+  for (const agentViewEnabled of [false, true]) {
+    it(`routes DM roots and replies with agent view ${agentViewEnabled}`, async () => {
+      bot = createTestBot({ agentViewEnabled })
+      const members = await slackBot.users.list({})
+      const userId = members.members?.find(member => member.name === 'tester')?.id
+      expect(userId).toBeDefined()
+      const dm = await slackBot.conversations.open({ users: userId! })
+      expect(dm.channel?.id).toBeDefined()
+      const channel = dm.channel!.id!
+      // A prior legacy DM leaves this subscription behind when the toggle is
+      // enabled. Agent mode must still use the new user message as its root.
+      if (agentViewEnabled) await bot.chat.getState().subscribe(`slack:${channel}:`)
+      const roots: string[] = []
+      for (let turn = 0; turn < 2; turn++) {
+        const posted = await slackBot.chat.postMessage({ channel, text: `DM request ${turn}` })
+        expect(posted.ts).toBeDefined()
+        roots.push(posted.ts!)
+        const waits: Promise<unknown>[] = []
+        const response = await bot.app.request('/api/webhooks/slack', signedSlackEvent({
+          event_id: `Ev-agent-dm-${turn}`,
+          event: {
+            type: 'message', channel_type: 'im', channel, user: USER_ID,
+            ts: posted.ts, text: `DM request ${turn}`
+          }
+        }), {}, waitUntilContext(waits))
+        expect(response.status).toBe(200)
+        await Promise.all(waits)
+        const delivered = agentViewEnabled
+          ? await slackBot.conversations.replies({ channel, ts: posted.ts! })
+          : await slackBot.conversations.history({ channel })
+        const answerText = (delivered.messages ?? [])
+          .map(message => [message.text ?? '', blocksText(message.blocks)].join('\n'))
+          .join('\n')
+        expect(answerText).toContain(`Executed request ${turn + 1}.`)
+      }
+      expect(codexApi.executes.map(request => request.threadKey)).toEqual(
+        roots.map(ts => `slack:${channel}:${agentViewEnabled ? ts : ''}`)
+      )
+      const reply = await slackBot.chat.postMessage({ channel, thread_ts: roots[0], text: 'Follow up' })
+      const waits: Promise<unknown>[] = []
+      const response = await bot.app.request('/api/webhooks/slack', signedSlackEvent({
+        event_id: 'Ev-agent-dm-reply',
+        event: {
+          type: 'message', channel_type: 'im', channel, user: USER_ID,
+          ts: reply.ts, thread_ts: roots[0], text: 'Follow up'
+        }
+      }), {}, waitUntilContext(waits))
+      expect(response.status).toBe(200)
+      await Promise.all(waits)
+      expect(codexApi.executes.at(-1)?.threadKey).toBe(`slack:${channel}:${roots[0]}`)
+      expect(slackApi.calls.some(call => call.method === 'chat.stopStream')).toBe(true)
+      expect(slackApi.calls.some(call => call.method === 'agents.sessions.rename')).toBe(agentViewEnabled)
+    })
+  }
+
   it('accepts Slack events on the legacy route', async () => {
     const parent = await postUserMessage('Legacy route context.')
     const mention = await postUserMessage(`<@${BOT_USER_ID}> use the legacy route`, parent.ts)
@@ -6500,6 +6558,8 @@ type PatchedSlackApi = {
 type StreamCall = {
   body: Record<string, unknown>
   method:
+    | 'agents.sessions.setStatus'
+    | 'agents.sessions.rename'
     | 'assistant.threads.setStatus'
     | 'assistant.threads.setTitle'
     | 'chat.startStream'
@@ -6698,6 +6758,12 @@ async function handlePatchedSlackRequest(
   }
 
   const path = normalizeApiPath(url.pathname)
+  if (path === '/api/agents.sessions.setStatus' || path === '/api/agents.sessions.rename') {
+    const body = await requestBody(request)
+    input.calls.push({ method: path.slice('/api/'.length) as StreamCall['method'], body })
+    await sendWebResponse(res, Response.json({ ok: true }))
+    return
+  }
   if (path === '/api/assistant.threads.setStatus') {
     const body = await requestBody(request)
     input.calls.push({ method: 'assistant.threads.setStatus', body })

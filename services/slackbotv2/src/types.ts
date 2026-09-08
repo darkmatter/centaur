@@ -131,6 +131,8 @@ export type SlackbotV2Options = {
   allowedExternalTeamIds?: readonly string[]
   apiKey?: string
   apiUrl: string
+  /** Enable Slack's Agent messaging experience. Must match the app manifest. */
+  agentViewEnabled?: boolean
   assistantStatus?: string
   /**
    * When enabled, session.activity_summary events update Slack's assistant

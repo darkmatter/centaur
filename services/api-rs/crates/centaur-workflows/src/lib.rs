@@ -36,6 +36,8 @@ use tokio::{
 };
 use tracing::{info, warn};
 
+pub mod slack_buttons;
+
 pub const WORKFLOW_QUEUE: &str = "centaur_workflows";
 pub const WORKFLOW_SLACK_LIVE_QUEUE: &str = "centaur_workflows_slack_live";
 pub const WORKFLOW_ETL_QUEUE: &str = "centaur_workflows_etl";
@@ -988,7 +990,7 @@ impl WorkflowRuntime {
             (WORKFLOW_ETL_BACKFILL_QUEUE, &self.inner.etl_backfill_client),
         ] {
             if let Some(run) = self.get_run_for_queue(queue_name, run_id).await? {
-                client.cancel_task(&run.task_id, Some(queue_name)).await?;
+                client.cancel_task(&run.task_id, None).await?;
                 return Ok(());
             }
         }
@@ -1796,6 +1798,7 @@ async fn discover_python_workflow_metadata() -> Result<PythonWorkflowMetadata, W
         env::var(PYTHON_HOST_INTERPRETER_ENV).unwrap_or_else(|_| "python3".to_owned()),
     );
     command
+        .env_remove("CENTAUR_JWT_SIGNING_SECRET")
         .arg(&host_path)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -2916,6 +2919,7 @@ async fn run_python_workflow_host_local(
         env::var(PYTHON_HOST_INTERPRETER_ENV).unwrap_or_else(|_| "python3".to_owned()),
     );
     command
+        .env_remove("CENTAUR_JWT_SIGNING_SECRET")
         .arg(&host_path)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -3042,7 +3046,11 @@ async fn run_python_workflow_host_in_sandbox(
     workflow_clients: WorkflowQueueClients,
 ) -> Result<Value, WorkflowRuntimeError> {
     let mut spec = sandbox.spec_for_workflow(&input.workflow_name)?;
+    spec.env
+        .retain(|entry| entry.name != "CENTAUR_JWT_SIGNING_SECRET");
     spec = spec
+        // Also mask inheritance from the development-only local process backend.
+        .env("CENTAUR_JWT_SIGNING_SECRET", "")
         .env("WORKFLOW_RUN_ID", ctx.run_id())
         .env("WORKFLOW_TASK_ID", ctx.task_id())
         .env("WORKFLOW_NAME", input.workflow_name.clone());
@@ -3457,6 +3465,9 @@ async fn handle_python_context_request(
             Ok(value) => Ok(value),
             Err(error) => Err(error.to_string()),
         },
+        Some("ctx.update_slack") => send_slack_request("chat.update", message["message"].clone())
+            .await
+            .map_err(|error| error.to_string()),
         Some("ctx.post_to_slack") => {
             match post_python_slack_message(message, ctx, &request_id).await {
                 Ok(value) => Ok(value),
@@ -4107,21 +4118,14 @@ async fn post_tool_result_to_slack(
     note: &str,
     tool: &ToolResult,
 ) -> Result<SlackPostResult, WorkflowRuntimeError> {
-    let token = env::var("SLACK_BOT_TOKEN")
-        .or_else(|_| env::var("SLACK_BOT_TOKEN_OVERRIDE"))
-        .map_err(|_| {
-            WorkflowRuntimeError::BadRequest(
-                "SLACK_BOT_TOKEN or SLACK_BOT_TOKEN_OVERRIDE must be set".to_owned(),
-            )
-        })?;
     let text = format!(
         "{note}\nworkflow=tool_and_slack\ntool={}.{}\nresult={}",
         tool.tool,
         tool.method,
         serde_json::to_string(&tool.output)?,
     );
-    let response = send_slack_message(
-        &token,
+    let response = send_slack_request(
+        "chat.postMessage",
         json!({
             "channel": channel,
             "text": text,
@@ -4155,15 +4159,10 @@ async fn post_python_slack_message(
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| format!("{}:slack:{request_id}", ctx.task_id()));
 
-    let token = env::var("SLACK_BOT_TOKEN")
-        .or_else(|_| env::var("SLACK_BOT_TOKEN_OVERRIDE"))
-        .map_err(|_| {
-            WorkflowRuntimeError::BadRequest(
-                "SLACK_BOT_TOKEN or SLACK_BOT_TOKEN_OVERRIDE must be set".to_owned(),
-            )
-        })?;
-    let payload = python_slack_message_payload(channel, text, &client_msg_id, &args);
-    let response = send_slack_message(&token, payload).await?;
+    let mut payload = python_slack_message_payload(channel, text, &client_msg_id, &args);
+    let secret = env::var("CENTAUR_JWT_SIGNING_SECRET").unwrap_or_default();
+    slack_buttons::sign_message(&mut payload, secret.trim().as_bytes())?;
+    let response = send_slack_request("chat.postMessage", payload).await?;
     serde_json::to_value(slack_post_result_from_response(channel, response))
         .map_err(WorkflowRuntimeError::from)
 }
@@ -4211,22 +4210,32 @@ fn python_slack_message_payload(
     payload
 }
 
-async fn send_slack_message(token: &str, payload: Value) -> Result<Value, WorkflowRuntimeError> {
+async fn send_slack_request(
+    method: &'static str,
+    payload: Value,
+) -> Result<Value, WorkflowRuntimeError> {
+    let token = env::var("SLACK_BOT_TOKEN")
+        .or_else(|_| env::var("SLACK_BOT_TOKEN_OVERRIDE"))
+        .map_err(|_| {
+            WorkflowRuntimeError::BadRequest(
+                "SLACK_BOT_TOKEN or SLACK_BOT_TOKEN_OVERRIDE must be set".into(),
+            )
+        })?;
+    let base = env::var("SLACK_API_URL").unwrap_or_else(|_| "https://slack.com/api/".into());
     let response: Value = reqwest::Client::new()
-        .post("https://slack.com/api/chat.postMessage")
+        .post(format!("{}/{method}", base.trim_end_matches('/')))
+        .timeout(Duration::from_secs(15))
         .bearer_auth(token)
         .json(&payload)
         .send()
         .await?
+        .error_for_status()?
         .json()
         .await?;
     if response.get("ok").and_then(Value::as_bool) != Some(true) {
         return Err(WorkflowRuntimeError::Upstream(format!(
-            "Slack chat.postMessage failed: {}",
-            response
-                .get("error")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown_error")
+            "Slack {method} failed: {}",
+            response["error"].as_str().unwrap_or("unknown_error")
         )));
     }
     Ok(response)

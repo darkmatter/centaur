@@ -436,6 +436,85 @@ describe('slackbotv2', () => {
     expect(JSON.stringify(codexApi.workflowEvents)).not.toContain('sensitive-response-token')
   })
 
+  it('durably hands off workflow buttons before acknowledging and retries failed acceptance', async () => {
+    const requests: Record<string, unknown>[] = []
+    let release: (() => void) | undefined
+    const held = new Promise<void>(resolve => { release = resolve })
+    let fail = true
+    bot = createTestBot({
+      fetch: async (input, init) => {
+        if (String(input).endsWith('/api/workflows/actions/invoke')) {
+          requests.push(JSON.parse(String(init?.body)))
+          await held
+          return fail
+            ? Response.json({ error: 'temporarily unavailable' }, { status: 503 })
+            : Response.json({ ok: true, run_id: 'run-click-1', task_id: 'task-click-1', created: true, status: 'queued' })
+        }
+        return globalThis.fetch(input, init)
+      }
+    })
+    const payload = {
+      type: 'block_actions', team: { id: TEAM_ID },
+      user: { id: USER_ID, username: 'tester', team_id: TEAM_ID },
+      channel: { id: CHANNEL_ID }, message: { ts: '1700000003.000200' },
+      actions: [{
+        action_id: 'centaur.workflow.action:00000000-0000-0000-0000-000000000001:approve',
+        action_ts: '1700000004.000200', type: 'button',
+        value: 'v1.opaque-signed-payload.signature'
+      }]
+    }
+    const waits: Promise<unknown>[] = []
+    let acknowledged = false
+    const first = Promise.resolve(bot.app.request('/api/slack/actions', signedSlackInteraction(payload), {}, waitUntilContext(waits)))
+      .then(response => { acknowledged = true; return response })
+    await waitFor(() => requests.length === 1)
+    expect(acknowledged).toBe(false)
+    release?.()
+    expect((await first).status).toBe(503)
+    fail = false
+    const retry = await bot.app.request('/api/slack/actions', signedSlackInteraction(payload), {}, waitUntilContext(waits))
+    expect(retry.status).toBe(200)
+    await Promise.all(waits)
+    expect(requests).toHaveLength(2)
+    expect(requests[0]).toEqual({
+      button: payload.actions[0]?.value,
+      idempotency_key: expect.stringMatching(/^slack\.button:[0-9a-f]{64}$/),
+      click: {
+          id: '00000000-0000-0000-0000-000000000001', action: 'approve',
+          action_ts: payload.actions[0]?.action_ts, channel_id: CHANNEL_ID,
+          message_ts: payload.message.ts, team_id: TEAM_ID, user_id: USER_ID
+      }
+    })
+    expect(requests[1]).toEqual(requests[0])
+    expect(codexApi.workflowEvents).toHaveLength(0)
+  })
+
+  it('acknowledges a permanently rejected workflow button without retrying it', async () => {
+    let starts = 0
+    bot = createTestBot({
+      fetch: async (input, init) => {
+        if (String(input).endsWith('/api/workflows/actions/invoke')) {
+          starts += 1
+          expect(JSON.parse(String(init?.body)).button).toBe('unsigned')
+          return Response.json({ error: 'invalid or untrusted workflow button' }, { status: 403 })
+        }
+        return globalThis.fetch(input, init)
+      }
+    })
+    const payload = {
+      type: 'block_actions', team: { id: TEAM_ID },
+      user: { id: USER_ID, username: 'tester', team_id: TEAM_ID },
+      channel: { id: CHANNEL_ID }, message: { ts: '1700000003.000200' },
+      actions: [{ type: 'button', action_id: 'centaur.workflow.action:00000000-0000-0000-0000-000000000001:approve',
+        action_ts: '1700000004.000200', value: 'unsigned' }]
+    }
+    const waits: Promise<unknown>[] = []
+    const response = await bot.app.request('/api/slack/actions', signedSlackInteraction(payload), {}, waitUntilContext(waits))
+    expect(response.status).toBe(200)
+    await Promise.all(waits)
+    expect(starts).toBe(1)
+  })
+
   it('applies the external-org allowlist to Slack block actions', async () => {
     const interaction = signedSlackInteraction({
       type: 'block_actions',

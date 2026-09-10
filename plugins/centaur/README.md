@@ -9,10 +9,13 @@ Deployments with `CENTAUR_MCP_V2_ENABLED=true` expose the `centaur` MCP tool. Pa
 ```json
 {"command": ["list"]}
 {"command": ["search", "slack messages"]}
-{"command": ["run", "slack", "--help"]}
+{"command": ["run", "gsuite", "--help"]}
+{"command": ["run", "gsuite", "gmail", "--help"]}
+{"command": ["run", "slack", "search", "--help"]}
+{"command": ["run", "slack", "search", "incident response"]}
 ```
 
-`centaur run <tool> <argv>` runs the tool's CLI in your principal's sandbox using current Console policy. Use `--help` to find its commands and options, then pass each argument as a separate array element. Spaces within values are preserved. Shell expansion, pipes, and redirection are not interpreted.
+`centaur run <tool> <argv>` runs the tool's CLI in your principal's sandbox using current Console policy. Start with `centaur run <tool> --help`, then add command segments before `--help` until the relevant options and arguments are shown. Pass each argument as a separate array element. Spaces within values are preserved. Shell expansion, pipes, and redirection are not interpreted.
 
 The result includes `stdout`, `stderr`, `exit_status`, and `timed_out` in both text and structured content. Plain-text help and JSON output are supported. Nonzero exits and timeouts set MCP `isError`. Calls have a 120-second execution timeout. Existing v1 tools with `method` and `arguments` remain available.
 

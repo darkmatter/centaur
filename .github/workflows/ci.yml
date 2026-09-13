@@ -111,6 +111,7 @@ jobs:
             '^package\.json$' \
             '^pnpm-lock\.yaml$' \
             '^pnpm-workspace\.yaml$' \
+            '^patches/' \
             '^\.github/workflows/ci\.yml$'
           set_output discordbot_checks \
             '^services/discordbot/' \
@@ -316,6 +317,9 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.11"
+
+      # Tool-host integration tests execute real CLIs through uvx.
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
 
       - name: Sandbox Python tests
         env:

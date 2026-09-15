@@ -1,7 +1,9 @@
 mod activity_summary;
 mod args;
 
-use centaur_api_server::{ApiAuthConfig, AppState, build_router_with_app_state};
+use centaur_api_server::{
+    ApiAuthConfig, AppState, build_router_with_app_state, warm_slack_public_channel_cache,
+};
 use centaur_session_runtime::SessionRuntime;
 use centaur_session_sqlx::PgSessionStore;
 use centaur_telemetry::{TelemetryConfig, init_telemetry};
@@ -28,6 +30,7 @@ async fn main() -> Result<(), ServerError> {
 
     let app_state = AppState::unready(api_auth);
     let app = build_router_with_app_state(app_state.clone());
+    warm_slack_public_channel_cache();
     let shutdown_state = app_state.clone();
     let drain_timeout = args.shutdown_execution_drain_timeout();
     let mut server = tokio::spawn(async move {
@@ -89,6 +92,9 @@ async fn initialize_runtime(args: Args, app_state: AppState) -> Result<(), Serve
     }
     runtime = runtime.with_sandbox_reaper(args.sandbox_reaper_config());
     runtime = runtime.with_sandbox_cleanup(args.sandbox_cleanup_config());
+    if let Some(config) = args.session_event_retention_config() {
+        runtime = runtime.with_session_event_retention(config);
+    }
     let workflow_host_sandbox = args
         .workflow_host_sandbox_runtime(&iron_control.workflow_host_principal)
         .await?;

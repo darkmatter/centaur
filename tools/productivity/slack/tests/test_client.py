@@ -3,6 +3,7 @@ import email.message
 import json
 
 import pytest
+import slack.client as slack_client
 from slack.client import SlackAuthError, SlackClient, SlackRateLimitError
 from slack_sdk.errors import SlackApiError
 
@@ -260,12 +261,13 @@ def test_resolve_channel_rejects_unknown_at_username() -> None:
         client._resolve_channel("@nobody")
 
 
-def test_resolve_channel_still_resolves_channel_names() -> None:
+def test_resolve_channel_still_resolves_channel_names(monkeypatch: pytest.MonkeyPatch) -> None:
     client, fake_web_client = _make_client()
     _restore_real_resolve_channel(client)
 
-    assert client._resolve_channel("paradigm-pulse") == "C123"
-    assert client._resolve_channel("C456DEF") == "C456DEF"
+    monkeypatch.setattr(slack_client, "_client", lambda: client)
+    assert slack_client.resolve_channel("paradigm-pulse") == "C123"
+    assert slack_client.resolve_channel("C456DEF") == "C456DEF"
     assert fake_web_client.open_calls == []
 
 
@@ -546,24 +548,15 @@ def test_get_channel_history_proxy_validates_inputs() -> None:
 def test_list_channels_proxy_calls_centaur_api() -> None:
     client, _ = _make_client()
 
+    calls = []
+
     def fake_get_json(path, params):
         assert path == "/api/slack/channels"
-        assert params == {}
+        calls.append(params)
+        history_only = params["history_only"]
         return {
             "ok": True,
             "channels": [
-                {
-                    "id": "C222222222",
-                    "name": "random",
-                    "purpose": "",
-                    "topic": "Chat",
-                    "member_count": 3,
-                    "is_private": False,
-                    "is_member": True,
-                    "can_upload": True,
-                    "can_download": False,
-                    "can_read_history": False,
-                },
                 {
                     "id": "C111111111",
                     "name": "general",
@@ -576,7 +569,20 @@ def test_list_channels_proxy_calls_centaur_api() -> None:
                     "can_download": True,
                     "can_read_history": True,
                 },
+                *([] if history_only else [{
+                    "id": "C222222222",
+                    "name": "random",
+                    "purpose": "",
+                    "topic": "Chat",
+                    "member_count": 3,
+                    "is_private": False,
+                    "is_member": True,
+                    "can_upload": True,
+                    "can_download": False,
+                    "can_read_history": False,
+                }]),
             ],
+            "response_metadata": {"next_cursor": ""},
         }
 
     client._centaur_api_get_json = fake_get_json  # type: ignore[method-assign]
@@ -587,6 +593,41 @@ def test_list_channels_proxy_calls_centaur_api() -> None:
     ]
     assert [channel["id"] for channel in client.list_channels_proxy(history_only=True)] == [
         "C111111111"
+    ]
+    assert calls == [
+        {"limit": 200, "cursor": None, "query": None, "history_only": False},
+        {"limit": 200, "cursor": None, "query": None, "history_only": True},
+    ]
+
+
+def test_list_channels_proxy_paginates_and_passes_query() -> None:
+    client, _ = _make_client()
+    calls = []
+
+    def fake_get_json(path, params):
+        assert path == "/api/slack/channels"
+        calls.append(params)
+        channel_id = "C111111111" if params["cursor"] is None else "G222222222"
+        return {
+            "ok": True,
+            "channels": [{
+                "id": channel_id,
+                "name": "alpha" if params["cursor"] is None else "beta",
+                "can_read_history": True,
+            }],
+            "response_metadata": {
+                "next_cursor": "1" if params["cursor"] is None else ""
+            },
+        }
+
+    client._centaur_api_get_json = fake_get_json  # type: ignore[method-assign]
+
+    channels = client.list_channels_proxy(limit=2, history_only=True, query="a")
+
+    assert [channel["id"] for channel in channels] == ["C111111111", "G222222222"]
+    assert calls == [
+        {"limit": 2, "cursor": None, "query": "a", "history_only": True},
+        {"limit": 1, "cursor": "1", "query": "a", "history_only": True},
     ]
 
 

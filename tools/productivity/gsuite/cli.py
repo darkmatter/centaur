@@ -1,4 +1,4 @@
-"""CLI for GSuite operations - Gmail, Calendar, Drive."""
+"""CLI for GSuite operations - Gmail, Calendar, Directory, Drive."""
 
 import json
 from pathlib import Path
@@ -7,7 +7,9 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-app = typer.Typer(name="gsuite", help="GSuite CLI for AI agents - Gmail, Calendar, Drive")
+app = typer.Typer(
+    name="gsuite", help="GSuite CLI for AI agents - Gmail, Calendar, Directory, Drive"
+)
 
 
 @app.command("health")
@@ -40,6 +42,7 @@ docs_app = typer.Typer(help="Google Docs operations")
 sheets_app = typer.Typer(help="Google Sheets operations")
 slides_app = typer.Typer(help="Google Slides operations")
 analytics_app = typer.Typer(help="Google Analytics operations")
+directory_app = typer.Typer(help="Directory operations")
 
 app.add_typer(gmail_app, name="gmail")
 app.add_typer(calendar_app, name="calendar")
@@ -48,11 +51,12 @@ app.add_typer(docs_app, name="docs")
 app.add_typer(sheets_app, name="sheets")
 app.add_typer(slides_app, name="slides")
 app.add_typer(analytics_app, name="analytics")
+app.add_typer(directory_app, name="directory")
 
 
 @app.callback()
 def main():
-    """GSuite CLI for AI agents - Gmail, Calendar, Drive.
+    """GSuite CLI for AI agents - Gmail, Calendar, Directory, Drive.
 
     Authentication is handled transparently by iron-proxy's ``gcp_auth``
     transform, which mints a service-account token for outbound Google API
@@ -1510,7 +1514,9 @@ def _get_channel_member_emails_via_cli(channel: str) -> list[str]:
 @docs_app.command("create")
 def docs_create_cmd(
     title: str = typer.Argument(..., help="Document title"),
-    channel: str = typer.Option(..., "--channel", help="Slack channel to share with (required)"),
+    channel: str | None = typer.Option(
+        None, "--channel", help="Optional Slack channel to share with"
+    ),
     owner: str = typer.Option(..., "--owner", help="Email of new owner (required)"),
     content: str = typer.Option(None, "--content", "-c", help="Initial content"),
 ):
@@ -1518,7 +1524,7 @@ def docs_create_cmd(
 
     This command:
     1. Creates the document
-    2. Shares with all channel members (writer role)
+    2. Shares with all channel members when --channel is provided (writer role)
     3. Transfers ownership to the specified owner
 
     The original owner (service account) is automatically downgraded to editor
@@ -1526,6 +1532,7 @@ def docs_create_cmd(
     removes the service account's editor role permissions after 7 days.
 
     Examples:
+        gsuite docs create "Personal Notes" --owner alice@paradigm.xyz
         gsuite docs create "Meeting Notes" --channel eng-ai --owner alice@paradigm.xyz
         gsuite docs create "Doc Title" --channel ai-agent --owner bob@paradigm.xyz --content "Hello"
     """
@@ -1537,8 +1544,11 @@ def docs_create_cmd(
         console.print(f"[cyan]URL: {result['url']}[/]", soft_wrap=True)
         console.print(f"[dim]ID: {result['document_id']}[/]")
 
-        member_emails = _get_channel_member_emails_via_cli(channel)
-        console.print(f"[dim]Setting up permissions for {len(member_emails)} channel members...[/]")
+        member_emails = _get_channel_member_emails_via_cli(channel) if channel else []
+        if channel:
+            console.print(
+                f"[dim]Setting up permissions for {len(member_emails)} channel members...[/]"
+            )
 
         perm_result = drive_setup_channel_permissions(
             file_id=result["document_id"],
@@ -1546,7 +1556,10 @@ def docs_create_cmd(
             requester_email=owner,
         )
 
-        console.print(f"[green]✓ Shared with {len(perm_result['shared_with'])} channel members[/]")
+        if channel:
+            console.print(
+                f"[green]✓ Shared with {len(perm_result['shared_with'])} channel members[/]"
+            )
         console.print(f"[green]✓ Ownership transferred to {owner}[/]")
 
     except Exception as e:
@@ -1599,6 +1612,48 @@ def sheets_read_cmd(
     except Exception as e:
         console.print(f"[red]Error: {e}[/]")
         raise typer.Exit(1)
+
+
+@sheets_app.command("batch-read")
+def sheets_batch_read_cmd(
+    spreadsheet_id: str = typer.Argument(..., help="Spreadsheet ID (from URL)"),
+    range_notations: list[str] = typer.Option(..., "--range", "-r", help="A1 notation range"),  # noqa: B008
+    output_json: bool = typer.Option(False, "--json", "-o", help="Output as JSON"),
+):
+    """Read data from a Google Sheet, across several ranges.
+
+    Example:
+        gsuite sheets batch-read "1Abc..." --range "Sheet1!A1:D10" --range "Sheet2!A1:B5"
+        gsuite sheets batch-read "1Abc..." --range "Sheet1!A1:D10" --json
+    """
+    from .client import sheets_batch_read
+
+    try:
+        result = sheets_batch_read(spreadsheet_id, range_notations)
+
+        if output_json:
+            console.print(json.dumps(result, indent=2), markup=False, soft_wrap=True)
+            return
+
+        for value_range in result:
+            if not value_range["rows"]:
+                console.print(f"[yellow]{value_range['range']}: No data found.[/]")
+                continue
+
+            table = Table(title=f"{value_range['range']} ({len(value_range['rows'])} rows)")
+            for header in value_range["headers"]:
+                table.add_column(header, style="cyan", max_width=30)
+
+            for row in value_range["rows"][:50]:
+                values = [str(row.get(h, ""))[:30] for h in value_range["headers"]]
+                table.add_row(*values)
+
+            console.print(table)
+            if len(value_range["rows"]) > 50:
+                console.print(f"[dim]... and {len(value_range['rows']) - 50} more rows[/]")
+    except Exception as e:
+        console.print(f"[red]Error: {e}[/]")
+        raise typer.Exit(1) from e
 
 
 @sheets_app.command("update")
@@ -2237,6 +2292,97 @@ def analytics_query(
     except Exception as e:
         console.print(f"[red]Error: {e}[/]")
         raise typer.Exit(1)
+
+
+# Directory commands
+
+
+@directory_app.command("list")
+def directory_list(
+    output_json: bool = typer.Option(False, "--json", "-o", help="Output as JSON"),
+    markdown: bool = typer.Option(False, "--markdown", help="Output as a Markdown table"),
+):
+    """List all visible Workspace directory profiles with names and email addresses.
+
+    Examples:
+        gsuite directory list
+        gsuite directory list --json
+    """
+    from .client import directory_list as list_people
+
+    try:
+        results = list_people()
+    except Exception as exc:
+        console.print(f"Error: {exc}", style="red", markup=False)
+        raise typer.Exit(1) from exc
+
+    _print_directory_people(results, output_json, markdown)
+
+
+@directory_app.command("search")
+def directory_search(
+    query: str = typer.Argument(..., help="Name or email prefix to search"),
+    limit: int = typer.Option(
+        20,
+        "--limit",
+        "-n",
+        min=1,
+        help="Maximum number of people",
+    ),
+    output_json: bool = typer.Option(False, "--json", "-o", help="Output as JSON"),
+    markdown: bool = typer.Option(False, "--markdown", help="Output as a Markdown table"),
+):
+    """Search Workspace directory profiles for names and email addresses.
+
+    Examples:
+        gsuite directory search "Alex" --json
+        gsuite directory search "alex@example.com" --limit 5
+    """
+    from .client import directory_search as search
+
+    try:
+        results = search(query, max_results=limit)
+    except Exception as exc:
+        console.print(f"Error: {exc}", style="red", markup=False)
+        raise typer.Exit(1) from exc
+
+    _print_directory_people(results, output_json, markdown)
+
+
+def _print_directory_people(results: list[dict], output_json: bool, markdown: bool) -> None:
+    """Render directory list and search results in the requested format."""
+    if output_json:
+        print(json.dumps(results, indent=2, ensure_ascii=False))
+        return
+
+    if markdown:
+
+        def escape_cell(value: str) -> str:
+            return (
+                value.replace("\\", "\\\\")
+                .replace("|", "\\|")
+                .replace("\r", " ")
+                .replace("\n", " ")
+            )
+
+        print("| Name | Email addresses |")
+        print("| --- | --- |")
+        for person in results:
+            name = escape_cell(person["name"])
+            emails = escape_cell(", ".join(person["email_addresses"]))
+            print(f"| {name} | {emails} |")
+        return
+
+    if not results:
+        console.print("No people found.", style="yellow")
+        return
+
+    table = Table(title=f"Directory ({len(results)} people)")
+    table.add_column("Name", style="cyan")
+    table.add_column("Email addresses", style="green", overflow="fold")
+    for person in results:
+        table.add_row(person["name"], "\n".join(person["email_addresses"]))
+    console.print(table)
 
 
 if __name__ == "__main__":

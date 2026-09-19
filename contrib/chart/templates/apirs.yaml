@@ -228,6 +228,7 @@ spec:
       imagePullSecrets:
 {{ toYaml . | nindent 8 }}
       {{- end }}
+{{- include "centaur.podScheduling" (dict "values" .Values.apiRs "indent" 6) }}
       containers:
         - name: api-rs
           image: {{ printf "%s:%s" .Values.apiRs.image.repository .Values.apiRs.image.tag | quote }}
@@ -286,6 +287,14 @@ spec:
 {{- end }}
             - name: RUN_MIGRATIONS
               value: {{ .Values.apiRs.runMigrations | quote }}
+{{- if not (hasKey .Values.apiRs.extraEnv "CENTAUR_SESSION_PRINCIPAL_ADMISSION") }}
+            - name: CENTAUR_SESSION_PRINCIPAL_ADMISSION
+              value: {{ .Values.apiRs.sessionPrincipalAdmission | quote }}
+{{- end }}
+{{- if not (hasKey .Values.apiRs.extraEnv "CENTAUR_MCP_V2_ENABLED") }}
+            - name: CENTAUR_MCP_V2_ENABLED
+              value: {{ .Values.apiRs.mcpV2Enabled | quote }}
+{{- end }}
             - name: IRON_CONTROL_SYNC_INFRA_SECRETS
               value: {{ .Values.apiRs.syncInfraSecrets | quote }}
             - name: RUST_LOG
@@ -357,6 +366,10 @@ spec:
               value: {{ .Values.apiRs.sandboxMaxLifetimeSecs | quote }}
             - name: SESSION_SANDBOX_REAP_INTERVAL_SECS
               value: {{ .Values.apiRs.sandboxReapIntervalSecs | quote }}
+            - name: SESSION_EVENTS_RETENTION_DAYS
+              value: {{ .Values.apiRs.sessionEventsRetentionDays | default 0 | quote }}
+            - name: SESSION_EVENTS_RETENTION_SWEEP_INTERVAL_SECS
+              value: {{ .Values.apiRs.sessionEventsRetentionSweepIntervalSecs | quote }}
             - name: SESSION_SANDBOX_ORPHAN_SWEEP_GRACE_SECS
               value: {{ .Values.apiRs.sandboxOrphanSweepGraceSecs | quote }}
             - name: SESSION_SANDBOX_CLEANUP_INTERVAL_SECS
@@ -405,6 +418,10 @@ spec:
 {{- if and .Values.sandbox.nodeSelector (not (hasKey .Values.apiRs.extraEnv "SESSION_SANDBOX_NODE_SELECTOR")) }}
             - name: SESSION_SANDBOX_NODE_SELECTOR
               value: {{ toJson .Values.sandbox.nodeSelector | quote }}
+{{- end }}
+{{- if and .Values.sandbox.podAnnotations (not (hasKey .Values.apiRs.extraEnv "SESSION_SANDBOX_POD_ANNOTATIONS")) }}
+            - name: SESSION_SANDBOX_POD_ANNOTATIONS
+              value: {{ toJson .Values.sandbox.podAnnotations | quote }}
 {{- end }}
 {{- if and .Values.sandbox.tolerations (not (hasKey .Values.apiRs.extraEnv "SESSION_SANDBOX_TOLERATIONS")) }}
             - name: SESSION_SANDBOX_TOLERATIONS

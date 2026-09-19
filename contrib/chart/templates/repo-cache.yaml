@@ -101,18 +101,7 @@ spec:
       imagePullSecrets:
 {{ toYaml . | nindent 8 }}
       {{- end }}
-{{- with .Values.repoCache.nodeSelector }}
-      nodeSelector:
-{{ toYaml . | nindent 8 }}
-{{- end }}
-{{- with .Values.repoCache.affinity }}
-      affinity:
-{{ toYaml . | nindent 8 }}
-{{- end }}
-{{- with .Values.repoCache.tolerations }}
-      tolerations:
-{{ toYaml . | nindent 8 }}
-{{- end }}
+{{- include "centaur.podScheduling" (dict "values" .Values.repoCache "indent" 6) }}
       containers:
         - name: repo-cache
           image: {{ printf "%s:%s" $repoCacheImageRepository $repoCacheImageTag | quote }}

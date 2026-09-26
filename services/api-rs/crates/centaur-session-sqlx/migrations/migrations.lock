@@ -1,5 +1,3 @@
-# Immutable SQLx migration blobs. Existing entries are append-only.
-# Format: <git blob oid> <migration filename>
 d65e5e438f2eaf07ffd79e23de31476cd227476c 0001_session_control_plane.sql
 1e5abbfa3fa46f861e1c569354c57ff96a45f64b 0002_session_event_notifications.sql
 dfa48d004fa46f58c0af26dbfa47f564fd737ee8 0003_session_iron_control_principal.sql
@@ -58,3 +56,6 @@ c870ff5e07b92f4d67dba43a1231b8c2b0a3b387 0055_harness_constraint_omp.sql
 4fdbcd06bfd6d0e065ad2f74feae5bc0e75a5129 0057_company_context_document_embeddings.sql
 ed1333d05591ad09036a5ae4d2425bf4588aeb07 0058_company_context_document_embeddings_hnsw.sql
 2f4c2afe09293de62d50eefaaa09f694a1712a25 0059_drop_session_owners.sql
+8935d1b6c944e184fd02fd3f7e4f5ecf380e18cb 0060_company_context_reader_slack_rows.sql
+# Format: <git blob oid> <migration filename>
+# Immutable SQLx migration blobs. Existing entries are append-only.

@@ -1,6 +1,6 @@
 //! SQLx-backed session repository.
 
-use std::{collections::BTreeMap, str::FromStr, time::Duration};
+use std::{borrow::Cow, collections::BTreeMap, str::FromStr, time::Duration};
 
 use centaur_session_core::{
     ExecutionStatus, HarnessType, MessageRole, SandboxCapabilities, SandboxRepoCacheAccess,
@@ -20,6 +20,14 @@ use uuid::Uuid;
 
 // The API binary embeds these migrations at compile time.
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
+const HERMES_HARNESS_MIGRATION_VERSION: i64 = 54;
+const HERMES_HARNESS_MIGRATION_SQL_OMP_COMPAT: &str = "alter table sessions
+drop constraint sessions_harness_type_supported;
+
+alter table sessions
+add constraint sessions_harness_type_supported
+check (harness_type in ('codex', 'amp', 'claudecode', 'nanocodex', 'omp', 'hermes'));
+";
 
 pub const SESSION_EVENTS_CHANNEL: &str = "centaur_session_events";
 const DEFAULT_MAX_CONNECTIONS: u32 = 500;
@@ -106,7 +114,7 @@ impl PgSessionStore {
     }
 
     pub async fn run_migrations(&self) -> Result<(), SessionStoreError> {
-        MIGRATOR.run(&self.pool).await?;
+        session_migrator().run(&self.pool).await?;
         Ok(())
     }
 
@@ -1824,6 +1832,26 @@ impl PgSessionStore {
     }
 }
 
+fn session_migrator() -> sqlx::migrate::Migrator {
+    let mut migrator = sqlx::migrate::Migrator::DEFAULT;
+    let mut migrations = MIGRATOR.iter().cloned().collect::<Vec<_>>();
+
+    if let Some(migration) = migrations
+        .iter_mut()
+        .find(|migration| migration.version == HERMES_HARNESS_MIGRATION_VERSION)
+    {
+        // Keep the deployed 0054 checksum immutable for databases that already
+        // recorded it, but run the OMP-compatible SQL when 0054 is still pending.
+        migration.sql = Cow::Borrowed(HERMES_HARNESS_MIGRATION_SQL_OMP_COMPAT);
+    }
+
+    migrator.migrations = Cow::Owned(migrations);
+    migrator.ignore_missing = MIGRATOR.ignore_missing;
+    migrator.locking = MIGRATOR.locking;
+    migrator.no_tx = MIGRATOR.no_tx;
+    migrator
+}
+
 pub struct SessionEventListener {
     listener: PgListener,
 }
@@ -2226,6 +2254,27 @@ mod tests {
                 thread_key: "cli:test".to_owned(),
                 event_id: 42,
             }
+        );
+    }
+
+    #[test]
+    fn runtime_migrator_keeps_0054_checksum_but_allows_omp() {
+        let file_migration = super::MIGRATOR
+            .iter()
+            .find(|migration| migration.version == super::HERMES_HARNESS_MIGRATION_VERSION)
+            .expect("0054 migration is embedded");
+        assert!(!file_migration.sql.contains("'omp'"));
+
+        let migrator = super::session_migrator();
+        let runtime_migration = migrator
+            .iter()
+            .find(|migration| migration.version == super::HERMES_HARNESS_MIGRATION_VERSION)
+            .expect("0054 migration is present in runtime migrator");
+
+        assert!(runtime_migration.sql.contains("'omp'"));
+        assert_eq!(
+            runtime_migration.checksum.as_ref(),
+            file_migration.checksum.as_ref()
         );
     }
 

@@ -139,6 +139,19 @@ async fn migrations_upgrade_from_version_51_with_omp_session() -> Result<(), Box
         .await?;
         assert_eq!(applied_versions, vec![54, 55]);
 
+        let hermes_migration = MIGRATOR
+            .iter()
+            .find(|migration| migration.version == 54)
+            .expect("0054 migration is embedded");
+        let stored_hermes_checksum: Vec<u8> =
+            sqlx::query_scalar("select checksum from _sqlx_migrations where version = 54")
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(
+            stored_hermes_checksum.as_slice(),
+            hermes_migration.checksum.as_ref()
+        );
+
         sqlx::query(
             "insert into sessions (thread_key, harness_type, status) values ($1, 'omp', 'idle')",
         )

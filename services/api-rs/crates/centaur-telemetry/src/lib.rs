@@ -64,6 +64,7 @@ pub const ETL_BACKFILL_JOBS: &str = "etl_backfill_jobs";
 pub const ETL_BACKFILL_JOB_AGE_SECONDS: &str = "etl_backfill_job_age_seconds";
 pub const COMPANY_CONTEXT_DOCUMENTS_CHANGED_TOTAL: &str = "company_context_documents_changed_total";
 pub const COMPANY_CONTEXT_PROJECTION_LAG_SECONDS: &str = "company_context_projection_lag_seconds";
+pub const WORKFLOW_RUNS_TOTAL: &str = "workflow_runs_total";
 pub const WORKFLOW_QUEUE_TASKS: &str = "workflow_queue_tasks";
 pub const WORKFLOW_QUEUE_TASKS_BY_WORKFLOW: &str = "workflow_queue_tasks_by_workflow";
 pub const WORKFLOW_QUEUE_OLDEST_TASK_AGE_SECONDS: &str = "workflow_queue_oldest_task_age_seconds";
@@ -459,6 +460,16 @@ pub fn record_workflow_schedule_tick(
     }
 }
 
+pub fn record_workflow_run(queue: &str, workflow_name: &str, status: &'static str) {
+    metrics::counter!(
+        WORKFLOW_RUNS_TOTAL,
+        "queue" => queue.to_owned(),
+        "workflow_name" => workflow_name.to_owned(),
+        "status" => status,
+    )
+    .increment(1);
+}
+
 pub fn set_workflow_queue_tasks(queue: &str, state: &str, value: f64) {
     metrics::gauge!(
         WORKFLOW_QUEUE_TASKS,
@@ -724,6 +735,10 @@ fn describe_metrics() {
         COMPANY_CONTEXT_PROJECTION_LAG_SECONDS,
         metrics::Unit::Seconds,
         "Company context projection lag in seconds."
+    );
+    metrics::describe_counter!(
+        WORKFLOW_RUNS_TOTAL,
+        "Workflow runs by queue, workflow name, and terminal status."
     );
     metrics::describe_gauge!(
         WORKFLOW_QUEUE_TASKS,
@@ -1084,6 +1099,7 @@ mod tests {
         record_sandbox_operation("local", "create", "success");
         record_sandbox_startup_duration("local", "success", Duration::from_secs(4));
         record_sandbox_warm_pool_claim("hit");
+        record_workflow_run("centaur_workflows", "example", "failed");
 
         let metrics = render_metrics().unwrap();
 
@@ -1113,6 +1129,9 @@ mod tests {
             r#"centaur_sandbox_startup_duration_seconds_count{backend="local",status="success"}"#
         ));
         assert!(metrics.contains(r#"centaur_sandbox_warm_pool_claims_total{result="hit"}"#));
+        assert!(metrics.contains(
+            r#"workflow_runs_total{queue="centaur_workflows",workflow_name="example",status="failed"} 1"#
+        ));
     }
 
     #[test]

@@ -178,6 +178,24 @@ namespace as this release, so a short DNS name is enough.
 {{- end -}}
 
 {{- /*
+Render the standard Kubernetes PodSpec scheduling fields supported by
+chart-managed workloads.
+*/ -}}
+{{- define "centaur.podScheduling" -}}
+{{- $values := .values -}}
+{{- $indent := .indent -}}
+{{- with $values.nodeSelector -}}
+{{- printf "nodeSelector:\n%s" (toYaml . | indent 2) | nindent $indent }}
+{{- end -}}
+{{- with $values.affinity -}}
+{{- printf "affinity:\n%s" (toYaml . | indent 2) | nindent $indent }}
+{{- end -}}
+{{- with $values.tolerations -}}
+{{- printf "tolerations:\n%s" (toYaml . | indent 2) | nindent $indent }}
+{{- end -}}
+{{- end -}}
+
+{{- /*
 console — Rails control plane (formerly "iron-control") for authenticated API
 access and encrypted secret storage. Required in-cluster ClusterIP Service.
 
@@ -245,4 +263,12 @@ names from database.yml, so IRON_CONTROL_DATABASE_URL must not pin one. */ -}}
 
 {{- define "centaur.postgresDatabaseUrl" -}}
 {{- printf "%s/%s" (include "centaur.postgresHostUrl" .) .Values.postgres.auth.database -}}
+{{- end -}}
+
+{{- define "centaur.proxySyncName" -}}
+{{- include "centaur.componentName" (dict "root" . "component" "proxy-sync") -}}
+{{- end -}}
+
+{{- define "centaur.proxySyncUrl" -}}
+{{- printf "http://%s:%v" (include "centaur.proxySyncName" .) .Values.proxySync.port -}}
 {{- end -}}

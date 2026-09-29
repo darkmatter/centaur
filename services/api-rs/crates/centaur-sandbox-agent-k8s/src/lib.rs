@@ -12,13 +12,14 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use centaur_iron_control::IronControlClient;
 use centaur_sandbox_core::{
-    MountKind, ObservedSandbox, SandboxBackend, SandboxCommandOutput, SandboxError, SandboxHandle,
-    SandboxId, SandboxIo, SandboxResult, SandboxSpec, SandboxStatus,
+    MountKind, ObservedSandbox, ResourceRequirements, SandboxBackend, SandboxCommandOutput,
+    SandboxError, SandboxHandle, SandboxId, SandboxIo, SandboxResult, SandboxSpec, SandboxStatus,
 };
 use k8s_openapi::api::core::v1::{ConfigMap, PersistentVolumeClaim, Pod};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use kube::api::{
     AttachParams, DeleteParams, ListParams, LogParams, Patch, PatchParams, PostParams,
+    Preconditions,
 };
 use kube::{Api, Client, Error, Resource};
 use serde_json::{Map, Value, json};
@@ -42,6 +43,8 @@ const SANDBOX_ID_LABEL: &str = "centaur.ai/sandbox-id";
 const OBSERVABILITY_ENABLED_LABEL: &str = "centaur.ai/observability-enabled";
 const MANAGED_BY_VALUE: &str = "api-rs";
 const SANDBOX_FILES_VOLUME: &str = "sandbox-files";
+const ARTIFACT_GET_COMMAND: &str = "/usr/local/bin/centaur-artifact-get";
+const ARTIFACT_ERROR_MAX_BYTES: usize = 64 * 1024;
 // iron-control principal OID the sandbox's proxy binds to, stamped at create
 // so resume (which has only the sandbox id) can rebind without the spec or any
 // in-memory state. Survives pause and api-rs restarts.
@@ -61,8 +64,13 @@ pub struct AgentSandboxConfig {
     pub namespace: String,
     pub field_manager: String,
     pub container_name: String,
+    /// Resources applied to the agent container when a retained sandbox resumes.
+    pub default_resources: Option<ResourceRequirements>,
     pub labels: BTreeMap<String, String>,
+    /// Metadata applied to the Sandbox custom resource and its pod template.
     pub annotations: BTreeMap<String, String>,
+    /// Operator metadata applied only to sandbox and iron-proxy pods.
+    pub pod_annotations: BTreeMap<String, String>,
     pub image_pull_policy: Option<String>,
     pub image_pull_secrets: Vec<String>,
     /// Node steering for every sandbox pod **and** its paired iron-proxy pod.
@@ -116,7 +124,9 @@ pub struct OtlpEgressTarget {
 pub struct IronControlSettings {
     /// Admin client used to register/deregister the per-sandbox proxy.
     pub client: IronControlClient,
-    /// Base URL injected into the proxy pod as `IRON_CONTROL_URL`.
+    /// Console base URL used by sandbox entitlement clients.
+    pub console_url: String,
+    /// Sync base URL injected into the proxy pod as `IRON_CONTROL_PLANE_URL`.
     pub control_url: String,
 }
 
@@ -124,6 +134,7 @@ pub struct IronControlSettings {
 fn test_iron_control_settings() -> IronControlSettings {
     IronControlSettings {
         client: IronControlClient::new("http://127.0.0.1:1", "test-key"),
+        console_url: "http://iron-control".to_owned(),
         control_url: "http://iron-control".to_owned(),
     }
 }
@@ -134,8 +145,10 @@ impl AgentSandboxConfig {
             namespace: namespace.into(),
             field_manager: "centaur-api-rs".to_owned(),
             container_name: DEFAULT_CONTAINER_NAME.to_owned(),
+            default_resources: None,
             labels: BTreeMap::new(),
             annotations: BTreeMap::new(),
+            pod_annotations: BTreeMap::new(),
             image_pull_policy: None,
             image_pull_secrets: Vec::new(),
             node_selector: BTreeMap::new(),
@@ -316,7 +329,8 @@ impl AgentSandboxBackend {
             .with_labels(sandbox.metadata.labels.clone().unwrap_or_default())
             .with_created_at(sandbox_creation_time(sandbox))
             .with_suspended_since(sandbox_paused_at(sandbox))
-            .with_reason(pod.as_ref().and_then(pod_termination_reason)))
+            .with_reason(pod.as_ref().and_then(pod_termination_reason))
+            .with_instance_id(pod.as_ref().and_then(|pod| pod.metadata.uid.clone())))
     }
 
     async fn patch_sandbox_merge(&self, id: &SandboxId, patch: Value) -> SandboxResult<()> {
@@ -326,6 +340,69 @@ impl AgentSandboxBackend {
             .await
             .map(|_| ())
             .map_err(|err| map_kube_error("patch sandbox", err))
+    }
+
+    async fn apply_configured_resources(
+        &self,
+        id: &SandboxId,
+        sandbox: &crd::Sandbox,
+    ) -> SandboxResult<()> {
+        let Some(resources) = self.config.default_resources.as_ref() else {
+            return Ok(());
+        };
+        let patch = sandbox_resources_patch(sandbox, &self.config.container_name, resources)?;
+        let patch = serde_json::from_value(patch).map_err(|error| {
+            SandboxError::backend(format!("build sandbox resources patch: {error}"))
+        })?;
+        self.sandboxes()
+            .patch(
+                id.as_str(),
+                &PatchParams::default(),
+                &Patch::Json::<crd::Sandbox>(patch),
+            )
+            .await
+            .map_err(|err| map_kube_error("patch sandbox resources", err))?;
+
+        // `resume` also repairs Created sandboxes, whose old Pod can already
+        // exist. Recreate that Pod after updating the durable template so the
+        // running container cannot retain the previous resources.
+        self.recreate_existing_pod(id, sandbox.spec.replicas.unwrap_or(1) == 0)
+            .await
+    }
+
+    async fn recreate_existing_pod(&self, id: &SandboxId, suspended: bool) -> SandboxResult<()> {
+        let Some(pod) = self.get_pod(id).await? else {
+            return Ok(());
+        };
+        // Keep resume idempotent for an already-running sandbox. Suspended
+        // sandboxes and Created (terminating, Pending, or unready) Pods must
+        // finish replacement from the updated template.
+        if !suspended && pod.metadata.deletion_timestamp.is_none() && pod_ready(&pod) {
+            return Ok(());
+        }
+        let uid = pod
+            .metadata
+            .uid
+            .ok_or_else(|| SandboxError::backend("sandbox pod has no uid"))?;
+        let params = DeleteParams {
+            preconditions: Some(Preconditions {
+                uid: Some(uid.clone()),
+                ..Preconditions::default()
+            }),
+            ..DeleteParams::default()
+        };
+        if let Err(error) = self.pods().delete(id.as_str(), &params).await {
+            // A replacement may have won the race after the read. Never delete
+            // it using a stale observation; it was created from the new CR.
+            match self.get_pod(id).await? {
+                None => return Ok(()),
+                Some(current) if current.metadata.uid.as_deref() != Some(uid.as_str()) => {
+                    return Ok(());
+                }
+                Some(_) => return Err(map_kube_error("recreate sandbox pod", error)),
+            }
+        }
+        self.wait_until_pod_instance_changes(id, &uid).await
     }
 
     async fn delete_state_pvc(&self, id: &SandboxId) -> SandboxResult<()> {
@@ -418,13 +495,63 @@ impl AgentSandboxBackend {
         }
     }
 
+    async fn wait_until_pod_gone(&self, id: &SandboxId) -> SandboxResult<()> {
+        let deadline = Instant::now() + self.config.ready_timeout;
+        loop {
+            match self.get_pod(id).await? {
+                None => return Ok(()),
+                Some(_) if Instant::now() >= deadline => {
+                    return Err(SandboxError::NotReady(format!(
+                        "sandbox {} pod did not terminate before timeout",
+                        id.as_str()
+                    )));
+                }
+                Some(_) => sleep(Duration::from_millis(500)).await,
+            }
+        }
+    }
+
+    async fn wait_until_pod_instance_changes(
+        &self,
+        id: &SandboxId,
+        previous_uid: &str,
+    ) -> SandboxResult<()> {
+        let deadline = Instant::now() + self.config.ready_timeout;
+        loop {
+            match self.get_pod(id).await? {
+                None => return Ok(()),
+                Some(pod) if pod.metadata.uid.as_deref() != Some(previous_uid) => return Ok(()),
+                Some(_) if Instant::now() >= deadline => {
+                    return Err(SandboxError::NotReady(format!(
+                        "sandbox {} pod instance did not change before timeout",
+                        id.as_str()
+                    )));
+                }
+                Some(_) => sleep(Duration::from_millis(500)).await,
+            }
+        }
+    }
+
+    async fn quiesce_sandbox(&self, id: &SandboxId) -> SandboxResult<()> {
+        match self
+            .patch_sandbox_merge(id, json!({ "spec": { "replicas": 0 } }))
+            .await
+        {
+            Ok(()) => self.wait_until_pod_gone(id).await,
+            Err(SandboxError::NotFound(_)) => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
     async fn attach_io(&self, id: &SandboxId) -> SandboxResult<SandboxIo> {
-        if self.status(id).await? != SandboxStatus::Running {
+        let observed = self.observe(id).await?;
+        if observed.status != SandboxStatus::Running {
             return Err(SandboxError::NotReady(format!(
                 "agent sandbox {} is not running",
                 id.as_str()
             )));
         }
+        let instance_id = observed.instance_id;
         let params = AttachParams::default()
             .container(self.config.container_name.clone())
             .stdin(true)
@@ -448,8 +575,16 @@ impl AgentSandboxBackend {
         let stdin = stdin.ok_or_else(|| SandboxError::io("stdin was not attached"))?;
         let stdout = stdout.ok_or_else(|| SandboxError::io("stdout was not attached"))?;
         let stderr = stderr.ok_or_else(|| SandboxError::io("stderr was not attached"))?;
+        let attached_instance_id = self.observe(id).await?.instance_id;
+        if attached_instance_id != instance_id {
+            return Err(SandboxError::NotReady(format!(
+                "agent sandbox {} changed instances while attaching",
+                id.as_str()
+            )));
+        }
         // Keep kube's attach process alive as long as the returned streams are in use.
-        Ok(SandboxIo::with_guard(stdin, stdout, stderr, attached))
+        Ok(SandboxIo::with_guard(stdin, stdout, stderr, attached)
+            .with_instance_id(attached_instance_id))
     }
 }
 
@@ -654,25 +789,26 @@ impl SandboxBackend for AgentSandboxBackend {
     }
 
     async fn stop(&self, id: &SandboxId) -> SandboxResult<()> {
-        let proxy_result = self.delete_iron_proxy_resources(id).await;
+        // TERM/preStop cleanup may still need the per-sandbox egress path.
+        let quiesce_result = self.quiesce_sandbox(id).await;
         let files_result = self.delete_sandbox_files_config_map(id).await;
-        match self
+        let sandbox_result = match self
             .sandboxes()
             .delete(id.as_str(), &DeleteParams::default())
             .await
         {
-            Ok(_) => {
-                proxy_result?;
-                files_result?;
-                self.delete_state_pvc(id).await
-            }
-            Err(err) if is_not_found(&err) => {
-                proxy_result?;
-                files_result?;
-                self.delete_state_pvc(id).await
-            }
+            Ok(_) => Ok(()),
+            Err(err) if is_not_found(&err) => Ok(()),
             Err(err) => Err(map_kube_error("delete sandbox", err)),
-        }
+        };
+        let proxy_result = self.delete_iron_proxy_resources(id).await;
+        let state_result = self.delete_state_pvc(id).await;
+
+        quiesce_result?;
+        files_result?;
+        sandbox_result?;
+        proxy_result?;
+        state_result
     }
 
     async fn assign_iron_control_proxy_principal(
@@ -760,10 +896,106 @@ impl SandboxBackend for AgentSandboxBackend {
                 sandbox_capability_labels(sandbox, &self.config.container_name, id.as_str())
             })
             .unwrap_or_default();
+        // Do not scale up with stale fleet policy. The container-name test
+        // makes the replacement atomic against a reordered pod template.
+        if let Some(sandbox) = &sandbox {
+            self.apply_configured_resources(id, sandbox).await?;
+        }
         self.patch_sandbox_merge(id, sandbox_resume_patch(&capability_labels))
             .await?;
         self.wait_until_running(id).await
     }
+}
+
+impl AgentSandboxBackend {
+    /// Read an artifact through a one-shot pod exec whose stdout is the file body.
+    pub async fn read_artifact(
+        &self,
+        id: &SandboxId,
+        path: &str,
+        max_bytes: usize,
+    ) -> SandboxResult<Vec<u8>> {
+        let params = AttachParams::default()
+            .container(self.config.container_name.clone())
+            .stdin(false)
+            .stdout(true)
+            .stderr(true)
+            .tty(false);
+        let mut process = self
+            .pods()
+            .exec(id.as_str(), [ARTIFACT_GET_COMMAND, path], &params)
+            .await
+            .map_err(|error| map_kube_error("exec sandbox artifact reader", error))?;
+        let mut stdout = process
+            .stdout()
+            .ok_or_else(|| SandboxError::io("artifact reader stdout was not attached"))?;
+        let mut stderr = process
+            .stderr()
+            .ok_or_else(|| SandboxError::io("artifact reader stderr was not attached"))?;
+        let status = process
+            .take_status()
+            .ok_or_else(|| SandboxError::io("artifact reader status was not attached"))?;
+
+        let mut contents = Vec::new();
+        let mut error_output = Vec::new();
+        let (stdout_result, stderr_result, status) = tokio::join!(
+            read_stream_bounded(&mut stdout, &mut contents, max_bytes),
+            read_stream_bounded(&mut stderr, &mut error_output, ARTIFACT_ERROR_MAX_BYTES),
+            status,
+        );
+        let contents_exceeded = stdout_result.map_err(|error| {
+            SandboxError::io_source("read sandbox artifact command stdout", error)
+        })?;
+        let error_output_exceeded = stderr_result.map_err(|error| {
+            SandboxError::io_source("read sandbox artifact command stderr", error)
+        })?;
+        process.join().await.map_err(|error| {
+            SandboxError::backend_source("join sandbox artifact command", error)
+        })?;
+
+        if status.as_ref().and_then(|status| status.status.as_deref()) != Some("Success") {
+            return Err(artifact_command_rejection(
+                &error_output,
+                error_output_exceeded,
+            ));
+        }
+        if contents_exceeded {
+            return Err(SandboxError::ArtifactRejected(format!(
+                "artifact exceeds the {max_bytes}-byte size limit"
+            )));
+        }
+
+        Ok(contents)
+    }
+}
+
+fn artifact_command_rejection(error_output: &[u8], truncated: bool) -> SandboxError {
+    if !truncated {
+        let stderr = String::from_utf8_lossy(error_output);
+        if let Some(detail) = stderr.trim().strip_prefix("centaur-artifact-get: ")
+            && !detail.is_empty()
+        {
+            return SandboxError::ArtifactRejected(detail.to_owned());
+        }
+    }
+    SandboxError::ArtifactRejected(
+        "artifact retrieval is unavailable in the current sandbox".to_owned(),
+    )
+}
+
+async fn read_stream_bounded(
+    reader: &mut (impl AsyncRead + Unpin),
+    retained: &mut Vec<u8>,
+    max_bytes: usize,
+) -> std::io::Result<bool> {
+    let retained_limit = max_bytes.saturating_add(1) as u64;
+    reader.take(retained_limit).read_to_end(retained).await?;
+    let exceeded = retained.len() > max_bytes;
+    if exceeded {
+        retained.truncate(max_bytes);
+    }
+    tokio::io::copy(reader, &mut tokio::io::sink()).await?;
+    Ok(exceeded)
 }
 
 fn sandbox_pause_patch(paused_at: jiff::Timestamp) -> Value {
@@ -1127,6 +1359,8 @@ fn build_agent_sandbox(
             .filter(|name| !name.is_empty()),
     );
 
+    let mut pod_annotations = config.annotations.clone();
+    pod_annotations.extend(config.pod_annotations.clone());
     let mut agent_spec = json!({
         "replicas": 1,
         "service": false,
@@ -1134,7 +1368,7 @@ fn build_agent_sandbox(
         "podTemplate": {
             "metadata": {
                 "labels": pod_labels,
-                "annotations": config.annotations,
+                "annotations": pod_annotations,
             },
             "spec": pod_spec,
         },
@@ -1282,6 +1516,41 @@ fn resources_json(spec: &SandboxSpec) -> Option<Value> {
     (!resources.is_empty()).then(|| json!(resources))
 }
 
+fn sandbox_resources_patch(
+    sandbox: &crd::Sandbox,
+    container_name: &str,
+    resources: &ResourceRequirements,
+) -> SandboxResult<Value> {
+    let index = sandbox
+        .spec
+        .pod_template
+        .spec
+        .containers
+        .iter()
+        .position(|container| container.name == container_name)
+        .ok_or_else(|| {
+            SandboxError::backend(format!("sandbox has no container named {container_name:?}"))
+        })?;
+    let resources = if resources.is_empty() {
+        Value::Null
+    } else {
+        json!(resources)
+    };
+
+    Ok(json!([
+        {
+            "op": "test",
+            "path": format!("/spec/podTemplate/spec/containers/{index}/name"),
+            "value": container_name,
+        },
+        {
+            "op": "add",
+            "path": format!("/spec/podTemplate/spec/containers/{index}/resources"),
+            "value": resources,
+        },
+    ]))
+}
+
 fn state_volume_claim_json(state_volume: &StateVolumeConfig) -> Vec<Value> {
     let mut pvc_spec = json!({
         "accessModes": ["ReadWriteOnce"],
@@ -1373,8 +1642,48 @@ mod tests {
     };
     use k8s_openapi::api::core::v1::{PodCondition, PodStatus};
     use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
+    use tokio::io::AsyncWriteExt;
 
     use super::*;
+
+    #[test]
+    fn artifact_command_failures_are_safe_tool_rejections() {
+        let expected =
+            artifact_command_rejection(b"centaur-artifact-get: artifact does not exist\n", false);
+        assert!(matches!(
+            expected,
+            SandboxError::ArtifactRejected(message) if message == "artifact does not exist"
+        ));
+
+        for (stderr, truncated) in [
+            (b"executable file not found".as_slice(), false),
+            (b"centaur-artifact-get: partial".as_slice(), true),
+        ] {
+            let error = artifact_command_rejection(stderr, truncated);
+            assert!(matches!(
+                error,
+                SandboxError::ArtifactRejected(message)
+                    if message == "artifact retrieval is unavailable in the current sandbox"
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_stream_read_caps_retained_bytes_and_drains_the_stream() {
+        let (mut writer, mut reader) = tokio::io::duplex(4);
+        let write = tokio::spawn(async move {
+            writer.write_all(b"abcdef").await.unwrap();
+        });
+        let mut retained = Vec::new();
+
+        let exceeded = read_stream_bounded(&mut reader, &mut retained, 3)
+            .await
+            .unwrap();
+        write.await.unwrap();
+
+        assert!(exceeded);
+        assert_eq!(retained, b"abc");
+    }
 
     #[test]
     fn builds_agent_sandbox_spec_with_state_volume_and_limits() {
@@ -1552,6 +1861,59 @@ mod tests {
     }
 
     #[test]
+    fn resource_patch_atomically_targets_the_agent_container() {
+        let config = AgentSandboxConfig::new("centaur", test_iron_control_settings());
+        let mut sandbox = build_agent_sandbox(
+            &SandboxId::new("asbx-test"),
+            &SandboxSpec::new("centaur-agent:latest"),
+            &config,
+        )
+        .unwrap();
+        let mut sidecar = sandbox.spec.pod_template.spec.containers[0].clone();
+        sidecar.name = "sidecar".to_owned();
+        sandbox.spec.pod_template.spec.containers.insert(0, sidecar);
+        let resources = ResourceRequirements::new()
+            .request("cpu", "2")
+            .limit("memory", "8Gi");
+
+        let patch = sandbox_resources_patch(&sandbox, "agent", &resources).unwrap();
+
+        assert_eq!(
+            patch,
+            json!([
+                {
+                    "op": "test",
+                    "path": "/spec/podTemplate/spec/containers/1/name",
+                    "value": "agent",
+                },
+                {
+                    "op": "add",
+                    "path": "/spec/podTemplate/spec/containers/1/resources",
+                    "value": {
+                        "limits": { "memory": "8Gi" },
+                        "requests": { "cpu": "2" },
+                    },
+                },
+            ])
+        );
+    }
+
+    #[test]
+    fn resource_patch_can_atomically_clear_stale_resources() {
+        let config = AgentSandboxConfig::new("centaur", test_iron_control_settings());
+        let sandbox = build_agent_sandbox(
+            &SandboxId::new("asbx-test"),
+            &SandboxSpec::new("centaur-agent:latest"),
+            &config,
+        )
+        .unwrap();
+        let patch =
+            sandbox_resources_patch(&sandbox, "agent", &ResourceRequirements::default()).unwrap();
+
+        assert!(patch[1]["value"].is_null());
+    }
+
+    #[test]
     fn node_steering_reaches_the_sandbox_pod_template() {
         let spec = SandboxSpec::new("centaur-agent:latest");
         let mut config = AgentSandboxConfig::new("centaur", test_iron_control_settings());
@@ -1565,8 +1927,33 @@ mod tests {
         }];
         config.runtime_class_name = Some("gvisor".to_owned());
         config.priority_class_name = Some("centaur-sandbox".to_owned());
+        config.pod_annotations = BTreeMap::from([
+            ("karpenter.sh/do-not-disrupt".to_owned(), "true".to_owned()),
+            (PAUSED_AT_ANNOTATION.to_owned(), "operator-value".to_owned()),
+        ]);
 
         let sandbox = build_agent_sandbox(&SandboxId::new("asbx-test"), &spec, &config).unwrap();
+        assert_eq!(
+            sandbox
+                .spec
+                .pod_template
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.annotations.as_ref())
+                .and_then(|annotations| annotations.get("karpenter.sh/do-not-disrupt"))
+                .map(String::as_str),
+            Some("true")
+        );
+        assert!(
+            sandbox
+                .metadata
+                .annotations
+                .as_ref()
+                .is_none_or(|annotations| {
+                    !annotations.contains_key("karpenter.sh/do-not-disrupt")
+                        && !annotations.contains_key(PAUSED_AT_ANNOTATION)
+                })
+        );
         let pod_spec = &sandbox.spec.pod_template.spec;
 
         assert_eq!(

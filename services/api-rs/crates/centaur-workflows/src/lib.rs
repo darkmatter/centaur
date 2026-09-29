@@ -10,7 +10,8 @@ use std::{
 
 use absurd::{
     AwaitEventOptions, Client, ClientOptions, CreateQueueOptions, RetryKind, RetryStrategy,
-    SpawnOptions, StepHandle, TaskContext, TaskRegistrationOptions, Worker, WorkerOptions,
+    SpawnOptions, StepHandle, TaskContext, TaskRegistrationOptions, TaskResultState,
+    TaskTerminalOutcome, Worker, WorkerOptions,
 };
 use centaur_iron_control::{IronControlClient, IronControlError, PrincipalInput, slugify};
 use centaur_sandbox_core::SandboxSpec;
@@ -35,6 +36,9 @@ use tokio::{
     task::JoinHandle,
 };
 use tracing::{info, warn};
+
+pub mod slack_button_feedback;
+pub mod slack_buttons;
 
 pub const WORKFLOW_QUEUE: &str = "centaur_workflows";
 pub const WORKFLOW_SLACK_LIVE_QUEUE: &str = "centaur_workflows_slack_live";
@@ -362,6 +366,7 @@ pub struct CreateWorkflowRunRequest {
 pub struct CreateWorkflowRunResponse {
     pub ok: bool,
     pub run_id: String,
+    pub initial_run_id: String,
     pub task_id: String,
     pub status: String,
     pub created: bool,
@@ -370,6 +375,7 @@ pub struct CreateWorkflowRunResponse {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct WorkflowRun {
     pub run_id: String,
+    pub initial_run_id: String,
     pub task_id: String,
     pub workflow_name: String,
     pub status: String,
@@ -472,6 +478,8 @@ struct WorkflowTaskInput {
     workflow_name: String,
     input: Value,
     harness_type: HarnessType,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    slack_button_feedback: Option<slack_button_feedback::ButtonFeedback>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -728,8 +736,10 @@ impl WorkflowRuntime {
             .clone();
         reconcile_schedules(&schedule_client, &startup_schedules).await?;
 
+        let terminal_outcome_hook = Arc::new(record_terminal_workflow_outcome);
         let worker = client.start_worker(WorkerOptions {
             worker_id: Some("centaur-api-rs-workflow-worker".to_owned()),
+            on_task_terminal: Some(terminal_outcome_hook.clone()),
             concurrency: worker_concurrency(
                 WORKFLOW_WORKER_CONCURRENCY_ENV,
                 DEFAULT_WORKFLOW_WORKER_CONCURRENCY,
@@ -741,6 +751,7 @@ impl WorkflowRuntime {
         });
         let slack_live_worker = slack_live_client.start_worker(WorkerOptions {
             worker_id: Some("centaur-api-rs-workflow-slack-live-worker".to_owned()),
+            on_task_terminal: Some(terminal_outcome_hook.clone()),
             concurrency: 1,
             on_error: Some(Arc::new(|error| {
                 warn!(%error, "absurd workflow slack live worker error");
@@ -749,6 +760,7 @@ impl WorkflowRuntime {
         });
         let etl_worker = etl_client.start_worker(WorkerOptions {
             worker_id: Some("centaur-api-rs-workflow-etl-worker".to_owned()),
+            on_task_terminal: Some(terminal_outcome_hook.clone()),
             concurrency: worker_concurrency(
                 WORKFLOW_ETL_WORKER_CONCURRENCY_ENV,
                 DEFAULT_WORKFLOW_ETL_WORKER_CONCURRENCY,
@@ -760,6 +772,7 @@ impl WorkflowRuntime {
         });
         let etl_backfill_worker = etl_backfill_client.start_worker(WorkerOptions {
             worker_id: Some("centaur-api-rs-workflow-etl-backfill-worker".to_owned()),
+            on_task_terminal: Some(terminal_outcome_hook),
             concurrency: worker_concurrency(
                 WORKFLOW_ETL_BACKFILL_WORKER_CONCURRENCY_ENV,
                 DEFAULT_WORKFLOW_ETL_BACKFILL_WORKER_CONCURRENCY,
@@ -836,6 +849,14 @@ impl WorkflowRuntime {
         &self,
         request: CreateWorkflowRunRequest,
     ) -> Result<CreateWorkflowRunResponse, WorkflowRuntimeError> {
+        self.create_button_run(request, None).await
+    }
+
+    pub async fn create_button_run(
+        &self,
+        request: CreateWorkflowRunRequest,
+        feedback: Option<slack_button_feedback::ButtonFeedback>,
+    ) -> Result<CreateWorkflowRunResponse, WorkflowRuntimeError> {
         let workflow_name = request.workflow_name.trim();
         if workflow_name.is_empty() {
             return Err(WorkflowRuntimeError::BadRequest(
@@ -851,6 +872,7 @@ impl WorkflowRuntime {
                     workflow_name: workflow_name.to_owned(),
                     input: request.input,
                     harness_type: request.harness_type.unwrap_or(HarnessType::Codex),
+                    slack_button_feedback: feedback,
                 },
                 SpawnOptions {
                     max_attempts: request.max_attempts,
@@ -859,13 +881,39 @@ impl WorkflowRuntime {
                 },
             )
             .await?;
+        let initial_run_id = self.initial_run_id(workflow_name, &spawn.task_id).await?;
         Ok(CreateWorkflowRunResponse {
             ok: true,
             run_id: spawn.run_id,
+            initial_run_id,
             task_id: spawn.task_id,
             status: "queued".to_owned(),
             created: spawn.created,
         })
+    }
+
+    pub async fn initial_run_id(
+        &self,
+        workflow_name: &str,
+        task_id: &str,
+    ) -> Result<String, WorkflowRuntimeError> {
+        let queue_name = queue_name_for_class(workflow_queue_class(workflow_name));
+        let (_, run_table) = absurd_queue_tables(queue_name)?;
+        let row = sqlx::query(&format!(
+            r#"
+            select run_id::text as run_id
+            from {run_table}
+            where task_id = $1::uuid
+            order by attempt, run_id
+            limit 1
+            "#,
+        ))
+        .bind(task_id)
+        .fetch_optional(self.inner.client.pool())
+        .await?;
+        row.map(|row| row.try_get("run_id"))
+            .transpose()?
+            .ok_or_else(|| WorkflowRuntimeError::NotFound(task_id.to_owned()))
     }
 
     pub async fn list_runs(
@@ -911,6 +959,13 @@ impl WorkflowRuntime {
             r#"
             select
                 r.run_id::text as run_id,
+                (
+                    select initial.run_id::text
+                    from {run_table} initial
+                    where initial.task_id = t.task_id
+                    order by initial.attempt, initial.run_id
+                    limit 1
+                ) as initial_run_id,
                 t.task_id::text as task_id,
                 t.task_name,
                 t.params,
@@ -962,6 +1017,13 @@ impl WorkflowRuntime {
             r#"
             select
                 r.run_id::text as run_id,
+                (
+                    select initial.run_id::text
+                    from {run_table} initial
+                    where initial.task_id = t.task_id
+                    order by initial.attempt, initial.run_id
+                    limit 1
+                ) as initial_run_id,
                 t.task_id::text as task_id,
                 t.task_name,
                 t.params,
@@ -990,7 +1052,7 @@ impl WorkflowRuntime {
             (WORKFLOW_ETL_BACKFILL_QUEUE, &self.inner.etl_backfill_client),
         ] {
             if let Some(run) = self.get_run_for_queue(queue_name, run_id).await? {
-                client.cancel_task(&run.task_id, Some(queue_name)).await?;
+                client.cancel_task(&run.task_id, None).await?;
                 return Ok(());
             }
         }
@@ -1800,6 +1862,7 @@ async fn discover_python_workflow_metadata() -> Result<PythonWorkflowMetadata, W
         env::var(PYTHON_HOST_INTERPRETER_ENV).unwrap_or_else(|_| "python3".to_owned()),
     );
     command
+        .env_remove("CENTAUR_JWT_SIGNING_SECRET")
         .arg(&host_path)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -2488,6 +2551,7 @@ async fn run_schedule_tick(
                 workflow_name: schedule.workflow_name.clone(),
                 input: schedule.input.clone(),
                 harness_type: HarnessType::Codex,
+                slack_button_feedback: None,
             },
             SpawnOptions {
                 idempotency_key: Some(fire_key.clone()),
@@ -2736,8 +2800,35 @@ fn workflow_attempt_outcome(result: &absurd::Result<WorkflowResult>) -> Option<&
     }
 }
 
+fn terminal_workflow_metric(outcome: &TaskTerminalOutcome) -> Option<(&str, &str, &'static str)> {
+    if outcome.task_name != WORKFLOW_TASK {
+        return None;
+    }
+    let workflow_name = outcome
+        .params
+        .get("workflow_name")
+        .and_then(Value::as_str)
+        .filter(|name| !name.is_empty())
+        .unwrap_or("unknown");
+    let status = match outcome.state {
+        TaskResultState::Completed => "completed",
+        TaskResultState::Failed => "failed",
+        TaskResultState::Cancelled => "cancelled",
+        TaskResultState::Pending | TaskResultState::Running | TaskResultState::Sleeping => {
+            return None;
+        }
+    };
+    Some((&outcome.queue_name, workflow_name, status))
+}
+
+fn record_terminal_workflow_outcome(outcome: TaskTerminalOutcome) {
+    if let Some((queue_name, workflow_name, status)) = terminal_workflow_metric(&outcome) {
+        centaur_telemetry::record_workflow_run(queue_name, workflow_name, status);
+    }
+}
+
 async fn run_centaur_workflow(
-    input: WorkflowTaskInput,
+    mut input: WorkflowTaskInput,
     ctx: TaskContext,
     session_runtime: SessionRuntime,
     workflow_host_sandbox: Option<WorkflowHostSandboxRuntime>,
@@ -2748,12 +2839,21 @@ async fn run_centaur_workflow(
     let started_at = Instant::now();
     let mut cleanup_guard =
         WorkflowSandboxCleanupGuard::new(session_runtime.clone(), ctx.run_id().to_owned());
-    let result = run_centaur_workflow_inner(
-        input,
-        ctx,
-        session_runtime,
-        workflow_host_sandbox,
-        workflow_clients,
+    let feedback = input.slack_button_feedback.take();
+    let result = slack_button_feedback::run(
+        feedback,
+        &ctx.clone(),
+        |message| send_slack_request("chat.update", message),
+        |feedback| {
+            input.slack_button_feedback = feedback;
+            run_centaur_workflow_inner(
+                input,
+                ctx,
+                session_runtime,
+                workflow_host_sandbox,
+                workflow_clients,
+            )
+        },
     )
     .await
     .map(|mut result| {
@@ -3080,6 +3180,7 @@ async fn run_python_workflow_host_local(
         env::var(PYTHON_HOST_INTERPRETER_ENV).unwrap_or_else(|_| "python3".to_owned()),
     );
     command
+        .env_remove("CENTAUR_JWT_SIGNING_SECRET")
         .arg(&host_path)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -3212,7 +3313,11 @@ async fn run_python_workflow_host_in_sandbox(
     workflow_clients: WorkflowQueueClients,
 ) -> Result<Value, WorkflowRuntimeError> {
     let mut spec = sandbox.spec_for_workflow(&input.workflow_name)?;
+    spec.env
+        .retain(|entry| entry.name != "CENTAUR_JWT_SIGNING_SECRET");
     spec = spec
+        // Also mask inheritance from the development-only local process backend.
+        .env("CENTAUR_JWT_SIGNING_SECRET", "")
         .env("WORKFLOW_RUN_ID", ctx.run_id())
         .env("WORKFLOW_TASK_ID", ctx.task_id())
         .env("WORKFLOW_NAME", input.workflow_name.clone());
@@ -3650,6 +3755,15 @@ async fn handle_python_context_request(
             Ok(value) => Ok(value),
             Err(error) => Err(error.to_string()),
         },
+        Some("ctx.update_slack") => {
+            slack_button_feedback::update(
+                input.slack_button_feedback.as_ref(),
+                ctx,
+                &message["message"],
+                send_slack_request("chat.update", message["message"].clone()),
+            )
+            .await
+        }
         Some("ctx.post_to_slack") => {
             match post_python_slack_message(message, ctx, &request_id).await {
                 Ok(value) => Ok(value),
@@ -3715,6 +3829,7 @@ async fn start_python_child_workflow(
                 workflow_name: workflow_name.to_owned(),
                 input: child_input,
                 harness_type: parent.harness_type.clone(),
+                slack_button_feedback: None,
             },
             SpawnOptions {
                 idempotency_key,
@@ -4300,21 +4415,14 @@ async fn post_tool_result_to_slack(
     note: &str,
     tool: &ToolResult,
 ) -> Result<SlackPostResult, WorkflowRuntimeError> {
-    let token = env::var("SLACK_BOT_TOKEN")
-        .or_else(|_| env::var("SLACK_BOT_TOKEN_OVERRIDE"))
-        .map_err(|_| {
-            WorkflowRuntimeError::BadRequest(
-                "SLACK_BOT_TOKEN or SLACK_BOT_TOKEN_OVERRIDE must be set".to_owned(),
-            )
-        })?;
     let text = format!(
         "{note}\nworkflow=tool_and_slack\ntool={}.{}\nresult={}",
         tool.tool,
         tool.method,
         serde_json::to_string(&tool.output)?,
     );
-    let response = send_slack_message(
-        &token,
+    let response = send_slack_request(
+        "chat.postMessage",
         json!({
             "channel": channel,
             "text": text,
@@ -4348,15 +4456,10 @@ async fn post_python_slack_message(
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| format!("{}:slack:{request_id}", ctx.task_id()));
 
-    let token = env::var("SLACK_BOT_TOKEN")
-        .or_else(|_| env::var("SLACK_BOT_TOKEN_OVERRIDE"))
-        .map_err(|_| {
-            WorkflowRuntimeError::BadRequest(
-                "SLACK_BOT_TOKEN or SLACK_BOT_TOKEN_OVERRIDE must be set".to_owned(),
-            )
-        })?;
-    let payload = python_slack_message_payload(channel, text, &client_msg_id, &args);
-    let response = send_slack_message(&token, payload).await?;
+    let mut payload = python_slack_message_payload(channel, text, &client_msg_id, &args);
+    let secret = env::var("CENTAUR_JWT_SIGNING_SECRET").unwrap_or_default();
+    slack_buttons::sign_message(&mut payload, secret.trim().as_bytes())?;
+    let response = send_slack_request("chat.postMessage", payload).await?;
     serde_json::to_value(slack_post_result_from_response(channel, response))
         .map_err(WorkflowRuntimeError::from)
 }
@@ -4404,22 +4507,32 @@ fn python_slack_message_payload(
     payload
 }
 
-async fn send_slack_message(token: &str, payload: Value) -> Result<Value, WorkflowRuntimeError> {
+async fn send_slack_request(
+    method: &'static str,
+    payload: Value,
+) -> Result<Value, WorkflowRuntimeError> {
+    let token = env::var("SLACK_BOT_TOKEN")
+        .or_else(|_| env::var("SLACK_BOT_TOKEN_OVERRIDE"))
+        .map_err(|_| {
+            WorkflowRuntimeError::BadRequest(
+                "SLACK_BOT_TOKEN or SLACK_BOT_TOKEN_OVERRIDE must be set".into(),
+            )
+        })?;
+    let base = env::var("SLACK_API_URL").unwrap_or_else(|_| "https://slack.com/api/".into());
     let response: Value = reqwest::Client::new()
-        .post("https://slack.com/api/chat.postMessage")
+        .post(format!("{}/{method}", base.trim_end_matches('/')))
+        .timeout(Duration::from_secs(15))
         .bearer_auth(token)
         .json(&payload)
         .send()
         .await?
+        .error_for_status()?
         .json()
         .await?;
     if response.get("ok").and_then(Value::as_bool) != Some(true) {
         return Err(WorkflowRuntimeError::Upstream(format!(
-            "Slack chat.postMessage failed: {}",
-            response
-                .get("error")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown_error")
+            "Slack {method} failed: {}",
+            response["error"].as_str().unwrap_or("unknown_error")
         )));
     }
     Ok(response)
@@ -4674,6 +4787,7 @@ fn workflow_run_from_row(row: sqlx::postgres::PgRow) -> Result<WorkflowRun, Work
         .to_owned();
     Ok(WorkflowRun {
         run_id: row.try_get("run_id")?,
+        initial_run_id: row.try_get("initial_run_id")?,
         task_id: row.try_get("task_id")?,
         workflow_name,
         status: row.try_get("state")?,
@@ -5400,6 +5514,7 @@ mod tests {
             + time::Duration::nanoseconds(44_019_000);
         let run = WorkflowRun {
             run_id: "run".to_owned(),
+            initial_run_id: "initial-run".to_owned(),
             task_id: "task".to_owned(),
             workflow_name: "workflow".to_owned(),
             status: "completed".to_owned(),
@@ -5411,6 +5526,7 @@ mod tests {
             updated_at: at,
         };
         let value = serde_json::to_value(run).unwrap();
+        assert_eq!(value["initial_run_id"], json!("initial-run"));
         assert_eq!(value["created_at"], json!("2026-06-09T13:35:05.044019Z"));
         assert_eq!(value["updated_at"], json!("2026-06-09T13:35:05.044019Z"));
     }
@@ -5819,6 +5935,36 @@ mod tests {
             .ensure_enabled("slack_sync")
             .unwrap_err();
         assert!(matches!(error, WorkflowRuntimeError::Disabled(_)));
+    }
+
+    #[test]
+    fn terminal_workflow_metrics_use_durable_outcomes() {
+        for (state, expected_status) in [
+            (TaskResultState::Completed, "completed"),
+            (TaskResultState::Failed, "failed"),
+            (TaskResultState::Cancelled, "cancelled"),
+        ] {
+            let outcome = TaskTerminalOutcome {
+                queue_name: WORKFLOW_QUEUE.to_owned(),
+                task_id: "task-1".to_owned(),
+                task_name: WORKFLOW_TASK.to_owned(),
+                params: json!({"workflow_name": "example"}),
+                state,
+            };
+            assert_eq!(
+                terminal_workflow_metric(&outcome),
+                Some((WORKFLOW_QUEUE, "example", expected_status))
+            );
+        }
+
+        let non_terminal = TaskTerminalOutcome {
+            queue_name: WORKFLOW_QUEUE.to_owned(),
+            task_id: "task-1".to_owned(),
+            task_name: WORKFLOW_TASK.to_owned(),
+            params: json!({"workflow_name": "example"}),
+            state: TaskResultState::Sleeping,
+        };
+        assert_eq!(terminal_workflow_metric(&non_terminal), None);
     }
 
     #[test]

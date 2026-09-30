@@ -19,6 +19,7 @@ use k8s_openapi::api::core::v1::{ConfigMap, PersistentVolumeClaim, Pod};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use kube::api::{
     AttachParams, DeleteParams, ListParams, LogParams, Patch, PatchParams, PostParams,
+    Preconditions,
 };
 use kube::{Api, Client, Error, Resource};
 use serde_json::{Map, Value, json};
@@ -92,6 +93,9 @@ pub struct AgentSandboxConfig {
     pub priority_class_name: Option<String>,
     pub state_volume: Option<StateVolumeConfig>,
     pub iron_proxy: Option<IronProxyConfig>,
+    /// Start new terminal-agent retirement decisions. Existing decisions
+    /// always recover, even while staged rollout or rollback disables this.
+    pub terminal_proxy_retirement_enabled: bool,
     pub iron_control: IronControlSettings,
     /// When set, every sandbox gets a `tools-bootstrap` init container that
     /// git-clones the tools repo into the agent's `/app/tools`, and `TOOL_DIRS`
@@ -154,6 +158,7 @@ impl AgentSandboxConfig {
             priority_class_name: None,
             state_volume: None,
             iron_proxy: None,
+            terminal_proxy_retirement_enabled: false,
             iron_control,
             tools: None,
             otlp_egress: None,
@@ -318,9 +323,8 @@ impl AgentSandboxBackend {
         id: &SandboxId,
         sandbox: &crd::Sandbox,
     ) -> SandboxResult<ObservedSandbox> {
-        let replicas = sandbox.spec.replicas.unwrap_or(1);
         let pod = self.get_pod(id).await?;
-        let status = sandbox_status_from_pod(replicas, pod.as_ref());
+        let status = sandbox_status(sandbox, pod.as_ref());
         Ok(ObservedSandbox::new(id.clone(), BACKEND_NAME, status)
             .with_labels(sandbox.metadata.labels.clone().unwrap_or_default())
             .with_created_at(sandbox_creation_time(sandbox))
@@ -336,6 +340,83 @@ impl AgentSandboxBackend {
             .await
             .map(|_| ())
             .map_err(|err| map_kube_error("patch sandbox", err))
+    }
+
+    async fn apply_resume_intent(
+        &self,
+        id: &SandboxId,
+        sandbox: &crd::Sandbox,
+        capability_labels: &BTreeMap<&'static str, bool>,
+    ) -> SandboxResult<()> {
+        let (Some(uid), Some(revision)) =
+            (&sandbox.metadata.uid, &sandbox.metadata.resource_version)
+        else {
+            return Err(SandboxError::backend("sandbox has no identity for resume"));
+        };
+        let mut patch = sandbox_resume_patch(capability_labels);
+        patch["metadata"]["uid"] = json!(uid);
+        patch["metadata"]["resourceVersion"] = json!(revision);
+        // Even an idempotent resume must invalidate any terminal decision
+        // captured before companion recreation. Removing absent keys is a no-op.
+        patch["metadata"]["annotations"][iron_proxy::retirement::RESUME_ANNOTATION] =
+            json!(uuid::Uuid::new_v4().to_string());
+        patch["metadata"]["annotations"][iron_proxy::retirement::RETIREMENT_ANNOTATION] =
+            Value::Null;
+        if iron_proxy::retirement::sandbox_retired(sandbox) {
+            patch["spec"]["shutdownTime"] = Value::Null;
+        }
+        self.sandboxes()
+            .patch(id.as_str(), &PatchParams::default(), &Patch::Merge(patch))
+            .await
+            .map(|_| ())
+            .map_err(|err| map_kube_error("commit sandbox resume", err))
+    }
+
+    async fn recreate_existing_pod(
+        &self,
+        id: &SandboxId,
+        previous: Option<&Pod>,
+        suspended: bool,
+    ) -> SandboxResult<()> {
+        let Some(previous_uid) = previous.and_then(|pod| pod.metadata.uid.as_ref()) else {
+            return Ok(());
+        };
+        let Some(pod) = self.get_pod(id).await? else {
+            return Ok(());
+        };
+        // The controller can create the resumed generation immediately after
+        // the intent commit. Replacement applies only to the pre-commit Pod.
+        if pod.metadata.uid.as_ref() != Some(previous_uid) {
+            return Ok(());
+        }
+        // Keep resume idempotent for an already-running sandbox. Suspended
+        // sandboxes and terminal Pods must finish replacement before I/O.
+        if !suspended && pod.metadata.deletion_timestamp.is_none() && pod_ready(&pod) {
+            return Ok(());
+        }
+        let uid = pod
+            .metadata
+            .uid
+            .ok_or_else(|| SandboxError::backend("sandbox pod has no uid"))?;
+        let params = DeleteParams {
+            preconditions: Some(Preconditions {
+                uid: Some(uid.clone()),
+                resource_version: pod.metadata.resource_version,
+            }),
+            ..DeleteParams::default()
+        };
+        if let Err(error) = self.pods().delete(id.as_str(), &params).await {
+            // A replacement may have won the race after the read. Never delete
+            // it using a stale observation; it was created from the new CR.
+            match self.get_pod(id).await? {
+                None => return Ok(()),
+                Some(current) if current.metadata.uid.as_deref() != Some(uid.as_str()) => {
+                    return Ok(());
+                }
+                Some(_) => return Err(map_kube_error("recreate sandbox pod", error)),
+            }
+        }
+        self.wait_until_pod_instance_changes(id, &uid).await
     }
 
     async fn delete_state_pvc(&self, id: &SandboxId) -> SandboxResult<()> {
@@ -425,6 +506,57 @@ impl AgentSandboxBackend {
                 }
                 _ => sleep(Duration::from_millis(500)).await,
             }
+        }
+    }
+
+    async fn wait_until_pod_gone(&self, id: &SandboxId) -> SandboxResult<()> {
+        let deadline = Instant::now() + self.config.ready_timeout;
+        loop {
+            match self.get_pod(id).await? {
+                None => return Ok(()),
+                Some(_) if Instant::now() >= deadline => {
+                    return Err(SandboxError::NotReady(format!(
+                        "sandbox {} pod did not terminate before timeout",
+                        id.as_str()
+                    )));
+                }
+                Some(_) => sleep(Duration::from_millis(500)).await,
+            }
+        }
+    }
+
+    async fn wait_until_pod_instance_changes(
+        &self,
+        id: &SandboxId,
+        previous_uid: &str,
+    ) -> SandboxResult<()> {
+        let deadline = Instant::now() + self.config.ready_timeout;
+        loop {
+            match self.get_pod(id).await? {
+                None => return Ok(()),
+                Some(pod) if pod.metadata.uid.as_deref() != Some(previous_uid) => return Ok(()),
+                Some(_) if Instant::now() >= deadline => {
+                    return Err(SandboxError::NotReady(format!(
+                        "sandbox {} pod instance did not change before timeout",
+                        id.as_str()
+                    )));
+                }
+                Some(_) => sleep(Duration::from_millis(500)).await,
+            }
+        }
+    }
+
+    async fn quiesce_sandbox(&self, id: &SandboxId) -> SandboxResult<()> {
+        match self
+            .patch_sandbox_merge(id, json!({ "spec": { "replicas": 0 } }))
+            .await
+        {
+            Ok(()) => {
+                self.release_terminal_retirement_pin(id).await?;
+                self.wait_until_pod_gone(id).await
+            }
+            Err(SandboxError::NotFound(_)) => Ok(()),
+            Err(error) => Err(error),
         }
     }
 
@@ -575,9 +707,8 @@ impl SandboxBackend for AgentSandboxBackend {
         let Some(sandbox) = self.get_sandbox(id).await? else {
             return Ok(SandboxStatus::Gone);
         };
-        let replicas = sandbox.spec.replicas.unwrap_or(1);
         let pod = self.get_pod(id).await?;
-        Ok(sandbox_status_from_pod(replicas, pod.as_ref()))
+        Ok(sandbox_status(&sandbox, pod.as_ref()))
     }
 
     async fn observe(&self, id: &SandboxId) -> SandboxResult<ObservedSandbox> {
@@ -611,25 +742,27 @@ impl SandboxBackend for AgentSandboxBackend {
     }
 
     async fn stop(&self, id: &SandboxId) -> SandboxResult<()> {
-        let proxy_result = self.delete_iron_proxy_resources(id).await;
+        // Scale down durably before releasing a retirement pin. Keep the
+        // egress path available until the agent has completed termination.
+        let quiesce_result = self.quiesce_sandbox(id).await;
         let files_result = self.delete_sandbox_files_config_map(id).await;
-        match self
+        let sandbox_result = match self
             .sandboxes()
             .delete(id.as_str(), &DeleteParams::default())
             .await
         {
-            Ok(_) => {
-                proxy_result?;
-                files_result?;
-                self.delete_state_pvc(id).await
-            }
-            Err(err) if is_not_found(&err) => {
-                proxy_result?;
-                files_result?;
-                self.delete_state_pvc(id).await
-            }
+            Ok(_) => Ok(()),
+            Err(err) if is_not_found(&err) => Ok(()),
             Err(err) => Err(map_kube_error("delete sandbox", err)),
-        }
+        };
+        let proxy_result = self.delete_iron_proxy_resources(id).await;
+        let state_result = self.delete_state_pvc(id).await;
+
+        quiesce_result?;
+        files_result?;
+        sandbox_result?;
+        proxy_result?;
+        state_result
     }
 
     async fn assign_iron_control_proxy_principal(
@@ -664,6 +797,7 @@ impl SandboxBackend for AgentSandboxBackend {
     async fn pause(&self, id: &SandboxId) -> SandboxResult<()> {
         self.patch_sandbox_merge(id, sandbox_pause_patch(jiff::Timestamp::now()))
             .await?;
+        self.release_terminal_retirement_pin(id).await?;
         // A paused sandbox has no agent pod, so its egress proxy is idle;
         // keeping it running holds a node pod slot per suspended sandbox for
         // the whole retention window (at ~500 pods per kubelet that starves
@@ -717,8 +851,44 @@ impl SandboxBackend for AgentSandboxBackend {
                 sandbox_capability_labels(sandbox, &self.config.container_name, id.as_str())
             })
             .unwrap_or_default();
-        self.patch_sandbox_merge(id, sandbox_resume_patch(&capability_labels))
+        let mut sandbox = sandbox.ok_or_else(|| SandboxError::NotFound(id.as_str().to_owned()))?;
+        if iron_proxy::retirement::sandbox_retired(&sandbox) && resolved_iron_proxy.is_none() {
+            return Err(SandboxError::NotReady(
+                "retired sandbox cannot resume without its recorded proxy configuration".to_owned(),
+            ));
+        }
+        let previous_pod = self.get_pod(id).await?;
+        let suspended = sandbox.spec.replicas.unwrap_or(1) == 0;
+        if suspended {
+            // A paused Pod can still be Ready while controller deletion lags.
+            // Keep replicas=0 until that captured instance is gone, so no reuse
+            // can admit work on it between the resume commit and replacement.
+            self.release_terminal_retirement_pin(id).await?;
+            self.recreate_existing_pod(id, previous_pod.as_ref(), true)
+                .await?;
+            let current = self
+                .get_sandbox(id)
+                .await?
+                .ok_or_else(|| SandboxError::NotFound(id.as_str().to_owned()))?;
+            if !same_resume_intent(&sandbox, &current) {
+                return Err(SandboxError::NotReady(
+                    "sandbox intent changed while completing pause".to_owned(),
+                ));
+            }
+            sandbox = current;
+        }
+        // Commit after companions are ready and any paused old Pod is gone.
+        // A terminal pinned Pod is released/replaced only after this write.
+        self.apply_resume_intent(id, &sandbox, &capability_labels)
             .await?;
+        self.release_terminal_retirement_pin(id).await?;
+        if !suspended
+            && (iron_proxy::retirement::sandbox_retired(&sandbox)
+                || previous_pod.as_ref().is_some_and(iron_proxy::pod_stopped))
+        {
+            self.recreate_existing_pod(id, previous_pod.as_ref(), false)
+                .await?;
+        }
         self.wait_until_running(id).await
     }
 }
@@ -821,6 +991,20 @@ fn sandbox_pause_patch(paused_at: jiff::Timestamp) -> Value {
     })
 }
 
+fn same_resume_intent(previous: &crd::Sandbox, current: &crd::Sandbox) -> bool {
+    let mut previous_annotations = previous.metadata.annotations.clone().unwrap_or_default();
+    let mut current_annotations = current.metadata.annotations.clone().unwrap_or_default();
+    // The controller clears only this annotation as a paused Pod disappears.
+    // Status/RV may advance; spec, labels and every user intent marker may not.
+    previous_annotations.remove("agents.x-k8s.io/pod-name");
+    current_annotations.remove("agents.x-k8s.io/pod-name");
+    current.metadata.deletion_timestamp.is_none()
+        && previous.metadata.uid == current.metadata.uid
+        && previous.spec == current.spec
+        && previous.metadata.labels == current.metadata.labels
+        && previous_annotations == current_annotations
+}
+
 fn sandbox_resume_patch(capability_labels: &BTreeMap<&'static str, bool>) -> Value {
     // A JSON merge patch null removes a key, so a disabled capability clears
     // its label rather than writing "false" — matching `build_agent_sandbox`,
@@ -889,6 +1073,16 @@ fn sandbox_paused_at(sandbox: &crd::Sandbox) -> Option<SystemTime> {
         .get(PAUSED_AT_ANNOTATION)?;
     let timestamp = raw.parse::<jiff::Timestamp>().ok()?;
     Some(SystemTime::from(timestamp))
+}
+
+fn sandbox_status(sandbox: &crd::Sandbox, pod: Option<&Pod>) -> SandboxStatus {
+    if iron_proxy::retirement::sandbox_retired(sandbox) {
+        // Retired runtime state is terminal even after the controller collects
+        // its Pod. Calling this Suspended would admit the retained PVC to idle
+        // and orphan reapers that deliberately skip Stopped sandboxes.
+        return SandboxStatus::Stopped;
+    }
+    sandbox_status_from_pod(sandbox.spec.replicas.unwrap_or(1), pod)
 }
 
 fn sandbox_status_from_pod(replicas: i32, pod: Option<&Pod>) -> SandboxStatus {

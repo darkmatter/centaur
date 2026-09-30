@@ -18,7 +18,7 @@ use k8s_openapi::api::networking::v1::{
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta};
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
-use kube::api::{DeleteParams, ListParams, Patch, PatchParams, PostParams};
+use kube::api::{DeleteParams, ListParams, Patch, PatchParams, PostParams, Preconditions};
 use kube::{Api, Resource};
 use serde_json::{Value, json};
 use tokio::time::{Instant, sleep};
@@ -27,6 +27,10 @@ use crate::{
     AgentSandboxBackend, MANAGED_BY_LABEL, MANAGED_BY_VALUE, OBSERVABILITY_ENABLED_LABEL,
     OtlpEgressTarget, SANDBOX_ID_LABEL, is_not_found, map_kube_error,
 };
+
+#[cfg(test)]
+mod cleanup_tests;
+pub(crate) mod retirement;
 
 const IRON_PROXY_LABEL: &str = "centaur.ai/iron-proxy";
 const IRON_CONTROL_PROXY_ID_ANNOTATION: &str = "centaur.ai/iron-control-proxy-id";
@@ -577,25 +581,30 @@ impl AgentSandboxBackend {
         }
     }
 
-    /// Delete iron-proxy resources that outlived their sandbox. A create,
-    /// resume, or unwind that fails (or dies mid-flight) can leave them
-    /// behind, and with the Sandbox CR gone no observed sandbox can ever
-    /// reach them again. The sweep keys off the labels every proxy resource
-    /// carries instead of an in-memory sandbox id. Returns how many of each
-    /// class were deleted.
+    /// Delete iron-proxy resources whose sandbox is gone or whose agent pod
+    /// has been safely retired. Retain the Sandbox CR, files, and state PVC.
+    /// Resources created during a resume remain protected by their age and
+    /// generation; every delete is conditional on the observed resource.
     pub(crate) async fn sweep_orphan_iron_proxy_resources(
         &self,
         grace: Duration,
     ) -> SandboxResult<BTreeMap<String, u32>> {
+        self.reconcile_terminal_proxy_owners(grace).await?;
         let live_sandboxes = self
             .sandboxes()
             .list(&ListParams::default())
             .await
             .map_err(|err| map_kube_error("list sandboxes for orphan sweep", err))?
             .items
-            .iter()
-            .filter_map(|sandbox| sandbox.metadata.name.clone())
-            .collect::<BTreeSet<String>>();
+            .into_iter()
+            .filter_map(|sandbox| {
+                sandbox
+                    .metadata
+                    .name
+                    .clone()
+                    .map(|name| (name, sandbox.metadata))
+            })
+            .collect::<BTreeMap<_, _>>();
         let now = SystemTime::now();
         let mut reaped = BTreeMap::new();
         let proxy_selector = format!("{IRON_PROXY_LABEL}=true");
@@ -607,11 +616,14 @@ impl AgentSandboxBackend {
         let mut count = 0u32;
         for pod in pods.items {
             let metadata = &pod.metadata;
-            if !is_orphan_proxy_resource(metadata, &live_sandboxes, now, grace) {
+            let Some(params) = self
+                .proxy_cleanup_delete_params(metadata, &live_sandboxes, now, grace)
+                .await?
+            else {
                 continue;
-            }
+            };
             let name = metadata.name.clone().unwrap_or_default();
-            match self.pods().delete(&name, &DeleteParams::default()).await {
+            match self.pods().delete(&name, &params).await {
                 Ok(_) => {
                     count += 1;
                     tracing::info!(name, "deleted orphaned iron-proxy pod");
@@ -635,15 +647,14 @@ impl AgentSandboxBackend {
         let mut count = 0u32;
         for service in services.items {
             let metadata = &service.metadata;
-            if !is_orphan_proxy_resource(metadata, &live_sandboxes, now, grace) {
+            let Some(params) = self
+                .proxy_cleanup_delete_params(metadata, &live_sandboxes, now, grace)
+                .await?
+            else {
                 continue;
-            }
+            };
             let name = metadata.name.clone().unwrap_or_default();
-            match self
-                .services()
-                .delete(&name, &DeleteParams::default())
-                .await
-            {
+            match self.services().delete(&name, &params).await {
                 Ok(_) => {
                     count += 1;
                     tracing::info!(name, "deleted orphaned iron-proxy service");
@@ -669,15 +680,14 @@ impl AgentSandboxBackend {
         let mut count = 0u32;
         for policy in policies.items {
             let metadata = &policy.metadata;
-            if !is_orphan_proxy_resource(metadata, &live_sandboxes, now, grace) {
+            let Some(params) = self
+                .proxy_cleanup_delete_params(metadata, &live_sandboxes, now, grace)
+                .await?
+            else {
                 continue;
-            }
+            };
             let name = metadata.name.clone().unwrap_or_default();
-            match self
-                .network_policies()
-                .delete(&name, &DeleteParams::default())
-                .await
-            {
+            match self.network_policies().delete(&name, &params).await {
                 Ok(_) => {
                     count += 1;
                     tracing::info!(name, "deleted orphaned iron-proxy network policy");
@@ -694,6 +704,60 @@ impl AgentSandboxBackend {
         }
         reaped.insert("network_policy".to_owned(), count);
         Ok(reaped)
+    }
+
+    async fn proxy_cleanup_delete_params(
+        &self,
+        metadata: &ObjectMeta,
+        live_sandboxes: &BTreeMap<String, ObjectMeta>,
+        now: SystemTime,
+        grace: Duration,
+    ) -> SandboxResult<Option<DeleteParams>> {
+        let (Some(name), Some(uid), Some(resource_version), Some(sandbox_id)) = (
+            metadata.name.as_ref(),
+            metadata.uid.as_ref(),
+            metadata.resource_version.as_ref(),
+            metadata
+                .labels
+                .as_ref()
+                .and_then(|labels| labels.get(SANDBOX_ID_LABEL)),
+        ) else {
+            return Ok(None);
+        };
+        if name.is_empty()
+            || metadata.deletion_timestamp.is_some()
+            || !proxy_resource_past_grace(metadata, now, grace)
+        {
+            return Ok(None);
+        }
+        let id = SandboxId::new(sandbox_id);
+        let current = self.get_sandbox(&id).await?;
+        if let Some(observed) = live_sandboxes.get(sandbox_id) {
+            let Some(sandbox) = current else {
+                return Ok(None);
+            };
+            // A changed owner or CR revision may be a concurrent resume. A
+            // later sweep can retry once that transition has settled.
+            if observed.resource_version.is_none()
+                || sandbox.metadata.uid != observed.uid
+                || sandbox.metadata.resource_version != observed.resource_version
+                || sandbox.metadata.deletion_timestamp.is_some()
+                || !self.retired_proxy_resource(metadata, &sandbox).await?
+            {
+                return Ok(None);
+            }
+        } else if current.is_some()
+            || !is_orphan_proxy_resource(metadata, live_sandboxes, now, grace)
+        {
+            return Ok(None);
+        }
+        Ok(Some(DeleteParams {
+            preconditions: Some(Preconditions {
+                uid: Some(uid.clone()),
+                resource_version: Some(resource_version.clone()),
+            }),
+            ..DeleteParams::default()
+        }))
     }
 
     pub(crate) async fn assign_proxy_principal(
@@ -2109,7 +2173,7 @@ fn pod_running(pod: &Pod) -> bool {
             })
 }
 
-fn pod_stopped(pod: &Pod) -> bool {
+pub(crate) fn pod_stopped(pod: &Pod) -> bool {
     pod.status
         .as_ref()
         .and_then(|status| status.phase.as_deref())
@@ -2124,7 +2188,7 @@ fn pod_stopped(pod: &Pod) -> bool {
 /// creation timestamp is treated as not an orphan; the sweep may not guess.
 fn is_orphan_proxy_resource(
     metadata: &ObjectMeta,
-    live_sandboxes: &BTreeSet<String>,
+    live_sandboxes: &BTreeMap<String, ObjectMeta>,
     now: SystemTime,
     grace: Duration,
 ) -> bool {
@@ -2135,14 +2199,32 @@ fn is_orphan_proxy_resource(
     else {
         return false;
     };
-    if live_sandboxes.contains(sandbox_id) {
+    if live_sandboxes.contains_key(sandbox_id) {
         return false;
     }
+    proxy_resource_past_grace(metadata, now, grace)
+}
+
+fn proxy_resource_past_grace(metadata: &ObjectMeta, now: SystemTime, grace: Duration) -> bool {
     let Some(created) = &metadata.creation_timestamp else {
         return false;
     };
     now.duration_since(SystemTime::from(created.0))
         .is_ok_and(|age| age >= grace)
+}
+
+fn owned_by_sandbox(metadata: &ObjectMeta, sandbox: &ObjectMeta) -> bool {
+    let (Some(name), Some(uid)) = (&sandbox.name, &sandbox.uid) else {
+        return false;
+    };
+    metadata.owner_references.as_ref().is_some_and(|owners| {
+        owners.iter().any(|owner| {
+            owner.api_version == crate::crd::Sandbox::api_version(&())
+                && owner.kind == crate::crd::Sandbox::kind(&())
+                && owner.name == *name
+                && owner.uid == *uid
+        })
+    })
 }
 
 fn sandbox_owner_reference(sandbox: &crate::crd::Sandbox) -> Option<Value> {
@@ -3486,8 +3568,11 @@ mod tests {
         }
     }
 
-    fn live_sandboxes(names: &[&str]) -> BTreeSet<String> {
-        names.iter().map(|name| (*name).to_owned()).collect()
+    fn live_sandboxes(names: &[&str]) -> BTreeMap<String, ObjectMeta> {
+        names
+            .iter()
+            .map(|name| ((*name).to_owned(), ObjectMeta::default()))
+            .collect()
     }
 
     #[test]

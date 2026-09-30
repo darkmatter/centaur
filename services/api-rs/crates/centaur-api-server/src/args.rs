@@ -697,6 +697,15 @@ struct SandboxArgs {
         value_parser = clap::value_parser!(u64).range(1..)
     )]
     sandbox_orphan_sweep_grace_secs: u64,
+    /// Start new terminal-agent proxy retirement decisions after every API
+    /// process understands retirement state. Existing decisions still recover.
+    #[arg(
+        long = "session-sandbox-terminal-proxy-retirement-enabled",
+        env = "SESSION_SANDBOX_TERMINAL_PROXY_RETIREMENT_ENABLED",
+        default_value_t = false,
+        action = clap::ArgAction::Set
+    )]
+    terminal_proxy_retirement_enabled: bool,
     #[arg(
         long = "session-sandbox-cleanup-interval-secs",
         env = "SESSION_SANDBOX_CLEANUP_INTERVAL_SECS",
@@ -1609,6 +1618,7 @@ impl TryFrom<&SandboxArgs> for AgentSandboxConfig {
     fn try_from(args: &SandboxArgs) -> Result<Self, Self::Error> {
         let mut config =
             AgentSandboxConfig::new(args.k8s_namespace.clone(), args.iron_control.settings()?);
+        config.terminal_proxy_retirement_enabled = args.terminal_proxy_retirement_enabled;
         config.image_pull_policy = args.agent_image_pull_policy.clone();
         config.image_pull_secrets = args
             .image_pull_secrets
@@ -2709,6 +2719,28 @@ mod tests {
         );
         assert_eq!(config.ready_timeout, Duration::from_secs(42));
         assert!(config.iron_proxy.is_some());
+        assert!(!config.terminal_proxy_retirement_enabled);
+    }
+
+    #[test]
+    fn terminal_proxy_retirement_enablement_converts_from_operator_args() {
+        for (value, expected) in [("false", false), ("true", true)] {
+            let args = Args::try_parse_from([
+                "centaur-api-server",
+                "--database-url",
+                "postgres://postgres:postgres@localhost/centaur",
+                "--iron-control-url",
+                "http://console.local",
+                "--iron-control-api-key",
+                "iak_test",
+                "--session-sandbox-terminal-proxy-retirement-enabled",
+                value,
+            ])
+            .unwrap();
+
+            let config = AgentSandboxConfig::try_from(&args.sandbox).unwrap();
+            assert_eq!(config.terminal_proxy_retirement_enabled, expected);
+        }
     }
 
     #[test]

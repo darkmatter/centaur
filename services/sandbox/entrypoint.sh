@@ -399,16 +399,30 @@ EOF
 export PI_CODING_AGENT_DIR="${PI_CODING_AGENT_DIR:-$HOME_DIR/.omp/agent}"
 mkdir -p "$PI_CODING_AGENT_DIR"
 OMP_LITELLM_BASE_URL="${OMP_LITELLM_BASE_URL:-https://litellm.drkmttr.dev/v1}"
+OMP_OVERLAY_WAIT_SECONDS="${CENTAUR_OVERLAY_OMP_WAIT_SECONDS:-10}"
+
+if [ -n "${CENTAUR_OVERLAY_OMP_DIR:-}" ]; then
+    omp_overlay_deadline=$((SECONDS + OMP_OVERLAY_WAIT_SECONDS))
+    while { [ ! -f "$CENTAUR_OVERLAY_OMP_DIR/config.yml" ] || [ ! -f "$CENTAUR_OVERLAY_OMP_DIR/models.yml" ]; } \
+        && [ "$SECONDS" -lt "$omp_overlay_deadline" ]; do
+        sleep 1
+    done
+    unset omp_overlay_deadline
+fi
+
 for omp_cfg in config.yml models.yml; do
     src="$HARNESS_CONFIG_DIR/omp/$omp_cfg"
     if [ -n "${CENTAUR_OVERLAY_OMP_DIR:-}" ] && [ -f "$CENTAUR_OVERLAY_OMP_DIR/$omp_cfg" ]; then
         src="$CENTAUR_OVERLAY_OMP_DIR/$omp_cfg"
     fi
-    if [ -f "$src" ]; then
-        sed "s|__OMP_LITELLM_BASE_URL__|$OMP_LITELLM_BASE_URL|g" \
-            "$src" > "$PI_CODING_AGENT_DIR/$omp_cfg"
+    if [ ! -f "$src" ]; then
+        echo "missing omp harness config: $omp_cfg (checked ${CENTAUR_OVERLAY_OMP_DIR:-<no overlay>} then $HARNESS_CONFIG_DIR/omp)" >&2
+        exit 1
     fi
+    sed "s|__OMP_LITELLM_BASE_URL__|$OMP_LITELLM_BASE_URL|g" \
+        "$src" > "$PI_CODING_AGENT_DIR/$omp_cfg"
 done
+unset OMP_OVERLAY_WAIT_SECONDS
 
 # ── GitHub App installation token (darkmatter deployments) ──────────────────
 # When the App credentials are passed through, mint a short-lived installation

@@ -371,6 +371,7 @@ pub enum HarnessType {
     Amp,
     ClaudeCode,
     Nanocodex,
+    Omp,
     Hermes,
     Pi,
     Omp,
@@ -886,6 +887,7 @@ mod tests {
             HarnessType::from_str("claudecode").unwrap(),
             HarnessType::ClaudeCode
         );
+        assert_eq!(HarnessType::from_str("omp").unwrap(), HarnessType::Omp);
         assert_eq!(HarnessType::from_str("pi").unwrap(), HarnessType::Pi);
     }
 
@@ -898,6 +900,10 @@ mod tests {
         assert_eq!(
             serde_json::from_value::<HarnessType>(serde_json::json!("codex")).unwrap(),
             HarnessType::Codex
+        );
+        assert_eq!(
+            serde_json::to_value(HarnessType::Omp).unwrap(),
+            serde_json::json!("omp")
         );
     }
 

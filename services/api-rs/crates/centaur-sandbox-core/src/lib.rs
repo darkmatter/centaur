@@ -13,7 +13,7 @@ mod spec;
 /// Home directory used by the sandbox agent image.
 pub const SANDBOX_AGENT_HOME: &str = "/home/agent";
 
-pub use backend::SandboxBackend;
+pub use backend::{SandboxBackend, SandboxCommandOutput};
 pub use error::{BoxedError, SandboxError, SandboxResult};
 pub use io::{SandboxIo, SandboxIoGuard, SandboxIoParts, SandboxRead, SandboxWrite};
 pub use lifecycle::{

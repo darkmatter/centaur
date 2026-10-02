@@ -60,6 +60,7 @@ const options: SlackbotV2Options = {
     'SLACKBOTV2_CODEX_NANOCODEX_ROLLOUT_PERCENT',
     0
   ),
+  ompViewerUrl: optionalEnv('CENTAUR_OMP_VIEWER_URL'),
   responseMetadataMode: responseMetadataModeEnv('SLACKBOTV2_RESPONSE_METADATA_MODE'),
   responseServiceTierEnabled: booleanEnv('SLACKBOTV2_RESPONSE_SERVICE_TIER_ENABLED', false),
   defaultHarnessType: optionalEnv('SLACKBOTV2_DEFAULT_HARNESS'),

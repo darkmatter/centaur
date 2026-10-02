@@ -1,0 +1,3 @@
+# Immutable SQLx migration blobs. Existing entries are append-only.
+# Format: <git blob oid> <migration filename>
+3386f1b537b73e827caa8f6f1314f00ac5c4c51f 0061_company_context_text_search.sql

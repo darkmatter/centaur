@@ -24,7 +24,9 @@ static POSTGRES_MIGRATOR: Migrator = sqlx::migrate!("./search-migrations/postgre
 /// SHA-384 checksums that databases recorded for core migrations before their
 /// ParadeDB statements moved to the `paradedb` text-search backend. Presenting
 /// the recorded checksum keeps those databases valid without rewriting
-/// `_sqlx_migrations`; fresh databases record the same values.
+/// `_sqlx_migrations`; fresh databases record the same values. Versions follow
+/// this fork's numbering: upstream's 45 (`slack_private_channel_oauth_sync`)
+/// is the fork's 46.
 const LEGACY_CHECKSUMS: [(i64, &str); 6] = [
     (
         12,
@@ -47,10 +49,17 @@ const LEGACY_CHECKSUMS: [(i64, &str); 6] = [
         "65cbd5bafcfd4e124d51bd99cc501fee923e87882d1032dad34f4cfba3fd78b5d4869b61bb765f8d76310e520f44cac2",
     ),
     (
-        45,
+        46,
         "8e1ee367cc62f1ffde0b4fad158291266ef78598ab613136822c9703d4fe049b883fd588328b894cb05480b0765b393e",
     ),
 ];
+
+/// Version 54 came from upstream before the fork-only `omp` harness was
+/// upstreamed; applied as written, it rebuilds the harness constraint without
+/// `omp` and fails on databases that already hold omp sessions.
+const HERMES_HARNESS_MIGRATION_VERSION: i64 = 54;
+const UPSTREAM_HERMES_HARNESS_SET: &str = "'codex', 'amp', 'claudecode', 'nanocodex', 'hermes'";
+const FORK_HERMES_HARNESS_SET: &str = "'codex', 'amp', 'claudecode', 'nanocodex', 'omp', 'hermes'";
 
 /// Tables that core migrations gave BM25 indexes before the backends split.
 const LEGACY_BM25_TABLES: [&str; 5] = [
@@ -138,10 +147,39 @@ pub async fn migrate(
     backend: TextSearchBackend,
 ) -> Result<(), SessionStoreError> {
     ensure_text_search_backend(conn, backend).await?;
-    Migrator::new(MigrationList(migration_list(backend)))
+    let mut migrations = migration_list(backend);
+    preserve_omp_in_hermes_constraint(&mut migrations)?;
+    Migrator::new(MigrationList(migrations))
         .await?
         .run(conn)
         .await?;
+    Ok(())
+}
+
+/// Keep version 54's immutable checksum, but preserve `omp` when SQLx applies
+/// that still-pending migration. Already-applied version 54 rows are
+/// checksum-validated and skipped by SQLx as usual.
+fn preserve_omp_in_hermes_constraint(
+    migrations: &mut [Migration],
+) -> Result<(), SessionStoreError> {
+    let migration = migrations
+        .iter_mut()
+        .find(|migration| migration.version == HERMES_HARNESS_MIGRATION_VERSION)
+        .ok_or_else(|| {
+            SessionStoreError::InvalidMigration(format!(
+                "missing version {HERMES_HARNESS_MIGRATION_VERSION}"
+            ))
+        })?;
+    let patched_sql =
+        migration
+            .sql
+            .replacen(UPSTREAM_HERMES_HARNESS_SET, FORK_HERMES_HARNESS_SET, 1);
+    if patched_sql == migration.sql {
+        return Err(SessionStoreError::InvalidMigration(format!(
+            "version {HERMES_HARNESS_MIGRATION_VERSION} no longer contains the upstream harness constraint"
+        )));
+    }
+    migration.sql = Cow::Owned(patched_sql);
     Ok(())
 }
 

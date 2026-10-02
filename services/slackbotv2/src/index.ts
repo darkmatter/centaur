@@ -79,6 +79,7 @@ import {
   slackStreamRecipientUserId
 } from './slack-events'
 import { isSlackStopCommand } from './stop-command'
+import { exportLinkForThread, isSlackExportCommand } from './export-command'
 import {
   createSteeringReactionController,
   type SteeringReactionAck,
@@ -659,6 +660,9 @@ async function handleSlackMessageHandoff(
     if (await handleStopCommand(thread, message, input.options, input.trigger)) {
       return
     }
+    if (await handleExportCommand(thread, message, input.options, input.trigger)) {
+      return
+    }
     // Assistant status is thread-wide. A mentioned follow-up that steers an
     // active execution must not clear or replace the status owned by that run.
     const assistantStatusRequested =
@@ -743,6 +747,20 @@ async function handleStopCommand(
     })
     throw error
   }
+}
+
+export async function handleExportCommand(
+  thread: Thread<SlackbotV2ThreadState>,
+  message: ChatMessage,
+  options: SlackbotV2Options,
+  trigger: string
+): Promise<boolean> {
+  if (!isSlackExportCommand(message) || !options.ompViewerUrl) return false
+  const trace = createHandoffTrace(thread, message, 'append')
+  await setAssistantStatus(thread, '', options, trace)
+  await thread.post(`Transcript export: ${exportLinkForThread(options.ompViewerUrl, thread.id)}`)
+  traceLog(options, 'slackbotv2_export_command_complete', trace, { trigger })
+  return true
 }
 
 async function subscribeSlackThreadForHandoff(

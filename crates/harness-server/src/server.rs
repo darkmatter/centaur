@@ -47,6 +47,7 @@ pub fn server_for(kind: HarnessKind) -> Box<dyn AppServerRuntime> {
         HarnessKind::Codex => Box::new(CodexHarnessServer::codex()),
         HarnessKind::ClaudeCode => Box::new(AppServerNormalizer::new(ClaudeCodeHarness)),
         HarnessKind::Amp => Box::new(AppServerNormalizer::new(AmpHarness)),
+        HarnessKind::Omp => Box::new(AppServerNormalizer::new(OmpHarness)),
         HarnessKind::Pi => Box::new(AppServerNormalizer::new(PiHarness)),
         HarnessKind::Omp => Box::new(AppServerNormalizer::new(OmpHarness)),
     }
@@ -60,6 +61,7 @@ pub fn run_blocks_server(kind: HarnessKind) -> Result<()> {
     match kind {
         HarnessKind::Codex => crate::codex::run_codex_blocks_server(CodexHarnessServer::codex()),
         HarnessKind::ClaudeCode => run_blocks_app_server(&ClaudeCodeHarness),
+        HarnessKind::Omp => crate::omp_rpc::run_omp_blocks_server(),
         HarnessKind::Amp => run_blocks_app_server(&AmpHarness),
         HarnessKind::Pi => run_blocks_app_server(&PiHarness),
         HarnessKind::Omp => run_blocks_app_server(&OmpHarness),
@@ -1074,7 +1076,9 @@ fn resumed_thread_state<H: HarnessServer>(
             .unwrap_or_else(|| harness.default_model_provider().to_string()),
         service_tier: params.service_tier.clone().flatten(),
         reasoning_effort: None,
-        harness_session_id: Some(params.thread_id.clone()),
+        harness_session_id: harness
+            .resume_session_id(&params.thread_id)
+            .or_else(|| Some(params.thread_id.clone())),
         thread_key: None,
         completed_turns: Vec::new(),
         process: None,
@@ -1311,7 +1315,7 @@ fn run_harness_turn<H: HarnessServer, W: Write>(
     request_rx: &Receiver<ActiveTurnRequest>,
     telemetry: &mut TurnTelemetry,
 ) -> Result<Option<codex_app_server_protocol::Turn>> {
-    ensure_harness_process(harness, state)?;
+    ensure_harness_process(harness, state, input)?;
     {
         let process = state
             .process
@@ -1384,6 +1388,9 @@ fn run_harness_turn<H: HarnessServer, W: Write>(
                 for normalized in normalized_events {
                     telemetry.observe_normalized(&normalized);
                     if let Some(session_id) = normalized.session_id() {
+                        if state.harness_session_id.as_deref() != Some(session_id) {
+                            harness.record_session_id(&state.id, session_id);
+                        }
                         last_session_id = Some(session_id.to_string());
                         state.harness_session_id = Some(session_id.to_string());
                     }
@@ -1493,7 +1500,11 @@ pub(crate) fn usage_span_input_value(input: &[UserInput]) -> Option<String> {
     non_empty(Some(&joined)).map(str::to_owned)
 }
 
-fn ensure_harness_process<H: HarnessServer>(harness: &H, state: &mut ThreadState) -> Result<()> {
+fn ensure_harness_process<H: HarnessServer>(
+    harness: &H,
+    state: &mut ThreadState,
+    input: &[UserInput],
+) -> Result<()> {
     if let Some(process) = state.process.as_mut()
         && (process.model == state.model || !harness.restart_on_model_change())
         && process.child.try_wait()?.is_none()
@@ -1510,7 +1521,7 @@ fn ensure_harness_process<H: HarnessServer>(harness: &H, state: &mut ThreadState
     }
     state.process = None;
 
-    let mut command = harness.command_for_turn(state);
+    let mut command = harness.command_for_turn(state, input);
     let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1708,7 +1719,6 @@ mod tests {
             Some("exe_123")
         );
     }
-
     #[test]
     fn ignores_blank_model_on_blocks_user_line() {
         let line = r#"{"type":"user","model":"  ","text":"hi"}"#;

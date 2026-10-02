@@ -299,9 +299,12 @@ impl HarnessServer for PiHarness {
         "pi"
     }
 
-    fn command_for_turn(&self, state: &ThreadState) -> ProcessCommand {
+    fn command_for_turn(&self, state: &ThreadState, _input: &[UserInput]) -> ProcessCommand {
         let bin = env::var("CENTAUR_PI_BIN").unwrap_or_else(|_| "pi".to_string());
         let mut command = ProcessCommand::new(bin);
+        // The sandbox exports PI_CODING_AGENT_DIR for omp (oh-my-pi), which
+        // reads the same variable; Pi keeps its own ~/.pi/agent state.
+        command.env_remove("PI_CODING_AGENT_DIR");
         // `--approve` trusts the workspace's project resources, such as the
         // skills the sandbox installs under `.agents/skills`; RPC mode cannot
         // prompt for trust and would skip them.

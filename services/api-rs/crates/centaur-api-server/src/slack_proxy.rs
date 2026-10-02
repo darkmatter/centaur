@@ -724,7 +724,7 @@ impl SlackPublicChannelCacheState {
     }
 
     fn can_refresh(&self, now: Instant) -> bool {
-        !self.refreshing && !self.retry_refresh_at.is_some_and(|retry_at| retry_at > now)
+        !self.refreshing && self.retry_refresh_at.is_none_or(|retry_at| retry_at <= now)
     }
 
     fn mark_refresh_failed(&mut self, now: Instant) {

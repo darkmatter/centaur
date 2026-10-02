@@ -24,6 +24,116 @@ version_number() {
   echo $((10#${version}))
 }
 
+# check_migration_lock <label> <dir> <lock-file> <regex> [legacy-dir]
+#
+# Every migration file in <dir> must match its append-only lock entry. A locked
+# file may differ only when <legacy-dir> holds a byte-identical copy of the
+# locked release under the same name: such edits keep the recorded SQLx
+# checksum at runtime (LEGACY_CHECKSUMS in centaur-session-sqlx), and
+# tests/migrations.rs checks that copy against it.
+check_migration_lock() {
+  local label="$1"
+  local dir="$2"
+  local lock_file="$3"
+  local regex="$4"
+  local legacy_dir="${5:-}"
+  local lock_failed=0
+
+  if [[ ! -f "${lock_file}" ]]; then
+    failed=1
+    echo "::error title=${label} migration lock missing::Expected ${lock_file}"
+    return
+  fi
+
+  local lock_entries
+  lock_entries="$(
+    awk 'NF && $1 !~ /^#/ { print }' "${lock_file}"
+  )"
+
+  while read -r expected_oid file extra; do
+    [[ -n "${expected_oid:-}" ]] || continue
+    if [[ -n "${extra:-}" || ! "${expected_oid}" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ || ! "${file:-}" =~ ${regex} ]]; then
+      failed=1
+      lock_failed=1
+      echo "::error title=${label} invalid migration lock entry::${expected_oid} ${file:-} ${extra:-}"
+      continue
+    fi
+
+    local entry_count
+    entry_count="$(
+      printf '%s\n' "${lock_entries}" |
+        awk -v file="${file}" '$2 == file { count++ } END { print count + 0 }'
+    )"
+    if [[ "${entry_count}" -ne 1 ]]; then
+      failed=1
+      lock_failed=1
+      echo "::error title=${label} duplicate migration lock entry::${file} appears ${entry_count} times in ${lock_file}"
+      continue
+    fi
+
+    local path="${dir}/${file}"
+    if [[ ! -f "${path}" ]]; then
+      failed=1
+      lock_failed=1
+      echo "::error title=${label} locked migration missing::Restore ${path}; applied migrations cannot be renamed or deleted"
+      continue
+    fi
+
+    local actual_oid
+    actual_oid="$(git hash-object -- "${path}")"
+    if [[ "${actual_oid}" != "${expected_oid}" ]]; then
+      local legacy_path="${legacy_dir}/${file}"
+      if [[ -n "${legacy_dir}" && -f "${legacy_path}" ]] &&
+        [[ "$(git hash-object -- "${legacy_path}")" == "${expected_oid}" ]]; then
+        echo "${label}: ${path} was edited after release; its released copy ${legacy_path} matches the lock."
+        continue
+      fi
+      failed=1
+      lock_failed=1
+      echo "::error title=${label} locked migration changed::${path} is ${actual_oid}, expected ${expected_oid}; add a new migration instead"
+    fi
+  done <<<"${lock_entries}"
+
+  while IFS= read -r path; do
+    local file="${path##*/}"
+    local entry_count
+    entry_count="$(
+      printf '%s\n' "${lock_entries}" |
+        awk -v file="${file}" '$2 == file { count++ } END { print count + 0 }'
+    )"
+    if [[ "${entry_count}" -eq 0 ]]; then
+      failed=1
+      lock_failed=1
+      echo "::error title=${label} unlocked migration::Append the blob oid and filename for ${path} to ${lock_file}"
+    fi
+  done < <(find "${dir}" -maxdepth 1 -type f -name '*.sql' -print | sort)
+
+  if git cat-file -e "${base_ref}:${lock_file}" 2>/dev/null; then
+    local base_lock_entries
+    base_lock_entries="$(
+      git show "${base_ref}:${lock_file}" |
+        awk 'NF && $1 !~ /^#/ { print }'
+    )"
+    while read -r base_oid file extra; do
+      [[ -n "${base_oid:-}" ]] || continue
+      local current_oid
+      current_oid="$(
+        printf '%s\n' "${lock_entries}" |
+          awk -v file="${file}" '$2 == file { print $1 }'
+      )"
+      if [[ "${current_oid}" != "${base_oid}" ]]; then
+        failed=1
+        lock_failed=1
+        echo "::error title=${label} migration lock rewritten::Keep ${base_oid} ${file} from ${base_ref}; existing lock entries are immutable"
+      fi
+    done <<<"${base_lock_entries}"
+  fi
+
+  if [[ "${lock_failed}" -eq 0 ]]; then
+    echo "${label}: every migration matches the append-only lock."
+  fi
+}
+
 # check_migrations <label> <regex> <primary-dir> [variant-dir...]
 #
 # All directories share one version sequence. A version may appear once in the
@@ -149,6 +259,21 @@ check_migrations() {
 }
 
 sqlx_crate="services/api-rs/crates/centaur-session-sqlx"
+check_migration_lock \
+  "SQLx" \
+  "${sqlx_crate}/migrations" \
+  "${sqlx_crate}/migrations/migrations.lock" \
+  '^([0-9]+)_.+\.sql$' \
+  "${sqlx_crate}/tests/fixtures/legacy-migrations"
+
+for search_backend in paradedb postgres; do
+  check_migration_lock \
+    "SQLx ${search_backend} search" \
+    "${sqlx_crate}/search-migrations/${search_backend}" \
+    "${sqlx_crate}/search-migrations/${search_backend}/migrations.lock" \
+    '^([0-9]+)_.+\.sql$'
+done
+
 check_migrations \
   "SQLx" \
   '^([0-9]+)_.+\.sql$' \

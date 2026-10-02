@@ -32,7 +32,7 @@ const SEARCHABLE_TABLES: [&str; 5] = [
 
 /// Last core version the pre-split releases shipped; every database migrated
 /// by those releases is at this version.
-const LAST_LEGACY_VERSION: i64 = 55;
+const LAST_LEGACY_VERSION: i64 = 60;
 
 /// Core migrations as the pre-split releases shipped them, before their
 /// ParadeDB statements moved to the paradedb backend.
@@ -58,8 +58,8 @@ const LEGACY_MIGRATIONS: [(i64, &str); 6] = [
         include_str!("fixtures/legacy-migrations/0040_granola_sync_tables.sql"),
     ),
     (
-        45,
-        include_str!("fixtures/legacy-migrations/0045_slack_private_channel_oauth_sync.sql"),
+        46,
+        include_str!("fixtures/legacy-migrations/0046_slack_private_channel_oauth_sync.sql"),
     ),
 ];
 

@@ -2346,7 +2346,6 @@ fn harness_fragment_engine_name(engine: &HarnessType) -> &'static str {
         HarnessType::Amp => "amp",
         HarnessType::ClaudeCode => "claude-code",
         HarnessType::Nanocodex => "codex",
-        HarnessType::Omp => "omp",
         HarnessType::Hermes => "hermes",
         // Pi and OMP default to Anthropic when its key is present.
         HarnessType::Pi | HarnessType::Omp => "claude-code",
@@ -2369,9 +2368,6 @@ fn harness_auth_mode_env(engine: &HarnessType) -> Option<String> {
             env::var("CLAUDE_CODE_AUTH_MODE").ok()
         }
         HarnessType::Amp => None,
-        // omp gets its upstream key through the plain sandbox env (LiteLLM
-        // gateway), not an iron-proxy auth fragment — the amp pattern.
-        HarnessType::Omp => None,
         // Hermes resolves providers through its own credential store /
         // iron-proxy placeholder injection; no dedicated auth-mode env.
         HarnessType::Hermes => None,

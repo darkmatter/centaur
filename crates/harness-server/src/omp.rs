@@ -61,7 +61,7 @@ impl HarnessServer for OmpHarness {
         "omp"
     }
 
-    fn command_for_turn(&self, _state: &ThreadState) -> ProcessCommand {
+    fn command_for_turn(&self, _state: &ThreadState, _input: &[UserInput]) -> ProcessCommand {
         let bin = env::var("CENTAUR_OMP_BIN").unwrap_or_else(|_| "omp".to_string());
         let mut command = ProcessCommand::new(bin);
         command.args(["--mode", "rpc", "--no-ui"]);

@@ -72,7 +72,10 @@ pub trait HarnessServer {
     fn cli_version(&self) -> &'static str;
     fn default_model(&self) -> String;
     fn default_model_provider(&self) -> &'static str;
-    fn command_for_turn(&self, state: &ThreadState) -> ProcessCommand;
+    /// The process to spawn for a turn. `input` is this turn's user input:
+    /// one-shot harnesses can build it into argv, while app-server harnesses
+    /// receive the input through `stdin_for_turn`.
+    fn command_for_turn(&self, state: &ThreadState, input: &[UserInput]) -> ProcessCommand;
     /// Initializes a freshly spawned process. No startup I/O by default.
     fn on_process_start(&self, _state: &ThreadState, _process: &mut HarnessChild) -> Result<()> {
         Ok(())
@@ -125,6 +128,17 @@ pub trait HarnessServer {
     /// after its own turn ended. Nothing outstanding by default.
     fn turn_hold(&self, _normalizer: &Self::EventNormalizer) -> TurnHold {
         TurnHold::Released
+    }
+
+    /// Persist the bridge-thread-id -> harness-session-id mapping so a
+    /// post-restart `thread/resume` can target the id the harness actually
+    /// issued. Default: no persistence.
+    fn record_session_id(&self, _thread_id: &str, _session_id: &str) {}
+
+    /// Look up a previously recorded harness session id for a bridge thread
+    /// id. `None` falls back to treating the bridge id as the session id.
+    fn resume_session_id(&self, _thread_id: &str) -> Option<String> {
+        None
     }
 
     fn thread_state(&self, params: &ThreadStartParams, cwd: PathBuf) -> ThreadState {

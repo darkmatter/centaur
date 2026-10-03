@@ -374,7 +374,6 @@ pub enum HarnessType {
     Omp,
     Hermes,
     Pi,
-    Omp,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, AsRefStr, Display, EnumString)]

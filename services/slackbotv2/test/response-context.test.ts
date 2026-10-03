@@ -18,6 +18,7 @@ describe('harnessDisplayName', () => {
     expect(harnessDisplayName('nanocodex')).toBe('Nanocodex')
     expect(harnessDisplayName('claudecode')).toBe('Claude Code')
     expect(harnessDisplayName('amp')).toBe('Amp')
+    expect(harnessDisplayName('omp')).toBe('OMP')
   })
 
   test('is case-insensitive and trims', () => {
@@ -94,8 +95,35 @@ describe('reasoningForModel', () => {
     expect(reasoningForModel('codex', 'gpt-5.3', 'high')).toBeUndefined()
   })
 
-  test('rejects Codex efforts for the currently selected non-Codex model', () => {
-    expect(reasoningForModel('claudecode', 'claude-opus-4-8', 'high')).toBeUndefined()
+  test('forwards Claude Code effort levels and rejects Codex-only efforts', () => {
+    for (const effort of ['low', 'medium', 'high', 'xhigh', 'max']) {
+      expect(reasoningForModel('claudecode', 'claude-opus-5-5', effort)).toBe(effort)
+    }
+    expect(reasoningForModel('claudecode', undefined, 'HIGH')).toBe('high')
+    for (const effort of ['none', 'minimal', 'ultra']) {
+      expect(reasoningForModel('claudecode', 'claude-opus-5-5', effort)).toBeUndefined()
+    }
+  })
+
+  test('rejects Claude efforts the selected model does not support', () => {
+    expect(reasoningForModel('claudecode', 'claude-haiku-4-5', 'max')).toBeUndefined()
+    expect(reasoningForModel('claudecode', 'claude-haiku-4-5-20251001', 'low')).toBeUndefined()
+    expect(reasoningForModel('claudecode', 'claude-sonnet-4-6', 'xhigh')).toBeUndefined()
+    expect(reasoningForModel('claudecode', 'claude-sonnet-4-6', 'max')).toBe('max')
+    expect(reasoningForModel('claudecode', 'claude-opus-4-5', 'max')).toBeUndefined()
+    expect(reasoningForModel('claudecode', 'claude-opus-4-5', 'high')).toBe('high')
+  })
+
+  test('forwards Pi thinking levels for any model and rejects Codex-only efforts', () => {
+    for (const harness of ['pi', 'omp']) {
+      for (const effort of ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']) {
+        expect(reasoningForModel(harness, undefined, effort)).toBe(effort)
+      }
+      expect(reasoningForModel(harness, 'openai/gpt-5.5', 'ultra')).toBeUndefined()
+    }
+  })
+
+  test('rejects efforts for harnesses without an effort control', () => {
     expect(reasoningForModel('amp', 'fast', 'low')).toBeUndefined()
   })
 })
@@ -117,6 +145,12 @@ describe('defaultModelForHarness', () => {
     expect(defaultModelForHarness('claudecode', configured)).toBe('claude-fable-5')
     expect(defaultModelForHarness('codex', configured)).toBe(bakedCodexModel)
     expect(defaultModelForHarness('claudecode', { claudecode: '   ' })).toBe(bakedClaudeModel)
+    for (const harness of ['pi', 'omp']) {
+      expect(defaultModelForHarness(harness, { [harness]: 'anthropic/claude-opus-4-8' })).toBe(
+        'anthropic/claude-opus-4-8'
+      )
+      expect(defaultModelForHarness(harness)).toBeUndefined()
+    }
   })
 
   test('is case-insensitive and trims', () => {
@@ -152,7 +186,11 @@ describe('defaultReasoningForHarness', () => {
   test('reports the effort the selected harness actually runs', () => {
     expect(effectiveReasoningForHarness('codex', 'xhigh')).toBe('xhigh')
     expect(effectiveReasoningForHarness('nanocodex', 'minimal')).toBe('low')
-    expect(effectiveReasoningForHarness('claudecode', 'high')).toBeUndefined()
+    expect(effectiveReasoningForHarness('claudecode', 'high')).toBe('high')
+    expect(effectiveReasoningForHarness('claudecode', undefined)).toBeUndefined()
+    expect(effectiveReasoningForHarness('omp', 'max')).toBe('max')
+    expect(effectiveReasoningForHarness('omp', undefined)).toBeUndefined()
+    expect(effectiveReasoningForHarness('amp', 'high')).toBeUndefined()
   })
 })
 

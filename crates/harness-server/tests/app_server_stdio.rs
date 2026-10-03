@@ -816,12 +816,7 @@ fn fake_codex_blocks_mode_interrupts_active_turn() {
     let fake_codex = temp_path("fake-interruptible-codex.sh");
     let fake_codex_log = temp_path("fake-interruptible-codex-requests.jsonl");
     let script = fake_codex_interruptible_app_server_script(&fake_codex_log);
-    std::fs::write(&fake_codex, script).expect("write fake codex script");
-    let mut permissions = std::fs::metadata(&fake_codex)
-        .expect("fake codex metadata")
-        .permissions();
-    permissions.set_mode(0o755);
-    std::fs::set_permissions(&fake_codex, permissions).expect("chmod fake codex script");
+    write_executable_script(&fake_codex, script);
 
     let mut bridge = BridgeProcess::spawn_harness_blocks(
         Harness::Codex,
@@ -2704,6 +2699,20 @@ fn temp_path(name: &str) -> PathBuf {
         std::process::id(),
         Uuid::new_v4().simple()
     ))
+}
+
+fn write_executable_script(path: &Path, contents: String) {
+    let mut file = std::fs::File::create(path).expect("create fake script");
+    file.write_all(contents.as_bytes())
+        .expect("write fake script");
+    file.sync_all().expect("sync fake script");
+    drop(file);
+
+    let mut permissions = std::fs::metadata(path)
+        .expect("fake script metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(path, permissions).expect("chmod fake script");
 }
 
 fn shell_quote(path: &Path) -> String {

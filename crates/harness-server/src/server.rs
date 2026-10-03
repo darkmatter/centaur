@@ -49,7 +49,6 @@ pub fn server_for(kind: HarnessKind) -> Box<dyn AppServerRuntime> {
         HarnessKind::Amp => Box::new(AppServerNormalizer::new(AmpHarness)),
         HarnessKind::Omp => Box::new(AppServerNormalizer::new(OmpHarness)),
         HarnessKind::Pi => Box::new(AppServerNormalizer::new(PiHarness)),
-        HarnessKind::Omp => Box::new(AppServerNormalizer::new(OmpHarness)),
     }
 }
 
@@ -61,7 +60,6 @@ pub fn run_blocks_server(kind: HarnessKind) -> Result<()> {
     match kind {
         HarnessKind::Codex => crate::codex::run_codex_blocks_server(CodexHarnessServer::codex()),
         HarnessKind::ClaudeCode => run_blocks_app_server(&ClaudeCodeHarness),
-        HarnessKind::Omp => crate::omp_rpc::run_omp_blocks_server(),
         HarnessKind::Amp => run_blocks_app_server(&AmpHarness),
         HarnessKind::Pi => run_blocks_app_server(&PiHarness),
         HarnessKind::Omp => run_blocks_app_server(&OmpHarness),

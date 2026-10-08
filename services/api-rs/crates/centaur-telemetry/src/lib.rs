@@ -75,25 +75,6 @@ pub const WORKFLOW_TASK_DURATION_SECONDS: &str = "centaur_workflow_task_duration
 pub const WORKFLOW_SCHEDULE_TICKS_TOTAL: &str = "centaur_workflow_schedule_ticks_total";
 pub const WORKFLOW_SCHEDULE_LAST_DISPATCH_TIMESTAMP_SECONDS: &str =
     "centaur_workflow_schedule_last_dispatch_timestamp_seconds";
-pub const SLACK_ARCHIVE_IMPORT_RUNS_TOTAL: &str = "slack_archive_import_runs_total";
-pub const SLACK_ARCHIVE_IMPORT_DURATION_SECONDS: &str = "slack_archive_import_duration_seconds";
-pub const SLACK_ARCHIVE_IMPORT_BYTES_TOTAL: &str = "slack_archive_import_bytes_total";
-pub const SLACK_ARCHIVE_IMPORT_CHANNELS_TOTAL: &str = "slack_archive_import_channels_total";
-pub const SLACK_ARCHIVE_IMPORT_USERS_TOTAL: &str = "slack_archive_import_users_total";
-pub const SLACK_ARCHIVE_IMPORT_MESSAGES_TOTAL: &str = "slack_archive_import_messages_total";
-pub const SLACK_ARCHIVE_IMPORT_MESSAGE_FILES_TOTAL: &str =
-    "slack_archive_import_message_files_total";
-pub const SLACK_ARCHIVE_IMPORT_ATTACHMENTS_TOTAL: &str = "slack_archive_import_attachments_total";
-pub const SLACK_ARCHIVE_IMPORT_BATCH_DURATION_SECONDS: &str =
-    "slack_archive_import_batch_duration_seconds";
-pub const SLACK_ARCHIVE_IMPORT_BATCH_SIZE: &str = "slack_archive_import_batch_size";
-pub const SLACK_ARCHIVE_IMPORT_FAILURES_TOTAL: &str = "slack_archive_import_failures_total";
-pub const SLACK_ARCHIVE_IMPORT_SKIPPED_ITEMS_TOTAL: &str =
-    "slack_archive_import_skipped_items_total";
-pub const SLACK_ARCHIVE_IMPORT_BATCH_FAILURES_TOTAL: &str =
-    "slack_archive_import_batch_failures_total";
-pub const SLACK_ARCHIVE_IMPORT_LAST_FAILURE_TIMESTAMP_SECONDS: &str =
-    "slack_archive_import_last_failure_timestamp_seconds";
 pub const SLACK_RETENTION_RUNS_TOTAL: &str = "slack_retention_runs_total";
 pub const SLACK_RETENTION_RUN_DURATION_SECONDS: &str = "slack_retention_run_duration_seconds";
 pub const SLACK_RETENTION_MESSAGES_PROCESSED_TOTAL: &str =
@@ -122,11 +103,6 @@ const SESSION_FIRST_TOKEN_LATENCY_BUCKETS: &[f64] = &[
 ];
 const SANDBOX_STARTUP_DURATION_BUCKETS: &[f64] =
     &[0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0];
-const SLACK_ARCHIVE_IMPORT_DURATION_BUCKETS: &[f64] = &[
-    1.0, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0, 600.0, 1_200.0, 3_600.0,
-];
-const SLACK_ARCHIVE_IMPORT_BATCH_SIZE_BUCKETS: &[f64] =
-    &[1.0, 10.0, 100.0, 500.0, 1_000.0, 5_000.0, 10_000.0];
 const SLACK_RETENTION_DURATION_BUCKETS: &[f64] =
     &[1.0, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0, 600.0, 1_200.0];
 const WORKFLOW_TASK_DURATION_BUCKETS: &[f64] = &[
@@ -261,18 +237,6 @@ pub fn prometheus_handle() -> Result<PrometheusHandle, TelemetryError> {
         .set_buckets_for_metric(
             Matcher::Full(WORKFLOW_TASK_DURATION_SECONDS.to_owned()),
             WORKFLOW_TASK_DURATION_BUCKETS,
-        )?
-        .set_buckets_for_metric(
-            Matcher::Full(SLACK_ARCHIVE_IMPORT_DURATION_SECONDS.to_owned()),
-            SLACK_ARCHIVE_IMPORT_DURATION_BUCKETS,
-        )?
-        .set_buckets_for_metric(
-            Matcher::Full(SLACK_ARCHIVE_IMPORT_BATCH_DURATION_SECONDS.to_owned()),
-            SLACK_ARCHIVE_IMPORT_DURATION_BUCKETS,
-        )?
-        .set_buckets_for_metric(
-            Matcher::Full(SLACK_ARCHIVE_IMPORT_BATCH_SIZE.to_owned()),
-            SLACK_ARCHIVE_IMPORT_BATCH_SIZE_BUCKETS,
         )?
         .set_buckets_for_metric(
             Matcher::Full(SLACK_RETENTION_RUN_DURATION_SECONDS.to_owned()),
@@ -775,65 +739,6 @@ fn describe_metrics() {
         WORKFLOW_SCHEDULE_LAST_DISPATCH_TIMESTAMP_SECONDS,
         metrics::Unit::Seconds,
         "Unix timestamp of the last workflow schedule dispatch or idempotent deduplication."
-    );
-    metrics::describe_counter!(
-        SLACK_ARCHIVE_IMPORT_RUNS_TOTAL,
-        "Slack archive import lifecycle events by status and reason."
-    );
-    metrics::describe_histogram!(
-        SLACK_ARCHIVE_IMPORT_DURATION_SECONDS,
-        metrics::Unit::Seconds,
-        "Slack archive import run duration in seconds by status."
-    );
-    metrics::describe_counter!(
-        SLACK_ARCHIVE_IMPORT_BYTES_TOTAL,
-        "Slack archive import zip bytes processed."
-    );
-    metrics::describe_counter!(
-        SLACK_ARCHIVE_IMPORT_CHANNELS_TOTAL,
-        "Slack archive import channel rows by result."
-    );
-    metrics::describe_counter!(
-        SLACK_ARCHIVE_IMPORT_USERS_TOTAL,
-        "Slack archive import user rows by result."
-    );
-    metrics::describe_counter!(
-        SLACK_ARCHIVE_IMPORT_MESSAGES_TOTAL,
-        "Slack archive import message rows by result."
-    );
-    metrics::describe_counter!(
-        SLACK_ARCHIVE_IMPORT_MESSAGE_FILES_TOTAL,
-        "Slack archive import message files by result."
-    );
-    metrics::describe_counter!(
-        SLACK_ARCHIVE_IMPORT_ATTACHMENTS_TOTAL,
-        "Slack archive import attachment rows by result."
-    );
-    metrics::describe_histogram!(
-        SLACK_ARCHIVE_IMPORT_BATCH_DURATION_SECONDS,
-        metrics::Unit::Seconds,
-        "Slack archive import batch write duration in seconds by entity."
-    );
-    metrics::describe_histogram!(
-        SLACK_ARCHIVE_IMPORT_BATCH_SIZE,
-        "Slack archive import batch size by entity."
-    );
-    metrics::describe_counter!(
-        SLACK_ARCHIVE_IMPORT_FAILURES_TOTAL,
-        "Slack archive import failures by stage and reason."
-    );
-    metrics::describe_counter!(
-        SLACK_ARCHIVE_IMPORT_SKIPPED_ITEMS_TOTAL,
-        "Slack archive import skipped items by type and reason."
-    );
-    metrics::describe_counter!(
-        SLACK_ARCHIVE_IMPORT_BATCH_FAILURES_TOTAL,
-        "Slack archive import batch failures by entity and reason."
-    );
-    metrics::describe_gauge!(
-        SLACK_ARCHIVE_IMPORT_LAST_FAILURE_TIMESTAMP_SECONDS,
-        metrics::Unit::Seconds,
-        "Unix timestamp of the most recent Slack archive import failure."
     );
     metrics::describe_counter!(
         SLACK_RETENTION_RUNS_TOTAL,

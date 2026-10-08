@@ -1,6 +1,6 @@
 //! SQLx-backed session repository.
 
-use std::{borrow::Cow, collections::BTreeMap, str::FromStr, time::Duration};
+use std::{collections::BTreeMap, str::FromStr, time::Duration};
 
 use centaur_session_core::{
     ExecutionStatus, HarnessType, MessageRole, SandboxCapabilities, SandboxRepoCacheAccess,
@@ -18,43 +18,9 @@ use thiserror::Error;
 use time::{Duration as TimeDuration, OffsetDateTime};
 use uuid::Uuid;
 
-// The API binary embeds these migrations at compile time.
-static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
+mod migrations;
 
-const HERMES_HARNESS_MIGRATION_VERSION: i64 = 54;
-const UPSTREAM_HERMES_HARNESS_SET: &str = "'codex', 'amp', 'claudecode', 'nanocodex', 'hermes'";
-const FORK_HERMES_HARNESS_SET: &str = "'codex', 'amp', 'claudecode', 'nanocodex', 'omp', 'hermes'";
-
-fn session_migrator() -> Result<sqlx::migrate::Migrator, SessionStoreError> {
-    let mut migrations = MIGRATOR.iter().cloned().collect::<Vec<_>>();
-    let migration = migrations
-        .iter_mut()
-        .find(|migration| migration.version == HERMES_HARNESS_MIGRATION_VERSION)
-        .ok_or_else(|| {
-            SessionStoreError::InvalidMigration(format!(
-                "missing version {HERMES_HARNESS_MIGRATION_VERSION}"
-            ))
-        })?;
-    let patched_sql =
-        migration
-            .sql
-            .replacen(UPSTREAM_HERMES_HARNESS_SET, FORK_HERMES_HARNESS_SET, 1);
-    if patched_sql == migration.sql {
-        return Err(SessionStoreError::InvalidMigration(format!(
-            "version {HERMES_HARNESS_MIGRATION_VERSION} no longer contains the upstream harness constraint"
-        )));
-    }
-
-    // Version 54 came from upstream before the fork-only `omp` harness was
-    // upstreamed. Keep its immutable checksum, but preserve `omp` when SQLx
-    // applies that still-pending migration. Already-applied version 54 rows
-    // are checksum-validated and skipped by SQLx as usual.
-    migration.sql = Cow::Owned(patched_sql);
-
-    let mut migrator = sqlx::migrate::Migrator::DEFAULT;
-    migrator.migrations = Cow::Owned(migrations);
-    Ok(migrator)
-}
+pub use migrations::{TextSearchBackend, migrate, migration_list};
 
 pub const SESSION_EVENTS_CHANNEL: &str = "centaur_session_events";
 const DEFAULT_MAX_CONNECTIONS: u32 = 500;
@@ -105,14 +71,6 @@ pub struct IdleSandboxCandidate {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SandboxCapacityCandidate {
-    pub thread_key: ThreadKey,
-    pub sandbox_id: String,
-    pub latest_execution_id: Option<String>,
-    pub last_active_at: OffsetDateTime,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WorkflowOwnedSandbox {
     pub thread_key: ThreadKey,
     pub sandbox_id: String,
@@ -140,9 +98,12 @@ impl PgSessionStore {
         &self.pool
     }
 
-    pub async fn run_migrations(&self) -> Result<(), SessionStoreError> {
-        session_migrator()?.run(&self.pool).await?;
-        Ok(())
+    pub async fn run_migrations(
+        &self,
+        text_search: TextSearchBackend,
+    ) -> Result<(), SessionStoreError> {
+        let mut conn = self.pool.acquire().await?;
+        migrate(&mut conn, text_search).await
     }
 
     pub async fn listen_session_events(&self) -> Result<SessionEventListener, SessionStoreError> {
@@ -1447,78 +1408,6 @@ impl PgSessionStore {
         Ok(result.rows_affected())
     }
 
-    pub async fn list_sandbox_capacity_candidates(
-        &self,
-        excluded_thread_key: Option<&ThreadKey>,
-        hot_idle_grace: std::time::Duration,
-        limit: i64,
-    ) -> Result<Vec<SandboxCapacityCandidate>, SessionStoreError> {
-        let rows = sqlx::query_as::<_, SandboxCapacityCandidateRow>(
-            r#"
-            with latest as (
-                select distinct on (thread_key)
-                    execution_id,
-                    thread_key,
-                    completed_at
-                from session_executions
-                order by thread_key, created_at desc, execution_id desc
-            )
-            select
-                s.thread_key,
-                s.sandbox_id as sandbox_id,
-                latest.execution_id as latest_execution_id,
-                coalesce(
-                    s.sandbox_last_active_at,
-                    latest.completed_at,
-                    s.updated_at,
-                    s.created_at
-                ) as last_active_at
-            from sessions s
-            left join latest on latest.thread_key = s.thread_key
-            where s.sandbox_id is not null
-              and ($1::text is null or s.thread_key != $1)
-              and not exists (
-                  select 1
-                  from lateral (
-                      select e.event_type
-                      from session_events e
-                      where e.thread_key = s.thread_key
-                        and e.payload->>'sandbox_id' = s.sandbox_id
-                        and e.event_type in (
-                            'session.sandbox_paused',
-                            'session.sandbox_ready',
-                            'session.sandbox_resumed'
-                        )
-                      order by e.created_at desc, e.event_id desc
-                      limit 1
-                  ) latest_sandbox_event
-                  where latest_sandbox_event.event_type = 'session.sandbox_paused'
-              )
-              and coalesce(
-                    s.sandbox_last_active_at,
-                    latest.completed_at,
-                    s.updated_at,
-                    s.created_at
-                  ) <= now() - ($2::float8 * interval '1 second')
-              and not exists (
-                  select 1
-                  from session_executions active
-                  where active.thread_key = s.thread_key
-                    and active.status in ('queued', 'running')
-              )
-            order by last_active_at, s.thread_key
-            limit $3
-            "#,
-        )
-        .bind(excluded_thread_key.map(ThreadKey::as_str))
-        .bind(hot_idle_grace.as_secs_f64())
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?;
-
-        rows.into_iter().map(TryInto::try_into).collect()
-    }
-
     pub async fn list_workflow_owned_sandboxes(
         &self,
         workflow_run_id: &str,
@@ -1811,35 +1700,6 @@ impl PgSessionStore {
         Ok(sandbox_id)
     }
 
-    pub async fn reserve_ready_warm_sandboxes_for_eviction(
-        &self,
-        limit: i64,
-    ) -> Result<Vec<String>, SessionStoreError> {
-        let rows = sqlx::query_scalar::<_, String>(
-            r#"
-            with candidates as (
-                select sandbox_id
-                from session_warm_sandboxes
-                where status = 'ready'
-                order by created_at, sandbox_id
-                for update skip locked
-                limit $1
-            )
-            update session_warm_sandboxes warm
-            set
-                status = 'evicting',
-                updated_at = now()
-            from candidates
-            where warm.sandbox_id = candidates.sandbox_id
-            returning warm.sandbox_id
-            "#,
-        )
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(rows)
-    }
-
     pub async fn list_stale_evicting_warm_sandbox_ids(
         &self,
         min_age: Duration,
@@ -2021,6 +1881,18 @@ pub enum SessionStoreError {
     Sqlx(#[from] sqlx::Error),
     #[error(transparent)]
     Migrate(#[from] sqlx::migrate::MigrateError),
+    #[error(
+        "database was migrated with the {applied} text search backend, but {configured} is configured"
+    )]
+    TextSearchBackendMismatch {
+        configured: TextSearchBackend,
+        applied: TextSearchBackend,
+    },
+    #[error(
+        "database has ParadeDB BM25 indexes ({}) from before text search backends were selectable; configure the paradedb text search backend",
+        indexes.join(", ")
+    )]
+    Bm25IndexesPresent { indexes: Vec<String> },
 }
 
 #[derive(Debug, FromRow)]
@@ -2179,27 +2051,6 @@ fn idle_deadline_elapsed(
         return false;
     }
     elapsed.whole_nanoseconds() >= idle_timeout.as_nanos() as i128
-}
-
-#[derive(Debug, FromRow)]
-struct SandboxCapacityCandidateRow {
-    thread_key: String,
-    sandbox_id: String,
-    latest_execution_id: Option<String>,
-    last_active_at: OffsetDateTime,
-}
-
-impl TryFrom<SandboxCapacityCandidateRow> for SandboxCapacityCandidate {
-    type Error = SessionStoreError;
-
-    fn try_from(row: SandboxCapacityCandidateRow) -> Result<Self, Self::Error> {
-        Ok(Self {
-            thread_key: parse_persisted(row.thread_key)?,
-            sandbox_id: row.sandbox_id,
-            latest_execution_id: row.latest_execution_id,
-            last_active_at: row.last_active_at,
-        })
-    }
 }
 
 #[derive(Debug, FromRow)]
@@ -2378,7 +2229,10 @@ mod tests {
         let store = PgSessionStore::connect(&url)
             .await
             .expect("connect test db");
-        store.run_migrations().await.expect("run migrations");
+        store
+            .run_migrations(crate::TextSearchBackend::Postgres)
+            .await
+            .expect("run migrations");
         Some(store)
     }
 
@@ -3214,63 +3068,6 @@ mod tests {
                 .await
                 .expect("release for peer")
                 .is_empty()
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn warm_eviction_reservation_blocks_later_claims() {
-        let Some(store) = test_store().await else {
-            return;
-        };
-        let sandbox_id = format!("sbx-warm-evict-{}", Uuid::new_v4());
-        let workload_key = format!("workload-warm-evict-{}", Uuid::new_v4());
-        store
-            .insert_ready_warm_sandbox(&sandbox_id, &workload_key)
-            .await
-            .expect("insert warm sandbox");
-        sqlx::query(
-            r#"
-            update session_warm_sandboxes
-            set created_at = now() - interval '100 years'
-            where sandbox_id = $1
-            "#,
-        )
-        .bind(&sandbox_id)
-        .execute(store.pool())
-        .await
-        .expect("age warm sandbox");
-
-        let reserved = store
-            .reserve_ready_warm_sandboxes_for_eviction(1)
-            .await
-            .expect("reserve warm sandbox");
-
-        assert_eq!(reserved, vec![sandbox_id.clone()]);
-        assert_eq!(
-            store
-                .claim_ready_warm_sandbox(&workload_key, "test-thread")
-                .await
-                .expect("claim after reservation"),
-            None
-        );
-        assert!(
-            store
-                .list_referenced_sandbox_ids()
-                .await
-                .expect("list referenced sandboxes")
-                .contains(&sandbox_id)
-        );
-
-        store
-            .mark_warm_sandbox_failed(&sandbox_id, "test cleanup")
-            .await
-            .expect("mark reserved warm sandbox failed");
-        assert!(
-            !store
-                .list_referenced_sandbox_ids()
-                .await
-                .expect("list referenced sandboxes")
-                .contains(&sandbox_id)
         );
     }
 

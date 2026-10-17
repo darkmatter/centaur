@@ -80,13 +80,6 @@ export type SlackbotV2CreateSessionRequest = {
   persona_id?: string
 }
 
-export type SlackbotV2HarnessAssignment = {
-  experiment: string
-  requestedHarness: string
-  cohort: string
-  rolloutPercent: number
-}
-
 export type SlackbotV2ExecuteSessionRequest = {
   idempotency_key?: string
   idle_timeout_ms?: number
@@ -151,22 +144,22 @@ export type SlackbotV2Options = {
   /** Include the Codex service tier in response metadata footers when they render. */
   responseServiceTierEnabled?: boolean
   /**
-   * Per-channel default harness/model/provider/reasoning, keyed by Slack
+   * Per-channel default persona/harness/model/provider/reasoning, keyed by Slack
    * conversation id (SLACKBOTV2_CHANNEL_DEFAULTS). See channel-defaults.ts.
    */
   channelDefaults?: ChannelDefaults
-  /** Percentage of otherwise-default Codex threads assigned to Nanocodex. */
-  codexNanocodexRolloutPercent?: number
   /**
    * Harness for new threads when no --claude/--amp/--codex/--nanocodex/--hermes
    * flag is given (HarnessType wire value: codex | amp | claudecode |
    * nanocodex | hermes). Defaults to codex.
    */
   defaultHarnessType?: string
+  enabledHarnesses?: readonly string[]
   fetch?: SlackbotV2Fetch
   /**
    * Deployment-configured default model per harness wire value (claudecode |
-   * codex), from the CLAUDE_MODEL / CODEX_MODEL env vars the chart mirrors
+   * codex | nanocodex | pi | omp), from the CLAUDE_MODEL / CODEX_MODEL /
+   * CENTAUR_PI_MODEL / CENTAUR_OMP_MODEL env vars the chart mirrors
    * out of sandbox.extraEnv. Display/metadata only — never forwarded to the
    * harness. Unset harnesses fall back to the models pinned in this repo's
    * harness config files (see response-context.ts).
@@ -283,12 +276,10 @@ export type ForwardSessionInput = {
   contextPreamble?: string
   executionId?: string
   executeMessage?: SlackbotV2ApiMessage
-  /** Effective harness selected by Slack policy, including any rollout cohort. */
+  /** Effective harness selected by sticky thread flags or channel defaults. */
   harnessType?: string
   /** Harness persisted by api-rs. */
   metadataHarnessType?: string
-  /** Slack-owned experiment/cohort recorded on the session and execution. */
-  harnessAssignment?: SlackbotV2HarnessAssignment
   messages: SlackbotV2ApiMessage[]
   /** Effective model selected by sticky thread flags (--model/--opus/...). */
   model?: string
@@ -302,10 +293,8 @@ export type ForwardSessionInput = {
   personaId?: string
   /** Effective model provider selected by sticky thread flags (--bedrock); codex only. */
   provider?: string
-  /** Per-turn reasoning effort parsed from the `-rsn` flag (Codex/Nanocodex). */
+  /** Per-turn reasoning effort parsed from the `-rsn` flag (Codex/Nanocodex/Claude Code). */
   reasoning?: string
-  /** Whether an explicit Slack override may restart a thread on harness conflict. */
-  restartOnHarnessConflict?: boolean
   onEventId(eventId: number): void
   openStream: boolean
   threadId: string

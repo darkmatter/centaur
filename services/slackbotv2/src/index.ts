@@ -30,7 +30,7 @@ import {
   type RendererEvent
 } from '@centaur/rendering'
 import { conflateChatSdkStream } from './conflate'
-import { resolveHarnessRollout } from './harness-rollout'
+import { CitationTextFilter, stripUnresolvedCitations } from './citation-text'
 import { observeSeconds, slackbotMetrics } from './metrics'
 import {
   renderSlackDisplayText,
@@ -51,6 +51,8 @@ import {
   serializeAttachment,
   serializeMessageLinks,
   serializeMessage,
+  SESSION_STEERING_DELIVERED_EVENT,
+  SESSION_STEERING_FAILED_EVENT,
   sessionStreamError,
   slackApiTimeoutMs,
   WORKFLOW_ACTION_PREFIX,
@@ -69,6 +71,8 @@ import { resolveChannelDefault } from './channel-defaults'
 import {
   extractMessageOverrides,
   extractPersonaOverride,
+  isHarnessEnabled,
+  validateStrategyOverrides,
   type HarnessOverrides
 } from './overrides'
 import { createFlagMessageOverridesStrategy } from './message-overrides-strategy'
@@ -604,7 +608,7 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
           return new globalThis.Response('Workflow action could not be recorded. Please retry.', { status: 503 })
         }
       }
-      const lateFileTask = lateSlackFiles.repairFromWebhook(rawBody)
+      const lateFileTask = response.ok ? lateSlackFiles.repairFromWebhook(rawBody) : null
       if (lateFileTask) waitUntil(c, lateFileTask)
       outcome = response.ok ? 'success' : 'error'
       return new globalThis.Response(await response.text(), {
@@ -1291,6 +1295,30 @@ async function syncThreadMessageToSession(
   // (unlike it) ridden on the input line to take effect. harness/model/provider
   // are sticky (effectiveOverrides); reasoning is per-turn.
   const channelDefault = resolveChannelDefault(input.options.channelDefaults, thread.id)
+  const selectedHarnessType =
+    effectiveOverrides.harnessType ?? channelDefault?.harnessType ??
+    input.options.defaultHarnessType ?? 'codex'
+  const modelHarness = validateStrategyOverrides({
+    model: stickyOverrideRaw(state, stickyOverridesUpdate, 'model') === null
+      ? undefined : effectiveOverrides.model ?? channelDefault?.model
+  }).harnessType ?? selectedHarnessType
+  if (!isHarnessEnabled(selectedHarnessType, input.options.enabledHarnesses) ||
+    !isHarnessEnabled(modelHarness, input.options.enabledHarnesses)) {
+    const fallbackHarness = input.options.defaultHarnessType ?? 'codex'
+    stickyOverridesUpdate = {
+      ...stickyOverridesUpdate,
+      harnessType: fallbackHarness,
+      model: null,
+      provider: null
+    }
+    effectiveOverrides.harnessType = fallbackHarness
+    effectiveOverrides.model = undefined
+    effectiveOverrides.provider = undefined
+    traceLog(input.options, 'slackbotv2_disabled_harness_reset', trace, {
+      disabled_harness: selectedHarnessType,
+      fallback_harness: fallbackHarness
+    })
+  }
   const resolvedHarnessType = effectiveOverrides.harnessType ?? channelDefault?.harnessType
   // A `null` sticky model/provider is a tombstone from a harness switch: honor
   // it, don't re-pair a stale channel default with the new harness. Only
@@ -1303,27 +1331,34 @@ async function syncThreadMessageToSession(
     stickyOverrideRaw(state, stickyOverridesUpdate, 'provider') === null
       ? undefined
       : effectiveOverrides.provider ?? channelDefault?.provider
+  // A `null` sticky persona means the session was created without one; it is
+  // pinned, so a channel default added later must not apply.
+  const resolvedPersonaId =
+    stickyOverrideRaw(state, stickyOverridesUpdate, 'personaId') === null
+      ? undefined
+      : effectiveOverrides.personaId ?? channelDefault?.personaId
+  // Where the persona sent on session creation came from, for tracing. A pinned
+  // thread persona overrides any later flag (see preservePinnedPersona).
+  const personaSource =
+    resolvedPersonaId === undefined
+      ? undefined
+      : Object.prototype.hasOwnProperty.call(state, 'personaId')
+        ? 'thread'
+        : overrides.personaId
+          ? 'flag'
+          : 'channel'
   const effectiveHarnessType = resolvedHarnessType ?? input.options.defaultHarnessType ?? 'codex'
   // Without an explicit override or channel default the harness runs its
   // configured default (CLAUDE_MODEL/CODEX_MODEL, else the baked harness
   // config); show and record that instead of dropping the model entirely.
-  const harnessDefaultModel = defaultModelForHarness(
-    effectiveHarnessType,
-    input.options.harnessDefaultModels
-  )
-  const effectiveModel = resolvedModel ?? harnessDefaultModel
-  const modelOverride = resolvedModel !== harnessDefaultModel ? resolvedModel : undefined
-  const harnessRollout = resolveHarnessRollout({
-    modelOverride,
-    requestedHarness: effectiveHarnessType,
-    rolloutPercent: input.options.codexNanocodexRolloutPercent ?? 0,
-    threadId: thread.id
-  })
-  const rolloutSelected = harnessRollout.assignment !== undefined
+  const effectiveModel =
+    resolvedModel ??
+    defaultModelForHarness(effectiveHarnessType, input.options.harnessDefaultModels)
+  const requestedReasoning = overrides.reasoning ?? channelDefault?.reasoning
   const resolvedReasoning = reasoningForModel(
     effectiveHarnessType,
     effectiveModel,
-    overrides.reasoning ?? channelDefault?.reasoning
+    requestedReasoning
   )
   const effectiveReasoning = effectiveReasoningForHarness(
     effectiveHarnessType,
@@ -1347,6 +1382,12 @@ async function syncThreadMessageToSession(
       persona_id: overrides.personaId,
       provider: overrides.provider,
       reasoning: overrides.reasoning
+    })
+  }
+  if (shouldStartExecution && personaSource) {
+    traceLog(input.options, 'slackbotv2_forward_persona_resolved', trace, {
+      persona_id: resolvedPersonaId,
+      persona_source: personaSource
     })
   }
   traceLog(input.options, 'slackbotv2_forward_message_serialized', trace, {
@@ -1415,21 +1456,14 @@ async function syncThreadMessageToSession(
     executeMessage: shouldStartExecution ? serializedMessage : undefined,
     // Sticky harness changes only apply when a message starts an execution;
     // restarting the thread out from under an active execution would kill it.
-    harnessType: shouldStartExecution
-      ? rolloutSelected
-        ? harnessRollout.harnessType
-        : resolvedHarnessType
-      : undefined,
-    harnessAssignment: shouldStartExecution ? harnessRollout.assignment : undefined,
+    harnessType: shouldStartExecution ? resolvedHarnessType : undefined,
     metadataHarnessType: shouldStartExecution ? effectiveHarnessType : undefined,
     messages: messagesToAppend,
     model: shouldStartExecution ? resolvedModel : undefined,
     metadataModel: shouldStartExecution ? effectiveModel : undefined,
-    personaId: shouldStartExecution ? effectiveOverrides.personaId : undefined,
+    personaId: shouldStartExecution ? resolvedPersonaId : undefined,
     provider: shouldStartExecution ? resolvedProvider : undefined,
     reasoning: resolvedReasoning,
-    restartOnHarnessConflict:
-      shouldStartExecution && rolloutSelected ? Boolean(resolvedHarnessType) : undefined,
     onEventId: eventId => {
       lastEventId = Math.max(lastEventId, eventId)
     },
@@ -1592,32 +1626,41 @@ async function syncThreadMessageToSession(
           if (requestedPersonaId !== undefined && outcome.personaId !== requestedPersonaId) {
             traceLog(input.options, 'slackbotv2_session_persona_reconciled', trace, {
               requested_persona_id: requestedPersonaId,
+              requested_persona_source: personaSource,
               resolved_persona_id: outcome.personaId,
               unavailable_requested_persona_id: outcome.unavailableRequestedPersonaId
             })
           }
         }
         const harnessType = outcome.harnessType ?? effectiveHarnessType
-        const abTested = outcome.harnessAssignment?.experiment === 'codex_nanocodex_ab'
         forwardInput.metadataHarnessType = harnessType
-        forwardInput.harnessAssignment = outcome.harnessAssignment
+        // A persona-pinned model overrides any model or provider selection.
+        const personaModel = outcome.personaModel
         let model = effectiveModel
         let reasoning = effectiveReasoning
-        if (harnessType !== effectiveHarnessType || abTested) {
+        if (harnessType !== effectiveHarnessType || personaModel) {
           model =
-            resolvedModel ?? defaultModelForHarness(harnessType, input.options.harnessDefaultModels)
-          const requestedReasoning = reasoningForModel(harnessType, model, resolvedReasoning)
+            personaModel ??
+            resolvedModel ??
+            defaultModelForHarness(harnessType, input.options.harnessDefaultModels)
+          // Validate the raw request: resolvedReasoning was filtered against
+          // the model expected before the session resolved.
+          const modelReasoning = reasoningForModel(harnessType, model, requestedReasoning)
           reasoning = effectiveReasoningForHarness(
             harnessType,
-            requestedReasoning,
+            modelReasoning,
             input.options.harnessDefaultReasoning
           )
           forwardInput.metadataModel = model
-          forwardInput.reasoning = requestedReasoning
+          forwardInput.reasoning = modelReasoning
+          if (personaModel) {
+            // The API ignores model and provider selections on a pinned thread;
+            // don't send them, so a rejected pin isn't blamed on a sticky model.
+            forwardInput.model = undefined
+            forwardInput.provider = undefined
+          }
           traceLog(input.options, 'slackbotv2_session_harness_resolved', trace, {
-            ab_tested: abTested,
-            ab_test_experiment: outcome.harnessAssignment?.experiment,
-            ab_test_cohort: outcome.harnessAssignment?.cohort,
+            persona_model: personaModel,
             requested_harness_type: effectiveHarnessType,
             resolved_harness_type: harnessType
           })
@@ -1629,7 +1672,7 @@ async function syncThreadMessageToSession(
           notice: fallbackNotice,
           reasoning,
           serviceTier:
-            input.options.responseServiceTierEnabled === true && !resolvedProvider
+            input.options.responseServiceTierEnabled === true && (personaModel || !resolvedProvider)
               ? defaultServiceTierForHarness(harnessType)
               : undefined
         })
@@ -2273,26 +2316,26 @@ async function recoverRenderObligations(
         })
         continue
       }
-      const releaseLease = async (): Promise<void> => {
-        const activeLeaseToken = await state.get<string>(renderRecoveryLeaseKey(threadId))
-        if (activeLeaseToken === leaseToken) await state.delete(renderRecoveryLeaseKey(threadId))
-      }
+      const releaseLease = renewRenderLease(state, threadId, leaseToken)
 
       // A single hung recovery (for example an event stream that never
       // produces a chunk) must not block every obligation queued behind it.
       // Race a deadline; on timeout move on and leave the attempt running
       // detached - it may still finish and clear the obligation, which is why
-      // the lease is kept so a later pass does not start a duplicate render.
+      // the lease is renewed until the detached attempt actually settles.
       const recovery = recoverRenderObligation(chat, state, options, threadId, obligation)
+        .finally(releaseLease)
       let outcome: { timedOut: true } | { timedOut: false; deferred: boolean }
+      let timeout: ReturnType<typeof setTimeout> | undefined
       try {
         outcome = await Promise.race([
           recovery.then(deferred => ({ timedOut: false as const, deferred })),
-          sleep(timeoutMs).then(() => ({ timedOut: true as const }))
+          new Promise<{ timedOut: true }>(resolve => {
+            timeout = setTimeout(() => resolve({ timedOut: true }), timeoutMs)
+          })
         ])
-      } catch (error) {
-        await releaseLease()
-        throw error
+      } finally {
+        clearTimeout(timeout)
       }
       if (outcome.timedOut) {
         void recovery.catch(() => undefined)
@@ -2318,7 +2361,6 @@ async function recoverRenderObligations(
         )
         continue
       }
-      await releaseLease()
       if (outcome.deferred) {
         deferredCount += 1
         retryableDeferredCount += 1
@@ -2648,6 +2690,16 @@ async function acquireRenderLease(
   const key = renderRecoveryLeaseKey(threadId)
   const token = randomUUID()
   await state.set(key, token, RENDER_RECOVERY_LEASE_TTL_MS)
+  return renewRenderLease(state, threadId, token)
+}
+
+/** Renew an owned lease until the render settles, including after a sweep timeout. */
+function renewRenderLease(
+  state: StateAdapter,
+  threadId: string,
+  token: string
+): () => Promise<void> {
+  const key = renderRecoveryLeaseKey(threadId)
   const refresh = setInterval(() => {
     void state
       .get<string>(key)
@@ -2690,23 +2742,25 @@ async function renderExecutionStream(
   }
   const titleStartedAtMs = nowMs()
   await setAssistantTitle(thread, titleFromMessage(promptText, options.userName), options, trace)
+  const statusTracker = newAssistantStatusTracker(thread, options)
   if (!assistantStatusVisible) {
-    await setAssistantStatus(thread, options.assistantStatus ?? 'Thinking...', options, trace)
+    await setTrackedAssistantStatus(thread, statusTracker, statusTracker.current, options, trace)
   }
   traceLog(options, 'slackbotv2_render_slack_metadata_set', trace, {
     assistant_status_already_visible: assistantStatusVisible,
     phase_ms: elapsedMs(titleStartedAtMs)
   })
   const capture = { diverged: false }
+  let visibleStream: FirstChunkStream | null = null
   try {
     const taskDisplayMode = slackStreamTaskDisplayMode(options)
-    const visibleStream = await streamAfterFirstChunk(
+    visibleStream = await streamAfterFirstChunk(
       conflateChatSdkStream(
         slackSafeChatSdkStream(
           slackVisibleChatSdkStream(
             harnessToChatSdkStream(
-              stream,
-              rendererOptions(thread, options, capture, trace)
+              restoreAssistantStatusAfterSteering(thread, stream, statusTracker, options, trace),
+              rendererOptions(thread, options, capture, trace, statusTracker)
             ),
             taskDisplayMode
           )
@@ -2729,7 +2783,10 @@ async function renderExecutionStream(
     }) ?? await thread.post(visibleStream)
     return { diverged: capture.diverged, messageId: sent?.id }
   } finally {
-    await setAssistantStatus(thread, '', options, trace)
+    // Stop the conflation pump and SSE even if the adapter abandoned the
+    // stream without draining it, then clear the status this render owns.
+    visibleStream?.close()
+    await closeAssistantStatus(thread, statusTracker, options, trace)
   }
 }
 
@@ -2747,20 +2804,22 @@ async function renderRecoveredExecutionStream(
   }
   const titleStartedAtMs = nowMs()
   await setAssistantTitle(thread, titleFromMessage(promptText, options.userName), options, trace)
-  await setAssistantStatus(thread, options.assistantStatus ?? 'Thinking...', options, trace)
+  const statusTracker = newAssistantStatusTracker(thread, options)
+  await setTrackedAssistantStatus(thread, statusTracker, statusTracker.current, options, trace)
   traceLog(options, 'slackbotv2_render_slack_metadata_set', trace, {
     phase_ms: elapsedMs(titleStartedAtMs)
   })
   const capture = { diverged: false }
+  let visibleStream: FirstChunkStream | null = null
   try {
     const taskDisplayMode = slackStreamTaskDisplayMode(options)
-    const visibleStream = await streamAfterFirstChunk(
+    visibleStream = await streamAfterFirstChunk(
       conflateChatSdkStream(
         slackSafeChatSdkStream(
           slackVisibleChatSdkStream(
             harnessToChatSdkStream(
-              stream,
-              rendererOptions(thread, options, capture, trace)
+              restoreAssistantStatusAfterSteering(thread, stream, statusTracker, options, trace),
+              rendererOptions(thread, options, capture, trace, statusTracker)
             ),
             taskDisplayMode
           )
@@ -2779,7 +2838,10 @@ async function renderRecoveredExecutionStream(
     ) ?? await thread.post(visibleStream)
     return { diverged: capture.diverged, messageId: sent?.id }
   } finally {
-    await setAssistantStatus(thread, '', options, trace)
+    // Stop the conflation pump and SSE even if the adapter abandoned the
+    // stream without draining it, then clear the status this render owns.
+    visibleStream?.close()
+    await closeAssistantStatus(thread, statusTracker, options, trace)
   }
 }
 
@@ -2799,8 +2861,9 @@ async function renderPlainTextExecutionStream(
     options,
     trace
   )
+  const statusTracker = newAssistantStatusTracker(thread, options)
   if (!assistantStatusVisible) {
-    await setAssistantStatus(thread, options.assistantStatus ?? 'Thinking...', options, trace)
+    await setTrackedAssistantStatus(thread, statusTracker, statusTracker.current, options, trace)
   }
   traceLog(options, 'slackbotv2_render_plain_text_metadata_set', trace, {
     assistant_status_already_visible: assistantStatusVisible,
@@ -2810,8 +2873,10 @@ async function renderPlainTextExecutionStream(
     const chatStream = fallback.collectChatSdk(
       slackSafeChatSdkStream(
         harnessToChatSdkStream(
-          fallback.collectSource(stream),
-          rendererOptions(thread, options, undefined, trace)
+          fallback.collectSource(
+            restoreAssistantStatusAfterSteering(thread, stream, statusTracker, options, trace)
+          ),
+          rendererOptions(thread, options, undefined, trace, statusTracker)
         )
       )
     )
@@ -2828,7 +2893,7 @@ async function renderPlainTextExecutionStream(
     })
     await thread.post(text)
   } finally {
-    await setAssistantStatus(thread, '', options, trace)
+    await closeAssistantStatus(thread, statusTracker, options, trace)
   }
 }
 
@@ -2856,7 +2921,7 @@ class SlackRenderFallback {
   }
 
   text(): string {
-    const terminalText = this.terminalText.trim()
+    const terminalText = stripUnresolvedCitations(this.terminalText).trim()
     const markdownText = this.markdownText.trim()
     if (this.interrupted && !terminalText && markdownText === EMPTY_FINAL_ANSWER_TEXT) return ''
     return terminalText || markdownText
@@ -2901,9 +2966,17 @@ class SlackRenderFallback {
 async function* slackSafeChatSdkStream(
   stream: AsyncIterable<ChatSDKStreamChunk>
 ): AsyncIterable<ChatSDKStreamChunk> {
+  const citations = new CitationTextFilter()
   for await (const chunk of stream) {
+    if (chunk.type === 'markdown_text') {
+      const text = citations.append(chunk.text)
+      if (text) yield { ...chunk, text }
+      continue
+    }
     yield slackSafeChatSdkChunk(chunk)
   }
+  const text = citations.finish()
+  if (text) yield { type: 'markdown_text', text }
 }
 
 type SlackStreamTaskDisplayMode = NonNullable<SlackbotV2Options['streamTaskDisplayMode']>
@@ -2960,20 +3033,40 @@ function truncateSlackText(value: string, maxChars: number, label: string): stri
   }
 }
 
+/** A render stream whose source can be released even if no consumer drains it. */
+type FirstChunkStream = AsyncIterable<ChatSDKStreamChunk> & { close(): void }
+
 async function streamAfterFirstChunk(
   stream: AsyncIterable<ChatSDKStreamChunk>
-): Promise<AsyncIterable<ChatSDKStreamChunk> | null> {
+): Promise<FirstChunkStream | null> {
   const iterator = stream[Symbol.asyncIterator]()
   const first = await iterator.next()
   if (first.done) return null
 
+  let finished = false
+  const close = (): void => {
+    if (finished) return
+    finished = true
+    // Do not await: a source blocked on a silent SSE can keep return() pending.
+    void Promise.resolve(iterator.return?.()).catch(() => undefined)
+  }
   return {
+    close,
     async *[Symbol.asyncIterator](): AsyncIterator<ChatSDKStreamChunk> {
-      yield first.value
-      for (;;) {
-        const next = await iterator.next()
-        if (next.done) return
-        yield next.value
+      try {
+        yield first.value
+        for (;;) {
+          const next = await iterator.next()
+          if (next.done) {
+            finished = true
+            return
+          }
+          yield next.value
+        }
+      } finally {
+        // A consumer that stops early (e.g. a Slack streaming error) must
+        // release the source so its pump stops consuming session events.
+        close()
       }
     }
   }
@@ -3662,11 +3755,123 @@ function rendererLogInfo(
   }
 }
 
+/** The status a live render currently owns, so it can be restored after Slack hides it. */
+type AssistantStatusTracker = { closed: boolean; current: string }
+
+/**
+ * Open render status trackers in this process, by thread id. A late status
+ * write from a finished render hands the thread back to the newer render
+ * that owns it instead of clearing that render's status.
+ */
+const openAssistantStatusTrackers = new Map<string, AssistantStatusTracker>()
+
+function newAssistantStatusTracker(
+  thread: Thread,
+  options: SlackbotV2Options
+): AssistantStatusTracker {
+  const tracker = { closed: false, current: options.assistantStatus ?? 'Thinking...' }
+  openAssistantStatusTrackers.set(thread.id, tracker)
+  return tracker
+}
+
+/**
+ * Sets a status owned by a live render. Once the render has cleared its
+ * status, late writers (an abandoned stream pump, or a Slack request that
+ * outlived its timeout and lands after the clear) must not leave a stale
+ * indicator behind. The timeout does not cancel the Slack request, so the
+ * compensating write is ordered after the request itself settles.
+ */
+async function setTrackedAssistantStatus(
+  thread: Thread,
+  tracker: AssistantStatusTracker,
+  status: string,
+  options: SlackbotV2Options,
+  trace?: SlackbotV2Trace
+): Promise<void> {
+  if (tracker.closed) return
+  let applied: Promise<boolean> | undefined
+  await setAssistantStatus(thread, status, options, trace, request => {
+    applied = request
+  })
+  if (!applied) return
+  backgroundWaitUntil(
+    applied
+      .then(async wasApplied => {
+        if (!wasApplied || !tracker.closed) return
+        const owner = openAssistantStatusTrackers.get(thread.id)
+        traceLog(options, 'slackbotv2_assistant_status_late_write_reverted', trace, {
+          restored_newer_render_status: Boolean(owner)
+        })
+        if (owner) {
+          await setTrackedAssistantStatus(thread, owner, owner.current, options, trace)
+        } else {
+          await setAssistantStatus(thread, '', options, trace)
+        }
+      })
+      .catch(() => undefined)
+  )
+}
+
+async function closeAssistantStatus(
+  thread: Thread,
+  tracker: AssistantStatusTracker,
+  options: SlackbotV2Options,
+  trace?: SlackbotV2Trace
+): Promise<void> {
+  tracker.closed = true
+  if (openAssistantStatusTrackers.get(thread.id) === tracker) {
+    openAssistantStatusTrackers.delete(thread.id)
+  }
+  await setAssistantStatus(thread, '', options, trace)
+}
+
+/**
+ * Slack hides the thread-wide assistant status when a new message is posted
+ * in the thread, and the steering handoff deliberately leaves the status to
+ * the active run. Once api-rs reports the follow-up delivered to (or failed
+ * for) that still-running execution, restore the run's latest status instead
+ * of leaving the thread without an indicator until the next activity summary
+ * (which may never arrive).
+ */
+async function* restoreAssistantStatusAfterSteering(
+  thread: Thread,
+  stream: AsyncIterable<SlackbotV2RendererSource>,
+  tracker: AssistantStatusTracker,
+  options: SlackbotV2Options,
+  trace?: SlackbotV2Trace
+): AsyncIterable<SlackbotV2RendererSource> {
+  for await (const event of stream) {
+    const steeringEvent = steeringEventKind(event)
+    if (steeringEvent) {
+      traceLog(
+        options,
+        tracker.closed
+          ? 'slackbotv2_assistant_status_restore_skipped_closed'
+          : 'slackbotv2_assistant_status_restored_after_steering',
+        trace,
+        { steering_event: steeringEvent }
+      )
+      await setTrackedAssistantStatus(thread, tracker, tracker.current, options, trace)
+      continue
+    }
+    yield event
+  }
+}
+
+function steeringEventKind(event: SlackbotV2RendererSource): string | null {
+  if (!event || typeof event !== 'object') return null
+  const eventKind = 'eventKind' in event ? event.eventKind : 'event' in event ? event.event : ''
+  return eventKind === SESSION_STEERING_DELIVERED_EVENT || eventKind === SESSION_STEERING_FAILED_EVENT
+    ? eventKind
+    : null
+}
+
 function rendererOptions(
   thread: Thread,
   options: SlackbotV2Options,
   capture?: { diverged: boolean },
-  trace?: SlackbotV2Trace
+  trace?: SlackbotV2Trace,
+  statusTracker?: AssistantStatusTracker
 ): CodexAppServerToChatStreamOptions {
   const mapper = options.mapper
   return {
@@ -3678,7 +3883,12 @@ function rendererOptions(
         await setAssistantTitle(thread, event.title, options)
       }
       if (event.type === 'renderer.status' && options.activitySummaryStatusEnabled) {
-        await setAssistantStatus(thread, event.status, options, trace)
+        if (statusTracker) {
+          statusTracker.current = event.status
+          await setTrackedAssistantStatus(thread, statusTracker, event.status, options, trace)
+        } else {
+          await setAssistantStatus(thread, event.status, options, trace)
+        }
       }
     }
   }
@@ -3735,7 +3945,9 @@ async function setAssistantStatus(
   thread: Thread,
   status: string,
   options?: SlackbotV2Options,
-  trace?: SlackbotV2Trace
+  trace?: SlackbotV2Trace,
+  /** Receives the Slack request itself, which may settle after the timeout. */
+  onRequest?: (applied: Promise<boolean>) => void
 ): Promise<boolean> {
   const startedAtMs = nowMs()
   const normalizedStatus = normalizeAssistantStatus(status)
@@ -3768,8 +3980,8 @@ async function setAssistantStatus(
       )
     : () => undefined
   try {
-    const visible = await withSlackApiTimeout(options, 'set assistant status', () =>
-      ignoreAssistantError(() =>
+    const visible = await withSlackApiTimeout(options, 'set assistant status', () => {
+      const request = ignoreAssistantError(() =>
         adapter.setAssistantStatus!(
           target.channel,
           target.threadTs,
@@ -3777,7 +3989,9 @@ async function setAssistantStatus(
           normalizedStatus ? [normalizedStatus] : undefined
         )
       )
-    )
+      onRequest?.(request)
+      return request
+    })
     if (options) {
       traceLog(options, 'slackbotv2_assistant_status_complete', trace, {
         ...fields,

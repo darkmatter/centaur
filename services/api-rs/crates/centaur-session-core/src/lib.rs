@@ -373,6 +373,7 @@ pub enum HarnessType {
     Nanocodex,
     Omp,
     Hermes,
+    Pi,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, AsRefStr, Display, EnumString)]
@@ -886,6 +887,7 @@ mod tests {
             HarnessType::ClaudeCode
         );
         assert_eq!(HarnessType::from_str("omp").unwrap(), HarnessType::Omp);
+        assert_eq!(HarnessType::from_str("pi").unwrap(), HarnessType::Pi);
     }
 
     #[test]

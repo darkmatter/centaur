@@ -9,17 +9,19 @@ It is a Rails application backed by Postgres. It provides a JSON API, an operato
 - **Stores credentials.** Each secret is a typed record. The value is either kept inline and encrypted, or pulled from an external store such as AWS Secrets Manager, AWS SSM, 1Password, or an environment variable. The supported kinds are static secrets, GCP service-account auth, AWS SigV4 auth, OAuth tokens, Postgres connection strings, and HMAC signing keys.
 - **Controls who can use them.** A **principal** is an identity that a proxy runs as. A **role** groups credentials so they can be assigned together. A **grant** gives one credential to a principal or a role. A principal can use its own grants plus the grants of every role it has.
 - **Limits where they apply.** Each grant has request rules for host, methods, and paths, so a credential is only added to the requests it is meant for.
-- **Configures proxies.** A **proxy** registers with `iron-control`, gets assigned a principal, and calls `POST /api/v1/proxy/sync` to fetch its configuration. The response includes a config hash that works like an ETag, so a proxy that already has the current config gets an empty response.
+- **Configures proxies.** A **proxy** registers with `iron-control`, gets assigned a principal, and calls `POST /api/v1/proxy/sync` on the `proxy-sync` service, which reads `iron-control`'s database, to fetch its configuration. The response includes a config hash that works like an ETag, so a proxy that already has the current config gets an empty response.
 - **Issues short-lived tokens.** For `token_broker` credentials, `iron-control` mints and rotates the access token itself and sends only the token to the proxy. The underlying credential never leaves the control plane.
 
 ## How It Fits Together
 
 ```
   operator ──▶ console / JSON API ──▶ iron-control ──▶ Postgres (encrypted secrets)
-                                           ▲
-                                           │ POST /api/v1/proxy/sync (iprx_ token)
-                                           │
-  application ──▶ iron-proxy ──────────────┘
+                                                             ▲
+                                                         proxy-sync
+                                                             ▲
+                                           POST /api/v1/proxy/sync (iprx_ token)
+                                                             │
+  application ──▶ iron-proxy ────────────────────────────────┘
                      │
                      └──▶ upstream APIs (credentials added per request rules)
 ```
@@ -28,24 +30,23 @@ Operators manage credentials, principals, roles, and grants through the API or t
 
 ## Local Development
 
-Console requires ParadeDB with the `pg_search` extension. A vanilla Postgres
-server cannot run the Console schema or skill search. Install Docker, Ruby using
-the version in `.ruby-version`, and Overmind or Foreman, then run:
+Console runs on stock PostgreSQL 16, including managed services such as RDS
+and Cloud SQL. Install Docker, Ruby using the version in `.ruby-version`, and
+Overmind or Foreman, then run:
 
 ```bash
 just dev
 ```
 
-This starts a persistent `paradedb/paradedb:0.23.0-pg16` container named
-`centaur-console-paradedb`, exposes it on `127.0.0.1:55432`, prepares the Rails
+This starts a persistent `postgres:16` container named
+`centaur-console-postgres`, exposes it on `127.0.0.1:55432`, prepares the Rails
 database, and starts the web and CSS processes. Database files are retained in
-the `centaur-console-paradedb-data` Docker volume between runs.
+the `centaur-console-postgres-data` Docker volume between runs.
 
-To use an existing ParadeDB installation instead, set
+To use an existing PostgreSQL server instead, set
 `CENTAUR_CONSOLE_DB_HOST`, `CENTAUR_CONSOLE_DB_PORT`,
 `CENTAUR_CONSOLE_DB_USERNAME`, and `CENTAUR_CONSOLE_DB_PASSWORD`, then set
-`CENTAUR_CONSOLE_MANAGE_PARADEDB=false` so `just dev` does not start Docker. The
-server must have `pg_search` installed and available to the Console database.
+`CENTAUR_CONSOLE_MANAGE_POSTGRES=false` so `just dev` does not start Docker.
 
 ## Environment Variables
 
@@ -112,6 +113,13 @@ Google Docs metadata and document-content ETL is disabled by default. Set
 and queued Google Docs sync jobs. This switch does not affect Google OAuth,
 credential refresh, or previously indexed content.
 
+## Company Context v1 Sync
+
+`CENTAUR_CONSOLE_COMPANY_CONTEXT_V1_ENABLED=false` stops the Slack DM, Google
+Docs, and Granola sync jobs, including jobs already queued, without deleting
+synced data. It defaults to enabled; Google Docs sync also still requires
+`CENTAUR_CONSOLE_GOOGLE_DOCS_SYNC_ENABLED`.
+
 ## Encryption Keys
 
 `iron-control` uses ActiveRecord encryption to protect secrets stored in the control plane (for example, the `control_plane` secret source type). The following environment variables configure the encryption keys:
@@ -128,6 +136,6 @@ Rotating any of these keys makes previously encrypted data unreadable. Treat the
 
 ## API
 
-`iron-control` exposes a JSON API under `/api/v1`. All resource endpoints authenticate with an API key sent as a bearer token (`Authorization: Bearer iak_...`); the one exception is `POST /api/v1/proxy/sync`, which `iron-proxy` instances call with a proxy bearer token.
+`iron-control` exposes a JSON API under `/api/v1`. All resource endpoints authenticate with an API key sent as a bearer token (`Authorization: Bearer iak_...`). `iron-proxy` instances fetch their configuration from the separate `proxy-sync` service with a proxy bearer token.
 
 See [docs/API.md](docs/API.md) for the full reference: authentication, request/response conventions, pagination, error formats, the shared secret-source and request-rule shapes, and detailed payloads for every endpoint (static secrets, GCP auth secrets, OAuth token secrets, principals, roles, grants, API keys, proxies, and proxy sync).

@@ -1,19 +1,12 @@
 # Proxy Sync
 
-`centaur-proxy-sync` is the Rust implementation of Console's
-`POST /api/v1/proxy/sync` endpoint. It authenticates proxy bearer tokens and
+`centaur-proxy-sync` serves `POST /api/v1/proxy/sync` for iron-proxy. It authenticates proxy bearer tokens and
 builds effective proxy configuration directly from Console's PostgreSQL schema.
 Console remains responsible for credential administration and token refresh.
 
-The service is disabled by default. Enable it in the Helm chart with:
-
-```yaml
-proxySync:
-  enabled: true
-```
-
-When enabled, `api-rs` continues sending administrative requests to Console but
-configures newly created managed proxies to poll this service.
+The Helm chart always deploys this service. `api-rs` sends administrative
+requests to Console and configures managed proxies to poll this service through
+`IRON_CONTROL_PROXY_SYNC_URL`.
 
 ## Metrics
 
@@ -32,3 +25,17 @@ excluded from the HTTP request metrics.
 - `CENTAUR_API_URL` / `CENTAUR_API_SERVER_PROXY_HOSTS` — API hosts used for generated API credentials.
 - `BIND_ADDR` — listen address; defaults to `0.0.0.0:8080`.
 - `DATABASE_MAX_CONNECTIONS` — SQLx pool limit; defaults to `5`.
+
+## Tests
+
+Integration tests run the HTTP handlers against Postgres with Console's schema.
+Load the schema into an empty database, then point the tests at it:
+
+```bash
+cd services/console
+RAILS_ENV=test CENTAUR_CONSOLE_DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:55432/proxy_sync_test bin/rails db:prepare
+cd ../proxy-sync
+PROXY_SYNC_TEST_DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:55432/proxy_sync_test cargo test
+```
+
+Without `PROXY_SYNC_TEST_DATABASE_URL` they are skipped locally and fail in CI.

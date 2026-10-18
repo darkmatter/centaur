@@ -1,0 +1,53 @@
+# Using the OMP Harness
+
+Centaur can run [oh-my-pi](https://github.com/can1357/oh-my-pi) (OMP) as a
+session harness alongside Codex, Claude Code, Amp, Nanocodex, Hermes, and Pi.
+Select it with the `omp` harness type. The sandbox image pins OMP (`OMP_VERSION`
+in `services/sandbox/Dockerfile`) to the release the harness's RPC adapter speaks.
+
+In blocks mode the sandbox keeps one resident `omp --mode rpc --auto-approve`
+process and reuses it across turns. Steers (`steer_active_execution`) go to the
+running turn as OMP `steer` commands; an interrupt sends OMP's `abort` and keeps
+the process. A turn runs for the execution's `max_duration_ms` plus a short grace
+period (five minutes when unset), then is aborted.
+
+OMP writes session JSONL files under `OMP_SESSION_DIR`. With persistent state the
+entrypoint points it at the state volume, and the harness records the session id
+in `$OMP_SESSION_DIR/.resident_session_id`, so a respawned process passes
+`--resume` and continues the same conversation after a crash or sandbox
+replacement.
+
+## Slash commands
+
+OMP runs its builtin slash commands locally in RPC mode. The harness forwards only
+commands with no effect beyond the current OMP session, such as `/compact`,
+`/context`, `/model`, `/todo`, `/session info`, and `/usage`, and returns their
+output as the turn's reply. Any other `/command` is answered by the harness with
+the list of available commands and never reaches OMP.
+
+## Models and credentials
+
+The entrypoint copies `harness/omp/config.yml` and `harness/omp/models.yml` into
+`~/.omp/agent`, substituting the LiteLLM gateway URL. They define a static
+`litellm` provider keyed by `LITELLM_API_KEY` and the default model roles.
+Subscription-backed roles authenticate through OMP's auth broker
+(`OMP_AUTH_BROKER_URL`, `OMP_AUTH_BROKER_TOKEN`) when one is configured, and
+otherwise fall back to the gateway.
+
+A turn's `model` (`provider/modelId`, optionally suffixed with `:<thinking level>`)
+switches the resident process with `set_model` before the prompt, and a turn's
+reasoning effort sets the thinking level (`inherit`, `off`, `minimal`, `low`,
+`medium`, `high`, `xhigh`, or `max`). A rejected model or level fails that turn.
+
+## Configuration
+
+| Variable | Purpose |
+|---|---|
+| `OMP_MODEL` | Model passed as `--model` when the process starts. When unset, the `default` role in `config.yml` applies. |
+| `OMP_BIN` | OMP executable (default: `omp` on `PATH`). |
+| `OMP_SESSION_DIR` | Session directory (default: `~/.omp-harness-sessions`; `$STATE_DIR/omp-sessions` with persistent state). |
+| `OMP_LITELLM_BASE_URL` | Gateway URL substituted into the baked config (default: `https://litellm.drkmttr.dev/v1`). |
+| `CENTAUR_OVERLAY_OMP_DIR` | Directory whose `config.yml`/`models.yml` replace the baked copies file by file. The entrypoint waits up to `CENTAUR_OVERLAY_OMP_WAIT_SECONDS` (default `10`) for them to appear. |
+| `PI_CODING_AGENT_DIR` | Overrides OMP's agent directory (default: `~/.omp/agent`). Pi reads the same variable, so setting it moves Pi's configuration too. |
+
+Set these through `sandbox.extraEnv`.

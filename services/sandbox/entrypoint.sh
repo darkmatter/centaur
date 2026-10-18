@@ -50,10 +50,12 @@ if [ -n "${TOOL_DIRS:-}" ]; then
 fi
 
 if [ -d "$STATE_DIR" ] && [ -w "$STATE_DIR" ]; then
-    mkdir -p "$STATE_DIR/workspace" "$STATE_DIR/uploads" "$STATE_DIR/branches" "$STATE_DIR/codex" "$STATE_DIR/claude"
-    rm -rf "$HOME_DIR/.codex" "$HOME_DIR/.claude" "$HOME_DIR/uploads" "$HOME_DIR/branches"
+    mkdir -p "$STATE_DIR/workspace" "$STATE_DIR/uploads" "$STATE_DIR/branches" "$STATE_DIR/codex" "$STATE_DIR/claude" "$STATE_DIR/pi" "$STATE_DIR/omp"
+    rm -rf "$HOME_DIR/.codex" "$HOME_DIR/.claude" "$HOME_DIR/.pi" "$HOME_DIR/.omp" "$HOME_DIR/uploads" "$HOME_DIR/branches"
     ln -s "$STATE_DIR/codex" "$HOME_DIR/.codex"
     ln -s "$STATE_DIR/claude" "$HOME_DIR/.claude"
+    ln -s "$STATE_DIR/pi" "$HOME_DIR/.pi"
+    ln -s "$STATE_DIR/omp" "$HOME_DIR/.omp"
     ln -s "$STATE_DIR/uploads" "$HOME_DIR/uploads"
     ln -s "$STATE_DIR/branches" "$HOME_DIR/branches"
     # omp session JSONLs + thread-map.json ride the state PVC so transcript
@@ -377,27 +379,19 @@ case "$CLAUDE_CODE_AUTH_MODE" in
         ;;
 esac
 
-# ── Pi-mono settings ─────────────────────────────────────────────────────────
-mkdir -p "$HOME_DIR/.pi/agent/extensions"
-cat > "$HOME_DIR/.pi/agent/settings.json" <<EOF
-{
-  "provider": "anthropic",
-  "model": "claude-sonnet-4-20250514",
-  "thinkingLevel": "medium",
-  "autoCompaction": true
-}
-EOF
-
 # ── omp (oh-my-pi) settings ──────────────────────────────────────────────────
-# Baked harness/omp/{config.yml,models.yml} land in $PI_CODING_AGENT_DIR with
+# Baked harness/omp/{config.yml,models.yml} land in omp's agent dir with
 # the LiteLLM base URL substituted (OMP_LITELLM_BASE_URL, default the public
 # darkmatter gateway) so in-cluster deployments can point at a local Service.
 # When CENTAUR_OVERLAY_OMP_DIR names a directory (an overlay checkout, e.g.
 # /home/agent/github/darkmatter/centaur-overlay/harness/omp), files there win
 # over the baked copies per file — the overlay owns agent behavior, including
 # model-role routing, and evals must exercise the candidate's config.
-export PI_CODING_AGENT_DIR="${PI_CODING_AGENT_DIR:-$HOME_DIR/.omp/agent}"
-mkdir -p "$PI_CODING_AGENT_DIR"
+# omp resolves its agent dir from PI_CODING_AGENT_DIR, else ~/.omp/agent. Pi
+# reads the same variable (default ~/.pi/agent), so it is deliberately not
+# exported here: an export would point the Pi harness at omp's config.
+OMP_AGENT_DIR="${PI_CODING_AGENT_DIR:-$HOME_DIR/.omp/agent}"
+mkdir -p "$OMP_AGENT_DIR"
 OMP_LITELLM_BASE_URL="${OMP_LITELLM_BASE_URL:-https://litellm.drkmttr.dev/v1}"
 OMP_OVERLAY_WAIT_SECONDS="${CENTAUR_OVERLAY_OMP_WAIT_SECONDS:-10}"
 
@@ -420,9 +414,9 @@ for omp_cfg in config.yml models.yml; do
         exit 1
     fi
     sed "s|__OMP_LITELLM_BASE_URL__|$OMP_LITELLM_BASE_URL|g" \
-        "$src" > "$PI_CODING_AGENT_DIR/$omp_cfg"
+        "$src" > "$OMP_AGENT_DIR/$omp_cfg"
 done
-unset OMP_OVERLAY_WAIT_SECONDS
+unset OMP_OVERLAY_WAIT_SECONDS OMP_AGENT_DIR
 
 # ── GitHub App installation token (darkmatter deployments) ──────────────────
 # When the App credentials are passed through, mint a short-lived installation

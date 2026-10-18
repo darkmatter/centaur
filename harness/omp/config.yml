@@ -1,4 +1,4 @@
-# Baked omp (oh-my-pi) agent config. Copied to $PI_CODING_AGENT_DIR/config.yml
+# Baked omp (oh-my-pi) agent config. Copied to ~/.omp/agent/config.yml
 # at container start by entrypoint.sh, which substitutes __OMP_LITELLM_BASE_URL__
 # (default https://litellm.drkmttr.dev/v1) so in-cluster deployments can point
 # at a local Service.

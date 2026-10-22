@@ -6,10 +6,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 use std::time::Duration;
 
-use codex_app_server_protocol::UserInput;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::protocol::UserInput;
 use crate::{
     HarnessKind, HarnessServer, NormalizedContent, NormalizedEvent, NormalizedTokenUsage,
     NormalizedToolResult, Result, ThreadState, command_from_override, stable_id,
@@ -510,7 +510,7 @@ fn prompt_text(input: &[UserInput]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use codex_app_server_protocol::UserInput;
+    use crate::protocol::UserInput;
 
     use crate::{HarnessServer, NormalizedContent, NormalizedEvent};
 

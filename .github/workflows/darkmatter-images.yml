@@ -13,6 +13,8 @@ on:
       - "services/sandbox/**"
       - "services/workflow-python/**"
       - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
       - "harness/**"
       - "tools/**"
       - "workflows/**"

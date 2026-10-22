@@ -757,7 +757,7 @@ fn write_local_turn(
     stdout: &mut impl Write,
     thread_id: &str,
     client_user_message_id: Option<String>,
-    input: Vec<codex_app_server_protocol::UserInput>,
+    input: Vec<crate::protocol::UserInput>,
     text: &str,
 ) -> Result<()> {
     use crate::traits::{NormalizedContent, NormalizedEvent};
@@ -1331,14 +1331,14 @@ fn drive_omp_turn(
 }
 
 /// The text blocks of a user line, one per content block, in order.
-fn prompt_text_parts(input: &[codex_app_server_protocol::UserInput]) -> Vec<String> {
+fn prompt_text_parts(input: &[crate::protocol::UserInput]) -> Vec<String> {
     crate::util::user_input_to_anthropic_content(input)
         .into_iter()
         .filter_map(|p| p.get("text").and_then(Value::as_str).map(str::to_owned))
         .collect()
 }
 
-fn prompt_text(input: &[codex_app_server_protocol::UserInput]) -> String {
+fn prompt_text(input: &[crate::protocol::UserInput]) -> String {
     prompt_text_parts(input).join("\n\n")
 }
 
@@ -1376,9 +1376,7 @@ fn write_blocks_error_with_request_id(
     )
 }
 
-fn notification_to_wire_value(
-    notification: &codex_app_server_protocol::ServerNotification,
-) -> Result<Value> {
+fn notification_to_wire_value(notification: &crate::protocol::ServerNotification) -> Result<Value> {
     crate::wire::notification_to_wire_value(notification)
 }
 

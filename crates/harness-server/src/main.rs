@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 use clap::{Parser, Subcommand, ValueEnum};
 use harness_server::{
     HarnessKind, Result, run_blocks_server, run_harness_server, run_hermes_blocks_server,
-    run_nanocodex_blocks_server, run_validate_agent_deltas, run_validate_jsonrpc,
+    run_nanocodex_blocks_server,
 };
 
 #[derive(Debug, Parser)]
@@ -25,14 +25,13 @@ enum CliCommand {
     Amp(HarnessCommand),
     /// Run Nanocodex directly as a library and stream its native typed events.
     Nanocodex,
-    Omp(HarnessCommand),
     /// Drive Hermes Agent's long-lived JSON-RPC gateway (sessions, memory,
     /// skills, crons survive across turns).
     Hermes,
     /// Drive Pi's long-lived RPC mode.
     Pi(HarnessCommand),
-    ValidateJsonrpc,
-    ValidateAgentDeltas,
+    /// Drive OMP's long-lived RPC mode with native session continuation.
+    Omp(HarnessCommand),
 }
 
 #[derive(Debug, Parser)]
@@ -66,10 +65,8 @@ fn run() -> Result<()> {
         CliCommand::Amp(command) => run_mode(HarnessKind::Amp, command.mode),
         CliCommand::Pi(command) => run_mode(HarnessKind::Pi, command.mode),
         CliCommand::Nanocodex => run_nanocodex_blocks_server(),
-        CliCommand::Omp(command) => run_mode(HarnessKind::Omp, command.mode),
         CliCommand::Hermes => run_hermes_blocks_server(),
-        CliCommand::ValidateJsonrpc => run_validate_jsonrpc(),
-        CliCommand::ValidateAgentDeltas => run_validate_agent_deltas(),
+        CliCommand::Omp(command) => run_mode(HarnessKind::Omp, command.mode),
     }
 }
 

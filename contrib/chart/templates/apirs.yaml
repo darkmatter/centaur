@@ -302,6 +302,12 @@ spec:
 {{- end }}
             - name: IRON_CONTROL_SYNC_INFRA_SECRETS
               value: {{ .Values.apiRs.syncInfraSecrets | quote }}
+{{- with .Values.slackbotv2.externalOrgAllowlist }}
+            # Deprecated: seeds the Slack Connect allowlist once when upgrading
+            # from this Helm value. Manage it in Console Settings.
+            - name: SLACKBOT_EXTERNAL_ORG_ALLOWLIST
+              value: {{ . | quote }}
+{{- end }}
             - name: RUST_LOG
               value: info
             - name: TOOL_DIRS
@@ -590,6 +596,22 @@ spec:
                 secretKeyRef:
                   name: {{ include "centaur.secretEnvName" . }}
                   key: {{ printf "%sIRON_CONTROL_INITIAL_API_KEY" .Values.secretManager.envPrefix }}
+            # Principals and their effective config are read from the console
+            # database directly, in read-only sessions.
+{{- if include "centaur.derivePostgresUrls" . }}
+            # Host-only derived URL; POSTGRES_PASSWORD is declared earlier in
+            # this container's env for kubelet $(VAR) expansion.
+            - name: IRON_CONTROL_DATABASE_URL
+              value: {{ include "centaur.postgresHostUrl" . | quote }}
+{{- else }}
+            - name: IRON_CONTROL_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "centaur.secretEnvName" . }}
+                  key: {{ printf "%sIRON_CONTROL_DATABASE_URL" .Values.secretManager.envPrefix }}
+{{- end }}
+            - name: IRON_CONTROL_DATABASE_NAME
+              value: {{ $console.database.name | quote }}
 {{- if and .Values.toolServer.enabled (not .Values.toolServer.repo) (eq (len $toolSources) 0) }}
 {{- fail "toolServer.repo (owner/name) must be set when toolServer.enabled=true" }}
 {{- end }}

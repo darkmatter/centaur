@@ -79,3 +79,6 @@ next-env.d.ts
 _
 .notes
 .worktrees/
+
+# Rust
+/target/

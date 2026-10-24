@@ -72,6 +72,7 @@ pub(crate) fn run_blocks_app_server<H: HarnessServer>(harness: &H) -> Result<()>
     let (command_tx, command_rx) = mpsc::channel();
     let (request_tx, request_rx) = mpsc::channel();
     let turn_active = Arc::new(AtomicBool::new(false));
+    let steers_blocks_active_turn = harness.steers_blocks_active_turn();
 
     {
         let turn_active = Arc::clone(&turn_active);
@@ -90,6 +91,28 @@ pub(crate) fn run_blocks_app_server<H: HarnessServer>(harness: &H) -> Result<()>
                 match parse_blocks_line_with_state(trimmed, &mut blocks_state) {
                     Ok(BlocksCommand::Interrupt) if turn_active.load(Ordering::SeqCst) => {
                         if request_tx.send(ActiveTurnRequest::BlocksInterrupt).is_err() {
+                            break;
+                        }
+                    }
+                    // A tagged steer belongs to the turn in flight; only
+                    // harnesses with a native steer frame opt in.
+                    Ok(BlocksCommand::User {
+                        input,
+                        client_user_message_id,
+                        trace_context,
+                        ..
+                    }) if steers_blocks_active_turn
+                        && turn_active.load(Ordering::SeqCst)
+                        && trace_context.metadata.get("action").and_then(Value::as_str)
+                            == Some("steer_active_execution") =>
+                    {
+                        if request_tx
+                            .send(ActiveTurnRequest::BlocksSteer {
+                                input,
+                                client_user_message_id,
+                            })
+                            .is_err()
+                        {
                             break;
                         }
                     }
@@ -222,8 +245,8 @@ pub(crate) fn run_app_server<H: HarnessServer>(harness: &H) -> Result<()> {
                     eprintln!("request failed: {error:#}");
                 }
             }
-            ActiveTurnRequest::BlocksInterrupt => {
-                eprintln!("blocks interrupt ignored: no active turn runs");
+            ActiveTurnRequest::BlocksInterrupt | ActiveTurnRequest::BlocksSteer { .. } => {
+                eprintln!("blocks request ignored: no active turn runs");
             }
         }
     }
@@ -273,6 +296,10 @@ enum BlocksReaderInput {
 enum ActiveTurnRequest {
     JsonRpc(JSONRPCRequest),
     BlocksInterrupt,
+    BlocksSteer {
+        input: Vec<UserInput>,
+        client_user_message_id: Option<String>,
+    },
 }
 
 fn drain_active_turn_requests(rx: &Receiver<ActiveTurnRequest>) {
@@ -1055,6 +1082,28 @@ fn apply_resume_overrides(state: &mut ThreadState, params: &ThreadResumeParams) 
     Ok(())
 }
 
+fn write_steer_frame<H: HarnessServer>(
+    harness: &H,
+    process: &mut HarnessChild,
+    input: &[UserInput],
+) -> Result<()> {
+    process.stdin.write_all(&harness.stdin_for_steer(input)?)?;
+    process.stdin.flush()?;
+    Ok(())
+}
+
+fn emit_steer_message<W: Write>(
+    normalizer: &mut CodexTurnNormalizer,
+    stdout: &mut W,
+    client_user_message_id: Option<String>,
+    input: Vec<UserInput>,
+) -> Result<()> {
+    for notification in normalizer.emit_user_message(client_user_message_id, input)? {
+        write_value(stdout, &notification_to_wire_value(&notification)?)?;
+    }
+    Ok(())
+}
+
 fn handle_active_turn_request<H: HarnessServer, W: Write>(
     harness: &H,
     process: &mut HarnessChild,
@@ -1062,8 +1111,19 @@ fn handle_active_turn_request<H: HarnessServer, W: Write>(
     request: ActiveTurnRequest,
     stdout: &mut W,
 ) -> Result<Option<InterruptOutcome>> {
-    let ActiveTurnRequest::JsonRpc(request) = request else {
-        return harness.interrupt_turn(process).map(Some);
+    let request = match request {
+        ActiveTurnRequest::BlocksInterrupt => {
+            return harness.interrupt_turn(process).map(Some);
+        }
+        ActiveTurnRequest::BlocksSteer {
+            input,
+            client_user_message_id,
+        } => {
+            write_steer_frame(harness, process, &input)?;
+            emit_steer_message(normalizer, stdout, client_user_message_id, input)?;
+            return Ok(None);
+        }
+        ActiveTurnRequest::JsonRpc(request) => request,
     };
 
     match request.method.as_str() {
@@ -1091,10 +1151,7 @@ fn handle_active_turn_request<H: HarnessServer, W: Write>(
                 )?;
                 return Ok(None);
             }
-            process
-                .stdin
-                .write_all(&harness.stdin_for_steer(&params.input)?)?;
-            process.stdin.flush()?;
+            write_steer_frame(harness, process, &params.input)?;
             write_response(
                 stdout,
                 request.id,
@@ -1102,11 +1159,12 @@ fn handle_active_turn_request<H: HarnessServer, W: Write>(
                     turn_id: normalizer.turn_id().to_string(),
                 },
             )?;
-            for notification in normalizer
-                .emit_user_message(params.client_user_message_id.clone(), params.input.clone())?
-            {
-                write_value(stdout, &notification_to_wire_value(&notification)?)?;
-            }
+            emit_steer_message(
+                normalizer,
+                stdout,
+                params.client_user_message_id.clone(),
+                params.input.clone(),
+            )?;
             Ok(None)
         }
         "turn/interrupt" => {
@@ -1730,6 +1788,14 @@ mod tests {
         let path = dir.join(name);
         img.save(&path).expect("write test png");
         path
+    }
+
+    #[test]
+    fn only_omp_steers_the_blocks_active_turn() {
+        assert!(OmpHarness.steers_blocks_active_turn());
+        assert!(!ClaudeCodeHarness.steers_blocks_active_turn());
+        assert!(!AmpHarness.steers_blocks_active_turn());
+        assert!(!PiHarness.steers_blocks_active_turn());
     }
 
     #[test]

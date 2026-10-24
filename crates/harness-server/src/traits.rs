@@ -100,6 +100,13 @@ pub trait HarnessServer {
     fn stdin_for_steer(&self, input: &[UserInput]) -> Result<Vec<u8>> {
         self.stdin_for_turn(input)
     }
+    /// Whether a blocks-mode user line tagged `steer_active_execution` steers
+    /// the turn in flight instead of being queued as the next turn. Off by
+    /// default: a harness whose blocks reader has no native steer keeps the
+    /// previous queueing behavior.
+    fn steers_blocks_active_turn(&self) -> bool {
+        false
+    }
     /// Ends the active turn. The default kills the process: harnesses that
     /// cannot settle a turn in-band need a new process for the next one.
     /// Harnesses whose abort is acknowledged on stdout may settle the turn and

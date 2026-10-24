@@ -900,6 +900,61 @@ fn unsettled_background_output_stays_in_the_original_turn() {
 }
 
 #[test]
+fn blocks_steering_reaches_the_active_turn_instead_of_queuing_a_second_prompt() {
+    let mut server = Server::new(&[]);
+    server.user("slow", json!({}));
+    server.until(|event| {
+        event["method"] == "item/started" && event["params"]["item"]["type"] == "commandExecution"
+    });
+    server.user(
+        "steered",
+        json!({
+            "client_user_message_id": "blocks-steer-1",
+            "trace_metadata": {"action": "steer_active_execution"},
+        }),
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let steer = loop {
+        if let Some(steer) = server
+            .commands()
+            .into_iter()
+            .find(|command| command["type"] == "steer")
+        {
+            break steer;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "steer never reached the running OMP process: {:#?}",
+            server.commands()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert_eq!(steer["message"], "steered");
+
+    server.send(json!({"type": "interrupt", "thread_key": KEY}));
+    let turn = server.read_until("turn/completed");
+    assert_eq!(status(&turn), "interrupted");
+    assert!(
+        items(&turn, "item/completed", "userMessage")
+            .iter()
+            .any(|item| item["clientId"] == "blocks-steer-1"),
+        "the steer belongs to the interrupted turn: {turn:#?}"
+    );
+
+    // The steer must not surface as a queued prompt for a later turn.
+    assert_eq!(status(&server.turn("text", json!({}))), "completed");
+    assert_eq!(
+        server
+            .commands()
+            .iter()
+            .filter(|command| command["type"] == "prompt")
+            .map(|command| command["message"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["slow", "text"]
+    );
+}
+
+#[test]
 fn startup_failures_never_send_a_prompt_and_next_turn_retries() {
     for fault in [
         "negotiate_protocol",

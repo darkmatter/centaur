@@ -107,13 +107,13 @@ pub trait HarnessServer {
     fn steers_blocks_active_turn(&self) -> bool {
         false
     }
-    /// Ends the active turn. The default kills the process: harnesses that
-    /// cannot settle a turn in-band need a new process for the next one.
-    /// Harnesses whose abort is acknowledged on stdout may settle the turn and
-    /// keep the process and its native session.
-    fn interrupt_turn(&self, process: &mut HarnessChild) -> Result<InterruptOutcome> {
+    /// Ends the active turn and its process: an interrupted run must not hand
+    /// its process, or output still in flight, to the next turn. A harness may
+    /// drain its abort acknowledgement first, but must still replace the
+    /// process; the next turn resumes the harness's own session.
+    fn interrupt_turn(&self, process: &mut HarnessChild) -> Result<()> {
         process.kill_and_wait()?;
-        Ok(InterruptOutcome::Restart)
+        Ok(())
     }
     /// Bounds on the stdout reader for harnesses whose output is hostile or
     /// resource-hungry. `None` reads unbounded lines into an unbounded queue.
@@ -209,17 +209,6 @@ pub trait HarnessServer {
             thread_started_sent: false,
         }
     }
-}
-
-/// What an interrupted turn leaves behind.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum InterruptOutcome {
-    /// The running process cannot continue the session; drop it so the next
-    /// turn spawns a new one.
-    Restart,
-    /// The harness settled the turn in-band; keep its process (and native
-    /// session) for the next turn.
-    Retain,
 }
 
 /// Bounds a harness puts on its stdout reader thread.

@@ -4,7 +4,7 @@ use std::process::ExitStatus;
 
 use thiserror::Error;
 
-use crate::traits::{HarnessKind, InterruptOutcome};
+use crate::traits::HarnessKind;
 
 pub type Result<T> = std::result::Result<T, HarnessServerError>;
 
@@ -59,10 +59,7 @@ pub enum HarnessServerError {
         timeout: std::time::Duration,
     },
     #[error("{kind:?} turn interrupted")]
-    TurnInterrupted {
-        kind: HarnessKind,
-        outcome: InterruptOutcome,
-    },
+    TurnInterrupted { kind: HarnessKind },
     #[error("failed to spawn {bin} app-server: {source}")]
     SpawnCodex {
         bin: String,

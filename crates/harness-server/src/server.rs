@@ -1,9 +1,9 @@
 use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::fs::OpenOptions;
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::process::{ChildStdout, Stdio};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -35,7 +35,7 @@ use crate::protocol::{
 };
 use crate::traits::{
     AppServerNormalizer, AppServerRuntime, HarnessChild, HarnessKind, HarnessServer,
-    NormalizedEvent, ThreadState, TurnHold,
+    InterruptOutcome, NormalizedEvent, StdoutLimits, ThreadState, TurnHold,
 };
 use crate::turn::{BridgeConfig, CodexTurnNormalizer};
 use crate::util::{absolute_path, default_codex_home, write_value};
@@ -60,7 +60,7 @@ pub fn run_blocks_server(kind: HarnessKind) -> Result<()> {
     match kind {
         HarnessKind::Codex => crate::codex::run_codex_blocks_server(CodexHarnessServer::codex()),
         HarnessKind::ClaudeCode => run_blocks_app_server(&ClaudeCodeHarness),
-        HarnessKind::Omp => crate::omp_rpc::run_omp_blocks_server(),
+        HarnessKind::Omp => run_blocks_app_server(&OmpHarness),
         HarnessKind::Amp => run_blocks_app_server(&AmpHarness),
         HarnessKind::Pi => run_blocks_app_server(&PiHarness),
     }
@@ -129,16 +129,19 @@ pub(crate) fn run_blocks_app_server<H: HarnessServer>(harness: &H) -> Result<()>
                 input,
                 client_user_message_id,
                 model,
-                // Provider selection only applies to the codex harness; the
-                // emulated (claude/amp) app-server fixes its provider at thread
-                // start from session params. Reasoning effort is applied by
-                // per turn by harnesses that support it.
-                provider: _,
+                // Only harnesses that take their provider per turn (omp) use
+                // it; the emulated (claude/amp/pi) app-server fixes its
+                // provider at thread start from session params. Reasoning
+                // effort is applied per turn by harnesses that support it.
+                provider,
                 reasoning,
                 trace_context,
             }) => {
                 if let Some(model) = model {
                     state.model = model;
+                }
+                if let Some(provider) = provider.filter(|_| harness.accepts_provider_override()) {
+                    state.model_provider = provider;
                 }
                 if trace_context.thread_key.is_some() {
                     state.thread_key.clone_from(&trace_context.thread_key);
@@ -1058,10 +1061,9 @@ fn handle_active_turn_request<H: HarnessServer, W: Write>(
     normalizer: &mut CodexTurnNormalizer,
     request: ActiveTurnRequest,
     stdout: &mut W,
-) -> Result<bool> {
+) -> Result<Option<InterruptOutcome>> {
     let ActiveTurnRequest::JsonRpc(request) = request else {
-        process.kill_and_wait()?;
-        return Ok(true);
+        return harness.interrupt_turn(process).map(Some);
     };
 
     match request.method.as_str() {
@@ -1074,7 +1076,7 @@ fn handle_active_turn_request<H: HarnessServer, W: Write>(
                     -32600,
                     format!("unknown threadId {}", params.thread_id),
                 )?;
-                return Ok(false);
+                return Ok(None);
             }
             if params.expected_turn_id != normalizer.turn_id() {
                 write_error(
@@ -1087,7 +1089,7 @@ fn handle_active_turn_request<H: HarnessServer, W: Write>(
                         normalizer.turn_id()
                     ),
                 )?;
-                return Ok(false);
+                return Ok(None);
             }
             process
                 .stdin
@@ -1105,7 +1107,7 @@ fn handle_active_turn_request<H: HarnessServer, W: Write>(
             {
                 write_value(stdout, &notification_to_wire_value(&notification)?)?;
             }
-            Ok(false)
+            Ok(None)
         }
         "turn/interrupt" => {
             let params: TurnInterruptParams = request_params(request.params)?;
@@ -1116,7 +1118,7 @@ fn handle_active_turn_request<H: HarnessServer, W: Write>(
                     -32600,
                     format!("unknown threadId {}", params.thread_id),
                 )?;
-                return Ok(false);
+                return Ok(None);
             }
             if params.turn_id != normalizer.turn_id() {
                 write_error(
@@ -1129,11 +1131,11 @@ fn handle_active_turn_request<H: HarnessServer, W: Write>(
                         normalizer.turn_id()
                     ),
                 )?;
-                return Ok(false);
+                return Ok(None);
             }
-            process.kill_and_wait()?;
+            let outcome = harness.interrupt_turn(process)?;
             write_response(stdout, request.id, &TurnInterruptResponse {})?;
-            Ok(true)
+            Ok(Some(outcome))
         }
         _ => {
             write_error(
@@ -1142,7 +1144,7 @@ fn handle_active_turn_request<H: HarnessServer, W: Write>(
                 -32600,
                 format!("cannot handle {} while a turn is active", request.method),
             )?;
-            Ok(false)
+            Ok(None)
         }
     }
 }
@@ -1190,9 +1192,11 @@ fn run_normalized_turn<H: HarnessServer, W: Write>(
             state.completed_turns.push(turn);
         }
         Ok(None) => telemetry.finish(TelemetryTurnStatus::Completed),
-        Err(HarnessServerError::TurnInterrupted { .. }) => {
+        Err(HarnessServerError::TurnInterrupted { outcome, .. }) => {
             telemetry.finish(TelemetryTurnStatus::Cancelled);
-            state.process = None;
+            if outcome == InterruptOutcome::Restart {
+                state.process = None;
+            }
             finish_turn_interrupted(state, normalizer, stdout)?;
         }
         Err(error) => {
@@ -1273,6 +1277,11 @@ fn run_harness_turn<H: HarnessServer, W: Write>(
         process.stdin.write_all(&harness.stdin_for_turn(input)?)?;
         process.stdin.flush()?;
     }
+    // Harnesses that acknowledge a turn themselves get a deadline: a prompt
+    // that is never acknowledged is a stuck run, not a slow model.
+    let mut ack_deadline = harness
+        .prompt_ack_timeout()
+        .map(|timeout| (Instant::now() + timeout, timeout));
 
     let settle_window = harness.terminal_assistant_stop_settle();
     // Armed after a terminal assistant stop with no native terminal event yet:
@@ -1292,10 +1301,12 @@ fn run_harness_turn<H: HarnessServer, W: Write>(
                 .process
                 .as_mut()
                 .ok_or(HarnessServerError::HarnessStdinUnavailable)?;
-            if handle_active_turn_request(harness, process, normalizer, request, stdout)? {
-                state.process = None;
+            if let Some(outcome) =
+                handle_active_turn_request(harness, process, normalizer, request, stdout)?
+            {
                 return Err(HarnessServerError::TurnInterrupted {
                     kind: harness.kind(),
+                    outcome,
                 });
             }
             // A steer re-opens the turn: the harness now owes a response whose
@@ -1353,6 +1364,9 @@ fn run_harness_turn<H: HarnessServer, W: Write>(
                     TurnHold::Idle(window) => Some(Instant::now() + window),
                     TurnHold::Released | TurnHold::Waiting => None,
                 };
+                if ack_deadline.is_some() && harness.prompt_acknowledged(&event_normalizer) {
+                    ack_deadline = None;
+                }
             }
             Err(RecvTimeoutError::Timeout)
                 if hold_deadline.is_some_and(|deadline| Instant::now() >= deadline) =>
@@ -1361,10 +1375,20 @@ fn run_harness_turn<H: HarnessServer, W: Write>(
                     kind: harness.kind(),
                 });
             }
-            Err(RecvTimeoutError::Timeout) => match settle_deadline {
-                Some(deadline) if Instant::now() >= deadline => terminal = true,
-                _ => continue,
-            },
+            Err(RecvTimeoutError::Timeout) => {
+                if let Some((deadline, timeout)) = ack_deadline
+                    && Instant::now() >= deadline
+                {
+                    return Err(HarnessServerError::PromptUnacknowledged {
+                        kind: harness.kind(),
+                        timeout,
+                    });
+                }
+                match settle_deadline {
+                    Some(deadline) if Instant::now() >= deadline => terminal = true,
+                    _ => continue,
+                }
+            }
             Err(RecvTimeoutError::Disconnected) => {
                 let status = state
                     .process
@@ -1444,16 +1468,40 @@ fn ensure_harness_process<H: HarnessServer>(
 ) -> Result<()> {
     if let Some(process) = state.process.as_mut()
         && (process.model == state.model || !harness.restart_on_model_change())
+        // A provider the harness takes per turn is part of the process
+        // identity: the same bare model on another provider needs a new one.
+        && (!harness.accepts_provider_override()
+            || process.model_provider == state.model_provider)
         && process.child.try_wait()?.is_none()
     {
         return Ok(());
     }
-    let previous_model = state.process.as_ref().map(|process| process.model.clone());
+    let previous = state
+        .process
+        .as_ref()
+        .map(|process| (process.model.clone(), process.model_provider.clone()));
+    // A failed switch restores the last working selection: both halves, since a
+    // provider alone cannot run the bare model that failed on it.
+    let restore_previous = |state: &mut ThreadState| match previous.clone() {
+        Some((model, model_provider)) => {
+            state.model = model;
+            state.model_provider = model_provider;
+        }
+        // Only a harness that takes a provider per turn has one to reset; for
+        // every other harness the provider is fixed at thread start and must
+        // be preserved exactly as reported.
+        None => {
+            state.model = harness.default_model();
+            if harness.accepts_provider_override() {
+                state.model_provider = harness.default_model_provider().to_string();
+            }
+        }
+    };
     if !state.model.is_empty()
         && let Err(message) = harness.validate_model(&state.model)
     {
         // Fail this turn, and let later turns run the last working model.
-        state.model = previous_model.unwrap_or_else(|| harness.default_model());
+        restore_previous(state);
         return Err(HarnessServerError::UnknownModel { message });
     }
     state.process = None;
@@ -1482,6 +1530,8 @@ fn ensure_harness_process<H: HarnessServer>(
         .stderr
         .take()
         .ok_or(HarnessServerError::HarnessStderrUnavailable)?;
+    let redact_stderr = harness.redact_stderr();
+    let kind = harness.kind();
     std::thread::spawn(move || {
         // Copy through the unlocked handle (it locks per write): the harness
         // process outlives each turn, so its stderr never EOFs, and holding
@@ -1489,34 +1539,119 @@ fn ensure_harness_process<H: HarnessServer>(
         // eprintln! in the server — including turn-completion paths, which
         // then never emit turn/completed.
         let mut parent_stderr = io::stderr();
+        if redact_stderr {
+            // Harness stderr can carry provider responses and authorization
+            // headers: never forward it, report only how much arrived.
+            let mut bytes = 0_u64;
+            let mut buffer = [0_u8; 8 * 1024];
+            loop {
+                match stderr.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(count) => bytes += count as u64,
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                    Err(_) => break,
+                }
+            }
+            eprintln!("{kind:?} stderr tail redacted ({bytes} bytes)");
+            return;
+        }
         let _ = io::copy(&mut stderr, &mut parent_stderr);
     });
-    let (stdout_tx, stdout_rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let reader = io::BufReader::new(stdout);
-        for raw in reader.lines() {
-            let should_stop = raw.is_err();
-            if stdout_tx.send(raw).is_err() || should_stop {
-                break;
-            }
-        }
-    });
+    let stdout_rx = spawn_stdout_reader(stdout, harness.stdout_limits());
 
     let mut process = HarnessChild {
         child,
         stdin,
         stdout: stdout_rx,
         model: state.model.clone(),
+        model_provider: state.model_provider.clone(),
         reasoning_effort: None,
     };
     if let Err(error) = harness.on_process_start(state, &mut process) {
         if matches!(error, HarnessServerError::UnknownModel { .. }) {
-            state.model = previous_model.unwrap_or_else(|| harness.default_model());
+            restore_previous(state);
         }
         return Err(error);
     }
     state.process = Some(process);
     Ok(())
+}
+
+/// Reads harness stdout into the turn loop. With `Some(limits)` each line is
+/// capped while it is read and the backlog between the reader and the turn loop
+/// is bounded; `None` keeps the unbounded reader every harness started with.
+fn spawn_stdout_reader(
+    stdout: ChildStdout,
+    limits: Option<StdoutLimits>,
+) -> Receiver<io::Result<String>> {
+    let Some(limits) = limits else {
+        let (stdout_tx, stdout_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let reader = io::BufReader::new(stdout);
+            for raw in reader.lines() {
+                let should_stop = raw.is_err();
+                if stdout_tx.send(raw).is_err() || should_stop {
+                    break;
+                }
+            }
+        });
+        return stdout_rx;
+    };
+    let (stdout_tx, stdout_rx) = mpsc::sync_channel(limits.queue_depth);
+    std::thread::spawn(move || {
+        let mut reader = io::BufReader::new(stdout);
+        loop {
+            let line = match read_bounded_line(&mut reader, limits.max_line_bytes) {
+                Ok(Some(line)) => String::from_utf8(line)
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error)),
+                Ok(None) => break,
+                Err(error) => {
+                    let _ = stdout_tx.send(Err(error));
+                    break;
+                }
+            };
+            let should_stop = line.is_err();
+            if stdout_tx.send(line).is_err() || should_stop {
+                break;
+            }
+        }
+    });
+    stdout_rx
+}
+
+/// Reads one `\n`-terminated line, refusing to allocate past `max_bytes`.
+/// Trailing `\r` is dropped; a final line without a newline is returned.
+fn read_bounded_line<R: BufRead>(reader: &mut R, max_bytes: usize) -> io::Result<Option<Vec<u8>>> {
+    let mut line = Vec::new();
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return if line.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(line))
+            };
+        }
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let take = newline.map_or(available.len(), |index| index + 1);
+        if line.len().saturating_add(take) > max_bytes.saturating_add(1) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("harness stdout line exceeds {max_bytes} bytes"),
+            ));
+        }
+        line.extend_from_slice(&available[..take]);
+        reader.consume(take);
+        if newline.is_some() {
+            if line.last() == Some(&b'\n') {
+                line.pop();
+            }
+            if line.last() == Some(&b'\r') {
+                line.pop();
+            }
+            return Ok(Some(line));
+        }
+    }
 }
 
 fn request_params<T: serde::de::DeserializeOwned>(params: Option<Value>) -> Result<T> {

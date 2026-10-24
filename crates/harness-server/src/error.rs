@@ -4,7 +4,7 @@ use std::process::ExitStatus;
 
 use thiserror::Error;
 
-use crate::traits::HarnessKind;
+use crate::traits::{HarnessKind, InterruptOutcome};
 
 pub type Result<T> = std::result::Result<T, HarnessServerError>;
 
@@ -53,8 +53,16 @@ pub enum HarnessServerError {
     BackgroundFollowUpStalled { kind: HarnessKind },
     #[error("{message}")]
     UnknownModel { message: String },
+    #[error("{kind:?} did not acknowledge the turn within {}s", timeout.as_secs())]
+    PromptUnacknowledged {
+        kind: HarnessKind,
+        timeout: std::time::Duration,
+    },
     #[error("{kind:?} turn interrupted")]
-    TurnInterrupted { kind: HarnessKind },
+    TurnInterrupted {
+        kind: HarnessKind,
+        outcome: InterruptOutcome,
+    },
     #[error("failed to spawn {bin} app-server: {source}")]
     SpawnCodex {
         bin: String,

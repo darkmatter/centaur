@@ -42,6 +42,9 @@ pub struct HarnessChild {
     pub stdout: Receiver<io::Result<String>>,
     /// Model the process was started with.
     pub model: String,
+    /// Model provider the process was started with, when the harness takes one
+    /// per turn; it is part of the process identity.
+    pub model_provider: String,
     /// Reasoning effort last applied in-band; a fresh process runs its default.
     pub reasoning_effort: Option<String>,
 }
@@ -73,9 +76,9 @@ pub trait HarnessServer {
     fn default_model(&self) -> String;
     fn default_model_provider(&self) -> &'static str;
     /// The process to spawn for a turn. `input` is this turn's user input:
-    /// one-shot harnesses that take the prompt as a command argument (omp)
-    /// build it into the argv; stream-stdin harnesses (claude, amp, pi) ignore
-    /// it and receive the input through `stdin_for_turn`.
+    /// one-shot harnesses that take the prompt as a command argument build it
+    /// into the argv; resident harnesses (claude, amp, pi, omp) ignore it and
+    /// receive the input through `stdin_for_turn` after their startup hook.
     fn command_for_turn(&self, state: &ThreadState, input: &[UserInput]) -> ProcessCommand;
     /// Initializes a freshly spawned process. No startup I/O by default.
     fn on_process_start(&self, _state: &ThreadState, _process: &mut HarnessChild) -> Result<()> {
@@ -96,6 +99,42 @@ pub trait HarnessServer {
     fn stdin_for_turn(&self, input: &[UserInput]) -> Result<Vec<u8>>;
     fn stdin_for_steer(&self, input: &[UserInput]) -> Result<Vec<u8>> {
         self.stdin_for_turn(input)
+    }
+    /// Ends the active turn. The default kills the process: harnesses that
+    /// cannot settle a turn in-band need a new process for the next one.
+    /// Harnesses whose abort is acknowledged on stdout may settle the turn and
+    /// keep the process and its native session.
+    fn interrupt_turn(&self, process: &mut HarnessChild) -> Result<InterruptOutcome> {
+        process.kill_and_wait()?;
+        Ok(InterruptOutcome::Restart)
+    }
+    /// Bounds on the stdout reader for harnesses whose output is hostile or
+    /// resource-hungry. `None` reads unbounded lines into an unbounded queue.
+    fn stdout_limits(&self) -> Option<StdoutLimits> {
+        None
+    }
+    /// Whether a blocks turn's `provider` overrides the thread's model
+    /// provider. Off by default: those harnesses fix their provider at thread
+    /// start and receive a model that already names it.
+    fn accepts_provider_override(&self) -> bool {
+        false
+    }
+    /// How long the harness has to acknowledge a written turn. `None` waits
+    /// for as long as the turn runs; a harness whose acknowledgement is
+    /// independent of the model answers in-band.
+    fn prompt_ack_timeout(&self) -> Option<Duration> {
+        None
+    }
+    /// Whether the harness acknowledged the turn in flight. Only consulted
+    /// when `prompt_ack_timeout` is set.
+    fn prompt_acknowledged(&self, _normalizer: &Self::EventNormalizer) -> bool {
+        true
+    }
+    /// Whether harness stderr stays out of pod logs. When true the runner
+    /// drains it and reports only the byte count, because stderr can carry
+    /// provider responses and authorization failures.
+    fn redact_stderr(&self) -> bool {
+        false
     }
     /// Normalizes a requested reasoning effort to a level this harness applies
     /// per turn, or `None` to run its configured default. No control by default.
@@ -163,6 +202,26 @@ pub trait HarnessServer {
             thread_started_sent: false,
         }
     }
+}
+
+/// What an interrupted turn leaves behind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InterruptOutcome {
+    /// The running process cannot continue the session; drop it so the next
+    /// turn spawns a new one.
+    Restart,
+    /// The harness settled the turn in-band; keep its process (and native
+    /// session) for the next turn.
+    Retain,
+}
+
+/// Bounds a harness puts on its stdout reader thread.
+#[derive(Debug, Clone, Copy)]
+pub struct StdoutLimits {
+    /// Longest accepted line, in bytes; a longer one is an I/O error.
+    pub max_line_bytes: usize,
+    /// Lines the reader may buffer ahead of the turn loop.
+    pub queue_depth: usize,
 }
 
 /// Background work a harness keeps a turn open for past its native result.

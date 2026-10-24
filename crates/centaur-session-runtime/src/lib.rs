@@ -5922,7 +5922,7 @@ fn bounded_archive_pipeline(producer: &str, max_bytes: usize) -> String {
 
 fn omp_transcript_archive_command(max_bytes: usize) -> [String; 3] {
     let producer =
-        "tar -C \"${OMP_SESSION_DIR:-$HOME/.omp-harness-sessions}\" -czf - . 2>/dev/null";
+        "tar -C \"${CENTAUR_OMP_SESSION_ROOT:-$HOME/.omp/centaur-sessions}\" -czf - . 2>/dev/null";
     [
         "bash".to_owned(),
         "-lc".to_owned(),
@@ -5973,8 +5973,8 @@ async fn archive_omp_transcripts(
     if session.harness_type != HarnessType::Omp {
         return Ok(());
     }
-    // Same env fallback as the harness launcher: OMP_SESSION_DIR when the
-    // sandbox persists sessions, else the harness default directory.
+    // Same env fallback as the harness launcher: CENTAUR_OMP_SESSION_ROOT when
+    // set, else omp's default sessions directory under the agent home.
     //
     // head terminates tar after MAX+1 bytes. The oversized branch must run
     // before the status check because pipefail reports tar's expected SIGPIPE
@@ -8086,7 +8086,7 @@ mod tests {
         let command = omp_transcript_archive_command(max_bytes);
         let output = std::process::Command::new(&command[0])
             .args(&command[1..])
-            .env("OMP_SESSION_DIR", &root)
+            .env("CENTAUR_OMP_SESSION_ROOT", &root)
             .output()
             .unwrap();
         assert_eq!(output.stdout.len(), max_bytes + 1);
@@ -8139,7 +8139,7 @@ mod tests {
         let command = omp_transcript_archive_command(max_bytes);
         let output = std::process::Command::new(&command[0])
             .args(&command[1..])
-            .env("OMP_SESSION_DIR", missing)
+            .env("CENTAUR_OMP_SESSION_ROOT", missing)
             .output()
             .unwrap();
 

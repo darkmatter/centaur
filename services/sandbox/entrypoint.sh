@@ -58,11 +58,8 @@ if [ -d "$STATE_DIR" ] && [ -w "$STATE_DIR" ]; then
     ln -s "$STATE_DIR/omp" "$HOME_DIR/.omp"
     ln -s "$STATE_DIR/uploads" "$HOME_DIR/uploads"
     ln -s "$STATE_DIR/branches" "$HOME_DIR/branches"
-    # omp session JSONLs + thread-map.json ride the state PVC so transcript
-    # continuity (and the bridge-id → omp-session-id map) survives sandbox
-    # replacement. harness-server honors OMP_SESSION_DIR directly.
-    mkdir -p "$STATE_DIR/omp-sessions"
-    export OMP_SESSION_DIR="$STATE_DIR/omp-sessions"
+    # omp session JSONLs ride the state PVC through the ~/.omp symlink, so
+    # transcript continuity survives sandbox replacement.
     export CENTAUR_PERSISTENT_STATE=1
 fi
 

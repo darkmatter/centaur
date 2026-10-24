@@ -61,6 +61,8 @@ while IFS= read -r line; do
         *) printf '%s\n' '{"id":"centaur-set_model","type":"response","command":"set_model","success":true,"data":{"provider":"litellm","id":"ok"}}' ;;
         esac ;;
     abort)
+        : > '@DIR@/aborting'
+        if [ -n "$OMP_TEST_ABORT_DELAY" ]; then sleep "$OMP_TEST_ABORT_DELAY"; fi
         printf '%s\n' '{"type":"response","command":"abort","success":true}' '{"type":"prompt_result","id":"prompt-1","agentInvoked":true,"status":"aborted","sessionSettled":true}' ;;
     prompt)
         case "$line" in *'"message":"/local-only"'*)
@@ -232,9 +234,13 @@ impl Server {
     }
 
     fn paused(&self) {
+        self.wait_for("paused");
+    }
+
+    fn wait_for(&self, name: &str) {
         let deadline = Instant::now() + Duration::from_secs(5);
-        while !self.dir.join("paused").exists() {
-            assert!(Instant::now() < deadline, "fake never paused");
+        while !self.dir.join(name).exists() {
+            assert!(Instant::now() < deadline, "fake never wrote {name}");
             std::thread::sleep(Duration::from_millis(5));
         }
     }
@@ -951,6 +957,72 @@ fn blocks_steering_reaches_the_active_turn_instead_of_queuing_a_second_prompt() 
             .map(|command| command["message"].as_str().unwrap())
             .collect::<Vec<_>>(),
         ["slow", "text"]
+    );
+}
+
+#[test]
+fn late_steer_after_interrupt_settles_runs_as_the_next_pinned_turn() {
+    let mut server = Server::new(&[("OMP_TEST_ABORT_DELAY", "0.5")]);
+    server.user("slow", json!({"model": "custom/base"}));
+    server.until(|event| {
+        event["method"] == "item/started" && event["params"]["item"]["type"] == "commandExecution"
+    });
+    server.send(json!({"type": "interrupt", "thread_key": KEY}));
+    // The abort is in its settlement grace, so a steer now cannot reach the
+    // native steer channel; it must be preserved for the next turn.
+    server.wait_for("aborting");
+    server.user(
+        "late",
+        json!({
+            "client_user_message_id": "blocks-late-steer",
+            "model": "custom/pinned",
+            "provider": "custom",
+            "reasoning": "high",
+            "trace_metadata": {"action": "steer_active_execution"},
+        }),
+    );
+
+    let interrupted = server.read_until("turn/completed");
+    assert_eq!(status(&interrupted), "interrupted");
+    assert!(
+        !server
+            .commands()
+            .iter()
+            .any(|command| command["type"] == "steer"),
+        "the steer arrived after the turn stopped reading: {:#?}",
+        server.commands()
+    );
+
+    let steered = server.read_until("turn/completed");
+    assert_eq!(status(&steered), "completed");
+    assert!(
+        items(&steered, "item/completed", "userMessage")
+            .iter()
+            .any(|item| item["clientId"] == "blocks-late-steer"),
+        "the late steer ran as the next turn: {steered:#?}"
+    );
+    let commands = server.commands();
+    assert_eq!(
+        commands
+            .iter()
+            .filter(|command| command["type"] == "prompt")
+            .map(|command| command["message"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["slow", "late"]
+    );
+    assert!(
+        commands.iter().any(|command| {
+            command["type"] == "open_session"
+                && command["provider"] == "custom"
+                && command["modelId"] == "pinned"
+        }),
+        "the late steer pins its model/provider: {commands:#?}"
+    );
+    assert!(
+        commands
+            .iter()
+            .any(|command| command["type"] == "set_thinking_level" && command["level"] == "high"),
+        "the late steer pins its reasoning level: {commands:#?}"
     );
 }
 

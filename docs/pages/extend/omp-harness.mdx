@@ -20,8 +20,11 @@ Steers (`steer_active_execution`) go to the running turn as OMP `steer`
 commands. This holds in both wire modes: the blocks runner that production uses
 routes a tagged message into the turn in flight instead of queueing it as the
 next turn, and a tagged message that arrives while the session is idle starts a
-turn as usual. Only OMP opts into that blocks-mode routing; the other shared
-harnesses keep their previous queueing behavior. An interrupt sends OMP's
+turn as usual. A steer that arrives after the turn has stopped reading requests
+(for example during abort settlement) is not dropped: it runs as the next turn
+with its pinned model, provider, and reasoning effort. Only OMP opts into that
+blocks-mode routing; the other shared harnesses keep their previous queueing
+behavior. An interrupt sends OMP's
 `abort`: when this abort's own result settles the turn within five seconds the
 process and its session stay live, otherwise it is replaced. A failed steer or
 abort ends the turn and replaces the process, because the run in flight can no

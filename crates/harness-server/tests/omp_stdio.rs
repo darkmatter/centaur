@@ -22,6 +22,8 @@ fn fake_omp(dir: &std::path::Path) -> PathBuf {
 printf '%s|%s\n' "$$" "$*" >> '@DIR@/argv'
 if [ -n "$OMP_TEST_STDERR" ]; then printf 'api_key=%s\n' "$OMP_TEST_STDERR" >&2; fi
 printf '%s\n' '@READY@'
+run_marker=$(mktemp '@DIR@/run.XXXXXX')
+rm -f "$run_marker"
 while IFS= read -r line; do
     printf '%s\n' "$line" >> '@DIR@/stdin'
     kind=${line##*\"type\":\"}
@@ -62,9 +64,19 @@ while IFS= read -r line; do
         esac ;;
     abort)
         : > '@DIR@/aborting'
+        # OMP writes the aborted result when the agent yields, before the abort
+        # response that follows session.abort()/waitForIdle.
+        printf '%s\n' '{"type":"prompt_result","id":"prompt-1","agentInvoked":true,"status":"aborted","sessionSettled":true}'
         if [ -n "$OMP_TEST_ABORT_DELAY" ]; then sleep "$OMP_TEST_ABORT_DELAY"; fi
-        printf '%s\n' '{"type":"response","command":"abort","success":true}' '{"type":"prompt_result","id":"prompt-1","agentInvoked":true,"status":"aborted","sessionSettled":true}' ;;
+        printf '%s\n' '{"id":"centaur-abort","type":"response","command":"abort","success":true}'
+        if [ -n "$aborted_run_may_continue" ]; then : > "$run_marker"; fi ;;
     prompt)
+        # An aborted run can keep running after its result and emit its output
+        # while the turn that follows is active.
+        if [ -f "$run_marker" ]; then
+            rm -f "$run_marker"
+            printf '%s\n' '{"type":"message_end","messageId":"aborted-run","message":{"role":"assistant","content":[{"type":"text","text":"LATE ABORTED RUN OUTPUT"}],"stopReason":"stop"}}'
+        fi
         case "$line" in *'"message":"/local-only"'*)
             printf '%s\n' '{"type":"command_output","text":"Available commands:\n/local-only\n"}' '{"type":"response","command":"prompt","success":true,"data":{"agentInvoked":false}}'
             continue ;;
@@ -80,6 +92,9 @@ while IFS= read -r line; do
             head -c 1100000 /dev/zero | tr '\0' 'x'
             printf '\n' ;;
         *'"message":"slow"'*) printf '%s\n' '{"type":"tool_execution_start","toolCallId":"slow","toolName":"bash","args":{"command":"sleep 60"}}' ;;
+        *'"message":"abort_late_output"'*)
+            aborted_run_may_continue=1
+            printf '%s\n' '{"type":"tool_execution_start","toolCallId":"abort-late","toolName":"bash","args":{"command":"sleep 60"}}' ;;
         *'"message":"extension_error"'*)
             printf '%s\n' '{"type":"agent_start"}' '{"type":"extension_error","message":"extension boom"}'
             cat '@FIXTURES@/text.jsonl' ;;
@@ -707,7 +722,7 @@ fn a_stale_settlement_does_not_retain_the_aborted_process() {
     server.send(json!({"type": "interrupt", "thread_key": KEY}));
     // The abort was rejected and the only settlement in flight belongs to the
     // previous turn, so the interrupted run must not be kept: the process is
-    // replaced once the grace period expires.
+    // replaced once the abort's own response arrives.
     assert_eq!(status(&server.read_until("turn/completed")), "interrupted");
     assert_eq!(status(&server.turn("text", json!({}))), "completed");
     let commands = server.commands();
@@ -722,6 +737,53 @@ fn a_stale_settlement_does_not_retain_the_aborted_process() {
             .count(),
         2
     );
+}
+
+#[test]
+fn late_output_from_an_aborted_run_never_reaches_the_next_turn() {
+    let mut server = Server::new(&[]);
+    server.user("abort_late_output", json!({}));
+    server.until(|event| {
+        event["method"] == "item/started" && event["params"]["item"]["type"] == "commandExecution"
+    });
+    server.send(json!({"type": "interrupt", "thread_key": KEY}));
+    assert_eq!(status(&server.read_until("turn/completed")), "interrupted");
+    // OMP's aborted result means the agent yielded, not that the run is
+    // quiescent: it can still emit output. A reused process would hand that
+    // output to the next turn.
+    let turn = server.turn("text", json!({}));
+    assert_eq!(status(&turn), "completed");
+    let messages = items(&turn, "item/completed", "agentMessage");
+    assert_eq!(
+        messages.iter().map(|m| &m["text"]).collect::<Vec<_>>(),
+        [&json!("Hello from the loopback mock.")],
+        "late aborted output crossed into the next turn: {turn:#?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(server.dir.join("argv"))
+            .unwrap()
+            .lines()
+            .count(),
+        2,
+        "an interrupted run must not hand its process to the next turn"
+    );
+    let opened: Vec<_> = server
+        .commands()
+        .into_iter()
+        .filter(|command| command["type"] == "open_session")
+        .collect();
+    assert_eq!(opened.len(), 2);
+    for open in opened {
+        assert_eq!(
+            open["sessionDir"],
+            server
+                .dir
+                .join("sessions")
+                .join(session_dir(KEY))
+                .to_string_lossy()
+                .as_ref()
+        );
+    }
 }
 
 #[test]
@@ -1024,6 +1086,43 @@ fn late_steer_after_interrupt_settles_runs_as_the_next_pinned_turn() {
             .any(|command| command["type"] == "set_thinking_level" && command["level"] == "high"),
         "the late steer pins its reasoning level: {commands:#?}"
     );
+    assert_eq!(
+        std::fs::read_to_string(server.dir.join("argv"))
+            .unwrap()
+            .lines()
+            .count(),
+        2,
+        "the interrupted run must not hand its process to the late steer"
+    );
+    let restarted = commands
+        .iter()
+        .position(|command| {
+            command["type"] == "open_session"
+                && command["provider"] == "custom"
+                && command["modelId"] == "pinned"
+        })
+        .unwrap();
+    assert_eq!(
+        commands[restarted]["sessionDir"],
+        server
+            .dir
+            .join("sessions")
+            .join(session_dir(KEY))
+            .to_string_lossy()
+            .as_ref()
+    );
+    let level = |wanted: &str| {
+        commands[restarted..]
+            .iter()
+            .position(|command| {
+                command["type"] == "set_thinking_level" && command["level"] == wanted
+            })
+            .unwrap()
+    };
+    assert!(
+        level("inherit") < level("high"),
+        "a respawn inherits the saved level before this turn's level: {commands:#?}"
+    );
 }
 
 #[test]
@@ -1072,7 +1171,7 @@ fn interrupt_and_model_switch_reopen_the_same_session() {
     });
     server.send(json!({"type": "interrupt", "thread_key": KEY}));
     assert_eq!(status(&server.read_until("turn/completed")), "interrupted");
-    // The abort settled in-band, so the turn's process and session stay live.
+    // The interrupt replaces the process; the next turn reopens the session.
     assert_eq!(status(&server.turn("text", json!({}))), "completed");
     assert_eq!(
         status(&server.turn("text", json!({"model": "custom/switched"}))),
@@ -1092,7 +1191,7 @@ fn interrupt_and_model_switch_reopen_the_same_session() {
             .iter()
             .map(|open| open.get("modelId"))
             .collect::<Vec<_>>(),
-        [None, Some(&json!("switched"))]
+        [None, None, Some(&json!("switched"))]
     );
     for open in opened {
         assert_eq!(
@@ -1110,7 +1209,7 @@ fn interrupt_and_model_switch_reopen_the_same_session() {
             .unwrap()
             .lines()
             .count(),
-        2
+        3
     );
 }
 

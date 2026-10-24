@@ -540,6 +540,30 @@ jobs:
       # Tool-host integration tests execute real CLIs through uvx.
       - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
 
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+
+      # The OMP context regression runs against a private install of the same
+      # version-pinned package the sandbox image patches. The version comes from
+      # the Dockerfile, and the patch refuses any version it was not anchored to.
+      - name: OMP interrupted-request context tests
+        run: |
+          set -eux
+          omp_root="$RUNNER_TEMP/omp-patched"
+          omp_version="$(sed -n 's/^ARG OMP_VERSION=//p' "$GITHUB_WORKSPACE/services/sandbox/Dockerfile")"
+          test -n "$omp_version"
+          mkdir -p "$omp_root"
+          cd "$omp_root"
+          printf '{"name":"omp-interrupt-boundary-test","private":true,"dependencies":{"@oh-my-pi/pi-coding-agent":"%s","@oh-my-pi/pi-natives-linux-x64":"%s"}}\n' \
+            "$omp_version" "$omp_version" > package.json
+          bun install --backend=copyfile --omit=optional --omit=peer
+          python "$GITHUB_WORKSPACE/services/sandbox/apply_omp_interrupt_boundary_patch.py" \
+            --package-root "$omp_root/node_modules/@oh-my-pi/pi-coding-agent"
+          cd "$GITHUB_WORKSPACE"
+          OMP_PACKAGE_ROOT="$omp_root/node_modules/@oh-my-pi/pi-coding-agent" \
+            bun test \
+              services/sandbox/omp_interrupt_boundary.test.ts \
+              services/sandbox/omp_interrupt_boundary_projection.test.ts
+
       - name: Sandbox Python tests
         env:
           GIT_CONFIG_GLOBAL: /dev/null

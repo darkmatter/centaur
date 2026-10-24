@@ -29,9 +29,8 @@ use sha2::{Digest, Sha256};
 use crate::pi::{command_line, message_text, thinking_level, token_usage, tool_result};
 use crate::protocol::UserInput;
 use crate::{
-    HarnessChild, HarnessKind, HarnessServer, HarnessServerError, InterruptOutcome,
-    NormalizedContent, NormalizedEvent, NormalizedToolResult, Result, StdoutLimits, ThreadState,
-    TurnHold,
+    HarnessChild, HarnessKind, HarnessServer, HarnessServerError, NormalizedContent,
+    NormalizedEvent, NormalizedToolResult, Result, StdoutLimits, ThreadState, TurnHold,
 };
 
 /// Budget for `ready` after spawn. A cold start loads a large binary and, in a
@@ -43,6 +42,9 @@ const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 const PROMPT_ACK_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long an aborted turn gets to settle before its process is replaced.
 const ABORT_GRACE: Duration = Duration::from_secs(5);
+/// Request id for the abort frame; its response is the abort's quiescence
+/// barrier, unlike the run's yield-time aborted `prompt_result`.
+const ABORT_ID: &str = "centaur-abort";
 /// Physical stdout lines: 1 MiB of JSON plus framing slack. Larger frames
 /// arrive as `rpc_chunk` groups.
 const MAX_FRAME_BYTES: usize = 1024 * 1024 + 1024;
@@ -256,24 +258,22 @@ impl HarnessServer for OmpHarness {
         }))
     }
 
-    /// An abort settles the turn in-band, so the process and its session stay
-    /// live; only an unsettled background turn needs a fresh process.
-    ///
-    /// Retention needs this abort's own `prompt_result`: OMP emits a trailing
-    /// `session_settled` after the previous stretch's result, and that stale
-    /// frame must not keep a process whose aborted run is still in flight.
-    fn interrupt_turn(&self, process: &mut HarnessChild) -> Result<InterruptOutcome> {
+    /// OMP's abort response is sent after `session.abort()`/`waitForIdle`, so
+    /// it — not the aborted `prompt_result`, which is written when the agent
+    /// yields and can precede abort completion — is the quiescence barrier.
+    /// Wait up to `ABORT_GRACE` for that correlated response, then replace the
+    /// process anyway: a run that outlives its result must not hand output to
+    /// the next turn. The next turn reopens the same session directory.
+    fn interrupt_turn(&self, process: &mut HarnessChild) -> Result<()> {
         process
             .stdin
-            .write_all(&command_line(json!({"type": "abort"}))?)?;
+            .write_all(&command_line(json!({"type": "abort", "id": ABORT_ID}))?)?;
         process.stdin.flush()?;
         let deadline = Instant::now() + ABORT_GRACE;
-        let mut saw_aborted_result = false;
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                process.kill_and_wait()?;
-                return Ok(InterruptOutcome::Restart);
+                break;
             }
             match process.stdout.recv_timeout(remaining) {
                 Ok(Ok(line)) => {
@@ -283,31 +283,20 @@ impl HarnessServer for OmpHarness {
                     }
                     let frame: Value = match serde_json::from_str(trimmed) {
                         Ok(frame) => frame,
-                        // The turn is being finished either way; a frame this
+                        // The process is replaced either way; a frame this
                         // process already garbled cannot be reported anywhere.
                         Err(_) => continue,
                     };
-                    match frame["type"].as_str() {
-                        Some("prompt_result") if frame["status"].as_str() == Some("aborted") => {
-                            if frame["sessionSettled"] != false {
-                                return Ok(InterruptOutcome::Retain);
-                            }
-                            saw_aborted_result = true;
-                        }
-                        // Only this abort's settlement can keep the process.
-                        Some("session_settled") if saw_aborted_result => {
-                            return Ok(InterruptOutcome::Retain);
-                        }
-                        _ => {}
+                    if frame["type"] == "response" && frame["id"] == ABORT_ID {
+                        break;
                     }
                 }
                 Ok(Err(error)) => return Err(error.into()),
-                Err(_) => {
-                    process.kill_and_wait()?;
-                    return Ok(InterruptOutcome::Restart);
-                }
+                Err(_) => break,
             }
         }
+        process.kill_and_wait()?;
+        Ok(())
     }
 
     /// A prompt OMP never acknowledges is a stuck run: fail the turn (which
@@ -605,15 +594,15 @@ impl OmpEventNormalizer {
             let error = event["error"].as_str().unwrap_or("command failed");
             match command {
                 // A rejected prompt never started a run, so the process can
-                // stay. A failed steer or abort leaves the run going with no
-                // way to steer it: end the turn and replace the process so
-                // none of that run's output reaches the next turn.
+                // stay. A failed steer leaves the run going with no way to
+                // steer it: end the turn and replace the process so none of
+                // that run's output reaches the next turn.
                 "prompt" | "parse" => {
                     return vec![NormalizedEvent::Error {
                         message: format!("omp {command}: {error}"),
                     }];
                 }
-                "steer" | "abort" => {
+                "steer" => {
                     self.process_must_restart = true;
                     return vec![NormalizedEvent::Error {
                         message: format!("omp {command}: {error}"),

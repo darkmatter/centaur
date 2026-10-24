@@ -8,10 +8,11 @@ because OMP's bin shim is a `#!/usr/bin/env bun` script.
 
 The harness drives OMP through its long-lived JSONL protocol,
 `omp --mode rpc --no-ui`. It starts one process per thread and reuses it across
-turns: the first turn performs the handshake (`ready`, `negotiate_protocol` v2,
-an event filter with delta message updates, `open_session`, an inherited
-thinking level, cache warming off) and every later turn writes a `prompt` frame
-to the same process. Startup waits up to 180 seconds for `ready`; handshake
+turns until a turn ends in a way that cannot hand its session on: the first
+turn performs the handshake (`ready`, `negotiate_protocol` v2, an event filter
+with delta message updates, `open_session`, an inherited thinking level, cache
+warming off) and every later turn writes a `prompt` frame to the same process.
+Startup waits up to 180 seconds for `ready`; handshake
 commands time out after 30 seconds, and a prompt that OMP does not acknowledge
 within 30 seconds fails the turn. Telemetry is left to the harness
 (`OTEL_SDK_DISABLED`), so OMP does not export duplicate spans.
@@ -25,10 +26,15 @@ turn as usual. A steer that arrives after the turn has stopped reading requests
 with its pinned model, provider, and reasoning effort. Only OMP opts into that
 blocks-mode routing; the other shared harnesses keep their previous queueing
 behavior. An interrupt sends OMP's
-`abort`: when this abort's own result settles the turn within five seconds the
-process and its session stay live, otherwise it is replaced. A failed steer or
-abort ends the turn and replaces the process, because the run in flight can no
-longer be steered; a rejected prompt keeps it.
+`abort` and always replaces the process. The harness waits up to five seconds
+for the abort's correlated response, which OMP sends after
+`session.abort()`/`waitForIdle`; an aborted `prompt_result` is written earlier,
+when the agent yields, and does not mean the run is quiescent. Even a settled
+abort costs the process, because the aborted run can still emit output that a
+reused process would read as the next turn's. The next turn reopens the same
+session directory, so the conversation resumes. A failed steer ends the turn
+and replaces the process too, because the run in flight can no longer be
+steered; a rejected prompt keeps it.
 A mid-run error — an extension failure or an error notice other than
 `session-persistence` — fails the turn at the run's own settlement, so the rest
 of that run never reaches the next turn; a `session-persistence` failure fails
@@ -56,9 +62,10 @@ turn lifecycle: spawning and reusing the process, the turn loop, streaming and
 telemetry to the client, turn completion, and process replacement. There is no
 parallel OMP-specific lifecycle. OMP supplies hooks that adapt the protocol
 (startup handshake, per-turn stdin frames, the JSONL event normalizer) and the
-protections the generic runner applies only when a harness opts in: in-band
-interrupt settlement, in-band blocks-mode steering, bounded stdout, prompt
-acknowledgement, stderr redaction, and provider-per-turn process identity.
+protections the generic runner applies only when a harness opts in: the
+bounded abort drain before process replacement, in-band blocks-mode steering,
+bounded stdout, prompt acknowledgement, stderr redaction, and provider-per-turn
+process identity.
 Harnesses that do not opt in keep their previous behavior, so these safeguards
 are not universal.
 

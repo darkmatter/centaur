@@ -34,7 +34,7 @@ use crate::protocol::{
 };
 use crate::traits::{
     AppServerNormalizer, AppServerRuntime, HarnessChild, HarnessKind, HarnessServer,
-    InterruptOutcome, NormalizedEvent, StdoutLimits, ThreadState, TurnHold,
+    NormalizedEvent, StdoutLimits, ThreadState, TurnHold,
 };
 use crate::turn::{BridgeConfig, CodexTurnNormalizer};
 use crate::util::{absolute_path, default_codex_home, write_value};
@@ -1131,10 +1131,11 @@ fn handle_active_turn_request<H: HarnessServer, W: Write>(
     normalizer: &mut CodexTurnNormalizer,
     request: ActiveTurnRequest,
     stdout: &mut W,
-) -> Result<Option<InterruptOutcome>> {
+) -> Result<bool> {
     let request = match request {
         ActiveTurnRequest::BlocksInterrupt => {
-            return harness.interrupt_turn(process).map(Some);
+            harness.interrupt_turn(process)?;
+            return Ok(true);
         }
         ActiveTurnRequest::BlocksSteer(command) => {
             let BlocksCommand::User {
@@ -1143,11 +1144,11 @@ fn handle_active_turn_request<H: HarnessServer, W: Write>(
                 ..
             } = *command
             else {
-                return Ok(None);
+                return Ok(false);
             };
             write_steer_frame(harness, process, &input)?;
             emit_steer_message(normalizer, stdout, client_user_message_id, input)?;
-            return Ok(None);
+            return Ok(false);
         }
         ActiveTurnRequest::JsonRpc(request) => request,
     };
@@ -1162,7 +1163,7 @@ fn handle_active_turn_request<H: HarnessServer, W: Write>(
                     -32600,
                     format!("unknown threadId {}", params.thread_id),
                 )?;
-                return Ok(None);
+                return Ok(false);
             }
             if params.expected_turn_id != normalizer.turn_id() {
                 write_error(
@@ -1175,7 +1176,7 @@ fn handle_active_turn_request<H: HarnessServer, W: Write>(
                         normalizer.turn_id()
                     ),
                 )?;
-                return Ok(None);
+                return Ok(false);
             }
             write_steer_frame(harness, process, &params.input)?;
             write_response(
@@ -1191,7 +1192,7 @@ fn handle_active_turn_request<H: HarnessServer, W: Write>(
                 params.client_user_message_id.clone(),
                 params.input.clone(),
             )?;
-            Ok(None)
+            Ok(false)
         }
         "turn/interrupt" => {
             let params: TurnInterruptParams = request_params(request.params)?;
@@ -1202,7 +1203,7 @@ fn handle_active_turn_request<H: HarnessServer, W: Write>(
                     -32600,
                     format!("unknown threadId {}", params.thread_id),
                 )?;
-                return Ok(None);
+                return Ok(false);
             }
             if params.turn_id != normalizer.turn_id() {
                 write_error(
@@ -1215,11 +1216,11 @@ fn handle_active_turn_request<H: HarnessServer, W: Write>(
                         normalizer.turn_id()
                     ),
                 )?;
-                return Ok(None);
+                return Ok(false);
             }
-            let outcome = harness.interrupt_turn(process)?;
+            harness.interrupt_turn(process)?;
             write_response(stdout, request.id, &TurnInterruptResponse {})?;
-            Ok(Some(outcome))
+            Ok(true)
         }
         _ => {
             write_error(
@@ -1228,7 +1229,7 @@ fn handle_active_turn_request<H: HarnessServer, W: Write>(
                 -32600,
                 format!("cannot handle {} while a turn is active", request.method),
             )?;
-            Ok(None)
+            Ok(false)
         }
     }
 }
@@ -1276,11 +1277,11 @@ fn run_normalized_turn<H: HarnessServer, W: Write>(
             state.completed_turns.push(turn);
         }
         Ok(None) => telemetry.finish(TelemetryTurnStatus::Completed),
-        Err(HarnessServerError::TurnInterrupted { outcome, .. }) => {
+        Err(HarnessServerError::TurnInterrupted { .. }) => {
             telemetry.finish(TelemetryTurnStatus::Cancelled);
-            if outcome == InterruptOutcome::Restart {
-                state.process = None;
-            }
+            // The interrupt hook ends the process: its run must not hand
+            // output to the next turn. The next turn resumes the session.
+            state.process = None;
             finish_turn_interrupted(state, normalizer, stdout)?;
         }
         Err(error) => {
@@ -1385,12 +1386,9 @@ fn run_harness_turn<H: HarnessServer, W: Write>(
                 .process
                 .as_mut()
                 .ok_or(HarnessServerError::HarnessStdinUnavailable)?;
-            if let Some(outcome) =
-                handle_active_turn_request(harness, process, normalizer, request, stdout)?
-            {
+            if handle_active_turn_request(harness, process, normalizer, request, stdout)? {
                 return Err(HarnessServerError::TurnInterrupted {
                     kind: harness.kind(),
-                    outcome,
                 });
             }
             // A steer re-opens the turn: the harness now owes a response whose

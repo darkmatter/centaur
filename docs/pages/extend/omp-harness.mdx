@@ -4,7 +4,10 @@ Centaur can run [oh-my-pi](https://github.com/can1357/oh-my-pi) (OMP) as a
 session harness alongside Codex, Claude Code, Amp, Nanocodex, Hermes, and Pi.
 Select it with the `omp` harness type. The sandbox image installs OMP 18.8.6
 with bun in the agent stage of `services/sandbox/Dockerfile` (`OMP_VERSION`),
-because OMP's bin shim is a `#!/usr/bin/env bun` script.
+because OMP's bin shim is a `#!/usr/bin/env bun` script. The image applies a
+hash-verified patch to that global install in the same build layer, so PATH
+`omp`, the harness, and native subagents share one patched CLI (see
+[Interrupted requests](#interrupted-requests)).
 
 The harness drives OMP through its long-lived JSONL protocol,
 `omp --mode rpc --no-ui`. It starts one process per thread and reuses it across
@@ -54,6 +57,134 @@ Earlier Centaur OMP integrations also stopped a run after 30 minutes without
 output. That watchdog is intentionally gone: run length is bounded by the
 execution's `max_duration_ms`, and a background run that stays quiet is allowed
 to settle on its own rather than being killed.
+
+## Interrupted requests
+
+OMP persists a user interrupt as an aborted assistant turn. When that turn
+produced no output — the common early interruption — OMP's non-transcript
+context rebuild dropped it, and `convertToLlm` drops that shape as well. A
+restored session therefore saw the cancelled request as unanswered and the next
+prompt as a continuation of it, so a background task could rerun the cancelled
+command.
+
+The image patches its freshly installed global package once, in the same layer
+that installs it. That layer deletes Bun's install cache, verifies the package
+root is not a symlink, and applies the pinned patch in place. Patched files are
+replaced atomically, which breaks any Bun hardlinks, so no shared cache is
+mutated. Keeping one global install means PATH `omp`, the harness, and native
+subagents all resolve the same patched CLI. Developer and CI runs patch
+disposable private copies instead, never an active host's global install. A
+`patchedDependencies` entry is not used either: this repository does not install
+OMP as a workspace dependency. The patch is applied post-install, but it is
+version-pinned, hash-verified, and re-anchored per upgrade.
+
+The change is confined to the rebuild. An aborted assistant turn that
+`isUserInterruptAbort` identifies and that has no content becomes a hidden
+native `custom` message (`turn-cancelled`) in agent state. It sits between the
+cancelled request and the next prompt. This applies only when the immediately
+preceding context message is user-written and the next message is not an
+assistant reply. Those two narrow the marker to a genuinely unanswered request:
+an Esc during tool execution still ends in its failed tool result, so the batch
+remains replayable, and a turn that was later answered rebuilds as the request
+plus that answer. An empty turn that carries request controls is left to OMP.
+
+`convertToLlm` does not send the marker as a developer note. It projects a
+synthetic **assistant cancellation receipt** instead: fixed text, zero usage,
+the original aborted turn's api/provider/model and timestamp, and no output,
+tool, error, thinking, or signature fields. A developer note is not a
+structural boundary on Anthropic — it serializes as a wire `user` turn, and
+Sonnet merges consecutive user turns — while an assistant turn separates the
+cancelled request from the next prompt on every provider.
+
+The receipt is emitted only when a later non-empty conversational turn follows
+the marker before any assistant. A trailing marker (including one followed only
+by filtered or empty messages that produce nothing on the wire) is omitted:
+otherwise the receipt would itself be the trailing assistant turn, which native
+providers extend with a `Continue.` pad. The conversion caches are keyed on this
+projection, and the array shortcut remembers a pending marker so that appending
+a real prompt later reconverts from it rather than reusing a prefix that omitted
+the receipt. Native session history, its JSONL bytes and schema, and the
+transcript view are untouched; the receipt exists only in the rebuilt provider
+request. A fresh process that reopens the session answers the next prompt on its
+own: the cancelled turn is not rerun, and none of its work is replayed into the
+new turn. A later explicit continue may still resume the old intent. An
+explicit `/retry` on a reopened session drops the trailing marker from the
+rebuild before continuing (the session file is never rewritten), so retry
+resumes the original request instead of continuing from a cancellation note.
+
+The boundary is generic, not keyed to particular text or tokens, and limited to
+user interrupts. Partial output, tool interrupts with their paired results,
+provider errors, and an abort without the user-interrupt marker keep OMP's
+behavior, as does the existing `interrupted-thinking` continuity pair.
+
+`services/sandbox/apply_omp_interrupt_boundary_patch.py` fails closed. It
+requires the package name and version 18.8.6, verifies the SHA-256 of
+`dist/cli.js`, `src/session/messages.ts`,
+`src/session/session-context.ts`, and
+`src/session/turn-recovery.ts` against the official registry artifact, requires
+each source and minified-bundle anchor exactly once, refuses
+an already-patched copy, and refuses a symlinked package root or symlinked
+files. Patched files are replaced through fresh inodes with their permission
+bits preserved, so a hardlinked package cache is never mutated and the CLI
+stays executable. The patch touches three source files (the marker/projection
+and conversion caches in `messages`; the `./messages` import, helper, and
+error/abort drop loop in `session-context`; the retry branch in
+`turn-recovery`) and the corresponding loops in `dist/cli.js`.
+
+To move to another OMP version, update `OMP_VERSION` in the Dockerfile and
+`SUPPORTED_VERSION` in the patch, refresh `OFFICIAL_SHA256` from the new
+registry artifact, re-anchor the source and bundle edits, then run the
+data-shape regression and the opt-in live regression against the new private
+package copy. The image build fails on a stale version, hash, or anchor; CI
+runs the same patch and regression against a private 18.8.6 install. The scope,
+risks, and removal criteria for this patch are recorded in the repository's
+`decisions.md`.
+
+The public regression is split by concern. Existing
+`services/sandbox/omp_interrupt_boundary.test.ts` covers restoration and
+history shape; new `services/sandbox/omp_interrupt_boundary_projection.test.ts`
+covers projection, caches, and the native wire. Shared native constructors and
+dynamic package imports live in
+`services/sandbox/omp_interrupt_boundary_fixture.ts`. Together they exercise
+`buildSessionContext`/`convertToLlm` and run in CI against a private patched
+install. They cover the restored boundary as an assistant receipt (original
+api/provider/model/timestamp, zero usage, no abort fields), the native Anthropic
+message serialization for Sonnet 5 (offline, through the sibling `pi-ai`
+transform), trailing-marker omission and the pending-marker cache transition
+when a real prompt is appended, a marker followed only by filtered messages, a
+marker followed by an assistant, malformed metadata and malformed hook content,
+the tool-replay shape, a successful-retry rebuild (the rebuilt context shape
+only; it does not call `retry()`), repeated interrupts, a control-carrying empty
+turn, and the `interrupted-thinking` pair. The receipt/wire checks require the
+installed package's sibling `@oh-my-pi/pi-ai` and `@oh-my-pi/pi-catalog`
+packages, which the private install links:
+
+```sh
+OMP_PACKAGE_ROOT=<private-package> bun test \
+  services/sandbox/omp_interrupt_boundary.test.ts \
+  services/sandbox/omp_interrupt_boundary_projection.test.ts
+```
+
+The shipped `dist/cli.js` is minified production code, so it is proven by the
+live RPC regression against a patched binary, not by extracting bundle text or
+wiring stand-in collaborators. The actual `retry()` path and process-replacement
+behavior likewise need a live binary.
+`services/sandbox/omp_interrupt_boundary.rpc.test.ts` is an opt-in regression:
+it skips by default, is not part of CI, and fails closed unless `OMP_BIN`
+points at an absolute patched 18.8.6 `dist/cli.js` — either a disposable
+private copy or the image-global install — with credentials for the fixed
+provider and model already configured. It drives OMP's RPC mode directly:
+
+```sh
+OMP_LIVE_TEST=1 OMP_BIN=/absolute/path/to/patched/node_modules/@oh-my-pi/pi-coding-agent/dist/cli.js \
+  bun test services/sandbox/omp_interrupt_boundary.rpc.test.ts
+```
+
+One case aborts an admitted early turn before any assistant or tool output,
+then asks a plain prompt from a fresh process. The other aborts an early short
+reply, runs `/retry` from a fresh process, then asks a plain prompt from a
+further fresh process as a control. Both require the session journal to be
+strictly appended and to contain no persisted `turn-cancelled` record.
 
 ## Harness architecture
 
@@ -122,7 +253,7 @@ leak into it even though OMP persists the level in the session.
 | Variable | Purpose |
 |---|---|
 | `OMP_MODEL` | Default model for a thread that names none (`modelId` or `provider/modelId`). When unset, the `default` role in `config.yml` applies. |
-| `OMP_BIN` | OMP executable (default: `omp` on `PATH`). |
+| `OMP_BIN` | `harness-server` executable override. When unset it runs `omp` on `PATH`, which is the image's patched global install. |
 | `CENTAUR_OMP_SESSION_ROOT` | Root of the per-thread session directories (default: `~/.omp/centaur-sessions`). |
 | `OMP_LITELLM_BASE_URL` | Gateway URL substituted into the baked config (default: `https://litellm.drkmttr.dev/v1`). |
 | `CENTAUR_OVERLAY_OMP_DIR` | Directory whose `config.yml`/`models.yml` replace the baked copies file by file. The entrypoint waits up to `CENTAUR_OVERLAY_OMP_WAIT_SECONDS` (default `10`) for them to appear. |

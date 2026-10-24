@@ -235,6 +235,14 @@ RUN curl -fsSL https://bun.sh/install | bash -s "${BUN_VERSION}"
 # transformers, speech), off by default and about 600 MB. Omitting them also
 # omits pi-natives' platform addon, so that is installed explicitly. Bun still
 # downloads them into its cache, which is dropped; the install keeps its files.
+COPY --link --chmod=755 services/sandbox/apply_omp_interrupt_boundary_patch.py /usr/local/bin/apply-omp-interrupt-boundary-patch
+# OMP's context builder drops an assistant turn aborted by the user when it has
+# no output, so a restored session can read the next prompt as a continuation of
+# the cancelled request. Patch the freshly installed global package once, in the
+# same layer: the install cache was just removed, and the patch script's atomic
+# replacements break Bun's hardlinks, so no shared cache is mutated. Fail closed
+# if the global package root is a symlink. Every caller (PATH `omp`, the harness,
+# and native subagents) then resolves the same fixed CLI.
 RUN set -eux; \
     omp_platform="$(case "$(dpkg --print-architecture)" in \
       amd64) echo linux-x64 ;; \
@@ -245,6 +253,11 @@ RUN set -eux; \
       "@oh-my-pi/pi-coding-agent@${OMP_VERSION}" \
       "@oh-my-pi/pi-natives-${omp_platform}@${OMP_VERSION}"; \
     rm -rf "$HOME/.bun/install/cache"; \
+    global_modules="${BUN_INSTALL:-$HOME/.bun}/install/global/node_modules"; \
+    package_root="$global_modules/@oh-my-pi/pi-coding-agent"; \
+    test -d "$package_root"; \
+    test ! -L "$package_root"; \
+    apply-omp-interrupt-boundary-patch --package-root "$package_root"; \
     omp --version | grep -Fx "omp/${OMP_VERSION}"
 RUN --mount=type=cache,target=/home/agent/.cache/uv,uid=1001,gid=1001,sharing=locked \
     uv tool install "manim==${MANIM_VERSION}" \

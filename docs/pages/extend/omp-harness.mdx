@@ -17,10 +17,18 @@ within 30 seconds fails the turn. Telemetry is left to the harness
 (`OTEL_SDK_DISABLED`), so OMP does not export duplicate spans.
 
 Steers (`steer_active_execution`) go to the running turn as OMP `steer`
-commands. An interrupt sends OMP's `abort`: when this abort's own result settles
-the turn within five seconds the process and its session stay live, otherwise it
-is replaced. A failed steer or abort ends the turn and replaces the process,
-because the run in flight can no longer be steered; a rejected prompt keeps it.
+commands. This holds in both wire modes: the blocks runner that production uses
+routes a tagged message into the turn in flight instead of queueing it as the
+next turn, and a tagged message that arrives while the session is idle starts a
+turn as usual. A steer that arrives after the turn has stopped reading requests
+(for example during abort settlement) is not dropped: it runs as the next turn
+with its pinned model, provider, and reasoning effort. Only OMP opts into that
+blocks-mode routing; the other shared harnesses keep their previous queueing
+behavior. An interrupt sends OMP's
+`abort`: when this abort's own result settles the turn within five seconds the
+process and its session stay live, otherwise it is replaced. A failed steer or
+abort ends the turn and replaces the process, because the run in flight can no
+longer be steered; a rejected prompt keeps it.
 A mid-run error — an extension failure or an error notice other than
 `session-persistence` — fails the turn at the run's own settlement, so the rest
 of that run never reaches the next turn; a `session-persistence` failure fails
@@ -49,9 +57,10 @@ telemetry to the client, turn completion, and process replacement. There is no
 parallel OMP-specific lifecycle. OMP supplies hooks that adapt the protocol
 (startup handshake, per-turn stdin frames, the JSONL event normalizer) and the
 protections the generic runner applies only when a harness opts in: in-band
-interrupt settlement, bounded stdout, prompt acknowledgement, stderr redaction,
-and provider-per-turn process identity. Harnesses that do not opt in keep their
-previous behavior, so these safeguards are not universal.
+interrupt settlement, in-band blocks-mode steering, bounded stdout, prompt
+acknowledgement, stderr redaction, and provider-per-turn process identity.
+Harnesses that do not opt in keep their previous behavior, so these safeguards
+are not universal.
 
 The boundary runs where OMP's own semantics begin: session directories and
 resume, model and provider selection, thinking levels, cache warming, builtin

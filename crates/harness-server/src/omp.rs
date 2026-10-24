@@ -233,6 +233,12 @@ impl HarnessServer for OmpHarness {
         prompt_command("steer", input)
     }
 
+    /// Production runs OMP through the blocks runner, so steering has to be
+    /// routed into the turn in flight there as well as over JSON-RPC.
+    fn steers_blocks_active_turn(&self) -> bool {
+        true
+    }
+
     fn reasoning_effort(&self, requested: &str) -> Option<String> {
         if let Some(level) = thinking_level(requested) {
             return Some(level.to_string());

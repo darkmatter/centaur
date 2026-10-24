@@ -1,12 +1,11 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::env;
 use std::fs::OpenOptions;
 use std::io::{self, BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{ChildStdout, Stdio};
 use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
     mpsc::{self, Receiver, RecvTimeoutError},
 };
 use std::time::{Duration, Instant};
@@ -71,7 +70,11 @@ pub(crate) fn run_blocks_app_server<H: HarnessServer>(harness: &H) -> Result<()>
     let mut state = initial_blocks_thread_state(harness)?;
     let (command_tx, command_rx) = mpsc::channel();
     let (request_tx, request_rx) = mpsc::channel();
-    let turn_active = Arc::new(AtomicBool::new(false));
+    // Routing a tagged steer and ending a turn race: the reader must not
+    // decide a steer is in-band after the turn-end drain has already run.
+    // Both sides hold this lock across the decision and the channel action.
+    let turn_active = Arc::new(Mutex::new(false));
+    let steers_blocks_active_turn = harness.steers_blocks_active_turn();
 
     {
         let turn_active = Arc::clone(&turn_active);
@@ -87,14 +90,36 @@ pub(crate) fn run_blocks_app_server<H: HarnessServer>(harness: &H) -> Result<()>
                     continue;
                 }
 
-                match parse_blocks_line_with_state(trimmed, &mut blocks_state) {
-                    Ok(BlocksCommand::Interrupt) if turn_active.load(Ordering::SeqCst) => {
+                let command = parse_blocks_line_with_state(trimmed, &mut blocks_state);
+                let is_steer = matches!(
+                    &command,
+                    Ok(BlocksCommand::User { trace_context, .. })
+                        if trace_context.metadata.get("action").and_then(Value::as_str)
+                            == Some("steer_active_execution")
+                );
+                let mut active = lock_turn_state(&turn_active);
+                match command {
+                    Ok(BlocksCommand::Interrupt) if *active => {
                         if request_tx.send(ActiveTurnRequest::BlocksInterrupt).is_err() {
                             break;
                         }
                     }
+                    // A tagged steer belongs to the turn in flight; only
+                    // harnesses with a native steer frame opt in. Keep the
+                    // whole command so a steer that misses the turn can run
+                    // as the next turn with its pinned overrides.
+                    Ok(command @ BlocksCommand::User { .. })
+                        if steers_blocks_active_turn && *active && is_steer =>
+                    {
+                        if request_tx
+                            .send(ActiveTurnRequest::BlocksSteer(Box::new(command)))
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
                     Ok(command @ BlocksCommand::User { .. }) => {
-                        turn_active.store(true, Ordering::SeqCst);
+                        *active = true;
                         if command_tx
                             .send(BlocksReaderInput::Command(command))
                             .is_err()
@@ -123,7 +148,17 @@ pub(crate) fn run_blocks_app_server<H: HarnessServer>(harness: &H) -> Result<()>
         });
     }
 
-    while let Ok(input) = command_rx.recv() {
+    // A steer that missed the turn-end race is already marked delivered by the
+    // runtime; run it as the next turn, in arrival order, with its overrides.
+    let mut pending_turns = VecDeque::new();
+    loop {
+        let input = match pending_turns.pop_front() {
+            Some(command) => BlocksReaderInput::Command(command),
+            None => match command_rx.recv() {
+                Ok(input) => input,
+                Err(_) => break,
+            },
+        };
         match input {
             BlocksReaderInput::Command(BlocksCommand::User {
                 input,
@@ -158,8 +193,8 @@ pub(crate) fn run_blocks_app_server<H: HarnessServer>(harness: &H) -> Result<()>
                     &mut stdout,
                     &request_rx,
                     &turn_active,
+                    &mut pending_turns,
                 );
-                drain_active_turn_requests(&request_rx);
                 if let Err(error) = result {
                     eprintln!("blocks turn failed: {error:#}");
                     write_blocks_error(&mut stdout, &state.id, "turn", error.to_string())?;
@@ -222,8 +257,8 @@ pub(crate) fn run_app_server<H: HarnessServer>(harness: &H) -> Result<()> {
                     eprintln!("request failed: {error:#}");
                 }
             }
-            ActiveTurnRequest::BlocksInterrupt => {
-                eprintln!("blocks interrupt ignored: no active turn runs");
+            ActiveTurnRequest::BlocksInterrupt | ActiveTurnRequest::BlocksSteer(_) => {
+                eprintln!("blocks request ignored: no active turn runs");
             }
         }
     }
@@ -237,6 +272,12 @@ fn initial_blocks_thread_state<H: HarnessServer>(harness: &H) -> Result<ThreadSt
     Ok(harness.thread_state(&params, cwd))
 }
 
+fn lock_turn_state(active: &Mutex<bool>) -> std::sync::MutexGuard<'_, bool> {
+    active
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_blocks_turn<H: HarnessServer, W: Write>(
     harness: &H,
@@ -246,11 +287,12 @@ fn run_blocks_turn<H: HarnessServer, W: Write>(
     trace_context: &TraceContext,
     stdout: &mut W,
     request_rx: &Receiver<ActiveTurnRequest>,
-    turn_active: &AtomicBool,
+    turn_active: &Mutex<bool>,
+    pending_turns: &mut VecDeque<BlocksCommand>,
 ) -> Result<()> {
     let turn_id = format!("turn-{}", Uuid::new_v4().simple());
     let mut normalizer = normalizer_for(harness, state, &turn_id);
-    turn_active.store(true, Ordering::SeqCst);
+    *lock_turn_state(turn_active) = true;
     let result = run_normalized_turn(
         harness,
         state,
@@ -261,7 +303,16 @@ fn run_blocks_turn<H: HarnessServer, W: Write>(
         stdout,
         request_rx,
     );
-    turn_active.store(false, Ordering::SeqCst);
+    // Keep the turn marked active until the drain finishes: a reader blocked
+    // on this lock either sends before it (and is drained here) or observes
+    // the turn ended and queues the steer as the next turn.
+    let mut active = lock_turn_state(turn_active);
+    *active = false;
+    while let Ok(request) = request_rx.try_recv() {
+        if let ActiveTurnRequest::BlocksSteer(command) = request {
+            pending_turns.push_back(*command);
+        }
+    }
     result
 }
 
@@ -273,10 +324,7 @@ enum BlocksReaderInput {
 enum ActiveTurnRequest {
     JsonRpc(JSONRPCRequest),
     BlocksInterrupt,
-}
-
-fn drain_active_turn_requests(rx: &Receiver<ActiveTurnRequest>) {
-    while rx.try_recv().is_ok() {}
+    BlocksSteer(Box<BlocksCommand>),
 }
 
 #[derive(Debug)]
@@ -1055,6 +1103,28 @@ fn apply_resume_overrides(state: &mut ThreadState, params: &ThreadResumeParams) 
     Ok(())
 }
 
+fn write_steer_frame<H: HarnessServer>(
+    harness: &H,
+    process: &mut HarnessChild,
+    input: &[UserInput],
+) -> Result<()> {
+    process.stdin.write_all(&harness.stdin_for_steer(input)?)?;
+    process.stdin.flush()?;
+    Ok(())
+}
+
+fn emit_steer_message<W: Write>(
+    normalizer: &mut CodexTurnNormalizer,
+    stdout: &mut W,
+    client_user_message_id: Option<String>,
+    input: Vec<UserInput>,
+) -> Result<()> {
+    for notification in normalizer.emit_user_message(client_user_message_id, input)? {
+        write_value(stdout, &notification_to_wire_value(&notification)?)?;
+    }
+    Ok(())
+}
+
 fn handle_active_turn_request<H: HarnessServer, W: Write>(
     harness: &H,
     process: &mut HarnessChild,
@@ -1062,8 +1132,24 @@ fn handle_active_turn_request<H: HarnessServer, W: Write>(
     request: ActiveTurnRequest,
     stdout: &mut W,
 ) -> Result<Option<InterruptOutcome>> {
-    let ActiveTurnRequest::JsonRpc(request) = request else {
-        return harness.interrupt_turn(process).map(Some);
+    let request = match request {
+        ActiveTurnRequest::BlocksInterrupt => {
+            return harness.interrupt_turn(process).map(Some);
+        }
+        ActiveTurnRequest::BlocksSteer(command) => {
+            let BlocksCommand::User {
+                input,
+                client_user_message_id,
+                ..
+            } = *command
+            else {
+                return Ok(None);
+            };
+            write_steer_frame(harness, process, &input)?;
+            emit_steer_message(normalizer, stdout, client_user_message_id, input)?;
+            return Ok(None);
+        }
+        ActiveTurnRequest::JsonRpc(request) => request,
     };
 
     match request.method.as_str() {
@@ -1091,10 +1177,7 @@ fn handle_active_turn_request<H: HarnessServer, W: Write>(
                 )?;
                 return Ok(None);
             }
-            process
-                .stdin
-                .write_all(&harness.stdin_for_steer(&params.input)?)?;
-            process.stdin.flush()?;
+            write_steer_frame(harness, process, &params.input)?;
             write_response(
                 stdout,
                 request.id,
@@ -1102,11 +1185,12 @@ fn handle_active_turn_request<H: HarnessServer, W: Write>(
                     turn_id: normalizer.turn_id().to_string(),
                 },
             )?;
-            for notification in normalizer
-                .emit_user_message(params.client_user_message_id.clone(), params.input.clone())?
-            {
-                write_value(stdout, &notification_to_wire_value(&notification)?)?;
-            }
+            emit_steer_message(
+                normalizer,
+                stdout,
+                params.client_user_message_id.clone(),
+                params.input.clone(),
+            )?;
             Ok(None)
         }
         "turn/interrupt" => {
@@ -1730,6 +1814,14 @@ mod tests {
         let path = dir.join(name);
         img.save(&path).expect("write test png");
         path
+    }
+
+    #[test]
+    fn only_omp_steers_the_blocks_active_turn() {
+        assert!(OmpHarness.steers_blocks_active_turn());
+        assert!(!ClaudeCodeHarness.steers_blocks_active_turn());
+        assert!(!AmpHarness.steers_blocks_active_turn());
+        assert!(!PiHarness.steers_blocks_active_turn());
     }
 
     #[test]

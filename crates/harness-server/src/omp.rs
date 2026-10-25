@@ -122,7 +122,7 @@ impl HarnessServer for OmpHarness {
         NO_MODEL_PROVIDER
     }
 
-    fn command_for_turn(&self, _state: &ThreadState, _input: &[UserInput]) -> ProcessCommand {
+    fn command_for_turn(&self, _state: &ThreadState) -> ProcessCommand {
         let bin = env::var("OMP_BIN").unwrap_or_else(|_| "omp".to_string());
         let mut command = ProcessCommand::new(bin);
         command.args(["--mode", "rpc", "--no-ui"]);

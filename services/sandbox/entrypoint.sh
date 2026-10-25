@@ -374,6 +374,28 @@ case "$CLAUDE_CODE_AUTH_MODE" in
         ;;
 esac
 
+# ── OMP settings overlay ────────────────────────────────────────────────────
+# OMP_CONFIG_OVERLAY carries YAML text, not a path, so a deployment can set
+# OMP settings that have no environment binding (for example modelRoles or
+# retry.fallbackChains) through sandbox.extraEnv. Write it to a private runtime
+# file and append that file to OMP's native PI_CONFIG_FILES list instead of
+# rewriting the persistent ~/.omp/agent/config.yml. OMP merges PI_CONFIG_FILES
+# in order, so appending makes this overlay win over earlier files. Unset (or
+# empty) leaves PI_CONFIG_FILES and the filesystem untouched.
+if [ -n "${OMP_CONFIG_OVERLAY:-}" ]; then
+    OMP_OVERLAY_DIR="$HOME_DIR/.config/centaur"
+    OMP_OVERLAY_FILE="$OMP_OVERLAY_DIR/omp-config-overlay.yml"
+    mkdir -p "$OMP_OVERLAY_DIR"
+    chmod 700 "$OMP_OVERLAY_DIR"
+    (umask 077; printf '%s\n' "$OMP_CONFIG_OVERLAY" > "$OMP_OVERLAY_FILE")
+    chmod 600 "$OMP_OVERLAY_FILE"
+    # Always append. If the inherited list already names this runtime path
+    # before another file, deduplicating would leave that later file winning.
+    PI_CONFIG_FILES="${PI_CONFIG_FILES:+$PI_CONFIG_FILES:}$OMP_OVERLAY_FILE"
+    export PI_CONFIG_FILES
+    unset OMP_OVERLAY_DIR OMP_OVERLAY_FILE
+fi
+
 # ── Per-session workspace clone (no shared worktree metadata) ────────────────
 if [ "${CENTAUR_PERSISTENT_STATE:-0}" = "1" ]; then
     WORKSPACE_DIR="$STATE_DIR/workspace"

@@ -396,6 +396,138 @@ if [ -n "${OMP_CONFIG_OVERLAY:-}" ]; then
     unset OMP_OVERLAY_DIR OMP_OVERLAY_FILE
 fi
 
+# ── OMP model-registry overlay ──────────────────────────────────────────────
+# OMP_MODELS_OVERLAY carries YAML text, not a path, for OMP's provider/model
+# registry. That registry is a single native file in the agent dir
+# (PI_CODING_AGENT_DIR, else ~/.omp/agent), not a PI_CONFIG_FILES overlay, so
+# OMP_CONFIG_OVERLAY cannot configure it. The image ships no baked registry:
+# a deployment that needs static or custom model definitions passes the
+# complete registry here through sandbox.extraEnv. The text replaces models.yml
+# atomically (same-directory temp file, then rename), so a partial write never
+# leaves OMP with a truncated registry. Unset (or empty) writes nothing and
+# leaves an existing models.yml untouched; config.yml is never rewritten.
+# __OMP_LITELLM_BASE_URL__ is substituted from OMP_LITELLM_BASE_URL, the value
+# deployments already forward for the gateway; a placeholder without that value
+# fails closed instead of writing a registry with an unusable base URL.
+if [ -n "${OMP_MODELS_OVERLAY:-}" ]; then
+    OMP_AGENT_DIR="${PI_CODING_AGENT_DIR:-$HOME_DIR/.omp/agent}"
+    case "$OMP_MODELS_OVERLAY" in
+        *__OMP_LITELLM_BASE_URL__*)
+            if [ -z "${OMP_LITELLM_BASE_URL:-}" ]; then
+                echo "OMP_MODELS_OVERLAY uses __OMP_LITELLM_BASE_URL__ but OMP_LITELLM_BASE_URL is unset" >&2
+                exit 1
+            fi
+            ;;
+    esac
+    mkdir -p "$OMP_AGENT_DIR"
+    OMP_MODELS_FILE="$OMP_AGENT_DIR/models.yml"
+    OMP_MODELS_TMP="$(mktemp "$OMP_AGENT_DIR/.models.yml.XXXXXX")"
+    (umask 077; printf '%s\n' "$OMP_MODELS_OVERLAY" \
+        | sed "s|__OMP_LITELLM_BASE_URL__|$OMP_LITELLM_BASE_URL|g" > "$OMP_MODELS_TMP")
+    chmod 600 "$OMP_MODELS_TMP"
+    mv -f "$OMP_MODELS_TMP" "$OMP_MODELS_FILE"
+    unset OMP_AGENT_DIR OMP_MODELS_FILE OMP_MODELS_TMP
+fi
+
+# ── GitHub App installation token (darkmatter deployments) ──────────────────
+# When the App credentials are passed through, mint a short-lived installation
+# token at boot so the agent can clone/push and reply on GitHub — legacy
+# github-executor parity (the App key lived in the agent's trust domain there
+# too). All api.github.com traffic rides the per-sandbox egress proxy
+# (fail-closed policy, no direct 443), and the proxy pod can lag this
+# entrypoint by a few seconds — retry across that window instead of losing the
+# whole boot's GitHub access to one refused connect.
+#
+# Installation tokens expire after 60 minutes — fixed by GitHub, not
+# extendable. Warm-pool sandboxes idle past that hour (and any session running
+# longer) used to serve dead tokens: every GitHub call 401'd. Two changes close
+# that hole:
+#   1. A background loop re-mints on an interval (default 50 min — hourly
+#      cadence with margin so a live token always exists) and rewrites the
+#      credential FILES below for the sandbox's whole life.
+#   2. No GITHUB_TOKEN/GH_TOKEN env export: env freezes into the exec'd
+#      harness at boot and goes stale where files can be refreshed. gh
+#      resolves the current token per invocation via the /usr/local/bin/gh
+#      wrapper reading $HOME/.centaur/github-token; git reads the refreshed
+#      credential store. Both env vars are explicitly unset so no runtime
+#      stub or stale value can shadow the fresh sources.
+# Fail-soft throughout: a failed re-mint keeps the previous token and retries
+# on a short interval; a deployment without App creds keeps the upstream
+# GITHUB_TOKEN placeholder flow untouched (see the credential-helper block
+# before readiness). Never log the App key or the minted token: diagnostics go
+# to a 0600 file under the private ~/.centaur directory.
+GITHUB_TOKEN_FILE_PATH="$HOME_DIR/.centaur/github-token"
+GITHUB_TOKEN_ERR_FILE="$HOME_DIR/.centaur/mint-github-token.err"
+
+mint_github_token() {
+    # 5 attempts with linear backoff; token on stdout, diagnostics to stderr.
+    local attempt token
+    (umask 077; : > "$GITHUB_TOKEN_ERR_FILE")
+    for attempt in 1 2 3 4 5; do
+        if token="$(bun /usr/local/bin/mint-github-token.mjs 2>>"$GITHUB_TOKEN_ERR_FILE")" \
+            && [ -n "$token" ]; then
+            printf '%s' "$token"
+            return 0
+        fi
+        sleep $((attempt * 2))
+    done
+    return 1
+}
+
+install_github_token() {
+    # Atomically publish the token file and the git credential store.
+    local token="$1" tmp
+    tmp="$(mktemp "$GITHUB_TOKEN_FILE_PATH.XXXXXX")"
+    printf '%s' "$token" > "$tmp"
+    chmod 600 "$tmp"
+    mv -f "$tmp" "$GITHUB_TOKEN_FILE_PATH"
+    # Scoped to github.com, kept out of URLs/reflog (legacy configureGit).
+    tmp="$(mktemp "$HOME_DIR/.git-credentials.XXXXXX")"
+    printf 'https://x-access-token:%s@github.com\n' "$token" > "$tmp"
+    chmod 600 "$tmp"
+    mv -f "$tmp" "$HOME_DIR/.git-credentials"
+}
+
+github_token_refresh_loop() {
+    # Re-mint before the 60-minute expiry; on failure keep the previous token
+    # (it may still be live) and retry sooner. stderr only — stdout is
+    # reserved for harness/workflow-host JSONL.
+    local interval="${GITHUB_TOKEN_REFRESH_SECONDS:-3000}" token
+    while true; do
+        sleep "$interval"
+        if token="$(mint_github_token)"; then
+            install_github_token "$token"
+            echo "github installation token re-minted" >&2
+            interval="${GITHUB_TOKEN_REFRESH_SECONDS:-3000}"
+        else
+            echo "github token re-mint failed, retrying in 300s: $(head -c 200 "$GITHUB_TOKEN_ERR_FILE" 2>/dev/null)" >&2
+            interval=300
+        fi
+    done
+}
+
+if [ -n "${GITHUB_APP_ID:-}" ] && [ -n "${GITHUB_APP_PRIVATE_KEY:-}" ]; then
+    mkdir -p "$HOME_DIR/.centaur"
+    chmod 700 "$HOME_DIR/.centaur"
+    if minted_token="$(mint_github_token)"; then
+        install_github_token "$minted_token"
+        git config --global credential.helper store
+        # stdout is reserved for harness/workflow-host JSONL (see
+        # install_tool_shims.py) — a stray line here poisons the workflow-host
+        # handshake with "expected value at line 1 column 1".
+        echo "github installation token minted" >&2
+    else
+        echo "github token mint failed after 5 attempts: $(head -c 200 "$GITHUB_TOKEN_ERR_FILE" 2>/dev/null)" >&2
+    fi
+    minted_token=""
+    github_token_refresh_loop &
+    # Stale/stub env must never shadow the refreshed file sources (gh prefers
+    # env over everything; see services/sandbox/gh-wrapper.sh). Scoped to the
+    # mint path: deployments that pass a real GITHUB_TOKEN env and no App
+    # creds — the upstream flow (and the tail auth block) stays untouched.
+    unset GITHUB_TOKEN GH_TOKEN
+fi
+
 # ── Per-session workspace clone (no shared worktree metadata) ────────────────
 if [ "${CENTAUR_PERSISTENT_STATE:-0}" = "1" ]; then
     WORKSPACE_DIR="$STATE_DIR/workspace"

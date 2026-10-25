@@ -77,12 +77,18 @@ def _migration_version(path: Path) -> int:
     return int(path.name.split("_", 1)[0])
 
 
+def _core_migration(path: Path) -> Path:
+    """Return the SQL api-rs runs for a core migration file: its override, if any."""
+    override = SESSION_SQLX / "core-migration-overrides" / path.name
+    return override if override.exists() else path
+
+
 async def _migrate(url: str, backend: str) -> None:
     """Apply the migrations that api-rs and, on ParadeDB, the company-context service run."""
     conn = await asyncpg.connect(url)
     try:
         migrations = [
-            *(SESSION_SQLX / "migrations").glob("*.sql"),
+            *map(_core_migration, (SESSION_SQLX / "migrations").glob("*.sql")),
             *(SESSION_SQLX / "search-migrations" / backend).glob("*.sql"),
         ]
         for path in sorted(migrations, key=_migration_version):

@@ -7,16 +7,23 @@ use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 const KEY: &str = "slack:C123:123.456";
 const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/omp");
+const READY: &str =
+    r#"{"type":"ready","supportedProtocolVersions":[1,2],"maxReassembledFrameBytes":67108864}"#;
 
 /// Answers startup before replaying recordings from OMP 18.8.6 against a
 /// loopback provider. The background gate pauses before session_settled.
 fn fake_omp(dir: &std::path::Path) -> PathBuf {
     let script = r##"#!/bin/sh
 printf '%s|%s\n' "$$" "$*" >> '@DIR@/argv'
+if [ -n "$OMP_TEST_STDERR" ]; then printf 'api_key=%s\n' "$OMP_TEST_STDERR" >&2; fi
+printf '%s\n' '@READY@'
+run_marker=$(mktemp '@DIR@/run.XXXXXX')
+rm -f "$run_marker"
 while IFS= read -r line; do
     printf '%s\n' "$line" >> '@DIR@/stdin'
     kind=${line##*\"type\":\"}
@@ -38,6 +45,7 @@ while IFS= read -r line; do
         cancelled=false error=
         case "$line" in
         *'"modelId":"missing"'*) error='Model not found: custom/missing' ;;
+        *'"provider":"broken"'*) error='Model not found: broken/glm-5.2-fp8' ;;
         *'"modelId"'*) ;;
         *) if [ "$OMP_TEST_FAULT" = restore_model ]; then error='Could not restore model custom/saved'; fi ;;
         esac
@@ -47,14 +55,54 @@ while IFS= read -r line; do
         else
             printf '{"id":"centaur-open_session","type":"response","command":"open_session","success":true,"data":{"cancelled":%s}}\n' "$cancelled"
         fi ;;
+    get_state)
+        printf '%s\n' '{"id":"centaur-get_state","type":"response","command":"get_state","success":true,"data":{"model":{"provider":"litellm","id":"restored-model"}}}' ;;
+    set_model)
+        case "$line" in
+        *'"modelId":"missing-bare"'*) printf '%s\n' '{"id":"centaur-set_model","type":"response","command":"set_model","success":false,"error":"Model not found: missing-bare"}' ;;
+        *) printf '%s\n' '{"id":"centaur-set_model","type":"response","command":"set_model","success":true,"data":{"provider":"litellm","id":"ok"}}' ;;
+        esac ;;
+    abort)
+        : > '@DIR@/aborting'
+        # OMP writes the aborted result when the agent yields, before the abort
+        # response that follows session.abort()/waitForIdle.
+        printf '%s\n' '{"type":"prompt_result","id":"prompt-1","agentInvoked":true,"status":"aborted","sessionSettled":true}'
+        if [ -n "$OMP_TEST_ABORT_DELAY" ]; then sleep "$OMP_TEST_ABORT_DELAY"; fi
+        printf '%s\n' '{"id":"centaur-abort","type":"response","command":"abort","success":true}'
+        if [ -n "$aborted_run_may_continue" ]; then : > "$run_marker"; fi ;;
     prompt)
-        case "$line" in *'"message":"/help"'*)
-            printf '%s\n' '{"type":"response","command":"prompt","success":true,"data":{"agentInvoked":false}}'
+        # An aborted run can keep running after its result and emit its output
+        # while the turn that follows is active.
+        if [ -f "$run_marker" ]; then
+            rm -f "$run_marker"
+            printf '%s\n' '{"type":"message_end","messageId":"aborted-run","message":{"role":"assistant","content":[{"type":"text","text":"LATE ABORTED RUN OUTPUT"}],"stopReason":"stop"}}'
+        fi
+        case "$line" in *'"message":"/local-only"'*)
+            printf '%s\n' '{"type":"command_output","text":"Available commands:\n/local-only\n"}' '{"type":"response","command":"prompt","success":true,"data":{"agentInvoked":false}}'
             continue ;;
         esac
+        # Accepts the prompt and never answers it: no acknowledgement at all.
+        case "$line" in *'"message":"no_ack"'*) continue ;; esac
         printf '%s\n' '{"type":"response","command":"prompt","success":true}'
         case "$line" in
+        # Accepted, then silent: an acknowledged run whose model is slow.
+        *'"message":"quiet_after_ack"'*) ;;
+        # A single physical line past the reader's bound, mid-run.
+        *'"message":"oversized_line"'*)
+            head -c 1100000 /dev/zero | tr '\0' 'x'
+            printf '\n' ;;
         *'"message":"slow"'*) printf '%s\n' '{"type":"tool_execution_start","toolCallId":"slow","toolName":"bash","args":{"command":"sleep 60"}}' ;;
+        *'"message":"abort_late_output"'*)
+            aborted_run_may_continue=1
+            printf '%s\n' '{"type":"tool_execution_start","toolCallId":"abort-late","toolName":"bash","args":{"command":"sleep 60"}}' ;;
+        *'"message":"extension_error"'*)
+            printf '%s\n' '{"type":"agent_start"}' '{"type":"extension_error","message":"extension boom"}'
+            cat '@FIXTURES@/text.jsonl' ;;
+        *'"message":"persistence_notice"'*)
+            printf '%s\n' '{"type":"notice","level":"error","source":"session-persistence","message":"persist failed"}' ;;
+        *'"message":"trailing_settle"'*)
+            cat '@FIXTURES@/text.jsonl'
+            ( sleep 2; printf '%s\n' '{"type":"session_settled"}' ) & ;;
         *'"message":"gated_background"'*)
             while IFS= read -r frame; do
                 printf '%s\n' "$frame"
@@ -73,11 +121,17 @@ while IFS= read -r line; do
     *) printf '{"type":"response","id":"centaur-%s","command":"%s","success":true}\n' "$kind" "$kind" ;;
     esac
 done
-"##.replace("@DIR@", &dir.to_string_lossy()).replace("@FIXTURES@", FIXTURES);
+"##.replace("@DIR@", &dir.to_string_lossy()).replace("@FIXTURES@", FIXTURES).replace("@READY@", READY);
     let path = dir.join("omp");
     std::fs::write(&path, script).unwrap();
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
     path
+}
+
+/// The native session directory OMP opens for a thread key or thread id.
+fn session_dir(key: &str) -> String {
+    let digest: [u8; 32] = Sha256::digest(key.as_bytes()).into();
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 struct Server {
@@ -101,18 +155,22 @@ impl Server {
     }
 
     fn with_binary(dir: PathBuf, mode: &str, binary: &OsStr, extra_env: &[(&str, &str)]) -> Self {
+        let stderr_log = dir.join("server.stderr");
         let mut child = Command::new(env!("CARGO_BIN_EXE_harness-server"))
             .args(["omp", "--mode", mode])
             .current_dir(&dir)
-            .env("CENTAUR_OMP_BIN", binary)
+            .env("OMP_BIN", binary)
             .env("CENTAUR_OMP_SESSION_ROOT", dir.join("sessions"))
-            .env_remove("CENTAUR_OMP_MODEL")
+            .env_remove("OMP_MODEL")
             .env_remove("CENTAUR_THREAD_KEY")
             .env_remove("OMP_TEST_FAULT")
+            .env_remove("OMP_TEST_STDERR")
             .envs(extra_env.iter().copied())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
+            .stderr(Stdio::from(
+                std::fs::File::create(&stderr_log).expect("server stderr log"),
+            ))
             .spawn()
             .unwrap();
         let stdin = child.stdin.take();
@@ -191,9 +249,13 @@ impl Server {
     }
 
     fn paused(&self) {
+        self.wait_for("paused");
+    }
+
+    fn wait_for(&self, name: &str) {
         let deadline = Instant::now() + Duration::from_secs(5);
-        while !self.dir.join("paused").exists() {
-            assert!(Instant::now() < deadline, "fake never paused");
+        while !self.dir.join(name).exists() {
+            assert!(Instant::now() < deadline, "fake never wrote {name}");
             std::thread::sleep(Duration::from_millis(5));
         }
     }
@@ -235,10 +297,16 @@ fn status(turn: &[Value]) -> &Value {
 fn result() -> Value {
     json!({"type": "prompt_result", "status": "completed", "sessionSettled": true})
 }
+fn kinds(commands: &[Value]) -> Vec<&str> {
+    commands
+        .iter()
+        .map(|command| command["type"].as_str().unwrap())
+        .collect()
+}
 
 #[test]
 fn startup_renders_final_text_and_reasoning_restores_default() {
-    let mut server = Server::new(&[("CENTAUR_OMP_MODEL", "custom/new-model")]);
+    let mut server = Server::new(&[("OMP_MODEL", "custom/new-model")]);
     let turn = server.turn("text", json!({"reasoning": "none"}));
     assert_eq!(status(&turn), "completed");
     let messages = items(&turn, "item/completed", "agentMessage");
@@ -247,16 +315,13 @@ fn startup_renders_final_text_and_reasoning_restores_default() {
     assert_eq!(messages[0]["phase"], "final_answer");
     let first = server.commands();
     assert_eq!(
-        first
-            .iter()
-            .map(|c| c["type"].as_str().unwrap())
-            .collect::<Vec<_>>(),
+        kinds(&first),
         [
             "negotiate_protocol",
             "set_event_filter",
             "open_session",
-            "set_cache_warming",
             "set_thinking_level",
+            "set_cache_warming",
             "set_thinking_level",
             "prompt",
         ]
@@ -265,19 +330,21 @@ fn startup_renders_final_text_and_reasoning_restores_default() {
         first[2]["sessionDir"],
         server
             .dir
-            .join("sessions/centaur-slack-C123-123.456")
+            .join("sessions")
+            .join(session_dir(KEY))
             .to_string_lossy()
             .as_ref()
     );
     assert_eq!(first[2]["provider"], "custom");
     assert_eq!(first[2]["modelId"], "new-model");
-    assert_eq!(first[4]["level"], "high");
+    // A respawned process must not inherit a saved level from an earlier turn.
+    assert_eq!(first[3]["level"], "inherit");
     assert_eq!(first[5]["level"], "off");
     assert_eq!(status(&server.turn("text", json!({}))), "completed");
     assert_eq!(
         &server.commands()[first.len()..],
         [
-            json!({"type": "set_thinking_level", "level": "high"}),
+            json!({"type": "set_thinking_level", "level": "inherit"}),
             json!({"type": "prompt", "message": "text"})
         ]
     );
@@ -462,12 +529,411 @@ fn prompt_rejection_retains_child_and_unknown_result_fails() {
 }
 
 #[test]
-fn prompt_handled_without_the_agent_completes_the_turn() {
+fn prompt_handled_without_the_agent_completes_the_turn_with_its_output() {
     let mut server = Server::new(&[]);
-    let turn = server.turn("/help", json!({}));
+    let turn = server.turn("/local-only", json!({}));
     assert_eq!(status(&turn), "completed");
-    assert!(items(&turn, "item/completed", "agentMessage").is_empty());
+    let messages = items(&turn, "item/completed", "agentMessage");
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0]["text"], "Available commands:\n/local-only\n");
+    assert_eq!(messages[0]["phase"], "final_answer");
+    assert!(items(&turn, "item/completed", "dynamicToolCall").is_empty());
     assert_eq!(status(&server.turn("text", json!({}))), "completed");
+    assert_eq!(
+        std::fs::read_to_string(server.dir.join("argv"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn mid_run_extension_error_fails_the_turn_only_after_it_settles() {
+    let mut server = Server::new(&[]);
+    let turn = server.turn("extension_error", json!({}));
+    assert_eq!(status(&turn), "failed");
+    assert_eq!(
+        turn.last().unwrap()["params"]["turn"]["error"]["message"],
+        "extension boom"
+    );
+    // The error outranked the successful result but arrived mid-run: the run
+    // still settled, so its output is complete and the process is reused.
+    assert_eq!(items(&turn, "item/completed", "agentMessage").len(), 1);
+    // The next turn starts clean: nothing of the failed run leaks into it.
+    let next = server.turn("text", json!({}));
+    assert_eq!(status(&next), "completed");
+    let messages = items(&next, "item/completed", "agentMessage");
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0]["text"], "Hello from the loopback mock.");
+    assert_eq!(
+        std::fs::read_to_string(server.dir.join("argv"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn session_persistence_notice_fails_the_turn_and_replaces_the_process() {
+    let mut server = Server::new(&[]);
+    let turn = server.turn("persistence_notice", json!({}));
+    assert_eq!(status(&turn), "failed");
+    assert!(
+        turn.last().unwrap()["params"]["turn"]["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("session persistence failed")
+    );
+    assert_eq!(status(&server.turn("text", json!({}))), "completed");
+    assert_eq!(
+        std::fs::read_to_string(server.dir.join("argv"))
+            .unwrap()
+            .lines()
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn bare_model_rejection_restores_the_last_working_model() {
+    let mut server = Server::new(&[("OMP_MODEL", "glm-5.2-fp8")]);
+    assert_eq!(status(&server.turn("text", json!({}))), "completed");
+    let turn = server.turn("text", json!({"model": "missing-bare"}));
+    assert_eq!(status(&turn), "failed");
+    assert!(
+        turn.last().unwrap()["params"]["turn"]["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("unsupported model `missing-bare` for OMP: Model not found: missing-bare")
+    );
+    assert_eq!(status(&server.turn("text", json!({}))), "completed");
+    let commands = server.commands();
+    // A bare model never reaches open_session: the default provider's model
+    // is selected in place, and only a working selection survives a rejection.
+    assert!(
+        commands
+            .iter()
+            .filter(|c| c["type"] == "open_session")
+            .all(|c| c.get("modelId").is_none())
+    );
+    assert_eq!(
+        commands
+            .iter()
+            .filter(|c| c["type"] == "set_model")
+            .map(|c| c["modelId"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["glm-5.2-fp8", "missing-bare", "glm-5.2-fp8"]
+    );
+}
+
+#[test]
+fn provider_switch_restarts_the_process_and_a_failed_switch_restores_both_halves() {
+    let mut server = Server::new(&[("OMP_MODEL", "glm-5.2-fp8")]);
+    assert_eq!(
+        status(&server.turn("text", json!({"provider": "litellm"}))),
+        "completed"
+    );
+    // Same model, different provider: the provider is part of process identity.
+    assert_eq!(
+        status(&server.turn("text", json!({"provider": "other"}))),
+        "completed"
+    );
+    let turn = server.turn("text", json!({"provider": "broken"}));
+    assert_eq!(status(&turn), "failed");
+    assert!(
+        turn.last().unwrap()["params"]["turn"]["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("unsupported model `glm-5.2-fp8` for OMP: Model not found: broken")
+    );
+    assert_eq!(status(&server.turn("text", json!({}))), "completed");
+    let commands = server.commands();
+    assert_eq!(
+        commands
+            .iter()
+            .filter(|c| c["type"] == "open_session")
+            .map(|c| (
+                c["provider"].as_str().unwrap().to_owned(),
+                c["modelId"].as_str().unwrap().to_owned(),
+            ))
+            .collect::<Vec<_>>(),
+        [
+            ("litellm".to_owned(), "glm-5.2-fp8".to_owned()),
+            ("other".to_owned(), "glm-5.2-fp8".to_owned()),
+            ("broken".to_owned(), "glm-5.2-fp8".to_owned()),
+            ("other".to_owned(), "glm-5.2-fp8".to_owned()),
+        ]
+    );
+    assert_eq!(
+        std::fs::read_to_string(server.dir.join("argv"))
+            .unwrap()
+            .lines()
+            .count(),
+        4
+    );
+}
+
+#[test]
+fn a_rejected_first_provider_falls_back_to_the_default_provider() {
+    let mut server = Server::new(&[("OMP_MODEL", "glm-5.2-fp8")]);
+    // No process ran before, so there is no working selection to go back to:
+    // the rejected provider itself must not be the fallback.
+    let turn = server.turn("text", json!({"provider": "broken"}));
+    assert_eq!(status(&turn), "failed");
+    let error = turn.last().unwrap()["params"]["turn"]["error"]["message"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(error.contains("Model not found: broken"), "{error}");
+    assert_eq!(status(&server.turn("text", json!({}))), "completed");
+    let commands = server.commands();
+    let opened: Vec<_> = commands
+        .iter()
+        .filter(|command| command["type"] == "open_session")
+        .collect();
+    assert_eq!(opened.len(), 2, "{commands:#?}");
+    assert_eq!(opened[0]["provider"], "broken");
+    assert_eq!(opened[0]["modelId"], "glm-5.2-fp8");
+    assert!(opened[1].get("provider").is_none(), "{:#?}", opened[1]);
+    assert!(opened[1].get("modelId").is_none(), "{:#?}", opened[1]);
+    assert_eq!(
+        commands
+            .iter()
+            .find(|command| command["type"] == "set_model")
+            .unwrap()["modelId"],
+        "glm-5.2-fp8"
+    );
+}
+
+#[test]
+fn a_stale_settlement_does_not_retain_the_aborted_process() {
+    let mut server = Server::new(&[("OMP_TEST_FAULT", "abort")]);
+    server.timeout = Duration::from_secs(20);
+    assert_eq!(
+        status(&server.turn("trailing_settle", json!({}))),
+        "completed"
+    );
+    server.user("slow", json!({}));
+    server.until(|event| {
+        event["method"] == "item/started" && event["params"]["item"]["type"] == "commandExecution"
+    });
+    server.send(json!({"type": "interrupt", "thread_key": KEY}));
+    // The abort was rejected and the only settlement in flight belongs to the
+    // previous turn, so the interrupted run must not be kept: the process is
+    // replaced once the abort's own response arrives.
+    assert_eq!(status(&server.read_until("turn/completed")), "interrupted");
+    assert_eq!(status(&server.turn("text", json!({}))), "completed");
+    let commands = server.commands();
+    assert!(
+        commands.iter().any(|c| c["type"] == "abort"),
+        "an interrupt must abort the turn in-band"
+    );
+    assert_eq!(
+        std::fs::read_to_string(server.dir.join("argv"))
+            .unwrap()
+            .lines()
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn late_output_from_an_aborted_run_never_reaches_the_next_turn() {
+    let mut server = Server::new(&[]);
+    server.user("abort_late_output", json!({}));
+    server.until(|event| {
+        event["method"] == "item/started" && event["params"]["item"]["type"] == "commandExecution"
+    });
+    server.send(json!({"type": "interrupt", "thread_key": KEY}));
+    assert_eq!(status(&server.read_until("turn/completed")), "interrupted");
+    // OMP's aborted result means the agent yielded, not that the run is
+    // quiescent: it can still emit output. A reused process would hand that
+    // output to the next turn.
+    let turn = server.turn("text", json!({}));
+    assert_eq!(status(&turn), "completed");
+    let messages = items(&turn, "item/completed", "agentMessage");
+    assert_eq!(
+        messages.iter().map(|m| &m["text"]).collect::<Vec<_>>(),
+        [&json!("Hello from the loopback mock.")],
+        "late aborted output crossed into the next turn: {turn:#?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(server.dir.join("argv"))
+            .unwrap()
+            .lines()
+            .count(),
+        2,
+        "an interrupted run must not hand its process to the next turn"
+    );
+    let opened: Vec<_> = server
+        .commands()
+        .into_iter()
+        .filter(|command| command["type"] == "open_session")
+        .collect();
+    assert_eq!(opened.len(), 2);
+    for open in opened {
+        assert_eq!(
+            open["sessionDir"],
+            server
+                .dir
+                .join("sessions")
+                .join(session_dir(KEY))
+                .to_string_lossy()
+                .as_ref()
+        );
+    }
+}
+
+#[test]
+fn a_rejected_steer_fails_the_turn_and_replaces_the_process() {
+    let mut server = Server::mode(&[("OMP_TEST_FAULT", "steer")], "jsonrpc");
+    server.send(
+        json!({"id": 1, "method": "initialize", "params": {"clientInfo": {"name": "omp-steer", "version": "1"}}}),
+    );
+    server.until(|value| value["id"] == 1);
+    server.send(json!({"id": 2, "method": "thread/start", "params": {"cwd": server.dir}}));
+    let thread = server.until(|value| value["id"] == 2).last().unwrap()["result"]["thread"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    server.send(
+        json!({"id": 3, "method": "turn/start", "params": {"threadId": thread, "input": [
+            {"type": "text", "text": "slow"},
+        ]}}),
+    );
+    let mut values = server.until(|value| {
+        value["method"] == "item/started" && value["params"]["item"]["type"] == "commandExecution"
+    });
+    let turn_id = values.last().unwrap()["params"]["turnId"].clone();
+    server.send(json!({"id": 4, "method": "turn/steer", "params": {
+        "threadId": thread, "expectedTurnId": turn_id,
+        "input": [{"type": "text", "text": "keep going"}],
+    }}));
+    values.extend(server.read_until("turn/completed"));
+    assert_eq!(status(&values), "failed");
+    let error = values.last().unwrap()["params"]["turn"]["error"]["message"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(error.contains("omp steer: startup rejected"), "{error}");
+    // The run could no longer be steered, so the next turn starts clean.
+    server.send(
+        json!({"id": 5, "method": "turn/start", "params": {"threadId": thread, "input": [
+            {"type": "text", "text": "text"},
+        ]}}),
+    );
+    let next = server.read_until("turn/completed");
+    assert_eq!(status(&next), "completed", "{next:#?}");
+    assert_eq!(
+        std::fs::read_to_string(server.dir.join("argv"))
+            .unwrap()
+            .lines()
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn an_unacknowledged_prompt_fails_the_turn_and_replaces_the_process() {
+    let mut server = Server::new(&[]);
+    server.timeout = Duration::from_secs(90);
+    let turn = server.turn("no_ack", json!({}));
+    assert_eq!(status(&turn), "failed");
+    let error = turn.last().unwrap()["params"]["turn"]["error"]["message"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        error.contains("did not acknowledge the turn within 30s"),
+        "{error}"
+    );
+    assert_eq!(status(&server.turn("text", json!({}))), "completed");
+    assert_eq!(
+        std::fs::read_to_string(server.dir.join("argv"))
+            .unwrap()
+            .lines()
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn an_acknowledged_prompt_may_stay_quiet_past_the_ack_window() {
+    let mut server = Server::new(&[]);
+    server.timeout = Duration::from_secs(90);
+    server.user("quiet_after_ack", json!({}));
+    // Stay past the acknowledgement window: the prompt was accepted, so a
+    // slow model must not be cut off.
+    let deadline = Instant::now() + Duration::from_secs(31);
+    let mut observed = Vec::new();
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match server.stdout.recv_timeout(remaining) {
+            Ok(value) => observed.push(value),
+            Err(mpsc::RecvTimeoutError::Timeout) => break,
+            Err(error) => panic!("turn output closed early: {error}"),
+        }
+    }
+    assert!(
+        observed
+            .iter()
+            .all(|value| value["method"] != "turn/completed"),
+        "an acknowledged run was cut off: {observed:#?}"
+    );
+    // It is still running: an interrupt ends it normally.
+    server.send(json!({"type": "interrupt", "thread_key": KEY}));
+    assert_eq!(status(&server.read_until("turn/completed")), "interrupted");
+}
+
+#[test]
+fn omp_stderr_is_redacted_and_only_its_size_is_reported() {
+    // The child exits during startup, which ends its stderr and makes the
+    // drain report the tail it withheld.
+    let mut server = Server::new(&[
+        ("OMP_TEST_FAULT", "eof"),
+        ("OMP_TEST_STDERR", "sk-secret-marker"),
+    ]);
+    assert_eq!(status(&server.turn("text", json!({}))), "failed");
+    let log = server.dir.join("server.stderr");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let text = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(!text.contains("sk-secret-marker"), "secret leaked: {text}");
+        if text.contains("stderr tail redacted") {
+            assert!(
+                text.contains("Omp stderr tail redacted ("),
+                "unexpected report: {text}"
+            );
+            break;
+        }
+        assert!(Instant::now() < deadline, "no redaction report: {text}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn an_oversized_physical_line_fails_the_turn_and_replaces_the_process() {
+    let mut server = Server::new(&[]);
+    let turn = server.turn("oversized_line", json!({}));
+    assert_eq!(status(&turn), "failed");
+    let error = turn.last().unwrap()["params"]["turn"]["error"]["message"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(error.contains("stdout line exceeds"), "{error}");
+    assert_eq!(status(&server.turn("text", json!({}))), "completed");
+    assert_eq!(
+        std::fs::read_to_string(server.dir.join("argv"))
+            .unwrap()
+            .lines()
+            .count(),
+        2
+    );
 }
 
 #[test]
@@ -502,21 +968,176 @@ fn unsettled_background_output_stays_in_the_original_turn() {
 }
 
 #[test]
+fn blocks_steering_reaches_the_active_turn_instead_of_queuing_a_second_prompt() {
+    let mut server = Server::new(&[]);
+    server.user("slow", json!({}));
+    server.until(|event| {
+        event["method"] == "item/started" && event["params"]["item"]["type"] == "commandExecution"
+    });
+    server.user(
+        "steered",
+        json!({
+            "client_user_message_id": "blocks-steer-1",
+            "trace_metadata": {"action": "steer_active_execution"},
+        }),
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let steer = loop {
+        if let Some(steer) = server
+            .commands()
+            .into_iter()
+            .find(|command| command["type"] == "steer")
+        {
+            break steer;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "steer never reached the running OMP process: {:#?}",
+            server.commands()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert_eq!(steer["message"], "steered");
+
+    server.send(json!({"type": "interrupt", "thread_key": KEY}));
+    let turn = server.read_until("turn/completed");
+    assert_eq!(status(&turn), "interrupted");
+    assert!(
+        items(&turn, "item/completed", "userMessage")
+            .iter()
+            .any(|item| item["clientId"] == "blocks-steer-1"),
+        "the steer belongs to the interrupted turn: {turn:#?}"
+    );
+
+    // The steer must not surface as a queued prompt for a later turn.
+    assert_eq!(status(&server.turn("text", json!({}))), "completed");
+    assert_eq!(
+        server
+            .commands()
+            .iter()
+            .filter(|command| command["type"] == "prompt")
+            .map(|command| command["message"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["slow", "text"]
+    );
+}
+
+#[test]
+fn late_steer_after_interrupt_settles_runs_as_the_next_pinned_turn() {
+    let mut server = Server::new(&[("OMP_TEST_ABORT_DELAY", "0.5")]);
+    server.user("slow", json!({"model": "custom/base"}));
+    server.until(|event| {
+        event["method"] == "item/started" && event["params"]["item"]["type"] == "commandExecution"
+    });
+    server.send(json!({"type": "interrupt", "thread_key": KEY}));
+    // The abort is in its settlement grace, so a steer now cannot reach the
+    // native steer channel; it must be preserved for the next turn.
+    server.wait_for("aborting");
+    server.user(
+        "late",
+        json!({
+            "client_user_message_id": "blocks-late-steer",
+            "model": "custom/pinned",
+            "provider": "custom",
+            "reasoning": "high",
+            "trace_metadata": {"action": "steer_active_execution"},
+        }),
+    );
+
+    let interrupted = server.read_until("turn/completed");
+    assert_eq!(status(&interrupted), "interrupted");
+    assert!(
+        !server
+            .commands()
+            .iter()
+            .any(|command| command["type"] == "steer"),
+        "the steer arrived after the turn stopped reading: {:#?}",
+        server.commands()
+    );
+
+    let steered = server.read_until("turn/completed");
+    assert_eq!(status(&steered), "completed");
+    assert!(
+        items(&steered, "item/completed", "userMessage")
+            .iter()
+            .any(|item| item["clientId"] == "blocks-late-steer"),
+        "the late steer ran as the next turn: {steered:#?}"
+    );
+    let commands = server.commands();
+    assert_eq!(
+        commands
+            .iter()
+            .filter(|command| command["type"] == "prompt")
+            .map(|command| command["message"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["slow", "late"]
+    );
+    assert!(
+        commands.iter().any(|command| {
+            command["type"] == "open_session"
+                && command["provider"] == "custom"
+                && command["modelId"] == "pinned"
+        }),
+        "the late steer pins its model/provider: {commands:#?}"
+    );
+    assert!(
+        commands
+            .iter()
+            .any(|command| command["type"] == "set_thinking_level" && command["level"] == "high"),
+        "the late steer pins its reasoning level: {commands:#?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(server.dir.join("argv"))
+            .unwrap()
+            .lines()
+            .count(),
+        2,
+        "the interrupted run must not hand its process to the late steer"
+    );
+    let restarted = commands
+        .iter()
+        .position(|command| {
+            command["type"] == "open_session"
+                && command["provider"] == "custom"
+                && command["modelId"] == "pinned"
+        })
+        .unwrap();
+    assert_eq!(
+        commands[restarted]["sessionDir"],
+        server
+            .dir
+            .join("sessions")
+            .join(session_dir(KEY))
+            .to_string_lossy()
+            .as_ref()
+    );
+    let level = |wanted: &str| {
+        commands[restarted..]
+            .iter()
+            .position(|command| {
+                command["type"] == "set_thinking_level" && command["level"] == wanted
+            })
+            .unwrap()
+    };
+    assert!(
+        level("inherit") < level("high"),
+        "a respawn inherits the saved level before this turn's level: {commands:#?}"
+    );
+}
+
+#[test]
 fn startup_failures_never_send_a_prompt_and_next_turn_retries() {
     for fault in [
         "negotiate_protocol",
         "set_event_filter",
         "open_session",
         "set_cache_warming",
-        "set_thinking_level",
         "v1",
         "eof",
         "cancelled",
     ] {
-        let mut server = Server::new(&[
-            ("OMP_TEST_FAULT", fault),
-            ("CENTAUR_OMP_MODEL", "custom/new-model"),
-        ]);
+        let mut server =
+            Server::new(&[("OMP_TEST_FAULT", fault), ("OMP_MODEL", "custom/new-model")]);
         for extra in [json!({"model": "custom/requested"}), json!({})] {
             assert_eq!(status(&server.turn("text", extra)), "failed", "{fault}");
         }
@@ -550,12 +1171,17 @@ fn interrupt_and_model_switch_reopen_the_same_session() {
     });
     server.send(json!({"type": "interrupt", "thread_key": KEY}));
     assert_eq!(status(&server.read_until("turn/completed")), "interrupted");
+    // The interrupt replaces the process; the next turn reopens the session.
     assert_eq!(status(&server.turn("text", json!({}))), "completed");
     assert_eq!(
         status(&server.turn("text", json!({"model": "custom/switched"}))),
         "completed"
     );
     let commands = server.commands();
+    assert!(
+        commands.iter().any(|c| c["type"] == "abort"),
+        "an interrupt must abort the turn in-band"
+    );
     let opened: Vec<_> = commands
         .iter()
         .filter(|c| c["type"] == "open_session")
@@ -572,16 +1198,24 @@ fn interrupt_and_model_switch_reopen_the_same_session() {
             open["sessionDir"],
             server
                 .dir
-                .join("sessions/centaur-slack-C123-123.456")
+                .join("sessions")
+                .join(session_dir(KEY))
                 .to_string_lossy()
                 .as_ref()
         );
     }
+    assert_eq!(
+        std::fs::read_to_string(server.dir.join("argv"))
+            .unwrap()
+            .lines()
+            .count(),
+        3
+    );
 }
 
 #[test]
 fn unavailable_model_restores_the_last_working_model() {
-    let mut server = Server::new(&[("CENTAUR_OMP_MODEL", "custom/default")]);
+    let mut server = Server::new(&[("OMP_MODEL", "custom/default")]);
     assert_eq!(
         status(&server.turn("text", json!({"model": "custom/working"}))),
         "completed"
@@ -623,6 +1257,55 @@ fn unrestorable_saved_model_fails_until_a_turn_names_a_model() {
         status(&server.turn("text", json!({"model": "custom/named"}))),
         "completed"
     );
+}
+
+#[test]
+fn bare_model_uses_the_blocks_provider_or_the_sessions_own() {
+    // A provider beside the model goes into open_session with the turn's model.
+    let mut server = Server::new(&[]);
+    assert_eq!(
+        status(&server.turn(
+            "text",
+            json!({"model": "glm-5.2-fp8", "provider": "custom"})
+        )),
+        "completed"
+    );
+    let commands = server.commands();
+    let open = commands
+        .iter()
+        .find(|command| command["type"] == "open_session")
+        .unwrap();
+    assert_eq!(open["provider"], "custom");
+    assert_eq!(open["modelId"], "glm-5.2-fp8");
+    assert!(
+        !commands
+            .iter()
+            .any(|command| command["type"] == "set_model"),
+        "{commands:#?}"
+    );
+    server.close();
+
+    // Without one, the resumed session's own provider is kept.
+    let mut server = Server::new(&[("OMP_MODEL", "glm-5.2-fp8")]);
+    assert_eq!(status(&server.turn("text", json!({}))), "completed");
+    let commands = server.commands();
+    let open = commands
+        .iter()
+        .find(|command| command["type"] == "open_session")
+        .unwrap();
+    assert!(open.get("provider").is_none(), "{open:#?}");
+    assert!(open.get("modelId").is_none(), "{open:#?}");
+    let set_model = commands
+        .iter()
+        .find(|command| command["type"] == "set_model")
+        .unwrap();
+    assert_eq!(set_model["provider"], "litellm");
+    assert_eq!(set_model["modelId"], "glm-5.2-fp8");
+    let sequence = kinds(&commands);
+    let position = |kind: &str| sequence.iter().position(|entry| *entry == kind).unwrap();
+    assert!(position("open_session") < position("get_state"));
+    assert!(position("get_state") < position("set_model"));
+    assert!(position("set_model") < position("set_cache_warming"));
 }
 
 #[test]
@@ -676,7 +1359,7 @@ fn jsonrpc_preserves_image_paths_when_attachments_cannot_be_inlined() {
         server
             .dir
             .join("sessions")
-            .join(format!("centaur-{thread}"))
+            .join(session_dir(&thread))
             .to_string_lossy()
             .as_ref()
     );
@@ -704,11 +1387,11 @@ fn real_omp_streaming_steer_and_resume() {
         std::env::var("ANTHROPIC_API_KEY").is_ok_and(|key| !key.is_empty()),
         "set ANTHROPIC_API_KEY before running real OMP tests"
     );
-    let binary = std::env::var_os("CENTAUR_OMP_BIN").unwrap_or_else(|| "omp".into());
+    let binary = std::env::var_os("OMP_BIN").unwrap_or_else(|| "omp".into());
     let version = Command::new(&binary)
         .arg("--version")
         .output()
-        .expect("real omp on PATH or CENTAUR_OMP_BIN");
+        .expect("real omp on PATH or OMP_BIN");
     assert!(version.status.success(), "OMP --version failed");
     let model = std::env::var("CENTAUR_REAL_OMP_MODEL")
         .unwrap_or_else(|_| "anthropic/claude-sonnet-5".to_string());
@@ -717,7 +1400,12 @@ fn real_omp_streaming_steer_and_resume() {
     let thread = format!("real-omp-{}", Uuid::new_v4().simple());
     let codeword = format!("OMP_MEMORY_{}", Uuid::new_v4().simple());
     let acknowledgement = format!("STEER_{}", Uuid::new_v4().simple());
-    let mut server = Server::with_binary(dir.clone(), "jsonrpc", &binary, &[]);
+    let mut server = Server::with_binary(
+        dir.clone(),
+        "jsonrpc",
+        &binary,
+        &[("OMP_BIN", binary.to_str().unwrap())],
+    );
     server.timeout = Duration::from_secs(300);
     resume(&mut server, &thread, &model);
     server.send(json!({"id": 3, "method": "turn/start", "params": {"threadId": thread, "input": [{"type": "text", "text": format!("Remember the codeword {codeword} for later. First run exactly `sleep 5` with bash. Then produce 300 numbered lines. If an update arrives, follow it.")}]}}));
@@ -776,7 +1464,12 @@ fn real_omp_streaming_steer_and_resume() {
     server.child.kill().unwrap();
     server.child.wait().unwrap();
 
-    let mut resumed = Server::with_binary(dir, "jsonrpc", &binary, &[]);
+    let mut resumed = Server::with_binary(
+        dir,
+        "jsonrpc",
+        &binary,
+        &[("OMP_BIN", binary.to_str().unwrap())],
+    );
     resumed.timeout = Duration::from_secs(300);
     resume(&mut resumed, &thread, &model);
     resumed.send(json!({"id": 3, "method": "turn/start", "params": {"threadId": thread, "effort": "none", "input": [{"type": "text", "text": "Without using tools, what exact codeword did I ask you to remember earlier? Reply with only that codeword."}]}}));

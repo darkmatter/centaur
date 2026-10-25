@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import os
+from collections.abc import Sequence
 from pathlib import Path
 
 
@@ -37,6 +38,8 @@ def compose_system_prompt(
     home_dir: Path,
     target_prompt: Path,
     repo_mount: Path,
+    configured_prompt_files: Sequence[Path] | None = None,
+    legacy_overlay_dir: Path | None = None,
     observability_enabled: bool = True,
 ) -> None:
     base_prompt = home_dir / "AGENTS_BASE.md"
@@ -46,20 +49,33 @@ def compose_system_prompt(
         return
 
     fragments = [selected_base.read_text()]
-    appended: set[Path] = set()
-
     home_overlay = home_dir / "AGENTS_OVERLAY.md"
-    if _append_file_fragment(fragments, home_overlay):
-        appended.add(home_overlay.resolve())
 
-    for prompt_path in _mounted_overlay_prompts(repo_mount, baked_prompt):
-        if not prompt_path.is_file():
-            continue
-        resolved = prompt_path.resolve()
-        if resolved in appended:
-            continue
-        if _append_file_fragment(fragments, prompt_path):
-            appended.add(resolved)
+    if configured_prompt_files is not None:
+        matched = False
+        for prompt_path in reversed(configured_prompt_files):
+            if _append_file_fragment(fragments, prompt_path):
+                matched = True
+                break
+        if not matched:
+            if not _append_file_fragment(fragments, home_overlay) and legacy_overlay_dir is not None:
+                _append_file_fragment(fragments, legacy_overlay_dir / OVERLAY_PROMPT)
+    elif legacy_overlay_dir is not None:
+        if not _append_file_fragment(fragments, home_overlay):
+            _append_file_fragment(fragments, legacy_overlay_dir / OVERLAY_PROMPT)
+    else:
+        appended: set[Path] = set()
+        if _append_file_fragment(fragments, home_overlay):
+            appended.add(home_overlay.resolve())
+
+        for prompt_path in _mounted_overlay_prompts(repo_mount, baked_prompt):
+            if not prompt_path.is_file():
+                continue
+            resolved = prompt_path.resolve()
+            if resolved in appended:
+                continue
+            if _append_file_fragment(fragments, prompt_path):
+                appended.add(resolved)
 
     persona_prompt_path = home_dir / PERSONA_PROMPT
     if persona_prompt_path.is_file():
@@ -80,10 +96,17 @@ def main() -> int:
     args = parser.parse_args()
 
     home_dir = Path(args.home_dir)
+    prompt_files = os.environ.get("CENTAUR_OVERLAY_PROMPT_FILES")
+    configured_prompt_files = (
+        [Path(path) for path in prompt_files.split(os.pathsep) if path] if prompt_files else None
+    )
+    legacy_overlay_dir = os.environ.get("CENTAUR_OVERLAY_DIR")
     compose_system_prompt(
         home_dir=home_dir,
         target_prompt=Path(args.target_prompt),
         repo_mount=Path(args.repo_mount) if args.repo_mount else home_dir / "github",
+        configured_prompt_files=configured_prompt_files,
+        legacy_overlay_dir=Path(legacy_overlay_dir) if legacy_overlay_dir else None,
         observability_enabled=os.environ.get(
             "CENTAUR_SANDBOX_OBSERVABILITY_ENABLED", "true"
         ).lower()

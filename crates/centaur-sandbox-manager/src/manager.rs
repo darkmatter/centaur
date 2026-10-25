@@ -1,8 +1,8 @@
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use centaur_sandbox_core::{
-    ObservedSandbox, SandboxBackend, SandboxHandle, SandboxId, SandboxIo, SandboxResult,
-    SandboxSpec, SandboxStatus,
+    ObservedSandbox, SandboxBackend, SandboxCommandOutput, SandboxHandle, SandboxId, SandboxIo,
+    SandboxResult, SandboxSpec, SandboxStatus,
 };
 use centaur_telemetry::{record_sandbox_operation, record_sandbox_startup_duration};
 use tokio::time::Instant;
@@ -118,6 +118,14 @@ impl SandboxManager {
             sandbox_id = %id.as_str(),
         ))
         .await
+    }
+
+    pub async fn exec(
+        &self,
+        id: &SandboxId,
+        command: &[String],
+    ) -> SandboxResult<SandboxCommandOutput> {
+        self.backend.exec(id, command).await
     }
 
     pub async fn status(&self, id: &SandboxId) -> SandboxResult<SandboxStatus> {

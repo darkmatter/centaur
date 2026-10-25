@@ -5,6 +5,11 @@
 //! backend's migrations share the core version sequence and are merged into it
 //! by version, so every search migration runs right after the core migrations
 //! it was written against, on fresh and existing databases alike.
+//!
+//! Applied core migration files are immutable (`migrations/migrations.lock`).
+//! Where a file's SQL must no longer run as written, the replacement lives in
+//! `core-migration-overrides/` under the same file name and runs with the
+//! original file's checksum, which is what existing databases recorded.
 
 use std::{borrow::Cow, fmt, future::Future, pin::Pin, str::FromStr};
 
@@ -21,34 +26,45 @@ static CORE_MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 static PARADEDB_MIGRATOR: Migrator = sqlx::migrate!("./search-migrations/paradedb");
 static POSTGRES_MIGRATOR: Migrator = sqlx::migrate!("./search-migrations/postgres");
 
-/// SHA-384 checksums that databases recorded for core migrations before their
-/// ParadeDB statements moved to the `paradedb` text-search backend. Presenting
-/// the recorded checksum keeps those databases valid without rewriting
-/// `_sqlx_migrations`; fresh databases record the same values.
-const LEGACY_CHECKSUMS: [(i64, &str); 6] = [
+/// SQL that runs in place of an immutable core migration file, keeping that
+/// file's checksum.
+///
+/// - 12, 28, 29, 30, 40, and 46 created ParadeDB BM25 indexes before keyword
+///   search moved to the text-search backends (`search-migrations/*/0061_*`).
+///   Their overrides only delete the `pg_search` statements.
+/// - 54 arrived from upstream with a harness constraint that omits the fork's
+///   `omp` harness, so applying it as written fails on databases with `omp`
+///   sessions. Its override keeps `omp` in the allowed set.
+const CORE_SQL_OVERRIDES: [(i64, &str); 7] = [
     (
         12,
-        "4c5484e974feda89ced85376ababe05457ebc1e9d2756b835c39fcf9c010a318f22166988da9f82d6b10da4587d1de38",
+        include_str!("../core-migration-overrides/0012_company_context_documents.sql"),
     ),
     (
         28,
-        "fd4aaae62dd5fd310ac028c335dfda19eb2169c199b738c068fb1ef0716426ff00623382f18be5f1a33ef4f7ebf109e3",
+        include_str!("../core-migration-overrides/0028_slack_dm_context_documents.sql"),
     ),
     (
         29,
-        "c472c35a307682a84bee8172af27348457442b6d7598dab1eaa23ac8068c79d33c544fa078ded09b130792ab673f0142",
+        include_str!(
+            "../core-migration-overrides/0029_slack_dm_conversation_context_documents.sql"
+        ),
     ),
     (
         30,
-        "2feeec8685e4e70ab831710247fe775c160fb97a7d5802cdfc9abaaebca914b5b6ddd49640cb5779bdf256d6595ea1b0",
+        include_str!("../core-migration-overrides/0030_google_docs_oauth_sync_tables.sql"),
     ),
     (
         40,
-        "65cbd5bafcfd4e124d51bd99cc501fee923e87882d1032dad34f4cfba3fd78b5d4869b61bb765f8d76310e520f44cac2",
+        include_str!("../core-migration-overrides/0040_granola_sync_tables.sql"),
     ),
     (
-        45,
-        "8e1ee367cc62f1ffde0b4fad158291266ef78598ab613136822c9703d4fe049b883fd588328b894cb05480b0765b393e",
+        46,
+        include_str!("../core-migration-overrides/0046_slack_private_channel_oauth_sync.sql"),
+    ),
+    (
+        54,
+        include_str!("../core-migration-overrides/0054_hermes_harness.sql"),
     ),
 ];
 
@@ -113,12 +129,12 @@ pub fn migration_list(backend: TextSearchBackend) -> Vec<Migration> {
         .iter()
         .cloned()
         .map(|mut migration| {
-            if let Some((_, checksum)) = LEGACY_CHECKSUMS
+            if let Some((_, sql)) = CORE_SQL_OVERRIDES
                 .iter()
                 .find(|(version, _)| *version == migration.version)
             {
-                migration.checksum =
-                    Cow::Owned(hex::decode(checksum).expect("legacy checksums are valid hex"));
+                // `checksum` stays the file's, as databases recorded it.
+                migration.sql = Cow::Borrowed(sql);
             }
             migration
         })
@@ -268,25 +284,93 @@ mod tests {
         }
     }
 
+    /// Core migrations that created BM25 indexes before the backends split.
+    const BM25_CORE_VERSIONS: [i64; 6] = [12, 28, 29, 30, 40, 46];
+
+    /// Whether any statement, ignoring `--` comment lines, needs ParadeDB.
+    fn needs_paradedb(sql: &str) -> bool {
+        sql.lines()
+            .filter(|line| !line.trim_start().starts_with("--"))
+            .map(str::to_ascii_lowercase)
+            .any(|line| line.contains("bm25") || line.contains("pg_search"))
+    }
+
     #[test]
-    fn legacy_checksums_replace_only_edited_core_migrations() {
-        let core = versions(&CORE_MIGRATOR);
-        for (version, _) in LEGACY_CHECKSUMS {
+    fn overrides_change_only_sql_of_their_core_migrations() {
+        let overridden: BTreeSet<i64> = CORE_SQL_OVERRIDES
+            .iter()
+            .map(|(version, _)| *version)
+            .collect();
+        assert_eq!(overridden.len(), CORE_SQL_OVERRIDES.len());
+        for backend in TextSearchBackend::ALL {
+            let merged = migration_list(backend);
+            let mut changed = BTreeSet::new();
+            for original in CORE_MIGRATOR.iter() {
+                let migration = merged
+                    .iter()
+                    .find(|migration| migration.version == original.version)
+                    .expect("core migration is merged");
+                assert_eq!(
+                    migration.checksum, original.checksum,
+                    "{backend} migration {} changes the checksum databases recorded",
+                    original.version
+                );
+                if migration.sql != original.sql {
+                    changed.insert(original.version);
+                }
+            }
+            assert_eq!(changed, overridden, "{backend} overrides the wrong SQL");
+        }
+    }
+
+    #[test]
+    fn bm25_overrides_only_delete_paradedb_statements() {
+        let merged = migration_list(TextSearchBackend::Postgres);
+        for version in BM25_CORE_VERSIONS {
+            let original = CORE_MIGRATOR
+                .iter()
+                .find(|migration| migration.version == version)
+                .expect("BM25 core migration exists");
+            let applied = merged
+                .iter()
+                .find(|migration| migration.version == version)
+                .expect("BM25 core migration is merged");
+            assert!(needs_paradedb(&original.sql));
             assert!(
-                core.contains(&version),
-                "legacy version {version} is not a core migration"
+                !needs_paradedb(&applied.sql),
+                "override for {version} still needs ParadeDB"
+            );
+            // Every override line appears in the original, in order.
+            let mut original_lines = original.sql.lines();
+            for line in applied.sql.lines() {
+                assert!(
+                    original_lines.any(|original| original == line),
+                    "override for {version} adds or reorders {line:?}"
+                );
+            }
+        }
+        for migration in merged {
+            assert!(
+                !needs_paradedb(&migration.sql),
+                "core or postgres migration {} needs ParadeDB",
+                migration.version
             );
         }
-        let merged = migration_list(TextSearchBackend::Postgres);
-        for (migration, original) in merged
+    }
+
+    #[test]
+    fn hermes_override_keeps_omp_sessions_valid() {
+        let original = CORE_MIGRATOR
             .iter()
-            .filter(|migration| core.contains(&migration.version))
-            .zip(CORE_MIGRATOR.iter())
-        {
-            let legacy = LEGACY_CHECKSUMS
-                .iter()
-                .any(|(version, _)| *version == migration.version);
-            assert_eq!(migration.checksum != original.checksum, legacy);
-        }
+            .find(|migration| migration.version == 54)
+            .expect("hermes migration exists");
+        let (_, applied) = CORE_SQL_OVERRIDES
+            .iter()
+            .find(|(version, _)| *version == 54)
+            .expect("hermes override exists");
+        let upstream = "'codex', 'amp', 'claudecode', 'nanocodex', 'hermes'";
+        let fork = "'codex', 'amp', 'claudecode', 'nanocodex', 'omp', 'hermes'";
+        assert!(original.sql.contains(upstream));
+        assert_eq!(*applied, original.sql.replacen(upstream, fork, 1));
     }
 }

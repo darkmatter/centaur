@@ -62,6 +62,7 @@ const options: SlackbotV2Options = {
   channelDefaults: parseChannelDefaults(optionalEnv('SLACKBOTV2_CHANNEL_DEFAULTS'), reason =>
     consoleLogger.warn('slackbotv2 SLACKBOTV2_CHANNEL_DEFAULTS', { reason })
   ),
+  ompViewerUrl: optionalEnv('CENTAUR_OMP_VIEWER_URL'),
   responseMetadataMode: responseMetadataModeEnv('SLACKBOTV2_RESPONSE_METADATA_MODE'),
   responseServiceTierEnabled: booleanEnv('SLACKBOTV2_RESPONSE_SERVICE_TIER_ENABLED', false),
   defaultHarnessType,
@@ -75,7 +76,7 @@ const options: SlackbotV2Options = {
       ? { codex: optionalEnv('CODEX_MODEL')!, nanocodex: optionalEnv('CODEX_MODEL')! }
       : {}),
     ...(optionalEnv('CENTAUR_PI_MODEL') ? { pi: optionalEnv('CENTAUR_PI_MODEL')! } : {}),
-    ...(optionalEnv('CENTAUR_OMP_MODEL') ? { omp: optionalEnv('CENTAUR_OMP_MODEL')! } : {})
+    ...(optionalEnv('OMP_MODEL') ? { omp: optionalEnv('OMP_MODEL')! } : {})
   },
   harnessDefaultReasoning: optionalEnv('CODEX_MODEL_REASONING_EFFORT')
     ? {

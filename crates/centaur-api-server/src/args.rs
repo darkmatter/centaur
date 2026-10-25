@@ -937,6 +937,12 @@ struct SandboxArgs {
     )]
     iron_control_sync_infra_secrets: bool,
     #[arg(
+        long = "session-sandbox-default-repo-cache-access",
+        env = "SESSION_SANDBOX_DEFAULT_REPO_CACHE_ACCESS",
+        default_value = ""
+    )]
+    default_repo_cache_access: String,
+    #[arg(
         long = "workflow-host-sandbox",
         env = "WORKFLOW_HOST_SANDBOX",
         default_value_t = true
@@ -2270,11 +2276,9 @@ impl IronProxyHarnessArgs {
     fn fragment(&self) -> Result<ProxyFragment, ServerError> {
         let engine = harness_fragment_engine_name(&self.engine);
         let auth_mode = self.resolved_auth_mode();
-        // Pi and OMP read placeholder API keys from the environment; they have
-        // no subscription (access_token) credential path.
-        if matches!(self.engine, HarnessType::Pi | HarnessType::Omp)
-            && auth_mode.replace('-', "_") != "api_key"
-        {
+        // Pi reads placeholder API keys from the environment; it has no
+        // subscription (access_token) credential path.
+        if self.engine == HarnessType::Pi && auth_mode.replace('-', "_") != "api_key" {
             let engine = &self.engine;
             return Err(ServerError::UnsupportedConfig(format!(
                 "the {engine} harness supports only api_key auth, not {auth_mode}"
@@ -2293,11 +2297,19 @@ impl IronProxyHarnessArgs {
     /// so sessions restarted onto another harness still get working
     /// credentials through the proxy.
     fn fragments(&self) -> Result<Vec<ProxyFragment>, ServerError> {
-        let mut fragments = vec![self.fragment()?];
+        let mut fragments = Vec::new();
+        // Engines with no auth-mode source (amp, omp — credentials reach the
+        // sandbox as plain env, not proxy-injected) have no infra fragment to
+        // require. An explicit KUBERNETES_IRON_PROXY_HARNESS_AUTH_MODE still
+        // forces resolution (and fails loudly on an unknown pair).
+        if self.auth_mode.is_some() || harness_auth_mode_env(&self.engine).is_some() {
+            fragments.push(self.fragment()?);
+        }
         for engine in [
             HarnessType::Codex,
             HarnessType::ClaudeCode,
             HarnessType::Amp,
+            HarnessType::Omp,
         ] {
             if harness_fragment_engine_name(&engine) == harness_fragment_engine_name(&self.engine) {
                 continue;
@@ -2340,9 +2352,10 @@ fn harness_fragment_engine_name(engine: &HarnessType) -> &'static str {
         HarnessType::Amp => "amp",
         HarnessType::ClaudeCode => "claude-code",
         HarnessType::Nanocodex => "codex",
+        HarnessType::Omp => "omp",
         HarnessType::Hermes => "hermes",
-        // Pi and OMP default to Anthropic when its key is present.
-        HarnessType::Pi | HarnessType::Omp => "claude-code",
+        // Pi defaults to Anthropic when its key is present.
+        HarnessType::Pi => "claude-code",
     }
 }
 
@@ -2358,10 +2371,11 @@ fn merge_fragment(target: &mut ProxyFragment, source: ProxyFragment) {
 fn harness_auth_mode_env(engine: &HarnessType) -> Option<String> {
     match engine {
         HarnessType::Codex | HarnessType::Nanocodex => env::var("CODEX_AUTH_MODE").ok(),
-        HarnessType::ClaudeCode | HarnessType::Pi | HarnessType::Omp => {
-            env::var("CLAUDE_CODE_AUTH_MODE").ok()
-        }
+        HarnessType::ClaudeCode | HarnessType::Pi => env::var("CLAUDE_CODE_AUTH_MODE").ok(),
         HarnessType::Amp => None,
+        // omp gets its upstream key through the plain sandbox env (LiteLLM
+        // gateway), not an iron-proxy auth fragment — the amp pattern.
+        HarnessType::Omp => None,
         // Hermes resolves providers through its own credential store /
         // iron-proxy placeholder injection; no dedicated auth-mode env.
         HarnessType::Hermes => None,
@@ -3801,25 +3815,23 @@ mod tests {
     fn pi_uses_anthropic_api_key_placeholder_and_rejects_access_token() {
         let _guard = ENV_LOCK.lock().unwrap();
         let _env = EnvGuard::set(&[("CLAUDE_CODE_AUTH_MODE", "api_key")]);
-        for engine in [HarnessType::Pi, HarnessType::Omp] {
-            let pi = |auth_mode: Option<&str>| IronProxyHarnessArgs {
-                engine: engine.clone(),
-                auth_mode: auth_mode.map(str::to_owned),
-            };
+        let pi = |auth_mode: Option<&str>| IronProxyHarnessArgs {
+            engine: HarnessType::Pi,
+            auth_mode: auth_mode.map(str::to_owned),
+        };
 
-            let fragment = pi(None).fragment().unwrap();
-            let replaced: Vec<_> = fragment
-                .transforms
-                .iter()
-                .flat_map(|transform| &transform.config.secrets)
-                .filter_map(|secret| secret.replace.as_ref()?.proxy_value.as_deref())
-                .collect();
-            assert_eq!(replaced, ["ANTHROPIC_API_KEY"]);
-            pi(Some("api-key")).fragment().unwrap();
+        let fragment = pi(None).fragment().unwrap();
+        let replaced: Vec<_> = fragment
+            .transforms
+            .iter()
+            .flat_map(|transform| &transform.config.secrets)
+            .filter_map(|secret| secret.replace.as_ref()?.proxy_value.as_deref())
+            .collect();
+        assert_eq!(replaced, ["ANTHROPIC_API_KEY"]);
+        pi(Some("api-key")).fragment().unwrap();
 
-            let error = pi(Some("access_token")).fragment().unwrap_err();
-            assert!(error.to_string().contains("only api_key"), "{error}");
-        }
+        let error = pi(Some("access_token")).fragment().unwrap_err();
+        assert!(error.to_string().contains("only api_key"), "{error}");
     }
 
     #[test]

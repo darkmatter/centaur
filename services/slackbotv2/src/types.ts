@@ -137,6 +137,8 @@ export type SlackbotV2Options = {
   autoJoinCreatedChannels?: boolean
   botToken: string
   botUserId?: string
+  /** Tailnet-only OMP viewer origin. Unset leaves export requests to the agent. */
+  ompViewerUrl?: string
   /** Controls whether response metadata renders on the first, every, or no live responses. */
   responseMetadataMode?: 'first' | 'always' | 'never'
   /** Include the Codex service tier in response metadata footers when they render. */
@@ -157,7 +159,7 @@ export type SlackbotV2Options = {
   /**
    * Deployment-configured default model per harness wire value (claudecode |
    * codex | nanocodex | pi | omp), from the CLAUDE_MODEL / CODEX_MODEL /
-   * CENTAUR_PI_MODEL / CENTAUR_OMP_MODEL env vars the chart mirrors
+   * CENTAUR_PI_MODEL / OMP_MODEL env vars the chart mirrors
    * out of sandbox.extraEnv. Display/metadata only — never forwarded to the
    * harness. Unset harnesses fall back to the models pinned in this repo's
    * harness config files (see response-context.ts).

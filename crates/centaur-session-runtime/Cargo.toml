@@ -6,6 +6,8 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+aws-config.workspace = true
+aws-sdk-s3.workspace = true
 async-trait.workspace = true
 centaur-iron-control.workspace = true
 centaur-sandbox-core.workspace = true
@@ -21,6 +23,7 @@ serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
+time.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "sync", "time"] }
 tokio-util = { workspace = true, features = ["codec"] }
 tracing.workspace = true
@@ -28,7 +31,6 @@ uuid.workspace = true
 
 [dev-dependencies]
 sqlx.workspace = true
-time.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "rt-multi-thread", "sync", "time"] }
 uuid.workspace = true
 

@@ -208,6 +208,8 @@ ENV PATH="/home/agent/.cargo/bin:/home/agent/.local/bin:/home/agent/.foundry/bin
 ARG FOUNDRY_VERSION=v1.7.0
 ARG AMP_CLI_VERSION=0.0.1774529752-g94f44d
 ARG MANIM_VERSION=0.20.1
+# omp (@oh-my-pi/pi-coding-agent) requires bun >= 1.3.14 (its bin shim is a
+# `#!/usr/bin/env bun` script); keep this pin at or above that.
 ARG BUN_VERSION=bun-v1.3.14
 ARG OMP_VERSION=18.8.6
 
@@ -233,6 +235,14 @@ RUN curl -fsSL https://bun.sh/install | bash -s "${BUN_VERSION}"
 # transformers, speech), off by default and about 600 MB. Omitting them also
 # omits pi-natives' platform addon, so that is installed explicitly. Bun still
 # downloads them into its cache, which is dropped; the install keeps its files.
+COPY --link --chmod=755 services/sandbox/apply_omp_interrupt_boundary_patch.py /usr/local/bin/apply-omp-interrupt-boundary-patch
+# OMP's context builder drops an assistant turn aborted by the user when it has
+# no output, so a restored session can read the next prompt as a continuation of
+# the cancelled request. Patch the freshly installed global package once, in the
+# same layer: the install cache was just removed, and the patch script's atomic
+# replacements break Bun's hardlinks, so no shared cache is mutated. Fail closed
+# if the global package root is a symlink. Every caller (PATH `omp`, the harness,
+# and native subagents) then resolves the same fixed CLI.
 RUN set -eux; \
     omp_platform="$(case "$(dpkg --print-architecture)" in \
       amd64) echo linux-x64 ;; \
@@ -243,6 +253,11 @@ RUN set -eux; \
       "@oh-my-pi/pi-coding-agent@${OMP_VERSION}" \
       "@oh-my-pi/pi-natives-${omp_platform}@${OMP_VERSION}"; \
     rm -rf "$HOME/.bun/install/cache"; \
+    global_modules="${BUN_INSTALL:-$HOME/.bun}/install/global/node_modules"; \
+    package_root="$global_modules/@oh-my-pi/pi-coding-agent"; \
+    test -d "$package_root"; \
+    test ! -L "$package_root"; \
+    apply-omp-interrupt-boundary-patch --package-root "$package_root"; \
     omp --version | grep -Fx "omp/${OMP_VERSION}"
 RUN --mount=type=cache,target=/home/agent/.cache/uv,uid=1001,gid=1001,sharing=locked \
     uv tool install "manim==${MANIM_VERSION}" \
@@ -289,7 +304,7 @@ RUN --mount=type=cache,target=/home/agent/.npm,uid=1001,gid=1001,sharing=locked 
     && test -s .agents/skills/agent-browser/SKILL.md
 # git-branch configures each writable clone with the publishing GitHub account.
 # A baked agent identity would reappear as a co-author when GitHub squash-merges its commits.
-RUN mkdir -p ~/.amp/bin ~/.config/amp ~/.codex ~/github ~/workspace \
+RUN mkdir -p ~/.amp/bin ~/.config/amp ~/.codex ~/.omp/agent ~/github ~/workspace \
     && git config --global init.defaultBranch main \
     && git config --global push.autoSetupRemote true \
     && git config --global core.hooksPath /opt/centaur/git-hooks \
@@ -341,6 +356,10 @@ COPY --link --chmod=755 services/sandbox/centaur_tool_host.py /usr/local/bin/cen
 COPY --link --chmod=755 services/sandbox/compose_system_prompt.py /usr/local/bin/compose-system-prompt
 COPY --link --chmod=755 services/sandbox/repo_cache_sync.py /usr/local/bin/repo-cache-sync
 COPY --link --chmod=755 services/sandbox/repo_cache_watch.py /usr/local/bin/repo-cache-watch
+COPY --link --chmod=755 services/sandbox/mint-github-token.mjs /usr/local/bin/mint-github-token.mjs
+# Shadows apt's /usr/bin/gh on PATH: re-reads the background-refreshed
+# installation token per invocation (see entrypoint.sh github token section).
+COPY --link --chmod=755 services/sandbox/gh-wrapper.sh /usr/local/bin/gh
 COPY --link --chmod=755 services/sandbox/entrypoint.sh /entrypoint.sh
 COPY --link --chown=1001:1001 --from=harness-server-build /home/agent/harness-server/bin/harness-server /home/agent/.local/bin/harness-server
 

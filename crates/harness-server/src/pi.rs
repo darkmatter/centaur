@@ -298,7 +298,7 @@ impl HarnessServer for PiHarness {
         "pi"
     }
 
-    fn command_for_turn(&self, state: &ThreadState) -> ProcessCommand {
+    fn command_for_turn(&self, state: &ThreadState, _input: &[UserInput]) -> ProcessCommand {
         let bin = env::var("CENTAUR_PI_BIN").unwrap_or_else(|_| "pi".to_string());
         let mut command = ProcessCommand::new(bin);
         // `--approve` trusts the workspace's project resources, such as the

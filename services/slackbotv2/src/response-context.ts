@@ -106,7 +106,7 @@ const CODEX_CONFIG = codexConfig as {
 // (sandbox.extraEnv) get the same values mirrored into slackbotv2 by the chart
 // and passed here through SlackbotV2Options.harnessDefaultModels, which takes
 // precedence. Pi and OMP defaults come only from CENTAUR_PI_MODEL and
-// CENTAUR_OMP_MODEL. Amp has no fixed default model (deep/fast modes), so it is
+// OMP_MODEL. Amp has no fixed default model (deep/fast modes), so it is
 // intentionally absent.
 const BAKED_DEFAULT_MODELS: Record<string, string | undefined> = {
   claudecode: typeof claudeSettings.model === 'string' ? claudeSettings.model : undefined,

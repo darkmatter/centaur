@@ -42,6 +42,9 @@ pub struct HarnessChild {
     pub stdout: Receiver<io::Result<String>>,
     /// Model the process was started with.
     pub model: String,
+    /// Model provider the process was started with, when the harness takes one
+    /// per turn; it is part of the process identity.
+    pub model_provider: String,
     /// Reasoning effort last applied in-band; a fresh process runs its default.
     pub reasoning_effort: Option<String>,
 }
@@ -72,7 +75,11 @@ pub trait HarnessServer {
     fn cli_version(&self) -> &'static str;
     fn default_model(&self) -> String;
     fn default_model_provider(&self) -> &'static str;
-    fn command_for_turn(&self, state: &ThreadState) -> ProcessCommand;
+    /// The process to spawn for a turn. `input` is this turn's user input:
+    /// one-shot harnesses that take the prompt as a command argument build it
+    /// into the argv; resident harnesses (claude, amp, pi, omp) ignore it and
+    /// receive the input through `stdin_for_turn` after their startup hook.
+    fn command_for_turn(&self, state: &ThreadState, input: &[UserInput]) -> ProcessCommand;
     /// Initializes a freshly spawned process. No startup I/O by default.
     fn on_process_start(&self, _state: &ThreadState, _process: &mut HarnessChild) -> Result<()> {
         Ok(())
@@ -92,6 +99,49 @@ pub trait HarnessServer {
     fn stdin_for_turn(&self, input: &[UserInput]) -> Result<Vec<u8>>;
     fn stdin_for_steer(&self, input: &[UserInput]) -> Result<Vec<u8>> {
         self.stdin_for_turn(input)
+    }
+    /// Whether a blocks-mode user line tagged `steer_active_execution` steers
+    /// the turn in flight instead of being queued as the next turn. Off by
+    /// default: a harness whose blocks reader has no native steer keeps the
+    /// previous queueing behavior.
+    fn steers_blocks_active_turn(&self) -> bool {
+        false
+    }
+    /// Ends the active turn and its process: an interrupted run must not hand
+    /// its process, or output still in flight, to the next turn. A harness may
+    /// drain its abort acknowledgement first, but must still replace the
+    /// process; the next turn resumes the harness's own session.
+    fn interrupt_turn(&self, process: &mut HarnessChild) -> Result<()> {
+        process.kill_and_wait()?;
+        Ok(())
+    }
+    /// Bounds on the stdout reader for harnesses whose output is hostile or
+    /// resource-hungry. `None` reads unbounded lines into an unbounded queue.
+    fn stdout_limits(&self) -> Option<StdoutLimits> {
+        None
+    }
+    /// Whether a blocks turn's `provider` overrides the thread's model
+    /// provider. Off by default: those harnesses fix their provider at thread
+    /// start and receive a model that already names it.
+    fn accepts_provider_override(&self) -> bool {
+        false
+    }
+    /// How long the harness has to acknowledge a written turn. `None` waits
+    /// for as long as the turn runs; a harness whose acknowledgement is
+    /// independent of the model answers in-band.
+    fn prompt_ack_timeout(&self) -> Option<Duration> {
+        None
+    }
+    /// Whether the harness acknowledged the turn in flight. Only consulted
+    /// when `prompt_ack_timeout` is set.
+    fn prompt_acknowledged(&self, _normalizer: &Self::EventNormalizer) -> bool {
+        true
+    }
+    /// Whether harness stderr stays out of pod logs. When true the runner
+    /// drains it and reports only the byte count, because stderr can carry
+    /// provider responses and authorization failures.
+    fn redact_stderr(&self) -> bool {
+        false
     }
     /// Normalizes a requested reasoning effort to a level this harness applies
     /// per turn, or `None` to run its configured default. No control by default.
@@ -127,6 +177,18 @@ pub trait HarnessServer {
         TurnHold::Released
     }
 
+    /// Persist the bridge-thread-id → harness-session-id mapping so a
+    /// post-restart `thread/resume` can target the id the harness actually
+    /// issued (the bridge id is minted here and unknown to the harness).
+    /// Default: no persistence — in-memory `ThreadState` is the only record.
+    fn record_session_id(&self, _thread_id: &str, _session_id: &str) {}
+
+    /// Look up a previously recorded harness session id for a bridge thread
+    /// id. `None` falls back to treating the bridge id as the session id.
+    fn resume_session_id(&self, _thread_id: &str) -> Option<String> {
+        None
+    }
+
     fn thread_state(&self, params: &ThreadStartParams, cwd: PathBuf) -> ThreadState {
         let model = params.model.clone().unwrap_or_else(|| self.default_model());
         let model_provider = params
@@ -147,6 +209,15 @@ pub trait HarnessServer {
             thread_started_sent: false,
         }
     }
+}
+
+/// Bounds a harness puts on its stdout reader thread.
+#[derive(Debug, Clone, Copy)]
+pub struct StdoutLimits {
+    /// Longest accepted line, in bytes; a longer one is an I/O error.
+    pub max_line_bytes: usize,
+    /// Lines the reader may buffer ahead of the turn loop.
+    pub queue_depth: usize,
 }
 
 /// Background work a harness keeps a turn open for past its native result.

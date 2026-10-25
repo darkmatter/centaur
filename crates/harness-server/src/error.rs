@@ -53,6 +53,11 @@ pub enum HarnessServerError {
     BackgroundFollowUpStalled { kind: HarnessKind },
     #[error("{message}")]
     UnknownModel { message: String },
+    #[error("{kind:?} did not acknowledge the turn within {}s", timeout.as_secs())]
+    PromptUnacknowledged {
+        kind: HarnessKind,
+        timeout: std::time::Duration,
+    },
     #[error("{kind:?} turn interrupted")]
     TurnInterrupted { kind: HarnessKind },
     #[error("failed to spawn {bin} app-server: {source}")]

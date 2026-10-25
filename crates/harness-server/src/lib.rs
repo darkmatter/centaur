@@ -23,8 +23,8 @@ pub use otel::flush_telemetry;
 pub use server::{run_blocks_server, run_harness_server, server_for};
 pub use traits::{
     AppServerNormalizer, AppServerRuntime, HarnessChild, HarnessKind, HarnessServer,
-    NormalizedContent, NormalizedEvent, NormalizedTokenUsage, NormalizedToolResult, ThreadState,
-    TurnHold,
+    NormalizedContent, NormalizedEvent, NormalizedTokenUsage, NormalizedToolResult, StdoutLimits,
+    ThreadState, TurnHold,
 };
 pub use turn::{BridgeConfig, CodexTurnNormalizer};
 pub use wire::{notification_to_jsonrpc, notification_to_wire_value};

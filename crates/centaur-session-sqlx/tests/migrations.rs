@@ -32,34 +32,34 @@ const SEARCHABLE_TABLES: [&str; 5] = [
 
 /// Last core version the pre-split releases shipped; every database migrated
 /// by those releases is at this version.
-const LAST_LEGACY_VERSION: i64 = 55;
+const LAST_LEGACY_VERSION: i64 = 60;
 
-/// Core migrations as the pre-split releases shipped them, before their
-/// ParadeDB statements moved to the paradedb backend.
+/// Core migrations whose ParadeDB statements moved to the paradedb backend,
+/// as the pre-split releases applied them: the immutable files, as written.
 const LEGACY_MIGRATIONS: [(i64, &str); 6] = [
     (
         12,
-        include_str!("fixtures/legacy-migrations/0012_company_context_documents.sql"),
+        include_str!("../migrations/0012_company_context_documents.sql"),
     ),
     (
         28,
-        include_str!("fixtures/legacy-migrations/0028_slack_dm_context_documents.sql"),
+        include_str!("../migrations/0028_slack_dm_context_documents.sql"),
     ),
     (
         29,
-        include_str!("fixtures/legacy-migrations/0029_slack_dm_conversation_context_documents.sql"),
+        include_str!("../migrations/0029_slack_dm_conversation_context_documents.sql"),
     ),
     (
         30,
-        include_str!("fixtures/legacy-migrations/0030_google_docs_oauth_sync_tables.sql"),
+        include_str!("../migrations/0030_google_docs_oauth_sync_tables.sql"),
     ),
     (
         40,
-        include_str!("fixtures/legacy-migrations/0040_granola_sync_tables.sql"),
+        include_str!("../migrations/0040_granola_sync_tables.sql"),
     ),
     (
-        45,
-        include_str!("fixtures/legacy-migrations/0045_slack_private_channel_oauth_sync.sql"),
+        46,
+        include_str!("../migrations/0046_slack_private_channel_oauth_sync.sql"),
     ),
 ];
 
@@ -91,10 +91,9 @@ async fn fresh_databases_migrate_and_index_every_searchable_table() -> Result<()
     Ok(())
 }
 
-/// SHA-384 of every released core migration file, pinned so neither an edit
-/// to a released file nor a stale legacy fixture goes unnoticed. The six edited
-/// files present their legacy checksums at runtime, so SQLx cannot catch edits
-/// to them.
+/// SHA-384 of every released core migration file, which databases recorded.
+/// Overridden core migrations run other SQL under these checksums, so a
+/// changed checksum would make SQLx reject every existing database.
 const RELEASED_CORE_CHECKSUMS: &str = include_str!("fixtures/released-core-migrations.sha384");
 
 #[test]
@@ -107,62 +106,35 @@ fn released_core_migrations_are_unchanged() {
             (version.parse().expect("numeric version"), checksum)
         })
         .collect();
-    let released: Vec<(i64, String)> = migration_list(TextSearchBackend::Paradedb)
-        .into_iter()
-        .filter(|migration| migration.version <= LAST_LEGACY_VERSION)
-        .map(|migration| {
-            // Recompute from the file: the legacy override replaces
-            // `checksum` but leaves `sql` as the file reads today.
-            let file = Migration::new(
-                migration.version,
-                migration.description,
-                migration.migration_type,
-                migration.sql,
-                migration.no_tx,
-            );
-            let checksum = file
-                .checksum
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect();
-            (migration.version, checksum)
-        })
-        .collect();
-    assert_eq!(
-        released
-            .iter()
-            .map(|(version, _)| *version)
-            .collect::<Vec<_>>(),
-        pinned
-            .iter()
-            .map(|(version, _)| *version)
-            .collect::<Vec<_>>(),
-        "released core migrations were added or removed"
-    );
-    for ((version, actual), (_, expected)) in released.iter().zip(&pinned) {
-        assert_eq!(
-            actual, expected,
-            "released core migration {version} was edited"
-        );
-    }
-}
-
-#[test]
-fn edited_core_migrations_present_their_legacy_checksums() {
-    // Every database migrated by a pre-split release recorded these.
-    let legacy = legacy_migrations();
     for backend in TextSearchBackend::ALL {
-        for migration in migration_list(backend) {
-            if let Some(recorded) = legacy
+        let released: Vec<(i64, String)> = migration_list(backend)
+            .into_iter()
+            .filter(|migration| migration.version <= LAST_LEGACY_VERSION)
+            .map(|migration| {
+                let checksum = migration
+                    .checksum
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect();
+                (migration.version, checksum)
+            })
+            .collect();
+        assert_eq!(
+            released
                 .iter()
-                .find(|legacy| legacy.version == migration.version)
-            {
-                assert_eq!(
-                    migration.checksum, recorded.checksum,
-                    "{backend} migration {} changes a recorded checksum",
-                    migration.version
-                );
-            }
+                .map(|(version, _)| *version)
+                .collect::<Vec<_>>(),
+            pinned
+                .iter()
+                .map(|(version, _)| *version)
+                .collect::<Vec<_>>(),
+            "released core migrations were added or removed"
+        );
+        for ((version, actual), (_, expected)) in released.iter().zip(&pinned) {
+            assert_eq!(
+                actual, expected,
+                "{backend} presents another checksum for released core migration {version}"
+            );
         }
     }
 }

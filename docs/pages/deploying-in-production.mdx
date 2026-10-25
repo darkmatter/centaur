@@ -504,11 +504,12 @@ ranges on `port`; see [Security](/security).
 indexed. Set it only with `postgres.enabled: false`; the bundled Postgres always
 uses `paradedb`.
 
-- `postgres` (the default when unset) uses PostgreSQL's built-in full-text search and works on
-  any server above.
-- `paradedb` uses ParadeDB BM25 indexes and requires the `pg_search` extension,
-  which RDS and Cloud SQL do not offer. Use it only for a self-managed ParadeDB
-  server.
+- `paradedb` (the default when unset) uses ParadeDB BM25 indexes and requires
+  the `pg_search` extension, which RDS and Cloud SQL do not offer. Every
+  database migrated before the text-search backends split has BM25 indexes and
+  must keep it.
+- `postgres` uses PostgreSQL's built-in full-text search and works on any
+  server above. Set it for a fresh database without `pg_search`.
 
 api-rs migrates its database at startup while `apiRs.runMigrations` is true. To
 migrate the external database on its own, for example with an administrator

@@ -78,6 +78,7 @@ next-env.d.ts
 *.tsbuildinfo
 _
 .notes
+.worktrees/
 
 # Rust
 /target/

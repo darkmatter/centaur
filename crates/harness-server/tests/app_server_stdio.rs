@@ -2357,7 +2357,9 @@ fn run_native_anthropic(harness: Harness, prompt: &str, timeout: Duration) -> Na
             ]);
             command
         }
-        Harness::Codex => panic!("native anthropic runner does not support Codex"),
+        Harness::Codex => {
+            panic!("native anthropic runner does not support {harness:?}")
+        }
     };
     command
         .stdin(Stdio::piped())

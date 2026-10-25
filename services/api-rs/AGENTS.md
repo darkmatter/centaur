@@ -44,9 +44,11 @@ Read the relevant RFC under `rfcs/` before changing a core protocol.
 ## Database changes
 
 Migrations live in `crates/centaur-session-sqlx/migrations` and are embedded in
-the binary and tests. Add the next numbered SQL file; never edit or reorder an
-applied migration. Update SQLx repository code and add database-backed coverage
-for upgrade, read/write, and recovery behavior.
+the binary and tests. Add the next numbered SQL file and append its
+`git hash-object` blob id and file name to `migrations/migrations.lock`; never
+edit, rename, or reorder an applied migration or an existing lock entry. Update
+SQLx repository code and add database-backed coverage for upgrade, read/write,
+and recovery behavior.
 
 Core migrations must run on stock PostgreSQL with pgvector. Keyword-search
 indexes belong to exactly one text-search backend per database, under
@@ -54,8 +56,15 @@ indexes belong to exactly one text-search backend per database, under
 migrations share the core version sequence and are merged into it by version.
 Every backend migration needs a counterpart with the same version in each
 backend directory; add a no-op migration where a backend has nothing to change.
-`.github/scripts/check-migration-order.sh` enforces the numbering, and
-`tests/migrations.rs` covers fresh installs and legacy BM25 databases.
+`.github/scripts/check-migration-order.sh` enforces the numbering and the lock,
+and `tests/migrations.rs` covers fresh installs and legacy BM25 databases.
+
+When an applied core migration must no longer run as written (its ParadeDB
+statements moved to the paradedb backend, or upstream SQL that rejects fork
+data), put the SQL to run instead in `crates/centaur-session-sqlx/core-migration-overrides`
+under the same file name and register it in `CORE_SQL_OVERRIDES`
+(`src/migrations.rs`). SQLx applies it under the original file's checksum, so
+existing databases still validate.
 
 Database-backed tests skip when their URL is absent. Point these variables at a
 disposable Postgres as required by the packages you run:

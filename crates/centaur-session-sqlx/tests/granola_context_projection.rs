@@ -6,7 +6,8 @@ use std::{
 
 use sqlx::{Connection, Executor, PgConnection, Row};
 
-const GRANOLA_SYNC_SQL: &str = include_str!("../migrations/0040_granola_sync_tables.sql");
+const GRANOLA_SYNC_SQL: &str =
+    include_str!("../core-migration-overrides/0040_granola_sync_tables.sql");
 const GRANOLA_CONTEXT_PROJECTION_SQL: &str =
     include_str!("../migrations/0044_granola_context_projection.sql");
 

@@ -1,5 +1,4 @@
 //! Shared telemetry setup for the Rust Centaur control plane.
-
 use std::{
     env, fmt as std_fmt,
     sync::{LazyLock, Mutex},
@@ -71,6 +70,11 @@ pub const WORKFLOW_QUEUE_TASKS_BY_WORKFLOW: &str = "workflow_queue_tasks_by_work
 pub const WORKFLOW_QUEUE_OLDEST_TASK_AGE_SECONDS: &str = "workflow_queue_oldest_task_age_seconds";
 pub const WORKFLOW_QUEUE_OLDEST_TASK_AGE_BY_WORKFLOW_SECONDS: &str =
     "workflow_queue_oldest_task_age_by_workflow_seconds";
+pub const WORKFLOW_TASK_ATTEMPTS_TOTAL: &str = "centaur_workflow_task_attempts_total";
+pub const WORKFLOW_TASK_DURATION_SECONDS: &str = "centaur_workflow_task_duration_seconds";
+pub const WORKFLOW_SCHEDULE_TICKS_TOTAL: &str = "centaur_workflow_schedule_ticks_total";
+pub const WORKFLOW_SCHEDULE_LAST_DISPATCH_TIMESTAMP_SECONDS: &str =
+    "centaur_workflow_schedule_last_dispatch_timestamp_seconds";
 pub const SLACK_RETENTION_RUNS_TOTAL: &str = "slack_retention_runs_total";
 pub const SLACK_RETENTION_RUN_DURATION_SECONDS: &str = "slack_retention_run_duration_seconds";
 pub const SLACK_RETENTION_MESSAGES_PROCESSED_TOTAL: &str =
@@ -101,10 +105,12 @@ const SANDBOX_STARTUP_DURATION_BUCKETS: &[f64] =
     &[0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0];
 const SLACK_RETENTION_DURATION_BUCKETS: &[f64] =
     &[1.0, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0, 600.0, 1_200.0];
+const WORKFLOW_TASK_DURATION_BUCKETS: &[f64] = &[
+    0.1, 1.0, 5.0, 15.0, 30.0, 60.0, 300.0, 900.0, 1_800.0, 3_600.0, 7_200.0,
+];
 
 static PROMETHEUS_HANDLE: LazyLock<Mutex<Option<PrometheusHandle>>> =
     LazyLock::new(|| Mutex::new(None));
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TelemetryConfig {
     pub service_name: String,
@@ -227,6 +233,10 @@ pub fn prometheus_handle() -> Result<PrometheusHandle, TelemetryError> {
         .set_buckets_for_metric(
             Matcher::Full(SANDBOX_STARTUP_DURATION_SECONDS.to_owned()),
             SANDBOX_STARTUP_DURATION_BUCKETS,
+        )?
+        .set_buckets_for_metric(
+            Matcher::Full(WORKFLOW_TASK_DURATION_SECONDS.to_owned()),
+            WORKFLOW_TASK_DURATION_BUCKETS,
         )?
         .set_buckets_for_metric(
             Matcher::Full(SLACK_RETENTION_RUN_DURATION_SECONDS.to_owned()),
@@ -363,6 +373,55 @@ pub fn record_workflow_histogram(name: &str, labels: &[(String, String)], value:
         return;
     }
     metrics::histogram!(name.to_owned(), workflow_metric_labels(labels)).record(value);
+}
+
+pub fn record_workflow_task_finished(
+    queue: &str,
+    workflow_name: &str,
+    outcome: &str,
+    duration: Duration,
+) {
+    metrics::counter!(
+        WORKFLOW_TASK_ATTEMPTS_TOTAL,
+        "queue" => queue.to_owned(),
+        "workflow_name" => workflow_name.to_owned(),
+        "outcome" => outcome.to_owned(),
+    )
+    .increment(1);
+    metrics::histogram!(
+        WORKFLOW_TASK_DURATION_SECONDS,
+        "queue" => queue.to_owned(),
+        "workflow_name" => workflow_name.to_owned(),
+        "outcome" => outcome.to_owned(),
+    )
+    .record(duration.as_secs_f64());
+}
+
+fn schedule_tick_advances_dispatch_timestamp(outcome: &str) -> bool {
+    matches!(outcome, "spawned" | "deduped")
+}
+
+pub fn record_workflow_schedule_tick(
+    schedule_id: &str,
+    workflow_name: &str,
+    outcome: &str,
+    timestamp_seconds: f64,
+) {
+    metrics::counter!(
+        WORKFLOW_SCHEDULE_TICKS_TOTAL,
+        "schedule_id" => schedule_id.to_owned(),
+        "workflow_name" => workflow_name.to_owned(),
+        "outcome" => outcome.to_owned(),
+    )
+    .increment(1);
+    if timestamp_seconds.is_finite() && schedule_tick_advances_dispatch_timestamp(outcome) {
+        metrics::gauge!(
+            WORKFLOW_SCHEDULE_LAST_DISPATCH_TIMESTAMP_SECONDS,
+            "schedule_id" => schedule_id.to_owned(),
+            "workflow_name" => workflow_name.to_owned(),
+        )
+        .set(timestamp_seconds);
+    }
 }
 
 pub fn record_workflow_run(queue: &str, workflow_name: &str, status: &'static str) {
@@ -664,6 +723,24 @@ fn describe_metrics() {
         "Oldest non-terminal workflow task age in seconds by queue, state, and workflow name."
     );
     metrics::describe_counter!(
+        WORKFLOW_TASK_ATTEMPTS_TOTAL,
+        "Terminal workflow task attempts by queue, workflow name, and semantic outcome."
+    );
+    metrics::describe_histogram!(
+        WORKFLOW_TASK_DURATION_SECONDS,
+        metrics::Unit::Seconds,
+        "Terminal workflow task duration in seconds by queue, workflow name, and semantic outcome."
+    );
+    metrics::describe_counter!(
+        WORKFLOW_SCHEDULE_TICKS_TOTAL,
+        "Workflow schedule tick decisions by schedule, workflow name, and outcome."
+    );
+    metrics::describe_gauge!(
+        WORKFLOW_SCHEDULE_LAST_DISPATCH_TIMESTAMP_SECONDS,
+        metrics::Unit::Seconds,
+        "Unix timestamp of the last workflow schedule dispatch or idempotent deduplication."
+    );
+    metrics::describe_counter!(
         SLACK_RETENTION_RUNS_TOTAL,
         "Slack retention workflow lifecycle events by workflow, status, mode, and reason."
     );
@@ -963,6 +1040,16 @@ mod tests {
     }
 
     #[test]
+    fn schedule_dispatch_timestamp_advances_only_after_a_dispatch() {
+        assert!(schedule_tick_advances_dispatch_timestamp("spawned"));
+        assert!(schedule_tick_advances_dispatch_timestamp("deduped"));
+        assert!(!schedule_tick_advances_dispatch_timestamp(
+            "overlap_skipped"
+        ));
+        assert!(!schedule_tick_advances_dispatch_timestamp("disabled"));
+    }
+
+    #[test]
     fn prometheus_metrics_render_workflow_metrics() {
         prometheus_handle().unwrap();
         record_workflow_counter(
@@ -1021,6 +1108,24 @@ mod tests {
             "slack_sync",
             42.0,
         );
+        record_workflow_task_finished(
+            "centaur_workflows",
+            "upstream_sync",
+            "blocked",
+            Duration::from_secs(12),
+        );
+        record_workflow_schedule_tick(
+            "upstream_sync_watch_v2",
+            "upstream_sync",
+            "overlap_skipped",
+            1_784_915_200.0,
+        );
+        record_workflow_schedule_tick(
+            "upstream_sync_watch_v2",
+            "upstream_sync",
+            "spawned",
+            1_784_915_201.0,
+        );
 
         let metrics = render_metrics().unwrap();
 
@@ -1032,11 +1137,18 @@ mod tests {
         assert!(metrics.contains("workflow_queue_tasks_by_workflow{"));
         assert!(metrics.contains("workflow_queue_oldest_task_age_seconds{"));
         assert!(metrics.contains("workflow_queue_oldest_task_age_by_workflow_seconds{"));
+        assert!(metrics.contains("centaur_workflow_task_attempts_total{"));
+        assert!(metrics.contains("centaur_workflow_task_duration_seconds_count{"));
+        assert!(metrics.contains("centaur_workflow_schedule_ticks_total{"));
+        assert!(metrics.contains("centaur_workflow_schedule_last_dispatch_timestamp_seconds{"));
         assert!(metrics.contains(r#"environment="production""#));
         assert!(metrics.contains(r#"namespace="centaur-system""#));
         assert!(metrics.contains(r#"source="slack""#));
         assert!(metrics.contains(r#"queue="centaur_workflows_slack_live""#));
         assert!(metrics.contains(r#"workflow_name="slack_sync""#));
+        assert!(metrics.contains(r#"outcome="blocked""#));
+        assert!(metrics.contains(r#"outcome="overlap_skipped""#));
+        assert!(metrics.contains(r#"schedule_id="upstream_sync_watch_v2""#));
     }
 
     #[test]

@@ -58,6 +58,7 @@ Keep secrets out of `OMP_CONFIG_OVERLAY`.
 | `CENTAUR_OMP_BIN` | OMP executable (default: `omp` on `PATH`). |
 | `CENTAUR_OMP_SESSION_ROOT` | Session root (default: `~/.omp/centaur-sessions`). |
 | `OMP_CONFIG_OVERLAY` | YAML text (not a path) that OMP applies as its last `PI_CONFIG_FILES` overlay. Use it for settings with no environment binding, such as `modelRoles` and `retry.fallbackChains`. Unset writes no file. |
+| `OMP_MODELS_OVERLAY` | YAML text (not a path) for OMP's provider/model registry, written to `${PI_CODING_AGENT_DIR:-~/.omp/agent}/models.yml` at startup. Supply the complete registry; unset writes no file. |
 
 Set these through `sandbox.extraEnv`; no chart template change is required.
 Slack mirrors `CENTAUR_OMP_MODEL` for its model display. A per-thread
@@ -122,4 +123,58 @@ order:
 kubectl exec <sandbox-pod> -- env \
   PI_CONFIG_FILES=/home/agent/.config/centaur/omp-config-overlay.yml \
   omp config get modelRoles
+```
+
+### Model registry overlay
+
+OMP reads its provider/model registry from a single native file in its agent
+directory, so `OMP_CONFIG_OVERLAY` (a `PI_CONFIG_FILES` overlay) cannot define
+models. The sandbox image ships no baked registry: a deployment that needs
+static or custom model definitions sets `OMP_MODELS_OVERLAY` to YAML text (not
+a path) through `sandbox.extraEnv`:
+
+```yaml
+sandbox:
+  extraEnv:
+    OMP_LITELLM_BASE_URL: https://litellm.example.internal/v1
+    OMP_MODELS_OVERLAY: |
+      providers:
+        litellm:
+          baseUrl: __OMP_LITELLM_BASE_URL__
+          apiKey: LITELLM_API_KEY
+          api: openai-completions
+          models:
+            - id: glm-5.2-fp8
+              name: GLM 5.2 fp8 (gateway)
+              supportsTools: true
+              reasoning: true
+              contextWindow: 1048576
+              maxTokens: 131072
+```
+
+At startup the entrypoint replaces
+`${PI_CODING_AGENT_DIR:-~/.omp/agent}/models.yml` with the text using an atomic
+same-directory rename and mode `0600`. It never touches the persistent
+`config.yml`. The value is the complete registry, not a patch: it replaces the
+previous `models.yml` wholesale, and it does not merge `providers.<name>.models`
+with the built-in catalog. When `OMP_MODELS_OVERLAY` is unset (or empty), it
+writes no file and leaves an existing `models.yml` alone.
+
+Define gateway models statically. Discovery-based registries fuzzy-merge
+gateway ids against the live models.dev catalog, where `glm-5.2-fp8` collides
+with a Fireworks entry and receives a wire id the gateway rejects; a static
+definition sends the id unchanged.
+
+The entrypoint substitutes `__OMP_LITELLM_BASE_URL__` with
+`OMP_LITELLM_BASE_URL`, so an overlay repository's registry can be passed
+verbatim. If the text still contains that placeholder and the variable is
+unset (or empty), startup fails instead of writing an unusable base URL.
+
+Do not put credentials in `OMP_MODELS_OVERLAY`. Use a placeholder such as
+`LITELLM_API_KEY` that iron-proxy replaces on the wire. Verify the registry from
+inside the sandbox:
+
+```bash
+omp models litellm
+omp models find glm-5.2-fp8
 ```

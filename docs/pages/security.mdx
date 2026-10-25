@@ -137,6 +137,34 @@ Other typed variants extend the same boundary in different ways:
 
 See [Creating Tools](/extend/tools) for the full schema.
 
+### GitHub App installation tokens
+
+A deployment can give sandboxes GitHub access by passing `GITHUB_APP_ID` and
+`GITHUB_APP_PRIVATE_KEY` into the sandbox (for example through
+`SESSION_SANDBOX_PASSTHROUGH_ENV`). At startup the sandbox entrypoint mints an
+installation token for the installation matching
+`GITHUB_APP_INSTALLATION_OWNER` (default `darkmatter`), preferring an
+organization or user installation over an enterprise one. It writes the token
+to `~/.centaur/github-token` and `~/.git-credentials` (both `0600`;
+`~/.centaur` is `0700`). `gh` reads the current token on every invocation
+through a wrapper on `PATH`, and git reads the credential store. A background
+loop re-mints before GitHub's fixed 60-minute expiry, so warm-pool sandboxes
+and long sessions keep a live token. `GITHUB_TOKEN` and `GH_TOKEN` are unset on
+this path so a stale environment value cannot shadow the refreshed files.
+
+Scope: the sandbox can do whatever the installation is granted (`contents`,
+`pull_requests`, `issues`, and so on) on every repository the installation
+covers, not only the current thread's repository. The private key and every
+minted token are readable by anything running in the sandbox, so grant the App
+the minimum permissions and repository selection the deployment needs. Failed
+mints log only the HTTP status and a short response body to a `0600` file;
+neither the key nor the token is logged.
+
+This is separate from the iron-proxy placeholder flow. Deployments without App
+credentials keep the upstream behavior: `sandbox.extraEnv` supplies the
+`GITHUB_TOKEN` placeholder and iron-proxy substitutes the real credential on
+approved outbound requests.
+
 ### Slack access
 
 Sandboxes never hold the Slack app's bot token. Slack access takes one of two

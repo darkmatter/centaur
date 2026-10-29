@@ -918,6 +918,23 @@ fn repo_tools_dir() -> Option<PathBuf> {
 }
 
 #[test]
+fn every_repo_tool_manifest_parses() {
+    let Some(tools_dir) = repo_tools_dir() else {
+        return;
+    };
+    let failures: Vec<String> = tools::collect_candidate_dirs(&tools_dir)
+        .into_iter()
+        .filter(|dir| dir.join("pyproject.toml").is_file())
+        .filter_map(|dir| tools::parse_manifest(&dir).err().map(|e| format!("{e:#}")))
+        .collect();
+    assert!(
+        failures.is_empty(),
+        "invalid tool manifests:\n{}",
+        failures.join("\n")
+    );
+}
+
+#[test]
 fn real_slack_tool_parses_and_translates() {
     let Some(tools_dir) = repo_tools_dir() else {
         return;

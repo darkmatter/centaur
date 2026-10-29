@@ -25,5 +25,5 @@ packages = ["."]
 module = "client.py"
 hosts = ["api.openai.com"]
 secrets = [
-    { type = "http", name = "OPENAI_API_KEY", mode = "replace", hosts = ["api.openai.com"] },
+    { type = "http", name = "OPENAI_API_KEY", mode = "replace", match_headers = ["Authorization"], hosts = ["api.openai.com"] },
 ]

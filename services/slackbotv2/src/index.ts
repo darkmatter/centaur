@@ -209,6 +209,10 @@ const PROACTIVE_CLAIM_TTL_MS = 60 * 1000
 // How long an accepted message waits for another handoff's turn to start.
 const PROACTIVE_CLAIM_WAIT_MS = 30 * 1000
 const PROACTIVE_CLAIM_POLL_MS = 250
+// Pending burst messages outlive the debounce by this much, covering handler
+// latency between recording a message and reading the burst.
+const PROACTIVE_PENDING_GRACE_MS = 60 * 1000
+const PROACTIVE_PENDING_MAX = 50
 // Mentions and proactive replies make a thread eligible; DMs already treat
 // every message as a mention.
 const PROACTIVE_ELIGIBILITY_TRIGGERS = new Set(['new_mention', 'proactive', 'subscribed_message'])
@@ -923,22 +927,51 @@ async function handleProactiveMessage(
     })
   }
   const rules = resolveProactivityRules(proactivity.rules, thread.id)
-  const state = (await thread.state) ?? {}
-  const skipReason = proactiveSkipReason(rules, state, message)
+  let state = (await thread.state) ?? {}
+  let skipReason = proactiveSkipReason(rules, state, message)
   if (skipReason) {
     record(`skip_${skipReason}`)
     return
   }
+  // An idle thread waits for a pause so a message sent in parts is judged,
+  // and answered, once. An active turn takes messages as steers right away.
+  const debounceMs = state.activeExecution === true ? 0 : proactivity.debounceMs ?? 0
+  let burstIds = new Set<string>()
+  if (debounceMs > 0) {
+    const earlierBurstIds = await waitForBurstEnd(thread, message, input.state, debounceMs)
+    if (!earlierBurstIds) {
+      record('skip_superseded')
+      return
+    }
+    state = (await thread.state) ?? {}
+    // A turn that started during the wait, such as a mention's, may already
+    // carry the message; its burst must not count what that turn has.
+    const forwarded = new Set(state.forwardedMessageIds ?? [])
+    if (forwarded.has(message.id)) {
+      record('skip_forwarded')
+      return
+    }
+    skipReason = proactiveSkipReason(rules, state, message)
+    if (skipReason) {
+      record(`skip_${skipReason}`)
+      return
+    }
+    burstIds = new Set(earlierBurstIds.filter(id => !forwarded.has(id)))
+  }
   // Each applicable layer asks its own question; any acceptance replies.
   const layers = proactiveLayers(rules, state)
+  const decisionFields: JsonObject = {}
   let decisions: Array<PromiseSettledResult<ProactiveDecision>>
   try {
     // A top-level message starts its thread, so it has no earlier messages.
-    const history = isSlackThreadReply(message)
+    const earlier = isSlackThreadReply(message)
       ? await withSlackApiTimeout(options, 'collect proactive thread history', () =>
           proactiveThreadHistory(thread, message)
         )
       : []
+    const history = earlier.filter(item => !burstIds.has(item.id)).map(proactiveThreadMessage)
+    const burst = earlier.filter(item => burstIds.has(item.id)).map(proactiveThreadMessage)
+    if (burst.length > 0) decisionFields.burst_messages = burst.length + 1
     const signal = AbortSignal.timeout(proactivity.timeoutMs ?? PROACTIVE_CLASSIFIER_TIMEOUT_MS)
     const aborted = new Promise<never>((_, reject) => {
       signal.addEventListener('abort', () => reject(signal.reason), { once: true })
@@ -947,6 +980,7 @@ async function handleProactiveMessage(
       proactivity.classifier(
         {
           botName: options.userName ?? 'centaur',
+          ...(burst.length > 0 ? { burst } : {}),
           history,
           message: proactiveThreadMessage(message),
           ...(layer === 'rules' ? { rules } : {})
@@ -956,10 +990,9 @@ async function handleProactiveMessage(
       aborted
     ])))
   } catch (error) {
-    record('error', { error: errorMessage(error) })
+    record('error', { ...decisionFields, error: errorMessage(error) })
     return
   }
-  const decisionFields: JsonObject = {}
   layers.forEach((layer, index) => {
     const result = decisions[index]!
     if (result.status === 'fulfilled' && result.value.probability !== undefined) {
@@ -1076,14 +1109,48 @@ function proactiveSkipReason(
   return undefined
 }
 
+/**
+ * Records the message as pending in its thread, waits, and resolves to the
+ * earlier pending messages it ends the burst of, or undefined when a newer one
+ * is pending or a burst already ended at or after it. Pending messages are
+ * ordered by Slack timestamp, not by when their handlers ran, so a slow
+ * handler cannot hide a newer message. Both keys live outside thread state so
+ * that writing them never races its read-merge-write updates.
+ */
+async function waitForBurstEnd(
+  thread: Thread<SlackbotV2ThreadState>,
+  message: ChatMessage,
+  state: StateAdapter,
+  debounceMs: number
+): Promise<string[] | undefined> {
+  const pendingKey = `slackbotv2:proactive:pending:${thread.id}`
+  const endKey = `slackbotv2:proactive:burst-end:${thread.id}`
+  const ttlMs = debounceMs + PROACTIVE_PENDING_GRACE_MS
+  await state.appendToList(pendingKey, message.id, { maxLength: PROACTIVE_PENDING_MAX, ttlMs })
+  await sleep(debounceMs)
+  const pending = await state.getList<string>(pendingKey)
+  if (pending.some(id => compareSlackTs(id, message.id) > 0)) return undefined
+  const lastEnd = await state.get<string>(endKey)
+  if (lastEnd && compareSlackTs(lastEnd, message.id) >= 0) return undefined
+  await state.set(endKey, message.id, ttlMs)
+  // Some adapters keep expired list entries, so older bursts are excluded by
+  // age as well as by the last burst end.
+  const oldestMs = slackTsToMs(message.id) - ttlMs
+  return pending.filter(id =>
+    compareSlackTs(id, message.id) < 0
+    && slackTsToMs(id) >= oldestMs
+    && (!lastEnd || compareSlackTs(id, lastEnd) > 0)
+  )
+}
+
 async function proactiveThreadHistory(
   thread: Thread<SlackbotV2ThreadState>,
   current: ChatMessage
-): Promise<ProactiveThreadMessage[]> {
-  const history: ProactiveThreadMessage[] = []
+): Promise<ChatMessage[]> {
+  const history: ChatMessage[] = []
   for await (const item of thread.messages) {
     if (item.id === current.id || compareSlackTs(item.id, current.id) > 0) continue
-    history.push(proactiveThreadMessage(item))
+    history.push(item)
     if (history.length >= PROACTIVE_HISTORY_MESSAGES) break
   }
   return history.reverse()

@@ -34,10 +34,13 @@ lifecycle, harness formatting, and durable execution state belong in `api-rs`.
   initial thread context, and mention-gated subscribed-message semantics when
   refactoring the main callback flow. Unmentioned replies must not be appended
   to or interrupt an active execution; collect them when the next mention
-  refreshes the Slack thread context. The only exception is proactivity: in a
-  thread a mention made eligible, an unmentioned reply the classifier accepts
-  may start a new execution. It never steers an active one, and a failed or
-  timed-out classifier decision means no reply.
+  refreshes the Slack thread context. The only exception is proactivity: an
+  unmentioned message the classifier accepts, in a thread a mention or
+  proactive reply made eligible or anywhere in a channel with a proactivity
+  prompt, is handled like a mentioned follow-up: it starts an execution or
+  steers the active one, but never stops it; only a mention can. Only one proactive handoff per thread may start an
+  execution at a time. A failed or timed-out classifier decision means no
+  reply.
 
 ## Validation
 

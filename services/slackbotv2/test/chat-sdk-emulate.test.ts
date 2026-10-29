@@ -27,6 +27,7 @@ import {
 } from '../src/index'
 import { clearRequesterIdentityCacheForTests } from '../src/session-api'
 import { slackbotMetrics } from '../src/metrics'
+import type { ProactivityPrompts } from '../src/proactivity-prompts'
 import { createOpenAiMessageOverridesStrategy } from '../src/message-overrides-strategy'
 import { modelDisplayName } from '../src/response-context'
 import claudeSettings from '../../../harness/claude/settings.json'
@@ -4602,7 +4603,8 @@ describe('slackbotv2', () => {
 describe('proactive replies', () => {
   function createProactiveBot(
     decide: (input: ProactiveClassifierInput) => ProactiveDecision | Promise<ProactiveDecision>,
-    overrides: Partial<Parameters<typeof createSlackbotV2>[0]> = {}
+    overrides: Partial<Parameters<typeof createSlackbotV2>[0]> = {},
+    prompts?: ProactivityPrompts
   ): ProactiveClassifierInput[] {
     const calls: ProactiveClassifierInput[] = []
     bot = createTestBot({
@@ -4610,7 +4612,8 @@ describe('proactive replies', () => {
         classifier: async input => {
           calls.push(input)
           return decide(input)
-        }
+        },
+        prompts
       },
       ...overrides
     })
@@ -4674,6 +4677,57 @@ describe('proactive replies', () => {
       .not.toContain('thanks, looks good')
   })
 
+  it('answers a top-level message that matches the channel prompt', async () => {
+    let repliesRequestsWhenClassified = -1
+    const calls = createProactiveBot(() => {
+      repliesRequestsWhenClassified = slackApi.repliesRequestCount()
+      return { respond: true }
+    }, {}, {
+      default: 'Questions about anything.',
+      channels: { [CHANNEL_ID]: 'Questions about deploys.' }
+    })
+    const repliesRequestsBefore = slackApi.repliesRequestCount()
+
+    const message = await sendMessage('is staging deployed?')
+    await message.finished()
+    await waitFor(async () => (await threadText(message.ts)).includes('Executed request 1.'))
+
+    expect(calls).toHaveLength(1)
+    expect(calls[0]).toMatchObject({ history: [], prompt: 'Questions about deploys.' })
+    // A top-level message has no earlier thread messages to read.
+    expect(repliesRequestsWhenClassified).toBe(repliesRequestsBefore)
+    expect(codexApi.executes).toHaveLength(1)
+    expect(codexApi.executes[0]!.threadKey).toBe(threadKey(message.ts))
+  })
+
+  it('treats a thread it answered on a prompt match as mentioned', async () => {
+    const calls = createProactiveBot(input => ({ respond: input.prompt !== undefined }), {}, {
+      default: 'Questions about deploys.'
+    })
+    const message = await sendMessage('is staging deployed?')
+    await message.finished()
+    await waitFor(async () => (await threadText(message.ts)).includes('Executed request 1.'))
+    expect(calls.map(call => call.prompt)).toEqual(['Questions about deploys.'])
+
+    await reply('and production?', message.ts)
+
+    expect(calls.slice(1).map(call => call.prompt).sort()).toEqual(['Questions about deploys.', undefined])
+    expect(codexApi.executes).toHaveLength(2)
+  })
+
+  it('ignores top-level messages in a channel whose prompt is empty', async () => {
+    const calls = createProactiveBot(() => ({ respond: true }), {}, {
+      default: 'Questions about deploys.',
+      channels: { [CHANNEL_ID]: '' }
+    })
+
+    const message = await sendMessage('is staging deployed?')
+    await message.finished()
+
+    expect(calls).toHaveLength(0)
+    expect(codexApi.creates).toHaveLength(0)
+  })
+
   it('only classifies replies in threads eligible since a mention', async () => {
     const calls = createProactiveBot(() => ({ respond: true }))
     const parent = await postUserMessage('Subscribed before proactivity.')
@@ -4681,6 +4735,8 @@ describe('proactive replies', () => {
 
     const reply = await sendMessage('can someone check this?', { threadTs: parent.ts })
     await reply.finished()
+    const topLevel = await sendMessage('can someone check this too?')
+    await topLevel.finished()
 
     expect(calls).toHaveLength(0)
     expect(codexApi.creates).toHaveLength(0)
@@ -4698,7 +4754,7 @@ describe('proactive replies', () => {
     expect(codexApi.executes).toHaveLength(2)
   })
 
-  it('never appends to an execution that started while classifying', async () => {
+  it('steers an execution that started while classifying', async () => {
     const sharedState = createMemoryState()
     await sharedState.connect()
     let threadTs = ''
@@ -4719,8 +4775,72 @@ describe('proactive replies', () => {
     await reply.finished()
 
     expect(calls).toHaveLength(1)
-    expect(codexApi.appends).toHaveLength(appendCount)
+    expect(sessionMessageTexts(codexApi.appends.slice(appendCount).flatMap(append => append.body.messages)))
+      .toEqual(['and the rollback?'])
     expect(codexApi.executes).toHaveLength(1)
+  })
+
+  it('steers instead of stopping on an accepted unmentioned stop phrase', async () => {
+    const sharedState = createMemoryState()
+    await sharedState.connect()
+    let threadTs = ''
+    let interrupts = 0
+    createProactiveBot(
+      async () => {
+        await sharedState.set(`thread-state:${threadKey(threadTs)}`, {
+          ...(await sharedState.get<Record<string, unknown>>(`thread-state:${threadKey(threadTs)}`)),
+          activeExecution: true
+        })
+        return { respond: true }
+      },
+      {
+        fetch: async (input, init) => {
+          if (String(input).endsWith('/interrupt')) interrupts += 1
+          return globalThis.fetch(input, init)
+        },
+        state: sharedState
+      }
+    )
+    threadTs = await mentionThread('Proactive stop phrase context.')
+    const appendCount = codexApi.appends.length
+
+    const reply = await sendMessage('stop that', { threadTs })
+    await reply.finished()
+
+    expect(interrupts).toBe(0)
+    expect(sessionMessageTexts(codexApi.appends.slice(appendCount).flatMap(append => append.body.messages)))
+      .toEqual(['stop that'])
+  })
+
+  it('steers one turn with two replies accepted at once', async () => {
+    let releaseClassifiers = () => {}
+    const bothClassifying = new Promise<void>(resolve => {
+      releaseClassifiers = resolve
+    })
+    const calls = createProactiveBot(async () => {
+      if (calls.length === 2) releaseClassifiers()
+      await bothClassifying
+      return { respond: true }
+    })
+    const threadTs = await mentionThread('Proactive concurrent context.')
+    // Keep the proactive turn running so the other reply finds it active.
+    codexApi.autoRespond = false
+
+    const first = await sendMessage('is staging deployed?', { threadTs })
+    const second = await sendMessage('and production?', { threadTs })
+    await Promise.all([first.finished(), second.finished()])
+    await waitFor(() => codexApi.executes.length === 2 && codexApi.eventRequests.length >= 2, 3000)
+    codexApi.emitSessionEvent(threadKey(threadTs), 'session.execution_completed', {})
+    await waitFor(async () =>
+      (await bot.chat.getState().get<Record<string, unknown>>(`thread-state:${threadKey(threadTs)}`))
+        ?.activeExecution !== true
+    )
+
+    expect(calls).toHaveLength(2)
+    // The mention's turn and one proactive turn; the other reply steers it.
+    expect(codexApi.executes).toHaveLength(2)
+    expect(sessionMessageTexts(codexApi.appends.flatMap(append => append.body.messages)))
+      .toEqual(expect.arrayContaining(['is staging deployed?', 'and production?']))
   })
 
   it('ends proactive replies at a stop until the next mention', async () => {
@@ -5623,6 +5743,7 @@ type PatchedSlackApi = {
   calls: StreamCall[]
   close(): Promise<void>
   failRepliesWithThreadNotFound(channel: string, ts: string): void
+  repliesRequestCount(): number
   failStreamAppendsAfter(count: number, error: string): void
   failStreamStopsLongerThan(maxChars: number): void
   failNextStreamStop(): void
@@ -5692,6 +5813,7 @@ async function startPatchedSlackApi(emulatorUrl: string): Promise<PatchedSlackAp
   const userProfiles = new Map<string, Record<string, unknown>>()
   const userProfileRequests = new Map<string, number>()
   const threadNotFoundReplies = new Set<string>()
+  const repliesRequests = { count: 0 }
   let assistantStatusGate: Promise<void> | null = null
   let releaseAssistantStatusGate: (() => void) | null = null
   let maxStreamStopChars: number | null = null
@@ -5726,6 +5848,7 @@ async function startPatchedSlackApi(emulatorUrl: string): Promise<PatchedSlackAp
       reactionResponses,
       streams,
       threadNotFoundReplies,
+      repliesRequests,
       threadMessageFiles,
       userProfiles,
       userProfileRequests,
@@ -5748,6 +5871,9 @@ async function startPatchedSlackApi(emulatorUrl: string): Promise<PatchedSlackAp
     url: `http://127.0.0.1:${port}`,
     failRepliesWithThreadNotFound(channel: string, ts: string) {
       threadNotFoundReplies.add(slackReplyKey(channel, ts))
+    },
+    repliesRequestCount() {
+      return repliesRequests.count
     },
     failStreamAppendsAfter(count: number, error: string) {
       appendFailure.remaining = count
@@ -5781,6 +5907,7 @@ async function startPatchedSlackApi(emulatorUrl: string): Promise<PatchedSlackAp
       conversationsJoinResponses.length = 0
       reactionResponses.length = 0
       threadNotFoundReplies.clear()
+      repliesRequests.count = 0
       threadMessageFiles.clear()
       fileInfo.clear()
       fileInfoRequests.clear()
@@ -5831,6 +5958,7 @@ async function handlePatchedSlackRequest(
     reactionResponses: QueuedSlackApiResponse[]
     streams: Map<string, StreamRecord>
     threadNotFoundReplies: Set<string>
+    repliesRequests: { count: number }
     threadMessageFiles: Map<string, Record<string, unknown>[]>
     userProfiles: Map<string, Record<string, unknown>>
     userProfileRequests: Map<string, number>
@@ -6036,6 +6164,7 @@ async function handlePatchedSlackRequest(
   }
   if (path === '/api/conversations.replies') {
     const body = await requestBody(request.clone())
+    input.repliesRequests.count += 1
     if (
       input.threadNotFoundReplies.has(
         slackReplyKey(stringField(body.channel), stringField(body.ts))

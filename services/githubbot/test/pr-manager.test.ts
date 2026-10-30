@@ -3,6 +3,7 @@ import { drainBackgroundWork } from "../src/context";
 import {
   decideMerge,
   handleCiEvent,
+  handlePullRequestEvent,
   handleReviewEvent,
   isOwnedPr,
   type PrManagerContext,
@@ -577,6 +578,68 @@ describe("decideMerge", () => {
 });
 
 describe("PR management webhooks", () => {
+  test("merges when CI settles green again on an already-evaluated head", async () => {
+    let mergeCalls = 0;
+    const state = makeState();
+    // An earlier green settle on this head was claimed while the PR was still
+    // blocked (e.g. waiting on an approval).
+    await state.set("centaur-githubbot:ci-settled:base/repo#7:abc123", "1");
+    const ctx = {
+      octokit: {
+        graphql: async () => ({
+          repository: {
+            object: {
+              statusCheckRollup: { state: "SUCCESS", contexts: { nodes: [] } },
+            },
+          },
+        }),
+        rest: {
+          pulls: {
+            get: async () => ({ data: prPayload({ headRepoFullName: "base/repo" }) }),
+            merge: async () => {
+              mergeCalls += 1;
+              return { data: {} };
+            },
+          },
+          git: { deleteRef: async () => ({ data: {} }) },
+        },
+      },
+      options: {
+        apiUrl: "http://localhost",
+        deleteBranchOnMerge: false,
+        logger: { debug() {}, warn() {}, error() {}, info() {} },
+      },
+      state,
+      userName: "centaur-bot",
+    } as unknown as PrManagerContext;
+
+    // A required check that finishes later on the same SHA.
+    await handleCiEvent(
+      ctx,
+      "check_suite",
+      JSON.stringify({
+        action: "completed",
+        repository: { full_name: "base/repo" },
+        check_suite: { head_sha: "abc123", pull_requests: [{ number: 7 }] },
+      }),
+    );
+    expect(mergeCalls).toBe(1);
+
+    // Re-assigning an already-green PR merges too.
+    mergeCalls = 0;
+    const reassigned = { ...ctx, state: makeState() } as unknown as PrManagerContext;
+    await reassigned.state.set("centaur-githubbot:ci-settled:base/repo#7:abc123", "1");
+    await handlePullRequestEvent(
+      reassigned,
+      JSON.stringify({
+        action: "assigned",
+        repository: { full_name: "base/repo" },
+        pull_request: { number: 7 },
+      }),
+    );
+    expect(mergeCalls).toBe(1);
+  });
+
   test("does not delete a base-repo branch after merging a fork PR", async () => {
     let deleteRefCalls = 0;
     let mergeCalls = 0;

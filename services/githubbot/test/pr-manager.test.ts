@@ -614,7 +614,12 @@ describe("PR management webhooks", () => {
         action: "submitted",
         repository: { full_name: "base/repo" },
         pull_request: { number: 7 },
-        review: { id: 123, state: "approved", user: { login: "reviewer" } },
+        review: {
+          id: 123,
+          state: "approved",
+          user: { login: "reviewer" },
+          author_association: "MEMBER",
+        },
       }),
     );
 
@@ -689,7 +694,12 @@ const approvedReview = (reviewId: number) =>
     action: "submitted",
     repository: { full_name: "base/repo" },
     pull_request: { number: 7 },
-    review: { id: reviewId, state: "approved", user: { login: "reviewer" } },
+    review: {
+      id: reviewId,
+      state: "approved",
+      user: { login: "reviewer" },
+      author_association: "MEMBER",
+    },
   });
 
 const quietLogger = { debug() {}, warn() {}, error() {}, info() {} };
@@ -1291,6 +1301,7 @@ describe("management turn reaction ack", () => {
         node_id: nodeId,
         state,
         user: { login: "reviewer" },
+        author_association: "MEMBER",
       },
     });
 
@@ -1356,5 +1367,46 @@ describe("management turn reaction ack", () => {
     await handleReviewEvent(reviewCtx(reactions), submittedReview("changes_requested"));
     await drainBackgroundWork(5_000);
     expect(reactions).toEqual([]);
+  });
+
+  const untrustedReview = (association?: string) =>
+    JSON.stringify({
+      action: "submitted",
+      repository: { full_name: "base/repo" },
+      pull_request: { number: 7 },
+      review: {
+        id: 77,
+        node_id: "PRR_test77",
+        state: "changes_requested",
+        user: { login: "drive-by" },
+        ...(association ? { author_association: association } : {}),
+      },
+    });
+
+  test("ignores a changes-requested review from an untrusted association", async () => {
+    const reactions: { subjectId: string; content: string }[] = [];
+    const ctx = reviewCtx(reactions);
+    await handleReviewEvent(ctx, untrustedReview("NONE"));
+    await handleReviewEvent(ctx, untrustedReview());
+    await drainBackgroundWork(5_000);
+    expect(reactions).toEqual([]);
+  });
+
+  test("honors a custom allowedAuthorAssociations list and the wildcard", async () => {
+    const reactions: { subjectId: string; content: string }[] = [];
+    const restricted = reviewCtx(reactions);
+    restricted.options.allowedAuthorAssociations = ["OWNER"];
+    await handleReviewEvent(restricted, untrustedReview("CONTRIBUTOR"));
+    await drainBackgroundWork(5_000);
+    expect(reactions).toEqual([]);
+
+    const open = reviewCtx(reactions);
+    open.options.allowedAuthorAssociations = ["*"];
+    await handleReviewEvent(open, untrustedReview("NONE"));
+    expect(reactions).toContainEqual({
+      subjectId: "PRR_test77",
+      content: "EYES",
+    });
+    await drainBackgroundWork(5_000);
   });
 });

@@ -1,6 +1,7 @@
 import type { GitHubAdapter } from "@chat-adapter/github";
 import type { StateAdapter } from "chat";
 import { backgroundWaitUntil } from "./context";
+import { resolveAllowedAuthorAssociations } from "./authorization";
 import { reactWorkingOnReview, settleReviewReaction } from "./reactions";
 import { runTurnStream, turnOutputChars } from "./turn";
 import {
@@ -355,6 +356,19 @@ export async function handleReviewEvent(
   if (!pr || !owns(ctx, pr)) return;
   // Never act on the bot's own review (it shouldn't review its own PRs anyway).
   if (reviewer && reviewer.toLowerCase() === ctx.userName.toLowerCase()) return;
+
+  // Same trust gate as the comment path: an untrusted reviewer must not steer
+  // a write-capable turn or drive the merge signal on a bot-owned PR.
+  const allowed = resolveAllowedAuthorAssociations(
+    ctx.options.allowedAuthorAssociations,
+  );
+  const association = stringValue(reviewNode.author_association)?.toUpperCase();
+  if (
+    !allowed.includes("*") &&
+    (!association || !allowed.includes(association))
+  ) {
+    return;
+  }
 
   if (
     !(await claim(

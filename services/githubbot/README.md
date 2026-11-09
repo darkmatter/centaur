@@ -48,6 +48,10 @@ reviewer** like any other collaborator.
   deployment can **fully replace** via `GITHUBBOT_REVIEW_PROMPT` / `GITHUBBOT_REVIEW_PROMPT_FILE`
   (the override is used verbatim, so org conventions supersede ours wholesale; for Splits this is
   where the overlay supplies its review guide). Webhook redeliveries are de-duplicated by delivery id.
+  The default `observe` mode records eligible requests without starting a review. To make Centaur
+  the review owner for a repository, set `GITHUBBOT_REVIEW_MODE=execute` and include its `owner/repo`
+  in `GITHUBBOT_REVIEW_REPOSITORIES`. Keep repositories owned by another reviewer out of that list.
+  Claim-store errors stop execution, so a redelivery cannot start an unclaimed duplicate review.
 - **Assigning an issue to the bot** (`issues` / `assigned` to the bot account) → an autonomous work
   turn runs on a **dedicated, isolated session thread** (`github-issue:{owner}/{repo}:{n}`): the agent
   reads the issue, implements a fix in its sandbox, and opens a PR (self-assigning it so it then
@@ -167,6 +171,8 @@ requests**, **Pull request reviews**, **Check runs**, **Check suites**, and **Wo
 | `GITHUBBOT_DEFAULT_HARNESS` | — | Harness for new threads without an inline flag, default `codex`. |
 | `GITHUBBOT_REVIEW_PROMPT` | — | Full review methodology, inline. Replaces the bundled default verbatim. |
 | `GITHUBBOT_REVIEW_PROMPT_FILE` | — | Path to a file holding the review methodology (e.g. an overlay-mounted file). Used when the inline var is unset. |
+| `GITHUBBOT_REVIEW_MODE` | — | `observe` (default), `execute`, or `off`. Observe logs eligible requests without running a review. |
+| `GITHUBBOT_REVIEW_REPOSITORIES` | — | Comma-separated `owner/repo` list assigned to Centaur. Required for `execute` to act. |
 | `GITHUBBOT_ISSUE_PROMPT` | — | Full issue-work methodology, inline. Replaces the bundled default verbatim. |
 | `GITHUBBOT_ISSUE_PROMPT_FILE` | — | Path to a file holding the issue-work methodology (e.g. an overlay-mounted file). Used when the inline var is unset. |
 | `GITHUBBOT_MANAGEMENT_PROMPT` | — | Extra guidance prepended to owned-PR management turns (CI-fix / conflict / address-review), inline. The per-action preamble still rides underneath. |

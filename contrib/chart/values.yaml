@@ -934,6 +934,11 @@ githubbot:
   mergeMethod: squash
   # Emit CI and review workflow events to api-rs.
   workflowEvents: false
+  # Review requests are logged without running a reviewer until a repository is
+  # explicitly assigned to this bot. Use execute only after choosing one owner
+  # for each PR review path alongside any other reviewer platform.
+  reviewMode: observe
+  reviewRepositories: ""
   # Fallback @handle (no leading @) the bot tags when it gives up; empty = none.
   escalationHandle: ""
   # Optional review / issue-work methodology overrides. When set, the chart writes

@@ -97,8 +97,13 @@ management thread (`github-manage:{owner}/{repo}:{n}`); the agent does its GitHu
   PR green on a check it never saw. Commit statuses and check runs from other GitHub Apps aren't
   Actions jobs, which is exactly what that count check catches.
 - **Address review.** A submitted review (`changes_requested` / `commented`) triggers one holistic
-  turn that reads all the feedback, makes a single coherent commit, replies on each thread, resolves
-  what it addressed, and re-requests review.
+  turn that reads the feedback and makes a coherent commit. Human reviews can re-request review.
+  Bot-authored feedback is limited to one response per reviewer and PR revision, and three response
+  cycles per PR; stale bot reviews are ignored. Review claims fail closed if state is unavailable.
+  The management prompt asks for at most one reply per thread and no automatic re-request of a bot.
+  These controls bound webhook-triggered turns; direct `gh` writes from an agent are outside this
+  receiver's write boundary and need a separate API or egress guard before a global posting budget
+  can be guaranteed.
 - **Merge when ready.** Deterministic — no agent. When GitHub reports the PR `mergeable_state == clean`
   the bot merges it (`GITHUBBOT_MERGE_METHOD`, default squash) and deletes the branch. `dirty` →
   conflict-resolution turn; `behind` → branch update; anything else → wait. Enabled by default for

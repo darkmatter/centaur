@@ -43,6 +43,7 @@ export type PrManagerContext = {
 const STATE_TTL_MS = 90 * 24 * 60 * 60 * 1000;
 const CLAIM_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const DEFAULT_CI_FIX_MAX_ATTEMPTS = 3;
+const MAX_AUTOMATED_REVIEW_RESPONSES_PER_PR = 3;
 
 // ---------------------------------------------------------------------------
 // Pure decision helpers (unit-tested without GitHub).
@@ -155,6 +156,40 @@ async function claim(ctx: PrManagerContext, key: string): Promise<boolean> {
     // drop work); the in-turn idempotency keys still guard double execution.
     return true;
   }
+}
+
+/** Review responses can create new commits and comments, so claim failures stop them. */
+async function claimReviewWork(
+  ctx: PrManagerContext,
+  key: string,
+  ttlMs = CLAIM_TTL_MS,
+): Promise<boolean> {
+  try {
+    return await ctx.state.setIfNotExists(key, "1", ttlMs);
+  } catch (error) {
+    logger(ctx).warn("githubbot_review_claim_failed", { error: errorMessage(error) });
+    return false;
+  }
+}
+
+async function claimAutomatedReviewSlot(
+  ctx: PrManagerContext,
+  owner: string,
+  repo: string,
+  number: number,
+): Promise<boolean> {
+  const prefix = `${ctx.options.stateKeyPrefix ?? "centaur-githubbot"}:bot-review-cycle:${owner}/${repo}#${number}`;
+  for (let slot = 1; slot <= MAX_AUTOMATED_REVIEW_RESPONSES_PER_PR; slot++) {
+    if (await claimReviewWork(ctx, `${prefix}:${slot}`, STATE_TTL_MS)) return true;
+  }
+  return false;
+}
+
+export function isAutomatedReviewer(user: unknown): boolean {
+  if (!isRecord(user)) return false;
+  const login = stringValue(user.login);
+  const type = stringValue(user.type);
+  return type?.toLowerCase() === "bot" || !!login?.toLowerCase().endsWith("[bot]");
 }
 
 /**
@@ -371,7 +406,7 @@ export async function handleReviewEvent(
   }
 
   if (
-    !(await claim(
+    !(await claimReviewWork(
       ctx,
       `${ctx.options.stateKeyPrefix ?? "centaur-githubbot"}:review-handled:${repo.owner}/${repo.repo}#${number}:${reviewId}`,
     ))
@@ -384,10 +419,24 @@ export async function handleReviewEvent(
     return;
   }
   if (reviewState === "changes_requested" || reviewState === "commented") {
+    const automated = isAutomatedReviewer(reviewNode.user);
+    if (automated) {
+      // Feedback on an old revision must not drive another push or review round.
+      if (!reviewedHeadSha || reviewedHeadSha !== pr.headSha) return;
+      const revisionKey = `${ctx.options.stateKeyPrefix ?? "centaur-githubbot"}:bot-review-reply:${repo.owner}/${repo.repo}#${number}:${pr.headSha}:${reviewer?.toLowerCase() ?? reviewId}`;
+      if (!(await claimReviewWork(ctx, revisionKey, STATE_TTL_MS))) return;
+      if (!(await claimAutomatedReviewSlot(ctx, repo.owner, repo.repo, number))) {
+        logger(ctx).warn("githubbot_automated_review_budget_exhausted", {
+          pr: `${repo.owner}/${repo.repo}#${number}`,
+        });
+        return;
+      }
+    }
     fireAddressReviewTurn(ctx, repo.owner, repo.repo, pr, {
       reviewer: reviewer ?? "the reviewer",
       reviewId,
       reviewNodeId: stringValue(reviewNode.node_id),
+      automated,
     });
   }
 }
@@ -654,7 +703,7 @@ function fireAddressReviewTurn(
   owner: string,
   repo: string,
   pr: PullRequestSummary,
-  review: { reviewer: string; reviewId: number; reviewNodeId?: string },
+  review: { reviewer: string; reviewId: number; reviewNodeId?: string; automated?: boolean },
 ): void {
   const { reviewer, reviewId, reviewNodeId } = review;
   const preamble =
@@ -664,9 +713,11 @@ function fireAddressReviewTurn(
     `pull-request review-comments API.\n` +
     `- Make the changes you agree with in a single coherent commit and push to ` +
     `${pr.headRef}.\n` +
-    `- Reply to each review thread saying what you changed; where you disagree, ` +
-    `explain why, briefly and respectfully. Resolve the threads you've addressed.\n` +
-    `- Re-request review from @${reviewer} once you've pushed.\n` +
+    `- Reply at most once per review thread for this revision, saying what changed; ` +
+    `where you disagree, explain why briefly. Resolve threads you've addressed.\n` +
+    (review.automated
+      ? `- Do not re-request an automated review. Leave the next review request to a human.\n`
+      : `- Re-request review from @${reviewer} once you've pushed.\n`) +
     `- If a request is unclear or you can't address it, say so in the thread and ask.`;
   fireManagementTurn(
     ctx,

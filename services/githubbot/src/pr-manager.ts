@@ -158,6 +158,8 @@ async function claim(ctx: PrManagerContext, key: string): Promise<boolean> {
   }
 }
 
+class ReviewClaimError extends Error {}
+
 /** Review responses can create new commits and comments, so claim failures stop them. */
 async function claimReviewWork(
   ctx: PrManagerContext,
@@ -177,7 +179,7 @@ async function claimReviewWork(
       if (attempt < 2) await new Promise((resolve) => setTimeout(resolve, 50 * (attempt + 1)));
     }
   }
-  throw new Error("Review claim storage is unavailable or its write is uncertain");
+  throw new ReviewClaimError("Review claim storage is unavailable or its write is uncertain");
 }
 
 async function claimAutomatedReviewSlot(
@@ -364,6 +366,7 @@ export async function handleReviewEvent(ctx: PrManagerContext, rawBody: string):
   try {
     await handleReviewEventInternal(ctx, rawBody);
   } catch (error) {
+    if (!(error instanceof ReviewClaimError)) throw error;
     logger(ctx).warn("githubbot_review_processing_blocked", { error: errorMessage(error) });
     const payload = parseJson(rawBody);
     const repo = payload && repoFromPayload(payload);

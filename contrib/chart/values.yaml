@@ -949,7 +949,8 @@ githubbot:
   # GitHub author_association values allowed to drive the comment-mention path.
   # Empty = the bot's safe default (OWNER, MEMBER, COLLABORATOR). Use "*" to allow
   # everyone (e.g. a fully-private repo). Comma-separated.
-  automatedReviewerLogins: ""
+  # Override with all User-account automation in this deployment.
+  automatedReviewerLogins: "darkmatteragent"
   allowedAuthorAssociations: ""
   # How long (seconds) to let in-flight turns finish on shutdown before the pod is
   # killed, so a deploy doesn't drop running CI fixes / reviews / issue work.

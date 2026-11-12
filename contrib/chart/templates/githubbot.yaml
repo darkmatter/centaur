@@ -122,6 +122,8 @@ spec:
             - name: GITHUBBOT_ALLOWED_AUTHOR_ASSOCIATIONS
               value: {{ .Values.githubbot.allowedAuthorAssociations | quote }}
 {{- end }}
+            - name: GITHUBBOT_AUTOMATED_REVIEWER_LOGINS
+              value: {{ .Values.githubbot.automatedReviewerLogins | quote }}
             # Drain budget on shutdown — kept ~10s under the grace period so the
             # final flush + exit still fit before the pod is force-killed.
             - name: GITHUBBOT_SHUTDOWN_DRAIN_MS

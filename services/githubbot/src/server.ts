@@ -127,6 +127,7 @@ const options: GithubbotOptions = {
   maxDurationMs: optionalNumberEnv("SESSION_MAX_DURATION_MS"),
   postgresUrl,
   reviewPrompt,
+  automatedReviewerLogins: listEnv("GITHUBBOT_AUTOMATED_REVIEWER_LOGINS"),
   issuePrompt,
   managementPrompt,
   stateKeyPrefix: optionalEnv("GITHUBBOT_STATE_KEY_PREFIX"),

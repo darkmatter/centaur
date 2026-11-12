@@ -975,8 +975,8 @@ function sampleCodexOutputLines(answer: string): string[] {
       JSON.stringify(notification),
     ),
     JSON.stringify({
-      type: "turn.completed",
-      turn: { id: "turn-1", items: [] },
+      method: "turn/completed",
+      params: { turn: { id: "turn-1", items: [], status: "completed" } },
     }),
   ];
 }
@@ -1004,8 +1004,8 @@ function answerOutputLines(answer: string): string[] {
       },
     }),
     JSON.stringify({
-      type: "turn.completed",
-      turn: { id: "turn-1", items: [] },
+      method: "turn/completed",
+      params: { turn: { id: "turn-1", items: [], status: "completed" } },
     }),
   ];
 }

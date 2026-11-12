@@ -34,7 +34,7 @@ test("captures only final-answer deltas when completion has no result text", asy
       { method: "item/started", params: { item: { id: "answer-1", phase: "final_answer" } } },
       { method: "item/agentMessage/delta", params: { itemId: "other", delta: "secret" } },
       { method: "item/agentMessage/delta", params: { itemId: "answer-1", delta: "GITHUB_SUMMARY:\nOutcome: Done." } },
-      { type: "turn.completed" },
+      { method: "turn/completed", params: { turn: { status: "completed" } } },
     ]) {
       yield { eventKind: "session.output.line", data: JSON.stringify(data) } as GithubbotRendererSource;
     }

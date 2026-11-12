@@ -94,6 +94,7 @@ export function handleReviewRequest(
     !!reviewer && reviewer.toLowerCase() === input.botUserName.toLowerCase();
   const teamSlug = stringValue(payload.requested_team?.slug);
   if (!directMatch && !teamSlug) return null;
+  if (input.options.reviewMode === "off") return null;
 
   const threadKey = reviewThreadKey(owner, repo, number);
   const title = stringValue(payload.pull_request?.title) ?? `#${number}`;
@@ -127,17 +128,38 @@ export function handleReviewRequest(
     // double-reviews. State-keyed (not Chat-thread-keyed) because the review
     // thread is synthetic and never touches the adapter.
     const dedupKey = `${options.stateKeyPrefix ?? "centaur-githubbot"}:review-delivery:${threadKey}:${input.deliveryId}`;
-    let claimed = true;
+    let claimed = false;
     try {
       claimed = await state.setIfNotExists(dedupKey, "1", REVIEW_DEDUP_TTL_MS);
     } catch (error) {
-      logger.debug("githubbot_review_dedup_failed", {
+      logger.warn("githubbot_review_dedup_failed", {
         error: errorMessage(error),
       });
+      return;
     }
     if (!claimed) {
       traceLog(options, "githubbot_review_duplicate_skipped", trace, {
         delivery_id: input.deliveryId,
+      });
+      return;
+    }
+    // Unconfigured deployments retain their pre-ownership review-request behavior.
+    // Explicit execute mode always requires an exact repository assignment.
+    const mode = options.reviewMode;
+    const assigned = options.reviewRepositories?.some(
+      (name) => name.toLowerCase() === `${owner}/${repo}`.toLowerCase(),
+    ) ?? false;
+    if (mode === "observe") {
+      traceLog(options, "githubbot_review_request_observed", trace, {
+        pr: `${owner}/${repo}#${number}`,
+        head_sha: headSha,
+        assigned_to_centaur: assigned,
+      });
+      return;
+    }
+    if (mode === "execute" && !assigned) {
+      traceLog(options, "githubbot_review_request_unassigned", trace, {
+        pr: `${owner}/${repo}#${number}`,
       });
       return;
     }

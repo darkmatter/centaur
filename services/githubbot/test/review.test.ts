@@ -7,6 +7,8 @@ import type { GithubbotOptions } from "../src/types";
 const options = {
   apiUrl: "http://127.0.0.1:8080",
   stateKeyPrefix: "test",
+  reviewMode: "execute",
+  reviewRepositories: ["0xSplits/centaur"],
   fetch: () => Promise.resolve(new Response("no", { status: 400 })),
 } as unknown as GithubbotOptions;
 
@@ -53,6 +55,47 @@ function reviewRequestedBody(reviewerLogin: string | null): string {
 }
 
 describe("handleReviewRequest", () => {
+  test("preserves existing review-request execution when ownership mode is unset", async () => {
+    let reactions = 0;
+    const result = handleReviewRequest(reviewRequestedBody("review-bot"), {
+      ...input,
+      options: { ...options, reviewMode: undefined, reviewRepositories: [] },
+      state: stubState(),
+      octokit: { rest: { reactions: { createForIssue: async () => { reactions++; } } } } as never,
+    });
+    await result;
+    expect(reactions).toBe(1);
+  });
+
+  test("explicit observe mode never executes an otherwise assigned request", async () => {
+    let reactions = 0;
+    await handleReviewRequest(reviewRequestedBody("review-bot"), {
+      ...input, options: {...options, reviewMode: "observe"}, state: stubState(),
+      octokit: {rest: {reactions: {createForIssue: async () => {reactions++;}}}} as never,
+    });
+    expect(reactions).toBe(0);
+  });
+
+  test("requires a repository assignment before executing a review", async () => {
+    let reactions = 0;
+    await handleReviewRequest(reviewRequestedBody("review-bot"), {
+      ...input,
+      options: { ...options, reviewRepositories: [] },
+      state: stubState(),
+      octokit: { rest: { reactions: { createForIssue: async () => { reactions++; } } } } as never,
+    });
+    expect(reactions).toBe(0);
+  });
+
+  test("fails closed when the delivery claim cannot be stored", async () => {
+    let reactions = 0;
+    await handleReviewRequest(reviewRequestedBody("review-bot"), {
+      ...input,
+      state: { setIfNotExists: async () => { throw new Error("store unavailable"); } } as never,
+      octokit: { rest: { reactions: { createForIssue: async () => { reactions++; } } } } as never,
+    });
+    expect(reactions).toBe(0);
+  });
   test("ignores non-JSON bodies", () => {
     expect(handleReviewRequest("not json", input)).toBeNull();
   });

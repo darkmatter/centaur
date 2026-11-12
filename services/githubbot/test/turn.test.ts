@@ -1,11 +1,47 @@
 import { describe, expect, test } from "bun:test";
 import {
+  GithubRenderFallback,
   githubContextPreamble,
   parseGithubThreadKey,
   reviewCommentContextFromRaw,
   turnOutputChars,
   type TurnResult,
 } from "../src/turn";
+import type { GithubbotRendererSource } from "../src/types";
+
+test("captures a marked terminal result inside an output line", async () => {
+  const fallback = new GithubRenderFallback();
+  const event = {
+    eventKind: "session.output.line",
+    data: JSON.stringify({
+      type: "turn.completed",
+      result_text: "GITHUB_SUMMARY:\nOutcome: Done.",
+    }),
+  } as GithubbotRendererSource;
+  async function* source() {
+    yield event;
+  }
+  for await (const _ of fallback.collectSource(source())) {
+    // Consume the source so the fallback sees the terminal event.
+  }
+  expect(fallback.text()).toContain("Outcome: Done.");
+});
+
+test("captures only final-answer deltas when completion has no result text", async () => {
+  const fallback = new GithubRenderFallback();
+  async function* source() {
+    for (const data of [
+      { method: "item/started", params: { item: { id: "answer-1", phase: "final_answer" } } },
+      { method: "item/agentMessage/delta", params: { itemId: "other", delta: "secret" } },
+      { method: "item/agentMessage/delta", params: { itemId: "answer-1", delta: "GITHUB_SUMMARY:\nOutcome: Done." } },
+      { method: "turn/completed", params: { turn: { status: "completed" } } },
+    ]) {
+      yield { eventKind: "session.output.line", data: JSON.stringify(data) } as GithubbotRendererSource;
+    }
+  }
+  for await (const _ of fallback.collectSource(source())) {}
+  expect(fallback.text()).toBe("GITHUB_SUMMARY:\nOutcome: Done.");
+});
 
 describe("parseGithubThreadKey", () => {
   test("parses a PR-level thread key", () => {

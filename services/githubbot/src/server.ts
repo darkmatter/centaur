@@ -1,3 +1,4 @@
+import { automatedReviewerLogins } from "./automated-reviewers";
 import { readFileSync } from "node:fs";
 import { drainBackgroundWork } from "./context";
 import { createGithubbot, type GithubbotOptions } from "./index";
@@ -127,6 +128,9 @@ const options: GithubbotOptions = {
   maxDurationMs: optionalNumberEnv("SESSION_MAX_DURATION_MS"),
   postgresUrl,
   reviewPrompt,
+  reviewMode: reviewModeEnv(),
+  reviewRepositories: listEnv("GITHUBBOT_REVIEW_REPOSITORIES"),
+  automatedReviewerLogins: [...automatedReviewerLogins(listEnv("GITHUBBOT_AUTOMATED_REVIEWER_LOGINS"))],
   issuePrompt,
   managementPrompt,
   stateKeyPrefix: optionalEnv("GITHUBBOT_STATE_KEY_PREFIX"),
@@ -213,6 +217,13 @@ function mergeMethodEnv(): "merge" | "squash" | "rebase" | undefined {
     throw new Error("GITHUBBOT_MERGE_METHOD must be one of: merge, squash, rebase");
   }
   return undefined;
+}
+
+function reviewModeEnv(): "observe" | "execute" | "off" | undefined {
+  const value = optionalEnv("GITHUBBOT_REVIEW_MODE")?.toLowerCase();
+  if (!value) return undefined;
+  if (value === "observe" || value === "execute" || value === "off") return value;
+  throw new Error("GITHUBBOT_REVIEW_MODE must be one of: observe, execute, off");
 }
 
 function optionalNumberEnv(name: string): number | undefined {

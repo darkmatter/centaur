@@ -14,6 +14,7 @@ export const sidebar = [
   {
     text: 'Operate',
     items: [
+      { text: 'GitHub review ownership', link: '/operate/github-review-ownership' },
       { text: 'Slack ETL', link: '/operate/slack-etl' },
       { text: 'Expose Slackbot with Tailscale Funnel', link: '/operate/tailscale-funnel' },
     ],

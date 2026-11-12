@@ -20,10 +20,11 @@ reviewer** like any other collaborator.
   diff hunk it's anchored to are injected into the turn so the agent knows exactly what it's looking
   at; for a **PR conversation thread** the agent is pointed at `gh pr view`/`gh pr diff` to fetch the
   PR itself. A 👀 reaction acks the triggering comment while the bot works, settling to 🚀 / 😕. The
-  reply is one comment: the answer with the chain-of-thought folded into a collapsed `<details>`
-  section. Mention detection is the adapter's (matches the bot account's `@username`). Only authors
+  reply is one concise outcome comment. Execution detail stays in Console; task updates, model
+  reasoning, and raw errors are never included in the public reply. Mention detection is the adapter's
+  (matches the bot account's `@username`). Only authors
   whose GitHub `author_association` is allowed (default `OWNER` / `MEMBER` / `COLLABORATOR`) can drive
-  a turn — the agent runs in a write-capable sandbox and posts its transcript back, so untrusted
+  a turn — the agent runs in a write-capable sandbox, so untrusted
   commenters can't steer it. Widen or open it with `GITHUBBOT_ALLOWED_AUTHOR_ASSOCIATIONS` (`*` allows
   everyone, e.g. a fully-private repo). Lifecycle triggers (assignment, review-request) are already
   gated by GitHub permissions, so this applies only to the comment path.
@@ -47,6 +48,10 @@ reviewer** like any other collaborator.
   deployment can **fully replace** via `GITHUBBOT_REVIEW_PROMPT` / `GITHUBBOT_REVIEW_PROMPT_FILE`
   (the override is used verbatim, so org conventions supersede ours wholesale; for Splits this is
   where the overlay supplies its review guide). Webhook redeliveries are de-duplicated by delivery id.
+  An unset mode preserves existing review-request execution during upgrades. Explicit
+  `observe` records eligible requests without starting a review. To enable scoped ownership, set `GITHUBBOT_REVIEW_MODE=execute` and include its `owner/repo`
+  in `GITHUBBOT_REVIEW_REPOSITORIES`. Keep repositories owned by another reviewer out of that list.
+  Claim-store errors stop execution, so a redelivery cannot start an unclaimed duplicate review.
 - **Assigning an issue to the bot** (`issues` / `assigned` to the bot account) → an autonomous work
   turn runs on a **dedicated, isolated session thread** (`github-issue:{owner}/{repo}:{n}`): the agent
   reads the issue, implements a fix in its sandbox, and opens a PR (self-assigning it so it then
@@ -96,8 +101,13 @@ management thread (`github-manage:{owner}/{repo}:{n}`); the agent does its GitHu
   PR green on a check it never saw. Commit statuses and check runs from other GitHub Apps aren't
   Actions jobs, which is exactly what that count check catches.
 - **Address review.** A submitted review (`changes_requested` / `commented`) triggers one holistic
-  turn that reads all the feedback, makes a single coherent commit, replies on each thread, resolves
-  what it addressed, and re-requests review.
+  turn that reads the feedback and makes a coherent commit. Human reviews can re-request review.
+  Bot-authored feedback is limited to one response per reviewer and PR revision, and three response
+  cycles per PR; stale bot reviews are ignored. Review claims fail closed if state is unavailable.
+  The management prompt asks for at most one reply per thread and no automatic re-request of a bot.
+  These controls bound webhook-triggered turns; direct `gh` writes from an agent are outside this
+  receiver's write boundary and need a separate API or egress guard before a global posting budget
+  can be guaranteed.
 - **Merge when ready.** Deterministic — no agent. When GitHub reports the PR `mergeable_state == clean`
   the bot merges it (`GITHUBBOT_MERGE_METHOD`, default squash) and deletes the branch. `dirty` →
   conflict-resolution turn; `behind` → branch update; anything else → wait. Enabled by default for
@@ -161,6 +171,8 @@ requests**, **Pull request reviews**, **Check runs**, **Check suites**, and **Wo
 | `GITHUBBOT_DEFAULT_HARNESS` | — | Harness for new threads without an inline flag, default `codex`. |
 | `GITHUBBOT_REVIEW_PROMPT` | — | Full review methodology, inline. Replaces the bundled default verbatim. |
 | `GITHUBBOT_REVIEW_PROMPT_FILE` | — | Path to a file holding the review methodology (e.g. an overlay-mounted file). Used when the inline var is unset. |
+| `GITHUBBOT_REVIEW_MODE` | — | Unset preserves existing requests. `observe`, `execute`, or `off`; explicit execute requires listed repositories. |
+| `GITHUBBOT_REVIEW_REPOSITORIES` | — | Comma-separated `owner/repo` list assigned to Centaur. Required for `execute` to act. |
 | `GITHUBBOT_ISSUE_PROMPT` | — | Full issue-work methodology, inline. Replaces the bundled default verbatim. |
 | `GITHUBBOT_ISSUE_PROMPT_FILE` | — | Path to a file holding the issue-work methodology (e.g. an overlay-mounted file). Used when the inline var is unset. |
 | `GITHUBBOT_MANAGEMENT_PROMPT` | — | Extra guidance prepended to owned-PR management turns (CI-fix / conflict / address-review), inline. The per-action preamble still rides underneath. |
@@ -187,3 +199,11 @@ preamble, the review-request trigger gating (incl. team requests), the issue-ass
 v2 PR-manager decision logic (CI evaluation, centaur-skip checks, the Actions fallback for unreadable check detail, assignment-based ownership, merge
 gating, the CI-fix counter / escalation, and the merge-claim release-on-failure), the
 author-association gate, body mentions, and the per-session serialization queue.
+
+`GITHUBBOT_AUTOMATED_REVIEWER_LOGINS` (chart `githubbot.automatedReviewerLogins`)
+is a comma-separated, case-insensitive list of automation using ordinary User
+accounts. The fork supplies its deployment default in `automated-reviewers.ts`;
+an explicit list replaces it. Include every deployed automated reviewer so the per-revision and
+three-cycle bounds apply, including the no-re-request instruction. Claim-store
+errors retry twice; a persistent or uncertain claim stops execution and posts
+a fixed operational notice on the PR rather than silently losing human feedback.

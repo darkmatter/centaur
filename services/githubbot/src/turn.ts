@@ -5,7 +5,11 @@ import {
 } from "@centaur/rendering";
 import type { GitHubAdapter } from "@chat-adapter/github";
 import type { Thread } from "chat";
-import { buildCommentReplyBody, CommentReplyCollector } from "./comment-bot";
+import {
+  buildFailedReplyBody,
+  buildPublicCommentReply,
+  CommentReplyCollector,
+} from "./comment-bot";
 import { runExclusive } from "./context";
 import { resolveStickyProvider } from "./overrides";
 import {
@@ -60,6 +64,16 @@ export type TurnResult = {
 export function turnOutputChars(result: TurnResult): number {
   if (result.failed) return result.errorText.length;
   return (result.answer || result.fallbackText).length;
+}
+
+/** GitHub receives only a marked, concise terminal outcome. */
+export function githubTurnPreamble(preamble?: string): string {
+  const publicReplyContract =
+    "Public GitHub response contract: Keep execution details in Console. " +
+    "Your terminal text must be one concise block with this form, using short factual statements: " +
+    "GITHUB_SUMMARY:\nOutcome: ...\nChanges: ...\nVerification: ...\nCI: ...\nNext: ... " +
+    "Do not include commands, raw logs, model reasoning, or a work transcript.";
+  return [preamble, publicReplyContract].filter(Boolean).join("\n\n");
 }
 
 const THREAD_KEY_PATTERN =
@@ -217,9 +231,9 @@ async function runTurnStreamInner(
         collector.update(chunk);
       }
       return {
-        answer: collector.answer,
-        cotLines: collector.cotLines,
-        errorText: collector.errorText,
+        answer: "",
+        cotLines: [],
+        errorText: "",
         failed: collector.failed,
         fallbackText: fallback.text(),
       };
@@ -306,7 +320,9 @@ export async function runSessionTurn(input: {
   let lastEventId = threadState.lastEventId ?? 0;
   const forwardInput: ForwardSessionInput = {
     afterEventId: lastEventId,
-    contextPreamble: input.contextPreamble ?? githubContextPreamble(threadKey),
+    contextPreamble: githubTurnPreamble(
+      input.contextPreamble ?? githubContextPreamble(threadKey),
+    ),
     conversationName,
     executeMessage,
     harnessType: overrides.harnessType,
@@ -329,15 +345,8 @@ export async function runSessionTurn(input: {
     lastEventId,
   });
   const body = result.failed
-    ? buildCommentReplyBody({
-        answer: `⚠️ I ran into an error before finishing:\n\n${result.errorText || "unknown error"}`,
-        cotLines: result.cotLines,
-      })
-    : buildCommentReplyBody({
-        answer: result.answer,
-        cotLines: result.cotLines,
-        fallback: result.fallbackText,
-      });
+    ? buildFailedReplyBody()
+    : buildPublicCommentReply({ fallback: result.fallbackText }).body;
   try {
     await thread.post(body);
   } catch (error) {
@@ -366,6 +375,8 @@ export async function runSessionTurn(input: {
  */
 export class GithubRenderFallback {
   private terminalText = "";
+  private readonly finalAnswerIds = new Set<string>();
+  private finalAnswerText = "";
 
   async *collectSource(
     stream: AsyncIterable<GithubbotRendererSource>,
@@ -389,25 +400,55 @@ export class GithubRenderFallback {
           ? event.event
           : "",
     );
+    const data = "data" in event ? parseTerminalEventData(event.data) : event;
+    if (eventKind === "session.output.line") this.captureFinalAnswer(data);
     if (
       eventKind !== "session.execution_completed" &&
       eventKind !== "session.execution_cancelled" &&
+      !(eventKind === "session.output.line" && isTerminalCodexAppServerEvent(data)) &&
       !isTerminalCodexAppServerEvent(event)
     ) {
       return;
     }
-    const data =
-      "data" in event && event.data && typeof event.data === "object"
-        ? event.data
-        : event;
-    const text = terminalResultText(data);
+    const text = terminalResultText(data) || this.finalAnswerText;
     if (text) this.terminalText = text;
+  }
+
+  private captureFinalAnswer(data: unknown): void {
+    if (!data || typeof data !== "object") return;
+    const notification = data as { method?: unknown; params?: unknown };
+    if (!notification.params || typeof notification.params !== "object") return;
+    const params = notification.params as Record<string, unknown>;
+    if (notification.method === "item/started" && params.item && typeof params.item === "object") {
+      const item = params.item as Record<string, unknown>;
+      if (item.phase === "final_answer" && typeof item.id === "string") {
+        this.finalAnswerIds.add(item.id);
+      }
+    }
+    if (
+      notification.method === "item/agentMessage/delta" &&
+      typeof params.itemId === "string" &&
+      this.finalAnswerIds.has(params.itemId) &&
+      typeof params.delta === "string"
+    ) {
+      this.finalAnswerText += params.delta.slice(0, 8_000 - this.finalAnswerText.length);
+    }
+  }
+}
+
+function parseTerminalEventData(data: unknown): unknown {
+  if (typeof data !== "string") return data;
+  try {
+    return JSON.parse(data) as unknown;
+  } catch {
+    return null;
   }
 }
 
 function isTerminalCodexAppServerEvent(event: unknown): boolean {
   if (!event || typeof event !== "object") return false;
-  const type = (event as { type?: unknown }).type;
+  const type = (event as { type?: unknown; method?: unknown }).type;
+  if ((event as { method?: unknown }).method === "turn/completed") return true;
   return type === "result" || type === "turn.done" || type === "turn.completed";
 }
 

@@ -26,6 +26,7 @@ import {
 } from "./issue-comments";
 import {
   buildCommentReplyBody,
+  buildFailedReplyBody,
   buildThinkingReplyBody,
   commentMentionsBot,
   CommentReplyCollector,
@@ -358,10 +359,6 @@ function issueCommentMessage(
 }
 
 const THREAD_TURN_MAX_RETRIES = 3;
-// Min gap between live edits of the streaming "Thinking…" comment. The first
-// thought posts immediately; subsequent thoughts coalesce to stay well under
-// Linear's mutation rate limits. The final answer always writes regardless.
-const LIVE_THINKING_EDIT_MIN_INTERVAL_MS = 2_500;
 // Cap on the full issue-context preamble seeded on a thread's first turn. The
 // description rides inline in the execute, so keep it bounded (the whole issue
 // description, untruncated, could be huge).
@@ -370,7 +367,6 @@ const ISSUE_CONTEXT_PREAMBLE_MAX_CHARS = 8_000;
 // (an assignment turn has no triggering comment to react to, so the comment
 // itself is the "I've started" signal). Replaced by the live thought, then the
 // final answer, as the run proceeds.
-const WORK_START_HEADLINE = "On it — working on this issue.";
 const PROFILE_HANDLE_PATTERN = /\/profiles\/([^/?#]+)/;
 
 type ThreadHandlerInput = {
@@ -712,10 +708,8 @@ function handleIssueAssignment(
 }
 
 /**
- * Runs one agent turn on a thread's sandbox in a single, live comment. The
- * comment is posted with the first thought as a collapsed "Thinking…" section
- * that logs thoughts as the run streams (throttled), then swapped in place to
- * the final answer above a "Chain of thought" section when the run settles.
+ * Runs one agent turn on a thread's sandbox. A generic working comment is
+ * edited to the concise final outcome when the run settles.
  * Seeds the issue context on the thread's first turn. Best-effort with a bounded
  * retry on transient (cold-start) failures; a hard failure shows an error.
  */
@@ -830,9 +824,13 @@ async function runThreadTurn(input: {
   // the work (and how to signal status) — including comment turns on delegated
   // issues, where the assignment instruction never runs.
   if (owns) contextParts.push(OWNERSHIP_CONTEXT);
-  const contextPreamble = contextParts.length
-    ? contextParts.join("\n\n")
-    : undefined;
+  contextParts.push(
+    "Public Linear response contract: Keep reasoning, commands, logs, and diagnostics in Console. " +
+      "Your terminal text must end with LINEAR_SUMMARY: followed by a concise factual outcome, " +
+      "changes, verification, and next step. Keep it under eight lines. " +
+      "If this is an owned issue, put the Linear-Status marker on its own line outside the summary.",
+  );
+  const contextPreamble = contextParts.join("\n\n");
   // Name the iron-control session principal after the issue (identifier, else
   // title). api-rs re-upserts the principal on every create and ignores an
   // absent name, so sourcing it from the per-turn issue fetch keeps it stable.
@@ -860,40 +858,17 @@ async function runThreadTurn(input: {
     threadId: threadKey,
     trace,
   };
-  // The live reply: posted with the first thought as a "Thinking…" section,
-  // edited (throttled) as more thoughts settle, then swapped to the final
-  // answer. `liveCommentId` persists across retries so a transient failure
-  // mid-stream keeps editing the same comment.
+  // A single generic acknowledgement can be edited to the outcome later.
   let liveCommentId: string | undefined;
   let livePostStarted = false;
-  let lastLiveRenderAtMs = 0;
-  let lastLiveLineCount = 0;
-  const renderThinking = async (
-    collector: CommentReplyCollector,
-  ): Promise<void> => {
-    if (!client) return;
-    const cotLines = collector.cotLines;
-    if (cotLines.length === 0) return;
+  const renderThinking = async (): Promise<void> => {
+    if (!client || livePostStarted) return;
+    livePostStarted = true;
     try {
-      if (!livePostStarted) {
-        livePostStarted = true;
-        lastLiveLineCount = cotLines.length;
-        lastLiveRenderAtMs = nowMs();
-        liveCommentId = await postIssueReply(client, {
-          body: buildThinkingReplyBody(cotLines, collector.latestThought),
-          issueId,
-          parentCommentId,
-        });
-        return;
-      }
-      if (!liveCommentId || cotLines.length === lastLiveLineCount) return;
-      if (nowMs() - lastLiveRenderAtMs < LIVE_THINKING_EDIT_MIN_INTERVAL_MS)
-        return;
-      lastLiveLineCount = cotLines.length;
-      lastLiveRenderAtMs = nowMs();
-      await updateIssueReply(client, {
-        body: buildThinkingReplyBody(cotLines, collector.latestThought),
-        commentId: liveCommentId,
+      liveCommentId = await postIssueReply(client, {
+        body: buildThinkingReplyBody(),
+        issueId,
+        parentCommentId,
       });
     } catch (error) {
       logger.debug("linearbot_live_render_failed", {
@@ -901,16 +876,13 @@ async function runThreadTurn(input: {
       });
     }
   };
-  // Assignment turns have no triggering comment to react to, so post the reply
-  // up front as the "I've started" signal — the chain of thought then fills in
-  // live (renderThinking) and the answer takes over when the run settles.
+  // Assignment turns have no triggering comment to react to, so post the
+  // generic acknowledgement before execution starts.
   if (announceStart && client) {
     livePostStarted = true;
-    lastLiveLineCount = 0;
-    lastLiveRenderAtMs = nowMs();
     try {
       liveCommentId = await postIssueReply(client, {
-        body: buildThinkingReplyBody([], WORK_START_HEADLINE),
+        body: buildThinkingReplyBody(),
         issueId,
         parentCommentId,
       });
@@ -941,7 +913,7 @@ async function runThreadTurn(input: {
         rendererOptions(options),
       )) {
         collector.update(chunk);
-        await renderThinking(collector);
+        await renderThinking();
       }
       await thread.setState({
         historyForwarded: true,
@@ -954,20 +926,11 @@ async function runThreadTurn(input: {
       });
       if (collector.failed) {
         failed = true;
-        body = buildCommentReplyBody({
-          answer: `⚠️ I ran into an error before finishing:\n\n${collector.errorText || "unknown error"}`,
-          cotLines: collector.cotLines,
-        });
+        body = buildFailedReplyBody();
       } else {
-        const extracted = extractStatusMarker(
-          collector.answer || fallback.text(),
-        );
+        const extracted = extractStatusMarker(fallback.text());
         marker = extracted.marker;
-        body = buildCommentReplyBody({
-          answer: extracted.text,
-          cotLines: collector.cotLines,
-          fallback: fallback.text(),
-        });
+        body = buildCommentReplyBody({ fallback: extracted.text });
       }
       break;
     } catch (error) {
@@ -985,14 +948,13 @@ async function runThreadTurn(input: {
         error: errorMessage(error),
       });
       failed = true;
-      body = `⚠️ I ran into an error before finishing: ${errorMessage(error)}`;
+      body = buildFailedReplyBody();
       break;
     }
   }
   if (client && body !== undefined) {
     try {
-      // Swap the live "Thinking…" comment to the final answer in place; if no
-      // thought ever streamed (no live comment), post the answer fresh.
+      // Replace the working acknowledgement with the final outcome.
       if (liveCommentId) {
         await updateIssueReply(client, { body, commentId: liveCommentId });
       } else {
@@ -1121,6 +1083,8 @@ async function applyAssignmentStatusMarker(
 
 class LinearRenderFallback {
   private terminalText = "";
+  private readonly finalAnswerIds = new Set<string>();
+  private finalAnswerText = "";
 
   async *collectSource(
     stream: AsyncIterable<LinearbotRendererSource>,
@@ -1144,25 +1108,56 @@ class LinearRenderFallback {
           ? event.event
           : "",
     );
+    const data =
+      "data" in event ? parseTerminalEventData(event.data) : event;
+    if (eventKind === "session.output.line") this.captureFinalAnswer(data);
     if (
       eventKind !== "session.execution_completed" &&
       eventKind !== "session.execution_cancelled" &&
+      !(eventKind === "session.output.line" && isTerminalCodexAppServerEvent(data)) &&
       !isTerminalCodexAppServerEvent(event)
     ) {
       return;
     }
-    const data =
-      "data" in event && event.data && typeof event.data === "object"
-        ? event.data
-        : event;
-    const text = terminalResultText(data);
+    const text = terminalResultText(data) || this.finalAnswerText;
     if (text) this.terminalText = text;
+  }
+
+  private captureFinalAnswer(data: unknown): void {
+    if (!data || typeof data !== "object") return;
+    const notification = data as { method?: unknown; params?: unknown };
+    if (!notification.params || typeof notification.params !== "object") return;
+    const params = notification.params as Record<string, unknown>;
+    if (notification.method === "item/started" && params.item && typeof params.item === "object") {
+      const item = params.item as Record<string, unknown>;
+      if (item.phase === "final_answer" && typeof item.id === "string") {
+        this.finalAnswerIds.add(item.id);
+      }
+    }
+    if (
+      notification.method === "item/agentMessage/delta" &&
+      typeof params.itemId === "string" &&
+      this.finalAnswerIds.has(params.itemId) &&
+      typeof params.delta === "string"
+    ) {
+      this.finalAnswerText += params.delta.slice(0, 8_000 - this.finalAnswerText.length);
+    }
+  }
+}
+
+function parseTerminalEventData(data: unknown): unknown {
+  if (typeof data !== "string") return data;
+  try {
+    return JSON.parse(data) as unknown;
+  } catch {
+    return null;
   }
 }
 
 function isTerminalCodexAppServerEvent(event: unknown): boolean {
   if (!event || typeof event !== "object") return false;
   const type = (event as { type?: unknown }).type;
+  if ((event as { method?: unknown }).method === "turn/completed") return true;
   return type === "result" || type === "turn.done" || type === "turn.completed";
 }
 

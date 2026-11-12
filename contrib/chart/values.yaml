@@ -934,6 +934,13 @@ githubbot:
   mergeMethod: squash
   # Emit CI and review workflow events to api-rs.
   workflowEvents: false
+  # Review requests are logged without running a reviewer until a repository is
+  # explicitly assigned to this bot. Use execute only after choosing one owner
+  # for each PR review path alongside any other reviewer platform.
+  # Empty preserves existing review-request execution during upgrades.
+  # Opt into observe, then execute with reviewRepositories in the same release.
+  reviewMode: ""
+  reviewRepositories: ""
   # Fallback @handle (no leading @) the bot tags when it gives up; empty = none.
   escalationHandle: ""
   # Optional review / issue-work methodology overrides. When set, the chart writes
@@ -949,6 +956,8 @@ githubbot:
   # GitHub author_association values allowed to drive the comment-mention path.
   # Empty = the bot's safe default (OWNER, MEMBER, COLLABORATOR). Use "*" to allow
   # everyone (e.g. a fully-private repo). Comma-separated.
+  # Override with all User-account automation in this deployment.
+  automatedReviewerLogins: "darkmatteragent"
   allowedAuthorAssociations: ""
   # How long (seconds) to let in-flight turns finish on shutdown before the pod is
   # killed, so a deploy doesn't drop running CI fixes / reviews / issue work.

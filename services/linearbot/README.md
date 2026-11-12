@@ -17,9 +17,8 @@ control plane is unchanged (`linear:…` thread keys flow through identically).
 
 - **`@`-mentioning the bot in a comment** → the bot answers in that comment thread, keyed
   `linear:{issueId}:c:{rootCommentId}` (one thread === one sandbox/context stack). The reply is a
-  single comment, live-edited: it posts with the latest reasoning line as a headline above a
-  collapsed **Thinking…** section that fills in as the run streams (throttled), then swaps in place
-  to the final answer above a collapsed **Chain of thought** section. A 👀 reaction acks the
+  single comment, edited from a generic working acknowledgement to a concise final outcome.
+  Task details, reasoning, and raw errors stay in Console. A 👀 reaction acks the
   triggering comment while the bot works, settling to ✅ / ❌. A mention is encoded by Linear as the
   bot profile's plain URL in the markdown body, so detection matches that (with the user id and a
   typed `@name` as fallbacks).

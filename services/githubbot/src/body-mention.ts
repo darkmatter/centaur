@@ -1,9 +1,9 @@
 import { resolveAllowedAuthorAssociations } from "./authorization";
 import { backgroundWaitUntil } from "./context";
-import { buildCommentReplyBody } from "./comment-bot";
+import { buildFailedReplyBody, buildPublicCommentReply } from "./comment-bot";
 import type { PrManagerContext } from "./pr-manager";
 import { reactWorkingOnSubject, settleSubjectReaction } from "./reactions";
-import { githubContextPreamble, runTurnStream } from "./turn";
+import { githubContextPreamble, githubTurnPreamble, runTurnStream } from "./turn";
 import type {
   ForwardSessionInput,
   GithubbotApiMessage,
@@ -101,7 +101,7 @@ export function handleBodyMention(
 
     const forwardInput: ForwardSessionInput = {
       afterEventId: 0,
-      contextPreamble: githubContextPreamble(threadKey),
+      contextPreamble: githubTurnPreamble(githubContextPreamble(threadKey)),
       conversationName: `${repo.owner}/${repo.repo}#${number}`,
       executeMessage: bodyMentionMessage(threadKey, number, body),
       messages: [],
@@ -114,15 +114,8 @@ export function handleBodyMention(
 
     const result = await runTurnStream(options, forwardInput);
     const reply = result.failed
-      ? buildCommentReplyBody({
-          answer: `⚠️ I ran into an error before finishing:\n\n${result.errorText || "unknown error"}`,
-          cotLines: result.cotLines,
-        })
-      : buildCommentReplyBody({
-          answer: result.answer,
-          cotLines: result.cotLines,
-          fallback: result.fallbackText,
-        });
+      ? buildFailedReplyBody()
+      : buildPublicCommentReply({ fallback: result.fallbackText }).body;
     try {
       await ctx.octokit.rest.issues.createComment({
         owner: repo.owner,

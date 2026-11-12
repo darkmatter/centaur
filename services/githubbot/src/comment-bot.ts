@@ -90,12 +90,15 @@ function extractPublicSummary(value: string | undefined): string | undefined {
     .slice(marker.index + marker[0].length)
     .replace(INTERNAL_DETAILS_SECTION, "")
     .trim();
-  if (!summary || summary.length > PUBLIC_SUMMARY_MAX_CHARS) return undefined;
-  if (summary.split(/\r?\n/).filter((line) => line.trim()).length > PUBLIC_SUMMARY_MAX_LINES) {
-    return undefined;
-  }
+  if (!summary) return undefined;
   if (EXECUTION_TRANSCRIPT_MARKERS.test(summary)) return undefined;
-  return formatPublicSummary(summary);
+  const formatted = formatPublicSummary(summary);
+  const lines = formatted.split(/\r?\n/).filter((line) => line.trim());
+  const bounded = lines.slice(0, PUBLIC_SUMMARY_MAX_LINES).join("\n");
+  if (bounded.length > PUBLIC_SUMMARY_MAX_CHARS || lines.length > PUBLIC_SUMMARY_MAX_LINES) {
+    return bounded.slice(0, PUBLIC_SUMMARY_MAX_CHARS - 48).trimEnd() + "\n… Full answer continues in Console.";
+  }
+  return bounded;
 }
 
 /**

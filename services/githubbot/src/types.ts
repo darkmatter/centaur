@@ -125,6 +125,8 @@ export type GithubbotOptions = {
   /** Review-request ownership. Observe by default; execute only on listed repos. */
   reviewMode?: "observe" | "execute" | "off";
   reviewRepositories?: string[];
+  /** User-account reviewers operated by automation; compared case-insensitively. */
+  automatedReviewerLogins?: string[];
   /**
    * Full issue-work methodology used when an issue is assigned to the bot.
    * Defaults to the bundled DEFAULT_ISSUE_PROMPT; a deployment can fully replace

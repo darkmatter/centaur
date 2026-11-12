@@ -44,3 +44,13 @@ describe("GitHub public replies", () => {
       .toBe(false);
   });
 });
+
+ test("shortens long marked answers without discarding their outcome", () => {
+   for (const summary of ["Useful answer. ".repeat(250), Array.from({length: 12}, (_, i) => `Line ${i}`).join("\n")]) {
+     const reply = buildPublicCommentReply({ fallback: `GITHUB_SUMMARY:\n${summary}` });
+     expect(reply.summaryAvailable).toBe(true);
+     expect(reply.body.length).toBeLessThanOrEqual(2000);
+     expect(reply.body).toContain("Console");
+     expect(reply.body).not.toContain("summary unavailable");
+   }
+ });

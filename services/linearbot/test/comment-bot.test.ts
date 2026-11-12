@@ -41,3 +41,12 @@ describe("Linear public replies", () => {
     expect(buildFailedReplyBody()).not.toContain("private stack trace");
   });
 });
+
+it("shortens long marked answers instead of losing them", () => {
+  for (const text of ["Useful answer. ".repeat(250), Array.from({length: 12}, (_, i) => `Line ${i}`).join("\n")]) {
+    const body = buildCommentReplyBody({fallback: `LINEAR_SUMMARY:\n${text}`});
+    expect(body.length).toBeLessThanOrEqual(2000);
+    expect(body).toContain("Console");
+    expect(body).not.toContain("summary unavailable");
+  }
+});

@@ -59,12 +59,13 @@ export function buildCommentReplyBody(input: { fallback?: string }): string {
   const marker = SUMMARY_MARKER.exec(value);
   if (!marker || marker.index === undefined) return MISSING_SUMMARY;
   const summary = value.slice(marker.index + marker[0].length).trim();
-  if (!summary || summary.length > MAX_SUMMARY_CHARS) return MISSING_SUMMARY;
-  if (summary.split(/\r?\n/).filter((line) => line.trim()).length > MAX_SUMMARY_LINES) {
-    return MISSING_SUMMARY;
-  }
+  if (!summary) return MISSING_SUMMARY;
   if (/<details\b|<summary\b|\b(?:chain of thought|command execution|tool output|raw log|execution log)\b|^\s*(?:let me|i need to|i'll|i’ll|now i'll|now i’ll)\b/im.test(summary)) {
     return MISSING_SUMMARY;
   }
-  return summary;
+  const lines = summary.split(/\r?\n/).filter((line) => line.trim());
+  const bounded = lines.slice(0, MAX_SUMMARY_LINES).join("\n");
+  return bounded.length > MAX_SUMMARY_CHARS || lines.length > MAX_SUMMARY_LINES
+    ? bounded.slice(0, MAX_SUMMARY_CHARS - 48).trimEnd() + "\n… Full answer continues in Console."
+    : bounded;
 }

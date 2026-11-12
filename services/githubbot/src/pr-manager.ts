@@ -164,12 +164,20 @@ async function claimReviewWork(
   key: string,
   ttlMs = CLAIM_TTL_MS,
 ): Promise<boolean> {
-  try {
-    return await ctx.state.setIfNotExists(key, "1", ttlMs);
-  } catch (error) {
-    logger(ctx).warn("githubbot_review_claim_failed", { error: errorMessage(error) });
-    return false;
+  let failure: unknown;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const claimed = await ctx.state.setIfNotExists(key, "1", ttlMs);
+      // A failed write may have committed. Do not interpret that uncertain claim
+      // as an ordinary duplicate and silently discard the review.
+      if (!claimed && failure) throw failure;
+      return claimed;
+    } catch (error) {
+      failure = error;
+      if (attempt < 2) await new Promise((resolve) => setTimeout(resolve, 50 * (attempt + 1)));
+    }
   }
+  throw new Error("Review claim storage is unavailable or its write is uncertain");
 }
 
 async function claimAutomatedReviewSlot(
@@ -185,11 +193,12 @@ async function claimAutomatedReviewSlot(
   return false;
 }
 
-export function isAutomatedReviewer(user: unknown): boolean {
+export function isAutomatedReviewer(user: unknown, configuredLogins: readonly string[] = []): boolean {
   if (!isRecord(user)) return false;
   const login = stringValue(user.login);
   const type = stringValue(user.type);
-  return type?.toLowerCase() === "bot" || !!login?.toLowerCase().endsWith("[bot]");
+  return type?.toLowerCase() === "bot" || !!login?.toLowerCase().endsWith("[bot]") ||
+    !!login && configuredLogins.some((value) => value.trim().toLowerCase() === login.toLowerCase());
 }
 
 /**
@@ -350,7 +359,28 @@ export async function handlePullRequestEvent(
 }
 
 /** `pull_request_review` submitted -> address review, or merge on approval. */
-export async function handleReviewEvent(
+/** An acknowledged review must surface storage refusal on the PR itself. */
+export async function handleReviewEvent(ctx: PrManagerContext, rawBody: string): Promise<void> {
+  try {
+    await handleReviewEventInternal(ctx, rawBody);
+  } catch (error) {
+    logger(ctx).warn("githubbot_review_processing_blocked", { error: errorMessage(error) });
+    const payload = parseJson(rawBody);
+    const repo = payload && repoFromPayload(payload);
+    const pr = payload && isRecord(payload.pull_request) ? payload.pull_request : undefined;
+    if (!repo || typeof pr?.number !== "number") return;
+    try {
+      await ctx.octokit.rest.issues.createComment({
+        owner: repo.owner, repo: repo.repo, issue_number: pr.number,
+        body: "Review processing is paused because the review claim store is unavailable or returned an uncertain result. No review response was started. Please check the bot's storage and resubmit the review after recovery.",
+      });
+    } catch {
+      logger(ctx).warn("githubbot_review_blocked_notice_failed", { pr: `${repo.owner}/${repo.repo}#${pr.number}` });
+    }
+  }
+}
+
+async function handleReviewEventInternal(
   ctx: PrManagerContext,
   rawBody: string,
 ): Promise<void> {
@@ -419,7 +449,7 @@ export async function handleReviewEvent(
     return;
   }
   if (reviewState === "changes_requested" || reviewState === "commented") {
-    const automated = isAutomatedReviewer(reviewNode.user);
+    const automated = isAutomatedReviewer(reviewNode.user, ctx.options.automatedReviewerLogins);
     if (automated) {
       // Feedback on an old revision must not drive another push or review round.
       if (!reviewedHeadSha || reviewedHeadSha !== pr.headSha) return;

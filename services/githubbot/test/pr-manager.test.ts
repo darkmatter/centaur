@@ -1480,6 +1480,7 @@ describe("automated review bounds", () => {
     expect(isAutomatedReviewer({ login: "reviewer[bot]" })).toBe(true);
     expect(isAutomatedReviewer({ login: "reviewer", type: "Bot" })).toBe(true);
     expect(isAutomatedReviewer({ login: "reviewer", type: "User" })).toBe(false);
+    expect(isAutomatedReviewer({ login: "AgentUser", type: "User" }, ["agentuser"])).toBe(true);
   });
 
   function fixture() {
@@ -1536,6 +1537,36 @@ describe("automated review bounds", () => {
     }
     await drainBackgroundWork(5_000);
     expect(reactions.filter((value) => value === "EYES")).toHaveLength(3);
+  });
+
+  test("bounds explicitly configured User-account automation", async () => {
+    const {ctx, reactions, review, setHead} = fixture();
+    ctx.options.automatedReviewerLogins = ["agentuser"];
+    for (let cycle = 1; cycle <= 4; cycle++) {
+      setHead(`head-${cycle}`);
+      await handleReviewEvent(ctx, review(cycle, "AgentUser"));
+    }
+    await drainBackgroundWork(5000);
+    expect(reactions.filter((value) => value === "EYES")).toHaveLength(3);
+  });
+
+  test("retries transient claim errors and exposes a persistent outage on the PR", async () => {
+    const {ctx, reactions, review} = fixture();
+    const claim = ctx.state.setIfNotExists.bind(ctx.state);
+    let attempts = 0;
+    ctx.state.setIfNotExists = async (...args) => {
+      if (++attempts === 1) throw new Error("temporary failure");
+      return claim(...args);
+    };
+    await handleReviewEvent(ctx, review(1, "human"));
+    await drainBackgroundWork(5000);
+    expect(reactions.filter(value => value === "EYES")).toHaveLength(1);
+    const notices: string[] = [];
+    ctx.octokit.rest.issues = {createComment: async (input: {body: string}) => {notices.push(input.body); return {};}} as never;
+    ctx.state.setIfNotExists = async () => {throw new Error("storage unavailable");};
+    await handleReviewEvent(ctx, review(2, "human"));
+    expect(notices).toHaveLength(1);
+    expect(notices[0]).toContain("Review processing is paused");
   });
 
   test("ignores stale bot feedback and stops when the claim store fails", async () => {

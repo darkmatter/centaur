@@ -199,3 +199,10 @@ preamble, the review-request trigger gating (incl. team requests), the issue-ass
 v2 PR-manager decision logic (CI evaluation, centaur-skip checks, the Actions fallback for unreadable check detail, assignment-based ownership, merge
 gating, the CI-fix counter / escalation, and the merge-claim release-on-failure), the
 author-association gate, body mentions, and the per-session serialization queue.
+
+`GITHUBBOT_AUTOMATED_REVIEWER_LOGINS` (chart `githubbot.automatedReviewerLogins`)
+is a comma-separated, case-insensitive list of automation using ordinary User
+accounts. Set it for every deployed automated reviewer so the per-revision and
+three-cycle bounds apply, including the no-re-request instruction. Claim-store
+errors retry twice; a persistent or uncertain claim stops execution and posts
+a fixed operational notice on the PR rather than silently losing human feedback.

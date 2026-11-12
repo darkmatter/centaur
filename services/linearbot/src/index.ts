@@ -1157,6 +1157,7 @@ function parseTerminalEventData(data: unknown): unknown {
 function isTerminalCodexAppServerEvent(event: unknown): boolean {
   if (!event || typeof event !== "object") return false;
   const type = (event as { type?: unknown }).type;
+  if ((event as { method?: unknown }).method === "turn/completed") return true;
   return type === "result" || type === "turn.done" || type === "turn.completed";
 }
 

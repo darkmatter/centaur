@@ -129,6 +129,7 @@ const options: GithubbotOptions = {
   reviewPrompt,
   reviewMode: reviewModeEnv(),
   reviewRepositories: listEnv("GITHUBBOT_REVIEW_REPOSITORIES"),
+  automatedReviewerLogins: listEnv("GITHUBBOT_AUTOMATED_REVIEWER_LOGINS"),
   issuePrompt,
   managementPrompt,
   stateKeyPrefix: optionalEnv("GITHUBBOT_STATE_KEY_PREFIX"),

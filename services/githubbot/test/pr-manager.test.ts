@@ -1,3 +1,4 @@
+import { automatedReviewerLogins } from "../src/automated-reviewers";
 import { describe, expect, test } from "bun:test";
 import { drainBackgroundWork } from "../src/context";
 import {
@@ -1537,6 +1538,19 @@ describe("automated review bounds", () => {
     }
     await drainBackgroundWork(5_000);
     expect(reactions.filter((value) => value === "EYES")).toHaveLength(3);
+  });
+
+  test("runtime default list bounds the deployed User-account reviewer", async () => {
+    const {ctx, reactions, review, setHead} = fixture();
+    ctx.options.automatedReviewerLogins = [...automatedReviewerLogins(undefined)];
+    expect(isAutomatedReviewer({login: "DarkmatterAgent", type: "User"})).toBe(true);
+    expect(isAutomatedReviewer({login: "darkmatteragent", type: "User"}, [])).toBe(false);
+    for (let cycle = 1; cycle <= 4; cycle++) {
+      setHead(`head-${cycle}`);
+      await handleReviewEvent(ctx, review(cycle, "darkmatteragent"));
+    }
+    await drainBackgroundWork(5000);
+    expect(reactions.filter(value => value === "EYES")).toHaveLength(3);
   });
 
   test("bounds explicitly configured User-account automation", async () => {

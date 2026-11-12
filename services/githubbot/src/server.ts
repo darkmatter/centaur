@@ -1,3 +1,4 @@
+import { automatedReviewerLogins } from "./automated-reviewers";
 import { readFileSync } from "node:fs";
 import { drainBackgroundWork } from "./context";
 import { createGithubbot, type GithubbotOptions } from "./index";
@@ -129,7 +130,7 @@ const options: GithubbotOptions = {
   reviewPrompt,
   reviewMode: reviewModeEnv(),
   reviewRepositories: listEnv("GITHUBBOT_REVIEW_REPOSITORIES"),
-  automatedReviewerLogins: listEnv("GITHUBBOT_AUTOMATED_REVIEWER_LOGINS"),
+  automatedReviewerLogins: [...automatedReviewerLogins(listEnv("GITHUBBOT_AUTOMATED_REVIEWER_LOGINS"))],
   issuePrompt,
   managementPrompt,
   stateKeyPrefix: optionalEnv("GITHUBBOT_STATE_KEY_PREFIX"),

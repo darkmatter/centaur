@@ -1,3 +1,4 @@
+import { automatedReviewerLogins } from "./automated-reviewers";
 import type { GitHubAdapter } from "@chat-adapter/github";
 import type { StateAdapter } from "chat";
 import { backgroundWaitUntil } from "./context";
@@ -195,12 +196,12 @@ async function claimAutomatedReviewSlot(
   return false;
 }
 
-export function isAutomatedReviewer(user: unknown, configuredLogins: readonly string[] = []): boolean {
+export function isAutomatedReviewer(user: unknown, configuredLogins?: readonly string[]): boolean {
   if (!isRecord(user)) return false;
   const login = stringValue(user.login);
   const type = stringValue(user.type);
   return type?.toLowerCase() === "bot" || !!login?.toLowerCase().endsWith("[bot]") ||
-    !!login && configuredLogins.some((value) => value.trim().toLowerCase() === login.toLowerCase());
+    !!login && automatedReviewerLogins(configuredLogins).some((value) => value.trim().toLowerCase() === login.toLowerCase());
 }
 
 /**

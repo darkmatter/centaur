@@ -122,7 +122,7 @@ export type GithubbotOptions = {
    * GITHUBBOT_REVIEW_PROMPT(_FILE) so org conventions override ours wholesale.
    */
   reviewPrompt?: string;
-  /** Review-request ownership. Observe by default; execute only on listed repos. */
+  /** Review-request ownership. Unset preserves legacy requests; explicit execute requires listed repos. */
   reviewMode?: "observe" | "execute" | "off";
   reviewRepositories?: string[];
   /** User-account reviewers operated by automation; compared case-insensitively. */

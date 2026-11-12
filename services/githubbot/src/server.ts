@@ -218,8 +218,9 @@ function mergeMethodEnv(): "merge" | "squash" | "rebase" | undefined {
   return undefined;
 }
 
-function reviewModeEnv(): "observe" | "execute" | "off" {
-  const value = optionalEnv("GITHUBBOT_REVIEW_MODE")?.toLowerCase() ?? "observe";
+function reviewModeEnv(): "observe" | "execute" | "off" | undefined {
+  const value = optionalEnv("GITHUBBOT_REVIEW_MODE")?.toLowerCase();
+  if (!value) return undefined;
   if (value === "observe" || value === "execute" || value === "off") return value;
   throw new Error("GITHUBBOT_REVIEW_MODE must be one of: observe, execute, off");
 }

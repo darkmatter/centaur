@@ -143,7 +143,9 @@ export function handleReviewRequest(
       });
       return;
     }
-    const mode = options.reviewMode ?? "observe";
+    // Unconfigured deployments retain their pre-ownership review-request behavior.
+    // Explicit execute mode always requires an exact repository assignment.
+    const mode = options.reviewMode;
     const assigned = options.reviewRepositories?.some(
       (name) => name.toLowerCase() === `${owner}/${repo}`.toLowerCase(),
     ) ?? false;
@@ -155,7 +157,7 @@ export function handleReviewRequest(
       });
       return;
     }
-    if (!assigned) {
+    if (mode === "execute" && !assigned) {
       traceLog(options, "githubbot_review_request_unassigned", trace, {
         pr: `${owner}/${repo}#${number}`,
       });

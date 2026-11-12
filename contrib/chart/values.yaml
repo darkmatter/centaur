@@ -937,7 +937,9 @@ githubbot:
   # Review requests are logged without running a reviewer until a repository is
   # explicitly assigned to this bot. Use execute only after choosing one owner
   # for each PR review path alongside any other reviewer platform.
-  reviewMode: observe
+  # Empty preserves existing review-request execution during upgrades.
+  # Opt into observe, then execute with reviewRepositories in the same release.
+  reviewMode: ""
   reviewRepositories: ""
   # Fallback @handle (no leading @) the bot tags when it gives up; empty = none.
   escalationHandle: ""

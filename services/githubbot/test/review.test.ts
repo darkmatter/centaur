@@ -55,15 +55,24 @@ function reviewRequestedBody(reviewerLogin: string | null): string {
 }
 
 describe("handleReviewRequest", () => {
-  test("observes eligible review requests by default without starting work", async () => {
+  test("preserves existing review-request execution when ownership mode is unset", async () => {
     let reactions = 0;
     const result = handleReviewRequest(reviewRequestedBody("review-bot"), {
       ...input,
-      options: { ...options, reviewMode: undefined },
+      options: { ...options, reviewMode: undefined, reviewRepositories: [] },
       state: stubState(),
       octokit: { rest: { reactions: { createForIssue: async () => { reactions++; } } } } as never,
     });
     await result;
+    expect(reactions).toBe(1);
+  });
+
+  test("explicit observe mode never executes an otherwise assigned request", async () => {
+    let reactions = 0;
+    await handleReviewRequest(reviewRequestedBody("review-bot"), {
+      ...input, options: {...options, reviewMode: "observe"}, state: stubState(),
+      octokit: {rest: {reactions: {createForIssue: async () => {reactions++;}}}} as never,
+    });
     expect(reactions).toBe(0);
   });
 

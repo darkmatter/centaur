@@ -550,7 +550,8 @@ export async function forwardToSessionApi(
       input.provider,
       input.metadataModel,
       input.metadataHarnessType,
-      input.proactiveContext
+      input.proactiveContext,
+      input.generativeUiNote
     ),
     sessionApiTimeoutMs(options),
     'execute session'
@@ -570,6 +571,8 @@ export const WORKFLOW_ACTION_PREFIX = 'centaur.workflow.action:'
 export const SESSION_STEERING_DELIVERED_EVENT = 'session.steering_delivered'
 /** Emitted by api-rs when a follow-up could not reach the still-running execution. */
 export const SESSION_STEERING_FAILED_EVENT = 'session.steering_failed'
+/** Emitted by api-rs while a long execution is still running. */
+export const SESSION_PROGRESS_UPDATE_EVENT = 'session.progress_update'
 
 export async function dispatchSlackBlockAction(
   options: SlackbotV2Options,
@@ -1394,7 +1397,8 @@ async function executeSession(
   provider?: string,
   metadataModel?: string,
   metadataHarnessType?: string,
-  proactiveContext?: string
+  proactiveContext?: string,
+  generativeUiNote?: string
 ): Promise<SlackbotV2ExecuteSessionResponse> {
   const fetchFn = options.fetch ?? fetch
   const requesterIdentity = await resolveRequesterIdentity(options, message)
@@ -1427,7 +1431,8 @@ async function executeSession(
       contextPreamble,
       reasoning,
       provider,
-      proactiveContext
+      proactiveContext,
+      generativeUiNote
     ),
     idle_timeout_ms: idleTimeoutMs,
     ...(options.maxDurationMs === undefined ? {} : { max_duration_ms: options.maxDurationMs })
@@ -1658,7 +1663,8 @@ function toCodexInputLines(
   contextPreamble?: string,
   reasoning?: string,
   provider?: string,
-  proactiveContext?: string
+  proactiveContext?: string,
+  generativeUiNote?: string
 ): string[] {
   const staged = new Map<SlackbotV2ApiAttachment, string>()
   const lines: string[] = []
@@ -1675,7 +1681,8 @@ function toCodexInputLines(
       contextPreamble,
       reasoning,
       provider,
-      proactiveContext
+      proactiveContext,
+      generativeUiNote
     )
     if (
       inlineLine.length <= MAX_CODEX_INPUT_LINE_CHARS
@@ -1699,7 +1706,8 @@ function toCodexInputLines(
       contextPreamble,
       reasoning,
       provider,
-      proactiveContext
+      proactiveContext,
+      generativeUiNote
     )
   )
   return lines
@@ -1729,7 +1737,8 @@ function toCodexInputLineWithStaged(
   contextPreamble?: string,
   reasoning?: string,
   provider?: string,
-  proactiveContext?: string
+  proactiveContext?: string,
+  generativeUiNote?: string
 ): string {
   return JSON.stringify({
     type: 'user',
@@ -1746,7 +1755,8 @@ function toCodexInputLineWithStaged(
         requesterIdentity,
         contextMessages,
         contextPreamble,
-        proactiveContext
+        proactiveContext,
+        generativeUiNote
       )
     }
   })
@@ -1848,7 +1858,8 @@ function codexInputContent(
   requesterIdentity?: RequesterIdentity,
   contextMessages?: SlackbotV2ApiMessage[],
   contextPreamble?: string,
-  proactiveContext?: string
+  proactiveContext?: string,
+  generativeUiNote?: string
 ): JsonValue[] {
   const content: JsonValue[] = []
   const slackSessionContext = slackUploadSessionContext(message.threadId)
@@ -1880,6 +1891,9 @@ function codexInputContent(
   }
   if (proactiveContext?.trim()) {
     content.push({ type: 'text', text: proactiveContext })
+  }
+  if (generativeUiNote) {
+    content.push({ type: 'text', text: generativeUiNote })
   }
   const promptText = slackMessagePromptText(message)
   if (promptText.trim()) {
@@ -2060,6 +2074,7 @@ async function* parseSessionEventStream(
     // Slack hides when a follow-up message lands in the thread.
     if (
       event.event === 'session.activity_summary' ||
+      event.event === SESSION_PROGRESS_UPDATE_EVENT ||
       event.event === SESSION_STEERING_DELIVERED_EVENT ||
       event.event === SESSION_STEERING_FAILED_EVENT
     ) {

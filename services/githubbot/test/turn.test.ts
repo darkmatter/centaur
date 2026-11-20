@@ -1,6 +1,6 @@
+import { TerminalAnswer } from "@centaur/rendering";
 import { describe, expect, test } from "bun:test";
 import {
-  GithubRenderFallback,
   githubContextPreamble,
   parseGithubThreadKey,
   reviewCommentContextFromRaw,
@@ -10,7 +10,7 @@ import {
 import type { GithubbotRendererSource } from "../src/types";
 
 test("captures a marked terminal result inside an output line", async () => {
-  const fallback = new GithubRenderFallback();
+  const fallback = new TerminalAnswer();
   const event = {
     eventKind: "session.output.line",
     data: JSON.stringify({
@@ -28,7 +28,7 @@ test("captures a marked terminal result inside an output line", async () => {
 });
 
 test("captures only final-answer deltas when completion has no result text", async () => {
-  const fallback = new GithubRenderFallback();
+  const fallback = new TerminalAnswer();
   async function* source() {
     for (const data of [
       { method: "item/started", params: { item: { id: "answer-1", phase: "final_answer" } } },

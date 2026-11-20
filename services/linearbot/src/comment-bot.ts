@@ -1,10 +1,9 @@
+import { boundPublicReply } from "@centaur/rendering";
 import type { ChatSDKStreamChunk } from "@centaur/rendering";
 
 // Linear comments carry concise outcomes. The durable session and Console keep
 // task activity, reasoning, and failure diagnostics.
 const SUMMARY_MARKER = /^\s*LINEAR_SUMMARY\s*:\s*/im;
-const MAX_SUMMARY_CHARS = 2_000;
-const MAX_SUMMARY_LINES = 8;
 const MISSING_SUMMARY =
   "Execution completed, but a concise outcome was unavailable. See Centaur Console for details.";
 const FAILED_SUMMARY =
@@ -63,9 +62,5 @@ export function buildCommentReplyBody(input: { fallback?: string }): string {
   if (/<details\b|<summary\b|\b(?:chain of thought|command execution|tool output|raw log|execution log)\b|^\s*(?:let me|i need to|i'll|i’ll|now i'll|now i’ll)\b/im.test(summary)) {
     return MISSING_SUMMARY;
   }
-  const lines = summary.split(/\r?\n/).filter((line) => line.trim());
-  const bounded = lines.slice(0, MAX_SUMMARY_LINES).join("\n");
-  return bounded.length > MAX_SUMMARY_CHARS || lines.length > MAX_SUMMARY_LINES
-    ? bounded.slice(0, MAX_SUMMARY_CHARS - 48).trimEnd() + "\n… Full answer continues in Console."
-    : bounded;
+  return boundPublicReply(summary);
 }

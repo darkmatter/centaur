@@ -1,3 +1,4 @@
+import { boundPublicReply } from "@centaur/rendering";
 import type { ChatSDKStreamChunk } from "@centaur/rendering";
 
 // Threads are king: a GitHub PR/issue comment thread maps to one Centaur
@@ -5,8 +6,6 @@ import type { ChatSDKStreamChunk } from "@centaur/rendering";
 // durable execution record. In particular, do not carry task updates or model
 // reasoning from the stream into a GitHub comment.
 
-const PUBLIC_SUMMARY_MAX_CHARS = 2_000;
-const PUBLIC_SUMMARY_MAX_LINES = 8;
 const PUBLIC_SUMMARY_MARKER = /^\s*GITHUB_SUMMARY\s*:\s*/im;
 const PUBLIC_SUMMARY_FIELDS = [ "Outcome", "Changes", "Verification", "CI", "Next" ] as const;
 const PUBLIC_SUMMARY_FIELD_MARKER =
@@ -36,7 +35,7 @@ export class CommentReplyCollector {
     // Markdown chunks are deliberately ignored. Some providers classify their
     // entire work trace as assistant prose, so treating this stream as a final
     // answer is a chain-of-thought disclosure bug. The structured terminal
-    // result is captured separately by GithubRenderFallback.
+    // result is captured separately by TerminalAnswer.
     if (chunk.type === "markdown_text") return;
     if (chunk.type !== "task_update" || chunk.status !== "error") return;
     this.sawError = true;
@@ -92,13 +91,7 @@ function extractPublicSummary(value: string | undefined): string | undefined {
     .trim();
   if (!summary) return undefined;
   if (EXECUTION_TRANSCRIPT_MARKERS.test(summary)) return undefined;
-  const formatted = formatPublicSummary(summary);
-  const lines = formatted.split(/\r?\n/).filter((line) => line.trim());
-  const bounded = lines.slice(0, PUBLIC_SUMMARY_MAX_LINES).join("\n");
-  if (bounded.length > PUBLIC_SUMMARY_MAX_CHARS || lines.length > PUBLIC_SUMMARY_MAX_LINES) {
-    return bounded.slice(0, PUBLIC_SUMMARY_MAX_CHARS - 48).trimEnd() + "\n… Full answer continues in Console.";
-  }
-  return bounded;
+  return boundPublicReply(formatPublicSummary(summary));
 }
 
 /**

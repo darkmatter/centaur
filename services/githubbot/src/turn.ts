@@ -1,11 +1,16 @@
 import {
   harnessToChatSdkStream,
+  TerminalAnswer,
   type CodexAppServerToChatStreamOptions,
   type RendererEvent,
 } from "@centaur/rendering";
 import type { GitHubAdapter } from "@chat-adapter/github";
 import type { Thread } from "chat";
-import { buildCommentReplyBody, CommentReplyCollector } from "./comment-bot";
+import {
+  buildFailedReplyBody,
+  buildPublicCommentReply,
+  CommentReplyCollector,
+} from "./comment-bot";
 import { runExclusive } from "./context";
 import { resolveStickyProvider } from "./overrides";
 import {
@@ -60,6 +65,16 @@ export type TurnResult = {
 export function turnOutputChars(result: TurnResult): number {
   if (result.failed) return result.errorText.length;
   return (result.answer || result.fallbackText).length;
+}
+
+/** GitHub receives only a marked, concise terminal outcome. */
+export function githubTurnPreamble(preamble?: string): string {
+  const publicReplyContract =
+    "Public GitHub response contract: Keep execution details in Console. " +
+    "Your terminal text must be one concise block with this form, using short factual statements: " +
+    "GITHUB_SUMMARY:\nOutcome: ...\nChanges: ...\nVerification: ...\nCI: ...\nNext: ... " +
+    "Do not include commands, raw logs, model reasoning, or a work transcript.";
+  return [preamble, publicReplyContract].filter(Boolean).join("\n\n");
 }
 
 const THREAD_KEY_PATTERN =
@@ -209,7 +224,7 @@ async function runTurnStreamInner(
         {},
       );
       const collector = new CommentReplyCollector();
-      const fallback = new GithubRenderFallback();
+      const fallback = new TerminalAnswer();
       for await (const chunk of harnessToChatSdkStream(
         fallback.collectSource(streamSessionAfterHandoff(options, forwardInput)),
         rendererOptions(options),
@@ -217,9 +232,9 @@ async function runTurnStreamInner(
         collector.update(chunk);
       }
       return {
-        answer: collector.answer,
-        cotLines: collector.cotLines,
-        errorText: collector.errorText,
+        answer: "",
+        cotLines: [],
+        errorText: "",
         failed: collector.failed,
         fallbackText: fallback.text(),
       };
@@ -306,7 +321,9 @@ export async function runSessionTurn(input: {
   let lastEventId = threadState.lastEventId ?? 0;
   const forwardInput: ForwardSessionInput = {
     afterEventId: lastEventId,
-    contextPreamble: input.contextPreamble ?? githubContextPreamble(threadKey),
+    contextPreamble: githubTurnPreamble(
+      input.contextPreamble ?? githubContextPreamble(threadKey),
+    ),
     conversationName,
     executeMessage,
     harnessType: overrides.harnessType,
@@ -329,15 +346,8 @@ export async function runSessionTurn(input: {
     lastEventId,
   });
   const body = result.failed
-    ? buildCommentReplyBody({
-        answer: `⚠️ I ran into an error before finishing:\n\n${result.errorText || "unknown error"}`,
-        cotLines: result.cotLines,
-      })
-    : buildCommentReplyBody({
-        answer: result.answer,
-        cotLines: result.cotLines,
-        fallback: result.fallbackText,
-      });
+    ? buildFailedReplyBody()
+    : buildPublicCommentReply({ fallback: result.fallbackText }).body;
   try {
     await thread.post(body);
   } catch (error) {
@@ -358,68 +368,6 @@ export async function runSessionTurn(input: {
     chars: body.length,
     failed: result.failed,
   });
-}
-
-/**
- * Captures the terminal result text from the raw session stream so the final
- * answer has a fallback when the chat-SDK mapper emits no markdown.
- */
-export class GithubRenderFallback {
-  private terminalText = "";
-
-  async *collectSource(
-    stream: AsyncIterable<GithubbotRendererSource>,
-  ): AsyncIterable<GithubbotRendererSource> {
-    for await (const event of stream) {
-      this.captureTerminalText(event);
-      yield event;
-    }
-  }
-
-  text(): string {
-    return this.terminalText.trim();
-  }
-
-  private captureTerminalText(event: GithubbotRendererSource): void {
-    if (!event || typeof event !== "object") return;
-    const eventKind = String(
-      "eventKind" in event
-        ? event.eventKind
-        : "event" in event
-          ? event.event
-          : "",
-    );
-    if (
-      eventKind !== "session.execution_completed" &&
-      eventKind !== "session.execution_cancelled" &&
-      !isTerminalCodexAppServerEvent(event)
-    ) {
-      return;
-    }
-    const data =
-      "data" in event && event.data && typeof event.data === "object"
-        ? event.data
-        : event;
-    const text = terminalResultText(data);
-    if (text) this.terminalText = text;
-  }
-}
-
-function isTerminalCodexAppServerEvent(event: unknown): boolean {
-  if (!event || typeof event !== "object") return false;
-  const type = (event as { type?: unknown }).type;
-  return type === "result" || type === "turn.done" || type === "turn.completed";
-}
-
-function terminalResultText(event: unknown): string {
-  if (!event || typeof event !== "object") return "";
-  for (const key of ["result", "result_text", "text", "final_text"]) {
-    const value = (event as Record<string, unknown>)[key];
-    if (typeof value !== "string") continue;
-    const resultText = value.trim();
-    if (resultText) return resultText;
-  }
-  return "";
 }
 
 async function* streamSessionAfterHandoff(

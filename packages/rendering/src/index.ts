@@ -34,3 +34,7 @@ export type {
   RendererTaskStatus,
   RendererTaskUpdate
 } from './types'
+
+export { TerminalAnswer } from "./terminal-answer";
+
+export { boundPublicReply } from "./public-reply";

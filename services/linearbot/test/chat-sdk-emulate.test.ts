@@ -81,7 +81,7 @@ function createTestBot(overrides: Partial<LinearbotOptions> = {}): Linearbot {
 describe("linearbot comment-thread pipeline", () => {
   // Assertions filter by this thread's own key / parent comment id: a prior
   // test's detached run can post into the shared mock servers after reset.
-  it("answers a comment @-mention with one comment (answer + collapsed CoT) on the comment-thread sandbox", async () => {
+  it("answers a comment @-mention with one concise comment on the comment-thread sandbox", async () => {
     const threadKey = `linear:${ISSUE_ID}:c:comment-q`;
     const res = await postWebhook(
       commentCreatedPayload({
@@ -123,11 +123,8 @@ describe("linearbot comment-thread pipeline", () => {
     )!;
     expect(reply.issueId).toBe(ISSUE_ID);
     expect(reply.body).toContain("About a day.");
-    expect(reply.body).toContain(">>> Chain of thought");
-    // The command renders as an inline code span, not a fenced block that
-    // would swallow the rest of the chain-of-thought list.
-    expect(reply.body).toContain("Command execution: `pnpm test`");
-    expect(reply.body).not.toContain("```");
+    expect(reply.body).not.toContain("pnpm test");
+    expect(reply.body).not.toContain("Thinking");
     // Edited in place, not re-posted: exactly one comment in this thread.
     expect(
       linearApi.botComments.filter((c) => c.parentId === "comment-q"),
@@ -236,7 +233,7 @@ describe("linearbot comment-thread pipeline", () => {
     );
   });
 
-  it("posts a live 'Thinking…' comment on the first thought, then swaps it to the answer in place", async () => {
+  it("posts a generic working comment, then swaps it to the concise answer in place", async () => {
     const threadKey = `linear:${ISSUE_ID}:c:comment-live`;
     await postWebhook(
       commentCreatedPayload({ id: "comment-live", body: "@centaur go" }),
@@ -254,12 +251,10 @@ describe("linearbot comment-thread pipeline", () => {
     const live = linearApi.botComments.find(
       (c) => c.parentId === "comment-live",
     )!;
-    expect(live.body).toContain(">>> Thinking…");
-    expect(live.body).toContain("pnpm test");
-    expect(live.body).not.toContain(">>> Chain of thought");
+    expect(live.body).toContain("On it");
+    expect(live.body).not.toContain("pnpm test");
 
-    // Stream the answer + terminal — the SAME comment switches to its final
-    // form (answer above a "Chain of thought" section).
+    // Stream the answer + terminal — the SAME comment switches to its final form.
     codexApi.emitOutputLines(threadKey, answerOutputLines("All set."));
     await waitFor(() =>
       linearApi.botComments.some(
@@ -271,8 +266,7 @@ describe("linearbot comment-thread pipeline", () => {
     )!;
     expect(finalReply.id).toBe(live.id);
     expect(finalReply.body).toContain("All set.");
-    expect(finalReply.body).toContain(">>> Chain of thought");
-    expect(finalReply.body).not.toContain(">>> Thinking…");
+    expect(finalReply.body).not.toContain("pnpm test");
     // Edited in place, never re-posted.
     expect(
       linearApi.botComments.filter((c) => c.parentId === "comment-live"),
@@ -545,7 +539,7 @@ describe("linearbot comment-thread pipeline", () => {
     )!;
     expect(reply.body).toContain("Shipped.");
     expect(reply.body).not.toContain("Linear-Status:");
-    expect(reply.body).toContain(">>> Chain of thought");
+    expect(reply.body).not.toContain("pnpm test");
     // Terminal marker moves the assigned issue to Done.
     await waitFor(() =>
       linearApi.issueStateUpdates.some((u) => u.stateId === "st-done"),
@@ -569,7 +563,7 @@ describe("linearbot comment-thread pipeline", () => {
       (c) => c.issueId === ISSUE_ID && !c.parentId,
     )!;
     expect(start.body).toContain("On it");
-    expect(start.body).toContain(">>> Thinking…");
+    expect(start.body).not.toContain("pnpm test");
 
     codexApi.emitOutputLines(threadKey, sampleCodexOutputLines("All done."));
     await waitFor(() =>
@@ -981,8 +975,8 @@ function sampleCodexOutputLines(answer: string): string[] {
       JSON.stringify(notification),
     ),
     JSON.stringify({
-      type: "turn.completed",
-      turn: { id: "turn-1", items: [] },
+      method: "turn/completed",
+      params: { turn: { id: "turn-1", items: [], status: "completed" } },
     }),
   ];
 }
@@ -1006,12 +1000,12 @@ function answerOutputLines(answer: string): string[] {
         threadId: "thread-1",
         turnId: "turn-1",
         itemId: "answer-1",
-        delta: answer,
+        delta: `LINEAR_SUMMARY:\n${answer}`,
       },
     }),
     JSON.stringify({
-      type: "turn.completed",
-      turn: { id: "turn-1", items: [] },
+      method: "turn/completed",
+      params: { turn: { id: "turn-1", items: [], status: "completed" } },
     }),
   ];
 }
@@ -1109,7 +1103,7 @@ function sampleCodexNotifications(
         threadId: "thread-1",
         turnId: "turn-1",
         itemId: "answer-1",
-        delta: answer,
+        delta: `LINEAR_SUMMARY:\n${answer}`,
       },
     },
   ];
@@ -1661,6 +1655,15 @@ function startMockCodexApi(): MockSessionApi {
     emitOutputLines(threadKey, lines, executionId) {
       for (const line of lines) {
         emit(threadKey, "session.output.line", line, executionId);
+        const event = JSON.parse(line) as { type?: string; result_text?: string };
+        if (event.type === "turn.completed" && event.result_text) {
+          emit(
+            threadKey,
+            "session.execution_completed",
+            JSON.stringify({ result_text: event.result_text }),
+            executionId,
+          );
+        }
       }
     },
     emitSessionEvent(threadKey, event, data, executionId) {

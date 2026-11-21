@@ -11,6 +11,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, spyOn } from 'bu
 import { WebClient } from '@slack/web-api'
 import { createEmulator, type Emulator } from 'emulate'
 import { createMemoryState } from '@chat-adapter/state-memory'
+import { Message as ChatSdkMessage, type StateAdapter } from 'chat'
 import type { ServerNotification } from '@centaur/harness-events'
 import {
   createSlackbotV2,
@@ -25,11 +26,11 @@ import {
   type SlackbotV2ExecuteSessionRequest,
   type SlackbotV2SessionMessage
 } from '../src/index'
-import { clearRequesterIdentityCacheForTests } from '../src/session-api'
-import { slackbotMetrics } from '../src/metrics'
+import { clearRequesterIdentityCacheForTests, NON_SLACK_FILE_URL_ERROR } from '../src/session-api'
+import { resetSlackbotMetricsForTests, slackbotMetrics } from '../src/metrics'
 import type { ProactivityRules } from '../src/proactivity-rules'
 import { createOpenAiMessageOverridesStrategy } from '../src/message-overrides-strategy'
-import { modelDisplayName } from '../src/response-context'
+import { buildProactiveMuteBlock, modelDisplayName } from '../src/response-context'
 import claudeSettings from '../../../harness/claude/settings.json'
 
 const BOT_TOKEN = 'xoxb-slackbotv2-emulate'
@@ -992,6 +993,129 @@ describe('slackbotv2', () => {
     ).toEqual(expect.objectContaining({ model: 'gpt-5.4' }))
   })
 
+  it('switches a sticky thread to a named configured model and forwards its default effort', async () => {
+    const previous = process.env.CODEX_CUSTOM_PROVIDERS
+    process.env.CODEX_CUSTOM_PROVIDERS = JSON.stringify({
+      private: { name: 'Private Inference', defaultModel: 'atlas-full', models: {
+        'atlas-full': { displayName: 'Atlas Full', aliases: ['atlas'],
+          reasoningEfforts: ['low', 'max'], defaultReasoning: 'max' }
+      } }
+    })
+    try {
+      const sharedState = createMemoryState()
+      await sharedState.connect()
+      bot = createTestBot({
+        state: sharedState,
+        responseMetadataMode: 'first',
+        messageOverridesStrategy: createOpenAiMessageOverridesStrategy({
+          apiKey: 'test-key', model: 'classifier',
+          fetch: (async (_url: RequestInfo | URL, init?: RequestInit) => Response.json({ answers: [
+            { name: 'selection_request', probability: 0.99, type: 'predicate' },
+            { name: 'model', choice: String(init?.body).includes('use Sol') ? 'gpt-6.1-sol' : 'private/atlas-full', type: 'choice' }
+          ] })) as unknown as typeof fetch
+        })
+      })
+      const parent = await sendMessage(`<@${BOT_USER_ID}> --codex --model gpt-6.1-sol start here`)
+      await parent.finished()
+      const switched = await sendMessage(`<@${BOT_USER_ID}> switch to Atlas for this`, { threadTs: parent.ts })
+      await switched.finished()
+      const followup = await sendMessage(`<@${BOT_USER_ID}> continue the work`, { threadTs: parent.ts })
+      await followup.finished()
+      for (const execution of codexApi.executes.slice(1)) {
+        const line = JSON.parse(execution.body.input_lines.at(-1)!)
+        expect(line.model).toBe('atlas-full')
+        expect(line.provider).toBe('private')
+        expect(line.reasoning).toBe('max')
+      }
+      expect(codexApi.executes).toHaveLength(3)
+      expect(await sharedState.get(`thread-state:${threadKey(parent.ts)}`)).toMatchObject({
+        model: 'atlas-full', provider: 'private', harnessType: 'codex'
+      })
+      const reset = await sendMessage(`<@${BOT_USER_ID}> use Sol again`, { threadTs: parent.ts })
+      await reset.finished()
+      const resetLine = JSON.parse(codexApi.executes[3]!.body.input_lines.at(-1)!)
+      expect(resetLine.model).toBe('gpt-6.1-sol')
+      // Slack clears the provider; the harness resolves the default route.
+      expect(resetLine.provider).toBeUndefined()
+      const invalid = await sendMessage(`<@${BOT_USER_ID}> --provider openrouter --model atlas use this`, { threadTs: parent.ts })
+      await invalid.finished()
+      expect(codexApi.executes).toHaveLength(4)
+      expect(await threadText(parent.ts)).toContain('incompatible')
+      const stopBlocks = slackApi.calls.filter(call => call.method === 'chat.stopStream')
+      expect(JSON.stringify(stopBlocks)).toContain('Atlas Full · Private Inference · Codex · Max')
+    } finally {
+      if (previous === undefined) delete process.env.CODEX_CUSTOM_PROVIDERS
+      else process.env.CODEX_CUSTOM_PROVIDERS = previous
+    }
+  })
+
+  it('clears a catalogued provider for a model-only flag and keeps an uncatalogued one', async () => {
+    const previous = process.env.CODEX_CUSTOM_PROVIDERS
+    process.env.CODEX_CUSTOM_PROVIDERS = JSON.stringify({
+      private: { name: 'Private Inference', models: { 'atlas-full': { displayName: 'Atlas Full' } } },
+      plain: { name: 'Plain Inference' }
+    })
+    try {
+      const sharedState = createMemoryState()
+      await sharedState.connect()
+      bot = createTestBot({ state: sharedState })
+      for (const [provider, model, expected] of [
+        ['private', 'atlas-full', undefined],
+        ['plain', 'plain-model', 'plain']
+      ] as const) {
+        const parent = await sendMessage(`<@${BOT_USER_ID}> --provider ${provider} --model ${model} start here`)
+        await parent.finished()
+        const switched = await sendMessage(`<@${BOT_USER_ID}> --model gpt-6.1-sol continue`, { threadTs: parent.ts })
+        await switched.finished()
+        const line = JSON.parse(codexApi.executes.at(-1)!.body.input_lines.at(-1)!)
+        expect(line.model).toBe('gpt-6.1-sol')
+        expect(line.provider).toBe(expected)
+        expect((await sharedState.get<Record<string, unknown>>(`thread-state:${threadKey(parent.ts)}`))?.provider)
+          .toBe(expected ?? null)
+      }
+    } finally {
+      if (previous === undefined) delete process.env.CODEX_CUSTOM_PROVIDERS
+      else process.env.CODEX_CUSTOM_PROVIDERS = previous
+    }
+  })
+
+  it('switches a pinned model using default Claude and versioned Codex names', async () => {
+    const sharedState = createMemoryState()
+    await sharedState.connect()
+    bot = createTestBot({
+      state: sharedState,
+      messageOverridesStrategy: createOpenAiMessageOverridesStrategy({
+        apiKey: 'test-key', model: 'classifier',
+        fetch: (async (_url: RequestInfo | URL, init?: RequestInit) => {
+          const request = JSON.parse(String(init?.body))
+          const text = String(request.input.at(-1).content)
+          const model = text.includes('use claude') ? 'claude-opus-5-5'
+            : text.includes('pro') ? 'gpt-5.4-pro' : 'gpt-5.5'
+          return Response.json({ answers: [
+            { name: 'selection_request', probability: 0.99, type: 'predicate' },
+            { name: 'model', choice: model, type: 'choice' }
+          ] })
+        }) as unknown as typeof fetch
+      })
+    })
+    const parent = await sendMessage(`<@${BOT_USER_ID}> --codex --model gpt-6.1-sol start here`)
+    await parent.finished()
+    for (const [text, harness, model] of [
+      ['use claude', 'claudecode', 'claude-opus-5-5'],
+      ['switch to codex 5.5', 'codex', 'gpt-5.5'],
+      ['switch to codex 5.4 pro', 'codex', 'gpt-5.4-pro']
+    ] as const) {
+      const followup = await sendMessage(`<@${BOT_USER_ID}> ${text}`, { threadTs: parent.ts })
+      await followup.finished()
+      expect(codexApi.creates.at(-1)!.body.harness_type).toBe(harness)
+      expect(JSON.parse(codexApi.executes.at(-1)!.body.input_lines.at(-1)!).model).toBe(model)
+      expect(await sharedState.get(`thread-state:${threadKey(parent.ts)}`)).toMatchObject({
+        harnessType: harness, model
+      })
+    }
+    expect(codexApi.executes).toHaveLength(4)
+  })
+
   it('keeps a top-level harness flag pinned when the LLM strategy guesses another harness', async () => {
     const sharedState = createMemoryState()
     await sharedState.connect()
@@ -1329,7 +1453,7 @@ describe('slackbotv2', () => {
     expect(mention.response.status).toBe(200)
     await mention.finished()
 
-    const fileUrl = `${slackApi.url}/files/captured.png`
+    const fileUrl = 'https://files.slack.com/files/captured.png'
     const fileTs = incrementSlackTs(mention.ts, 2)
     const fileDelivery = await deliverEvent({
       type: 'message',
@@ -1384,7 +1508,7 @@ describe('slackbotv2', () => {
     const mention = await sendMessage(`<@${BOT_USER_ID}> inspect the delayed file`)
     await mention.finished()
 
-    const fileUrl = `${slackApi.url}/files/captured.png`
+    const fileUrl = 'https://files.slack.com/files/captured.png'
     slackApi.setFileInfo('F-check-file-info', {
       id: 'F-check-file-info',
       mimetype: 'image/png',
@@ -1488,7 +1612,7 @@ describe('slackbotv2', () => {
             id: 'F-dedupe-late',
             mimetype: 'image/png',
             name: 'dedupe.png',
-            url_private: `${slackApi.url}/files/captured.png`
+            url_private: 'https://files.slack.com/files/captured.png'
           }
         ]
       }
@@ -1507,7 +1631,7 @@ describe('slackbotv2', () => {
   it('fetches attachments from preceding Slack thread messages for a mid-thread mention', async () => {
     const parent = await postUserMessage('Root context before an attachment.')
     const priorReply = await postUserMessage('Screenshot is attached here.', parent.ts)
-    const fileUrl = `${slackApi.url}/files/captured.png`
+    const fileUrl = 'https://files.slack.com/files/captured.png'
     slackApi.addFileToMessage(CHANNEL_ID, priorReply.ts, {
       id: 'F-thread-context-image',
       mimetype: 'image/png',
@@ -1545,6 +1669,42 @@ describe('slackbotv2', () => {
     expect(executeInput).toContain('"type":"attachment"')
     expect(executeInput).toContain(`"dataBase64":"${Buffer.from('captured-image').toString('base64')}"`)
     expect(executeInput).not.toContain('data:image/png;base64')
+  })
+
+  it('does not fetch a thread attachment hosted outside Slack', async () => {
+    let elsewhereRequests = 0
+    const elsewhere = createServer((_req, res) => {
+      elsewhereRequests += 1
+      res.end('elsewhere-bytes')
+    })
+    await new Promise<void>(resolve => elsewhere.listen(0, '127.0.0.1', resolve))
+    try {
+      // Another origin than the Slack API emulator, and reachable, so a fetch
+      // would be counted rather than fail to connect.
+      const fileUrl = `http://127.0.0.1:${(elsewhere.address() as { port: number }).port}/files/elsewhere.png`
+      const parent = await postUserMessage('Root context before an attachment.')
+      const priorReply = await postUserMessage('A file from elsewhere is attached here.', parent.ts)
+      slackApi.addFileToMessage(CHANNEL_ID, priorReply.ts, {
+        id: 'F-thread-context-elsewhere',
+        mimetype: 'image/png',
+        name: 'elsewhere.png',
+        size: 15,
+        url_private: fileUrl
+      })
+      const mention = await sendMessage(`<@${BOT_USER_ID}> inspect the earlier file`, {
+        threadTs: parent.ts
+      })
+
+      expect(mention.response.status).toBe(200)
+      await mention.finished()
+
+      expect(elsewhereRequests).toBe(0)
+      const executeInput = JSON.stringify(JSON.parse(codexApi.executes[0]!.body.input_lines.at(-1)!))
+      expect(executeInput).toContain(`fetch_error=${NON_SLACK_FILE_URL_ERROR}`)
+      expect(executeInput).not.toContain(Buffer.from('elsewhere-bytes').toString('base64'))
+    } finally {
+      await new Promise<void>(resolve => elsewhere.close(() => resolve()))
+    }
   })
 
   it('caches Slack requester identity across mentions from the same user', async () => {
@@ -1815,7 +1975,7 @@ describe('slackbotv2', () => {
     )
   })
 
-  it('renders interrupted executions with no final answer as interrupted', async () => {
+  it('ends interrupted executions with no final answer without an interruption notice', async () => {
     codexApi.autoRespond = false
 
     const parent = await postUserMessage('Context before an interrupt.')
@@ -1864,16 +2024,41 @@ describe('slackbotv2', () => {
     const transcripts = slackStreamTranscripts(slackApi.calls)
     expect(transcripts).toHaveLength(1)
     const markdownChunks = transcripts[0]!.chunks.filter(chunk => chunk.type === 'markdown_text')
-    expect(markdownChunks).toEqual([
-      {
-        type: 'markdown_text',
-        text: 'Execution interrupted.'
-      }
-    ])
+    expect(markdownChunks).toEqual([])
     const renderedText = transcripts[0]!.chunks.map(chunkText).filter(Boolean).join('\n')
     expect(renderedText).toContain('Command execution')
-    expect(renderedText.trim().endsWith('Execution interrupted.')).toBe(true)
+    expect(renderedText).not.toContain('Execution interrupted.')
     expect(renderedText).not.toContain('Execution completed, but no final text was captured.')
+  })
+
+  it('posts nothing for a plain-text request stopped by a native interrupted turn', async () => {
+    codexApi.autoRespond = false
+
+    const parent = await postUserMessage('Context before a plain text interrupt.')
+    const mention = await sendMessage(
+      `<@${BOT_USER_ID}> Plain text only, no interactive blocks. Run until stopped.`,
+      { threadTs: parent.ts }
+    )
+
+    expect(mention.response.status).toBe(200)
+    await waitFor(() => codexApi.executes.length === 1)
+    await waitFor(() => codexApi.streamCount === 1)
+
+    codexApi.emitOutputLine(
+      threadKey(parent.ts),
+      JSON.stringify({ type: 'turn.completed', turn: { id: 'turn-1', status: 'interrupted' } })
+    )
+    codexApi.emitSessionEvent(threadKey(parent.ts), 'session.execution_cancelled', {
+      execution_id: 'exe-interrupted',
+      status: 'cancelled',
+      reason: 'turn_interrupted'
+    })
+
+    await mention.finished()
+    const text = await threadText(parent.ts)
+    expect(text).not.toContain('Execution interrupted.')
+    expect(text).not.toContain('Execution completed, but no final text was captured.')
+    expect(slackApi.calls.filter(call => call.method === 'chat.postMessage')).toHaveLength(0)
   })
 
   it('renders api-rs completion result text when no final answer delta streamed', async () => {
@@ -3613,6 +3798,119 @@ describe('slackbotv2', () => {
     expect(await threadText(parent.ts)).toContain('Deploy is fine.')
   })
 
+  it('posts progress updates as separate thread messages once, even when recovery replays them', async () => {
+    const sharedState = createMemoryState()
+    await sharedState.connect()
+    bot = createProductionDefaultTestBot({ activitySummaryStatusEnabled: true, state: sharedState })
+    codexApi.autoRespond = false
+
+    const parent = await postUserMessage('Context before a long task.')
+    const mentionText = `<@${BOT_USER_ID}> audit every service`
+    const mention = await sendMessage(mentionText, { threadTs: parent.ts })
+    expect(mention.response.status).toBe(200)
+    await waitFor(() => codexApi.streamCount === 1)
+
+    const key = threadKey(parent.ts)
+    const summary = "I'm auditing the billing service"
+    const progress = 'I audited billing and found two stale configs; now checking the search service.'
+    codexApi.emitSessionEvent(key, 'session.activity_summary', { summary })
+    codexApi.emitSessionEvent(key, 'session.progress_update', { elapsed_secs: 120, text: progress })
+    await waitFor(async () => (await threadTexts(parent.ts)).includes(progress))
+    codexApi.emitOutputLine(key, JSON.stringify({ type: 'turn.done', result: 'Audit complete.' }))
+    await mention.finished()
+
+    const texts = await threadTexts(parent.ts)
+    expect(texts.filter(text => text === progress)).toHaveLength(1)
+    expect(texts.indexOf(progress)).toBeLessThan(
+      texts.findIndex(text => text.includes('Audit complete.'))
+    )
+    // Posting in the thread clears Slack's assistant status, so it is restored.
+    const statuses = slackApi.calls
+      .filter(call => call.method === 'assistant.threads.setStatus')
+      .map(call => stringField(call.body.status))
+    expect(statuses).toEqual(['Thinking...', summary, summary, ''])
+
+    // A recovery render replays the execution from its start.
+    const stopStreams = () => slackApi.calls.filter(call => call.method === 'chat.stopStream').length
+    const stopStreamsBeforeRecovery = stopStreams()
+    await sharedState.set(`thread-state:${key}`, {
+      activeExecution: true,
+      renderObligation: {
+        afterEventId: 0,
+        executionId: 'exe-progress-replay',
+        message: apiMessageFromSlackEvent({
+          isMention: true,
+          text: mentionText,
+          threadId: key,
+          ts: mention.ts
+        })
+      }
+    })
+    await sharedState.appendToList('slackbotv2:render:index', key)
+    bot = createProductionDefaultTestBot({ activitySummaryStatusEnabled: true, state: sharedState })
+    await waitFor(() => stopStreams() > stopStreamsBeforeRecovery, 2000)
+
+    expect((await threadTexts(parent.ts)).filter(text => text === progress)).toHaveLength(1)
+  })
+
+  it('skips a progress update once the answer is already streaming', async () => {
+    bot = createProductionDefaultTestBot({ activitySummaryStatusEnabled: true })
+    codexApi.autoRespond = false
+
+    const parent = await postUserMessage('Context before a streaming answer.')
+    const mention = await sendMessage(`<@${BOT_USER_ID}> audit every service`, {
+      threadTs: parent.ts
+    })
+    expect(mention.response.status).toBe(200)
+    await waitFor(() => codexApi.streamCount === 1)
+
+    const key = threadKey(parent.ts)
+    // Complete lines, long enough to flush the Slack SDK's stream buffer.
+    const answer = `Audit started streaming.\n\n${'x'.repeat(300)}\n\n`
+    const lines = sampleCodexOutputLines(answer)
+    const turnCompleted = lines.pop()!
+    const answerDelta = lines.at(-1)!
+    codexApi.emitOutputLines(key, lines)
+    // Buffered answer text flushes on the first event after the pre-stream grace.
+    await new Promise(resolve => setTimeout(resolve, 600))
+    codexApi.emitOutputLine(key, answerDelta.replace(answer, ' Still going.'))
+    await waitFor(() => slackApi.calls.some(call => call.method === 'chat.startStream'))
+    const progress = 'I audited billing; now checking the search service.'
+    codexApi.emitSessionEvent(key, 'session.progress_update', { elapsed_secs: 120, text: progress })
+    codexApi.emitOutputLine(key, turnCompleted)
+    await mention.finished()
+
+    const texts = await threadTexts(parent.ts)
+    expect(texts.some(text => text.includes('Audit started streaming.'))).toBe(true)
+    expect(texts).not.toContain(progress)
+  })
+
+  it('drops progress updates that are already stale when rendered', async () => {
+    bot = createProductionDefaultTestBot({ activitySummaryStatusEnabled: true })
+    codexApi.autoRespond = false
+
+    const parent = await postUserMessage('Context before a long-running task.')
+    const mention = await sendMessage(`<@${BOT_USER_ID}> audit every service`, {
+      threadTs: parent.ts
+    })
+    expect(mention.response.status).toBe(200)
+    await waitFor(() => codexApi.streamCount === 1)
+
+    const key = threadKey(parent.ts)
+    const stale = 'I am starting with the billing service.'
+    const current = 'I audited billing; now checking the search service.'
+    codexApi.emitSessionEvent(key, 'session.progress_update', {
+      created_at_ms: Date.now() - 10 * 60 * 1000,
+      text: stale
+    })
+    codexApi.emitSessionEvent(key, 'session.progress_update', { created_at_ms: Date.now(), text: current })
+    await waitFor(async () => (await threadTexts(parent.ts)).includes(current))
+    codexApi.emitOutputLine(key, JSON.stringify({ type: 'turn.done', result: 'Audit complete.' }))
+    await mention.finished()
+
+    expect(await threadTexts(parent.ts)).not.toContain(stale)
+  })
+
   it('restores the default status after a steering message when no summary was published', async () => {
     bot = createProductionDefaultTestBot()
     codexApi.autoRespond = false
@@ -4356,6 +4654,363 @@ describe('slackbotv2', () => {
     expect(codexApi.appends).toHaveLength(1)
   })
 
+  it('starts a new turn for a steer that lands after the execution ended', async () => {
+    const logs: CapturedLog[] = []
+    const sharedState = createMemoryState()
+    await sharedState.connect()
+    bot = createTestBot({
+      logger: captureLogger(logs),
+      state: sharedState,
+      steeringReactionEnabled: true
+    })
+    codexApi.autoRespond = false
+
+    const parent = await postUserMessage('History before a late steer.')
+    const firstMention = await sendMessage(`<@${BOT_USER_ID}> start running`, {
+      threadTs: parent.ts
+    })
+    expect(firstMention.response.status).toBe(200)
+    await waitFor(() => codexApi.streamCount === 1)
+
+    // The execution completed in api-rs, but its render has not finalized,
+    // so the bot still treats the thread as active and only appends.
+    codexApi.nextAppendSteering = { status: 'no_active_execution' }
+    const lateMention = await sendMessage(`<@${BOT_USER_ID}> answer me after the turn ended`, {
+      threadTs: parent.ts
+    })
+    expect(lateMention.response.status).toBe(200)
+    await lateMention.finished()
+    expect(codexApi.executes).toHaveLength(1)
+    expect(logData(logs, 'slackbotv2_steer_undelivered')).toMatchObject({
+      pending_turn_queued: true,
+      steering_status: 'no_active_execution'
+    })
+    const key = threadKey(parent.ts)
+    expect(await pendingTurnIds(sharedState, key)).toEqual([lateMention.ts])
+
+    codexApi.autoRespond = true
+    codexApi.emitOutputLines(key, sampleCodexOutputLines('First execution complete.'))
+    await firstMention.finished()
+
+    await waitFor(() => codexApi.executes.length === 2, 3000)
+    expect(JSON.stringify(codexApi.executes[1]?.body.input_lines)).toContain(
+      'answer me after the turn ended'
+    )
+    await waitFor(async () => (await threadText(parent.ts)).includes('Executed request 2.'), 3000)
+    expect(await threadText(parent.ts)).toContain('First execution complete.')
+    await waitFor(async () => (await pendingTurnIds(sharedState, key)).length === 0, 3000)
+    await waitFor(() => slackApi.calls.some(call =>
+      call.method === 'reactions.remove' && stringField(call.body.timestamp) === lateMention.ts
+    ), 3000)
+  })
+
+  it('does not start another turn when steer delivery is unknown', async () => {
+    const logs: CapturedLog[] = []
+    bot = createTestBot({ logger: captureLogger(logs) })
+    codexApi.autoRespond = false
+
+    const parent = await postUserMessage('History before an ambiguous steer.')
+    const firstMention = await sendMessage(`<@${BOT_USER_ID}> start running`, {
+      threadTs: parent.ts
+    })
+    await waitFor(() => codexApi.streamCount === 1)
+
+    codexApi.nextAppendSteering = { status: 'delivery_unknown', execution_id: 'exe-1' }
+    const steer = await sendMessage(`<@${BOT_USER_ID}> maybe delivered`, { threadTs: parent.ts })
+    await steer.finished()
+    expect(logData(logs, 'slackbotv2_steer_undelivered')).toMatchObject({
+      pending_turn_queued: false,
+      steering_status: 'delivery_unknown'
+    })
+
+    codexApi.emitOutputLines(threadKey(parent.ts), sampleCodexOutputLines('Only turn.'))
+    await firstMention.finished()
+    await sleep(200)
+    expect(codexApi.executes).toHaveLength(1)
+  })
+
+  it('keeps a pending turn queued while its execute is retried', async () => {
+    const logs: CapturedLog[] = []
+    const sharedState = createMemoryState()
+    await sharedState.connect()
+    bot = createTestBot({ handoffRetryDelaysMs: [100], logger: captureLogger(logs), state: sharedState })
+    codexApi.autoRespond = false
+
+    const parent = await postUserMessage('History before a retried pending turn.')
+    const firstMention = await sendMessage(`<@${BOT_USER_ID}> start running`, {
+      threadTs: parent.ts
+    })
+    await waitFor(() => codexApi.streamCount === 1)
+    codexApi.nextAppendSteering = { status: 'not_delivered', execution_id: 'exe-1' }
+    const late = await sendMessage(`<@${BOT_USER_ID}> retry my turn`, { threadTs: parent.ts })
+    await late.finished()
+
+    const key = threadKey(parent.ts)
+    codexApi.autoRespond = true
+    codexApi.failNextExecute = true
+    codexApi.emitOutputLines(key, sampleCodexOutputLines('First execution complete.'))
+    await firstMention.finished()
+
+    await waitFor(() => hasLog(logs, 'slackbotv2_handoff_retry_scheduled'), 3000)
+    expect(logData(logs, 'slackbotv2_handoff_retry_scheduled')).toMatchObject({ pending_turn: true })
+    expect(await pendingTurnIds(sharedState, key)).toEqual([late.ts])
+    // The retry budget is stored with the message for every trigger to honour.
+    expect(await sharedState.get(`slackbotv2:pending-turn:retry:${key}:${late.ts}`)).toMatchObject({
+      attempt: 1
+    })
+
+    await waitFor(async () => (await threadText(parent.ts)).includes('Executed request 2.'), 3000)
+    expect(JSON.stringify(codexApi.executes.at(-1)?.body.input_lines)).toContain('retry my turn')
+    await waitFor(async () => (await pendingTurnIds(sharedState, key)).length === 0, 3000)
+  })
+
+  it('runs queued pending turns one at a time', async () => {
+    const sharedState = createMemoryState()
+    await sharedState.connect()
+    bot = createTestBot({ state: sharedState })
+    codexApi.autoRespond = false
+
+    const parent = await postUserMessage('History before two late steers.')
+    const firstMention = await sendMessage(`<@${BOT_USER_ID}> start running`, {
+      threadTs: parent.ts
+    })
+    await waitFor(() => codexApi.streamCount === 1)
+
+    for (const text of ['first late steer', 'second late steer']) {
+      codexApi.nextAppendSteering = { status: 'no_active_execution' }
+      const late = await sendMessage(`<@${BOT_USER_ID}> ${text}`, { threadTs: parent.ts })
+      await late.finished()
+    }
+    const key = threadKey(parent.ts)
+    expect(await pendingTurnIds(sharedState, key)).toHaveLength(2)
+
+    codexApi.emitOutputLines(key, sampleCodexOutputLines('First execution complete.'))
+    await firstMention.finished()
+    await waitFor(() => codexApi.executes.length === 2, 3000)
+    // The second pending turn waits for the first one's render.
+    await sleep(200)
+    expect(codexApi.executes).toHaveLength(2)
+    expect(JSON.stringify(codexApi.executes[1]?.body.input_lines)).toContain('first late steer')
+
+    codexApi.autoRespond = true
+    codexApi.emitOutputLines(key, sampleCodexOutputLines('Second execution complete.'))
+    await waitFor(() => codexApi.executes.length === 3, 3000)
+    expect(JSON.stringify(codexApi.executes[2]?.body.input_lines)).toContain('second late steer')
+    await waitFor(async () => (await pendingTurnIds(sharedState, key)).length === 0, 3000)
+  })
+
+  it('holds pending turns until an undelivered answer is rendered', async () => {
+    const sharedState = createMemoryState()
+    await sharedState.connect()
+    const parent = await postUserMessage('History before an undelivered answer.')
+    const undelivered = await postUserMessage(`<@${BOT_USER_ID}> first turn`, parent.ts)
+    const mentionText = `<@${BOT_USER_ID}> answer me after the undelivered one`
+    const mention = await postUserMessage(mentionText, parent.ts)
+    const key = threadKey(parent.ts)
+    const message = new ChatSdkMessage({
+      attachments: [],
+      author: { fullName: 'User', isBot: false, isMe: false, userId: USER_ID, userName: 'user' },
+      formatted: { type: 'root', children: [] },
+      id: mention.ts,
+      isMention: true,
+      metadata: { dateSent: new Date(), edited: false },
+      raw: {
+        channel: CHANNEL_ID,
+        team: TEAM_ID,
+        text: mentionText,
+        thread_ts: parent.ts,
+        ts: mention.ts,
+        type: 'message',
+        user: USER_ID
+      },
+      text: mentionText,
+      threadId: key
+    })
+    // The first turn's render failed: activeExecution cleared but its
+    // obligation stayed, and a steer from that window is queued behind it.
+    await sharedState.set(`thread-state:${key}`, {
+      forwardedMessageIds: [mention.ts],
+      lastEventId: 0,
+      renderObligation: {
+        afterEventId: 0,
+        executionId: 'exe-undelivered',
+        message: apiMessageFromSlackEvent({
+          isMention: true,
+          text: `<@${BOT_USER_ID}> first turn`,
+          threadId: key,
+          ts: undelivered.ts
+        })
+      }
+    })
+    await sharedState.appendToList(`slackbotv2:pending-turns:${key}`, {
+      message: message.toJSON(),
+      queuedAt: Date.now()
+    })
+    await sharedState.appendToList('slackbotv2:render:index', key)
+    codexApi.emitOutputLines(key, sampleCodexOutputLines('Undelivered answer.'))
+
+    // The sweep read the thread just before the obligation was committed, so
+    // the queue sees it first; that must not replace the obligation.
+    let staleReads = 1
+    const racyState = new Proxy(sharedState, {
+      get(target, prop, receiver) {
+        if (prop !== 'get') return Reflect.get(target, prop, receiver)
+        return async (stateKey: string) => {
+          const value = await target.get<Record<string, unknown>>(stateKey)
+          if (staleReads > 0 && value?.renderObligation) {
+            staleReads -= 1
+            return { ...value, renderObligation: null }
+          }
+          return value
+        }
+      }
+    })
+
+    bot = createTestBot({ state: racyState })
+
+    const threadEventRequests = () =>
+      codexApi.eventRequests.filter(request => request.threadKey === key)
+    const threadExecutes = () => codexApi.executes.filter(request => request.threadKey === key)
+    // The queued turn opens its own stream right after recovery renders, so
+    // the count may pass 1 between polls.
+    await waitFor(() => threadEventRequests().length >= 1, 3000)
+    await waitFor(async () => (await threadText(parent.ts)).includes('Undelivered answer.'), 5000)
+    // The obligation was recovered under its own execution, not replaced by
+    // the queued turn's.
+    expect(threadEventRequests()[0]).toEqual({
+      afterEventId: 0,
+      executionId: 'exe-undelivered',
+      threadKey: key
+    })
+    // Only then does the queued turn run, and it still answers its own message.
+    await waitFor(() => threadExecutes().length === 1, 3000)
+    expect(JSON.stringify(threadExecutes()[0]?.body.input_lines)).toContain(
+      'answer me after the undelivered one'
+    )
+    await waitFor(async () => (await threadText(parent.ts)).includes('Executed request 1.'), 3000)
+    await waitFor(async () => (await pendingTurnIds(sharedState, key)).length === 0, 3000)
+  })
+
+  it('keeps a pending turn queued when its handoff throws unexpectedly', async () => {
+    const logs: CapturedLog[] = []
+    const sharedState = createMemoryState()
+    await sharedState.connect()
+    const parent = await postUserMessage('History before a broken pending turn.')
+    const mentionText = `<@${BOT_USER_ID}> survive a broken handoff`
+    const mention = await postUserMessage(mentionText, parent.ts)
+    const key = threadKey(parent.ts)
+    const message = new ChatSdkMessage({
+      attachments: [],
+      author: { fullName: 'User', isBot: false, isMe: false, userId: USER_ID, userName: 'user' },
+      formatted: { type: 'root', children: [] },
+      id: mention.ts,
+      isMention: true,
+      metadata: { dateSent: new Date(), edited: false },
+      raw: {
+        channel: CHANNEL_ID,
+        team: TEAM_ID,
+        text: mentionText,
+        thread_ts: parent.ts,
+        ts: mention.ts,
+        type: 'message',
+        user: USER_ID
+      },
+      text: mentionText,
+      threadId: key
+    })
+    const serialized = message.toJSON()
+    await sharedState.set(`thread-state:${key}`, { forwardedMessageIds: [mention.ts] })
+    await sharedState.appendToList(`slackbotv2:pending-turns:${key}`, {
+      // A timestamp the SDK cannot parse makes the handoff throw.
+      message: {
+        ...serialized,
+        metadata: { ...serialized.metadata, dateSent: 'not-a-date' }
+      } as never,
+      queuedAt: Date.now()
+    })
+    await sharedState.appendToList('slackbotv2:render:index', key)
+
+    bot = createTestBot({ logger: captureLogger(logs), state: sharedState })
+
+    await waitFor(() => hasLog(logs, 'slackbotv2_pending_turn_handoff_failed'), 3000)
+    // A thrown handoff is not an answer: the message stays queued for a later
+    // trigger instead of being retired by the run that failed.
+    expect(await pendingTurnIds(sharedState, key)).toEqual([mention.ts])
+    expect(codexApi.executes.filter(request => request.threadKey === key)).toHaveLength(0)
+  })
+
+  it('leaves a newer turn\'s state alone when an older render finalizes', async () => {
+    const sharedState = createMemoryState()
+    await sharedState.connect()
+    bot = createTestBot({ state: sharedState })
+    codexApi.autoRespond = false
+
+    const parent = await postUserMessage('History before overlapping turns.')
+    const mention = await sendMessage(`<@${BOT_USER_ID}> start running`, { threadTs: parent.ts })
+    await waitFor(() => codexApi.streamCount === 1)
+    const key = threadKey(parent.ts)
+    const stateKey = `thread-state:${key}`
+    // A stop cleared this turn's obligation, and a newer handoff has marked
+    // the thread active but not yet committed its own obligation.
+    const current = (await sharedState.get<Record<string, unknown>>(stateKey)) ?? {}
+    await sharedState.set(stateKey, {
+      ...current,
+      activeExecution: true,
+      activeTurnMessageId: 'newer-turn-message',
+      renderObligation: null
+    })
+
+    codexApi.emitOutputLines(key, sampleCodexOutputLines('Older execution complete.'))
+    await mention.finished()
+
+    expect(await sharedState.get<Record<string, unknown>>(stateKey)).toMatchObject({
+      activeExecution: true,
+      activeTurnMessageId: 'newer-turn-message'
+    })
+  })
+
+  it('runs pending turns left by a restart from the startup recovery sweep', async () => {
+    const sharedState = createMemoryState()
+    await sharedState.connect()
+    const parent = await postUserMessage('History before a restart.')
+    const mention = await postUserMessage(`<@${BOT_USER_ID}> answer me after the restart`, parent.ts)
+    const key = threadKey(parent.ts)
+    const message = new ChatSdkMessage({
+      attachments: [],
+      author: { fullName: 'User', isBot: false, isMe: false, userId: USER_ID, userName: 'user' },
+      formatted: { type: 'root', children: [] },
+      id: mention.ts,
+      isMention: true,
+      metadata: { dateSent: new Date(), edited: false },
+      raw: {
+        channel: CHANNEL_ID,
+        team: TEAM_ID,
+        text: `<@${BOT_USER_ID}> answer me after the restart`,
+        thread_ts: parent.ts,
+        ts: mention.ts,
+        type: 'message',
+        user: USER_ID
+      },
+      text: `<@${BOT_USER_ID}> answer me after the restart`,
+      threadId: key
+    })
+    await sharedState.set(`thread-state:${key}`, { forwardedMessageIds: [mention.ts] })
+    await sharedState.appendToList(`slackbotv2:pending-turns:${key}`, {
+      message: message.toJSON(),
+      queuedAt: Date.now()
+    })
+    await sharedState.appendToList('slackbotv2:render:index', key)
+
+    bot = createTestBot({ state: sharedState })
+
+    await waitFor(() => codexApi.executes.length === 1, 3000)
+    expect(JSON.stringify(codexApi.executes[0]?.body.input_lines)).toContain(
+      'answer me after the restart'
+    )
+    await waitFor(async () => (await threadText(parent.ts)).includes('Executed request 1.'), 3000)
+    await waitFor(async () => (await pendingTurnIds(sharedState, key)).length === 0, 3000)
+  })
+
   it('keeps a steering reaction when an append retry starts an execution', async () => {
     let failNextAppend = false
     bot = createTestBot({
@@ -4904,6 +5559,28 @@ describe('proactive replies', () => {
     expect(await threadText(threadTs)).toContain('Executed request 2.')
   })
 
+  it('answers a proactive follow-up with flag-like text without a selection error', async () => {
+    const previous = process.env.CODEX_CUSTOM_PROVIDERS
+    process.env.CODEX_CUSTOM_PROVIDERS = JSON.stringify({
+      private: { name: 'Private Inference', models: { 'atlas-full': { displayName: 'Atlas Full', aliases: ['atlas'] } } }
+    })
+    try {
+      createProactiveBot(() => ({ respond: true }))
+      const threadTs = await mentionThread('Proactive selection context.')
+
+      await reply('does --claude --model atlas work here?', threadTs)
+
+      expect(await threadText(threadTs)).not.toContain('incompatible')
+      expect(codexApi.executes).toHaveLength(2)
+      expect(codexApi.creates.at(-1)!.body.harness_type).toBe('codex')
+      expect(sessionMessageTexts(codexApi.appends.flatMap(append => append.body.messages)).join('\n'))
+        .toContain('work here?')
+    } finally {
+      if (previous === undefined) delete process.env.CODEX_CUSTOM_PROVIDERS
+      else process.env.CODEX_CUSTOM_PROVIDERS = previous
+    }
+  })
+
   it('stays quiet when the classifier declines or fails', async () => {
     let fail = false
     const calls = createProactiveBot(() => {
@@ -5236,6 +5913,155 @@ describe('proactive replies', () => {
       .toEqual(expect.arrayContaining(['is staging deployed?', 'and production?']))
   })
 
+  const MUTE_ANSWER_BLOCK = { type: 'section', text: { type: 'mrkdwn', text: 'Executed request 2.' } }
+
+  // Clicks the mute button on a proactive reply, as Slack's interactivity
+  // delivery would, and waits for the handler to finish.
+  async function clickMute(threadTs: string, replyTs: string): Promise<void> {
+    const waits: Promise<unknown>[] = []
+    const response = await bot.app.request('/api/webhooks/slack', signedSlackInteraction({
+      type: 'block_actions',
+      team: { id: TEAM_ID },
+      user: { id: USER_ID, username: 'tester', team_id: TEAM_ID },
+      channel: { id: CHANNEL_ID },
+      message: {
+        ts: replyTs,
+        thread_ts: threadTs,
+        text: 'Executed request 2.',
+        blocks: [MUTE_ANSWER_BLOCK, buildProactiveMuteBlock()]
+      },
+      actions: [{
+        action_id: 'slackbotv2.proactive.mute',
+        action_ts: '1700000009.000100',
+        block_id: 'slackbotv2.proactive.mute',
+        type: 'button'
+      }]
+    }), {}, waitUntilContext(waits))
+    expect(response.status).toBe(200)
+    await Promise.all(waits)
+  }
+
+  it('adds a mute button to proactive replies that silences the thread until a mention', async () => {
+    const updates: Record<string, unknown>[] = []
+    const calls = createProactiveBot(() => ({ respond: true }), {
+      fetch: async (input, init) => {
+        if (String(input).endsWith('/chat.update')) {
+          const body = Object.fromEntries(new URLSearchParams(String(init?.body)))
+          updates.push({ ...body, blocks: JSON.parse(body.blocks ?? '[]') })
+          return Response.json({ ok: true })
+        }
+        return globalThis.fetch(input, init)
+      }
+    })
+    const threadTs = await mentionThread('Proactive mute context.')
+    const muteBlocks = () => slackApi.calls
+      .filter(call => call.method === 'chat.stopStream')
+      .map(call => (Array.isArray(call.body.blocks) ? call.body.blocks : [])
+        .filter(block => (block as Record<string, unknown>).block_id === 'slackbotv2.proactive.mute'))
+    // The mentioned reply was asked for, so it has no mute button.
+    expect(muteBlocks().flat()).toHaveLength(0)
+
+    await reply('what about staging?', threadTs)
+    expect(codexApi.executes).toHaveLength(2)
+    const stops = muteBlocks()
+    expect(stops.at(-1)).toEqual([{
+      type: 'actions',
+      block_id: 'slackbotv2.proactive.mute',
+      elements: [{
+        type: 'button',
+        action_id: 'slackbotv2.proactive.mute',
+        accessibility_label: 'Stop replying proactively in this thread',
+        text: { type: 'plain_text', text: ':mute: Mute', emoji: true }
+      }]
+    }])
+
+    const replyTs = slackApi.calls.filter(call => call.method === 'chat.stopStream').at(-1)!.streamTs!
+    await clickMute(threadTs, replyTs)
+
+    // The click stays in slackbotv2: no workflow event reaches the API.
+    expect(codexApi.workflowEvents).toHaveLength(0)
+    expect(updates).toHaveLength(1)
+    expect(updates[0]).toMatchObject({
+      channel: CHANNEL_ID,
+      ts: replyTs,
+      blocks: [MUTE_ANSWER_BLOCK, {
+        type: 'actions',
+        block_id: 'slackbotv2.proactive.mute',
+        elements: [{ text: { type: 'plain_text', text: ':mute: Muted', emoji: true } }]
+      }]
+    })
+
+    await reply('are you still there?', threadTs)
+    expect(calls).toHaveLength(1)
+    expect(codexApi.executes).toHaveLength(2)
+
+    await reply(`<@${BOT_USER_ID}> one more`, threadTs)
+    await reply('and after that?', threadTs)
+    expect(calls).toHaveLength(2)
+    expect(calls[1]!.message.text).toBe('and after that?')
+  })
+
+  it('drops a proactive handoff already past the classifier when the thread is muted', async () => {
+    let holdAppends = false
+    let appendHeld = false
+    let release: (() => void) | undefined
+    const held = new Promise<void>(resolve => { release = resolve })
+    createProactiveBot(() => ({ respond: true }), {
+      fetch: async (input, init) => {
+        if (String(input).endsWith('/chat.update')) return Response.json({ ok: true })
+        if (holdAppends && String(input).endsWith('/messages')) {
+          appendHeld = true
+          await held
+        }
+        return globalThis.fetch(input, init)
+      }
+    })
+    const threadTs = await mentionThread('Proactive mute race context.')
+
+    holdAppends = true
+    const accepted = await sendMessage('what about staging?', { threadTs })
+    await waitFor(() => appendHeld)
+    await clickMute(threadTs, threadTs)
+    release?.()
+    await accepted.finished()
+    await waitFor(async () =>
+      (await bot.chat.getState().get<Record<string, unknown>>(`thread-state:${threadKey(threadTs)}`))
+        ?.activeExecution !== true
+    )
+
+    expect(codexApi.executes).toHaveLength(1)
+    const state = await bot.chat.getState().get<Record<string, unknown>>(`thread-state:${threadKey(threadTs)}`)
+    expect(state?.proactiveEligible).toBe(false)
+    expect(typeof state?.proactiveMutedAt).toBe('number')
+  })
+
+  it('confirms a mute ephemerally when Slack rejects the message update', async () => {
+    const ephemerals: Record<string, string>[] = []
+    createProactiveBot(() => ({ respond: true }), {
+      fetch: async (input, init) => {
+        if (String(input).endsWith('/chat.update')) {
+          return Response.json({ ok: false, error: 'invalid_blocks' })
+        }
+        if (String(input).endsWith('/chat.postEphemeral')) {
+          ephemerals.push(Object.fromEntries(new URLSearchParams(String(init?.body))))
+          return Response.json({ ok: true })
+        }
+        return globalThis.fetch(input, init)
+      }
+    })
+    const threadTs = await mentionThread('Proactive mute fallback context.')
+
+    await clickMute(threadTs, threadTs)
+
+    expect(ephemerals).toHaveLength(1)
+    expect(ephemerals[0]).toMatchObject({
+      channel: CHANNEL_ID,
+      user: USER_ID,
+      thread_ts: threadTs,
+      text: expect.stringContaining('Proactive replies are off')
+    })
+  })
+
   it('ends proactive replies at a stop until the next mention', async () => {
     const calls = createProactiveBot(
       () => ({ respond: true }),
@@ -5266,6 +6092,357 @@ describe('proactive replies', () => {
   })
 })
 
+describe('generative UI cards', () => {
+  const CARD_SPEC = {
+    root: 'card',
+    elements: {
+      card: { type: 'Card', props: { title: 'GENUI_CARD_TITLE' }, children: ['kpis', 'venues'] },
+      kpis: { type: 'Fields', props: {}, children: ['total'] },
+      total: { type: 'Field', props: { label: 'Total paid', value: 31150 }, children: [] },
+      venues: {
+        type: 'Table',
+        props: { headers: ['Venue', 'USD'], rows: [['Ethena', 12400], ['Maple', 9850]] },
+        children: []
+      }
+    }
+  }
+  const TWO_TABLES_SPEC = {
+    root: 'card',
+    elements: {
+      card: { type: 'Card', props: { title: 'GENUI_INVALID' }, children: ['t1', 't2'] },
+      t1: { type: 'Table', props: { headers: ['a'], rows: [['1']] }, children: [] },
+      t2: { type: 'Table', props: { headers: ['a'], rows: [['1']] }, children: [] }
+    }
+  }
+  const PROSE_BEFORE = 'GENUI_PROSE_BEFORE: all three venues paid on time.'
+  const PROSE_AFTER = 'GENUI_PROSE_AFTER: ledger updated.'
+
+  function answerWithBlock(spec: unknown): string {
+    return `${PROSE_BEFORE}\n\n\`\`\`json-render\n${JSON.stringify(spec, null, 2)}\n\`\`\`\n\n${PROSE_AFTER}`
+  }
+
+  async function runFinalAnswer(
+    prompt: string,
+    answer: string,
+    deltas: string[] = [answer],
+    options: { withTask?: boolean } = {}
+  ): Promise<{ logs: CapturedLog[]; parentTs: string }> {
+    codexApi.autoRespond = false
+    const parent = await postUserMessage('Context before a generative UI answer.')
+    const mention = await sendMessage(`<@${BOT_USER_ID}> ${prompt}`, { threadTs: parent.ts })
+    expect(mention.response.status).toBe(200)
+    await waitFor(() => codexApi.executes.length === 1)
+    await waitFor(() => codexApi.eventRequests.length === 1)
+    await waitFor(() => codexApi.streamCount === 1)
+    const key = threadKey(parent.ts)
+    if (options.withTask) {
+      codexApi.emitOutputLine(key, JSON.stringify({
+        type: 'item.completed',
+        item: { id: 'cmd-genui', type: 'commandExecution', command: 'true', status: 'completed', aggregatedOutput: 'done' }
+      }))
+    }
+    codexApi.emitOutputLine(key, JSON.stringify({
+      type: 'item.started',
+      item: { id: 'answer-genui', type: 'agentMessage', text: '', phase: 'final_answer' }
+    }))
+    for (const delta of deltas) {
+      codexApi.emitOutputLine(key, JSON.stringify({
+        type: 'item.agentMessage.delta',
+        itemId: 'answer-genui',
+        delta
+      }))
+    }
+    codexApi.emitOutputLine(key, JSON.stringify({
+      type: 'item.completed',
+      item: { id: 'answer-genui', type: 'agentMessage', phase: 'final_answer', text: answer }
+    }))
+    codexApi.emitSessionEvent(key, 'session.execution_completed', {
+      execution_id: 'exe-genui',
+      status: 'completed',
+      result_text: answer
+    })
+    await mention.finished()
+    return { logs: capturedLogs, parentTs: parent.ts }
+  }
+
+  /**
+   * Streams `draft` as the live answer, then seals the answer item with
+   * `finalAnswer`. When the final text does not extend the draft the live
+   * stream is frozen and the render reconciles it with the durable answer.
+   */
+  async function runDivergingAnswer(
+    prompt: string,
+    draft: string,
+    finalAnswer: string
+  ): Promise<{ logs: CapturedLog[]; parentTs: string }> {
+    codexApi.autoRespond = false
+    const parent = await postUserMessage('Context before a diverging generative UI answer.')
+    const mention = await sendMessage(`<@${BOT_USER_ID}> ${prompt}`, { threadTs: parent.ts })
+    expect(mention.response.status).toBe(200)
+    await waitFor(() => codexApi.executes.length === 1)
+    await waitFor(() => codexApi.streamCount === 1)
+    const key = threadKey(parent.ts)
+    codexApi.emitOutputLines(
+      key,
+      sampleCodexNotifications(draft).map(notification => JSON.stringify(notification))
+    )
+    codexApi.emitOutputLine(key, JSON.stringify({
+      method: 'item/completed',
+      params: {
+        threadId: 'thread-1',
+        turnId: 'turn-1',
+        item: { type: 'agentMessage', id: 'answer-1', text: finalAnswer, phase: 'final_answer', memoryCitation: null }
+      }
+    }))
+    codexApi.emitSessionEvent(key, 'session.execution_completed', {
+      execution_id: 'exe-genui-divergence',
+      status: 'completed',
+      result_text: finalAnswer
+    })
+    await mention.finished()
+    return { logs: capturedLogs, parentTs: parent.ts }
+  }
+
+  let capturedLogs: CapturedLog[] = []
+
+  async function threadMessages(threadTs: string): Promise<Array<Record<string, unknown>>> {
+    const response = await slack.conversations.replies({ channel: CHANNEL_ID, ts: threadTs, limit: 20 })
+    return (response.messages ?? []) as Array<Record<string, unknown>>
+  }
+
+  /** Messages posted as Block Kit cards: a header block plus Slack's native table block. */
+  function cardMessages(messages: Array<Record<string, unknown>>): Array<Record<string, unknown>> {
+    return messages.filter(message => {
+      if (!Array.isArray(message.blocks)) return false
+      const types = (message.blocks as Array<Record<string, unknown>>).map(block => block.type)
+      return types.includes('header') && (types.includes('data_table') || types.includes('table'))
+    })
+  }
+
+  function metricValue(outcome: string): number {
+    const pattern = new RegExp(
+      `^slackbotv2_generative_ui_cards_total\\{outcome="${outcome}"\\} (\\d+)$`,
+      'm'
+    )
+    const match = pattern.exec(slackbotMetrics.expose())
+    return match ? Number(match[1]) : 0
+  }
+
+  function streamedMarkdown(): string {
+    const transcripts = slackStreamTranscripts(slackApi.calls)
+    expect(transcripts).toHaveLength(1)
+    return transcripts[0]!.chunks
+      .filter(chunk => chunk.type === 'markdown_text')
+      .map(chunk => chunk.text)
+      .join('')
+  }
+
+  beforeEach(() => {
+    resetSlackbotMetricsForTests()
+    capturedLogs = []
+  })
+
+  it('streams the prose without the block and posts the card as a second message', async () => {
+    bot = createTestBot({ generativeUi: { enabled: true }, logger: captureLogger(capturedLogs) })
+    const answer = answerWithBlock(CARD_SPEC)
+    // Split so the fence and the JSON arrive across several deltas.
+    const cut = answer.indexOf('json-render') + 5
+    const { parentTs, logs } = await runFinalAnswer('summarize the close', answer, [
+      answer.slice(0, cut),
+      answer.slice(cut, cut + 40),
+      answer.slice(cut + 40)
+    ])
+
+    const markdown = streamedMarkdown()
+    expect(markdown).toContain(PROSE_BEFORE)
+    expect(markdown).toContain(PROSE_AFTER)
+    expect(markdown).not.toContain('json-render')
+    expect(markdown).not.toContain('GENUI_CARD_TITLE')
+
+    const cards = cardMessages(await threadMessages(parentTs))
+    expect(cards).toHaveLength(1)
+    const blocks = cards[0]!.blocks as Array<Record<string, unknown>>
+    expect(JSON.stringify(blocks)).toContain('GENUI_CARD_TITLE')
+    expect(JSON.stringify(blocks)).toContain('Ethena')
+    expect(slackApi.calls.filter(call => call.method === 'chat.postMessage')).toHaveLength(0)
+    expect(metricValue('rendered')).toBe(1)
+    expect(hasLog(logs, 'slackbotv2_generative_ui_card_posted')).toBe(true)
+    expect(hasLog(logs, 'slackbotv2_generative_ui_card_rejected')).toBe(false)
+  })
+
+  it('posts a rejected spec as a code block, logs the issues and counts the failure', async () => {
+    bot = createTestBot({ generativeUi: { enabled: true }, logger: captureLogger(capturedLogs) })
+    const { parentTs, logs } = await runFinalAnswer('two tables please', answerWithBlock(TWO_TABLES_SPEC))
+
+    const markdown = streamedMarkdown()
+    expect(markdown).toContain(PROSE_BEFORE)
+    expect(markdown).not.toContain('GENUI_INVALID')
+    expect(cardMessages(await threadMessages(parentTs))).toHaveLength(0)
+    const fallbackPosts = slackApi.calls.filter(call => call.method === 'chat.postMessage')
+    expect(fallbackPosts).toHaveLength(1)
+    const posted = stringField(fallbackPosts[0]!.body.markdown_text)
+    expect(posted).toStartWith('```json\n')
+    expect(posted).toContain('GENUI_INVALID')
+    expect(posted).toEndWith('\n```')
+    expect(metricValue('invalid_spec')).toBe(1)
+    expect(metricValue('rendered')).toBe(0)
+    const rejected = logData(logs, 'slackbotv2_generative_ui_card_rejected')
+    expect(rejected).toEqual(expect.objectContaining({
+      reason: 'invalid_spec',
+      issues: ['at most 1 Table per message']
+    }))
+    expect(logs.find(log => log.event === 'slackbotv2_generative_ui_card_rejected')?.level).toBe('warn')
+    expect(JSON.stringify(rejected)).not.toContain(PROSE_BEFORE)
+  })
+
+  it('renders the block as ordinary code when the flag is off', async () => {
+    bot = createTestBot({ logger: captureLogger(capturedLogs) })
+    const answer = answerWithBlock(CARD_SPEC)
+    const { parentTs, logs } = await runFinalAnswer('summarize the close', answer)
+
+    expect(streamedMarkdown()).toBe(answer)
+    expect(cardMessages(await threadMessages(parentTs))).toHaveLength(0)
+    expect(slackApi.calls.filter(call => call.method === 'chat.postMessage')).toHaveLength(0)
+    expect(metricValue('rendered')).toBe(0)
+    expect(logs.some(log => log.event.startsWith('slackbotv2_generative_ui'))).toBe(false)
+  })
+
+  it('renders no card when the user asked for plain text only', async () => {
+    bot = createTestBot({ generativeUi: { enabled: true }, logger: captureLogger(capturedLogs) })
+    const answer = answerWithBlock(CARD_SPEC)
+    const { parentTs } = await runFinalAnswer('reply in plain text only', answer)
+
+    const messages = await threadMessages(parentTs)
+    expect(cardMessages(messages)).toHaveLength(0)
+    const replies = messages.map(message => String(message.text ?? ''))
+    expect(replies.some(text => text.includes('json-render') && text.includes('GENUI_CARD_TITLE'))).toBe(true)
+    expect(metricValue('rendered')).toBe(0)
+  })
+
+  it('delivers the card from the durable fallback when the live stream breaks', async () => {
+    const sharedState = createMemoryState()
+    await sharedState.connect()
+    bot = createTestBot({
+      generativeUi: { enabled: true },
+      logger: captureLogger(capturedLogs),
+      state: sharedState
+    })
+    // Slack rejects every stop as too long, so the streamed message is
+    // replaced with the durable final answer and the card follows it.
+    slackApi.failStreamStopsLongerThan(10)
+    const answer = answerWithBlock(CARD_SPEC)
+    const { parentTs, logs } = await runFinalAnswer('summarize the close', answer)
+
+    expect(hasLog(logs, 'slackbotv2_render_fallback_complete')).toBe(true)
+    expect(slackApi.calls.filter(call => call.method === 'chat.postMessage')).toHaveLength(0)
+    const replacements = slackApi.calls.filter(call => call.method === 'chat.update')
+    expect(replacements).toHaveLength(1)
+    const posted = stringField(replacements[0]!.body.markdown_text)
+    expect(posted).toBe(`${PROSE_BEFORE}\n\n${PROSE_AFTER}`)
+    const texts = await threadTexts(parentTs)
+    expect(texts.some(text => text.includes(BROKEN_STREAM_TEXT))).toBe(false)
+    expect(texts.filter(text => text.includes('json-render'))).toHaveLength(0)
+    const cards = cardMessages(await threadMessages(parentTs))
+    expect(cards).toHaveLength(1)
+    expect(JSON.stringify(cards[0]!.blocks)).toContain('GENUI_CARD_TITLE')
+    expect(metricValue('rendered')).toBe(1)
+    const threadState = await sharedState.get<Record<string, unknown>>(`thread-state:${threadKey(parentTs)}`)
+    expect(threadState).toEqual(expect.objectContaining({ activeExecution: false, renderObligation: null }))
+  })
+
+  it('posts the card once when a diverged live stream is reconciled', async () => {
+    bot = createTestBot({ generativeUi: { enabled: true }, logger: captureLogger(capturedLogs) })
+    const draft = answerWithBlock(CARD_SPEC)
+    // The sealed answer no longer extends the streamed draft, so the live
+    // stream (block included) is frozen and replaced by the durable answer.
+    const finalAnswer = `GENUI_CORRECTED. ${draft}`
+    const { parentTs, logs } = await runDivergingAnswer('summarize the close', draft, finalAnswer)
+
+    expect(hasLog(logs, 'codex_renderer_stream_divergence_suppressed')).toBe(true)
+    expect(hasLog(logs, 'slackbotv2_render_fallback_complete')).toBe(true)
+    const replacement = slackApi.calls.find(call => call.method === 'chat.update')
+    expect(stringField(replacement?.body.markdown_text)).toStartWith('GENUI_CORRECTED.')
+    expect(stringField(replacement?.body.markdown_text)).not.toContain('json-render')
+    expect(cardMessages(await threadMessages(parentTs))).toHaveLength(1)
+    expect(metricValue('rendered')).toBe(1)
+  })
+
+  it('keeps a card-only answer as code when Slack rejects the card in the fallback', async () => {
+    bot = createTestBot({ generativeUi: { enabled: true }, logger: captureLogger(capturedLogs) })
+    const block = `\`\`\`json-render\n${JSON.stringify(CARD_SPEC)}\n\`\`\``
+    // A diverging draft sends the card-only answer through the fallback, whose
+    // card edit Slack then rejects.
+    slackApi.failNextBlocksMessage()
+    const { parentTs, logs } = await runDivergingAnswer('summarize the close', 'GENUI_DRAFT prose', block)
+
+    expect(hasLog(logs, 'slackbotv2_render_fallback_complete')).toBe(true)
+    expect(cardMessages(await threadMessages(parentTs))).toHaveLength(0)
+    const updates = slackApi.calls.filter(call => call.method === 'chat.update')
+    // The rejected card edit, then the edit with the block as code.
+    expect(updates).toHaveLength(2)
+    const posted = stringField(updates[1]!.body.markdown_text)
+    expect(posted).toStartWith('```json\n')
+    expect(posted).toContain('GENUI_CARD_TITLE')
+    const texts = await threadTexts(parentTs)
+    expect(texts.some(text => text.includes('GENUI_DRAFT'))).toBe(false)
+    expect(metricValue('post_failed')).toBe(1)
+    expect(metricValue('rendered')).toBe(0)
+  })
+
+  describe('agent note', () => {
+    const NOTE_HEADING = '# Slack card (generative UI)'
+    const executeText = (index: number) => JSON.stringify(
+      JSON.parse(codexApi.executes[index]!.body.input_lines.at(-1)!).message.content
+    )
+
+    async function mentionInThread(text: string, threadTs: string): Promise<void> {
+      const delivery = await sendMessage(`<@${BOT_USER_ID}> ${text}`, { threadTs })
+      expect(delivery.response.status).toBe(200)
+      await delivery.finished()
+      await waitFor(async () =>
+        (await bot.chat.getState().get<Record<string, unknown>>(`thread-state:${threadKey(threadTs)}`))
+          ?.activeExecution !== true
+      )
+    }
+
+    it('sends the note on the first execute turn of a thread only', async () => {
+      bot = createTestBot({ generativeUi: { enabled: true } })
+      const parent = await postUserMessage('Context before generative UI turns.')
+
+      await mentionInThread('summarize the close', parent.ts)
+      await mentionInThread('and last quarter?', parent.ts)
+
+      expect(codexApi.executes).toHaveLength(2)
+      expect(executeText(0)).toContain(NOTE_HEADING)
+      expect(executeText(1)).not.toContain(NOTE_HEADING)
+    })
+
+    it('waits for a turn that allows cards and resends after a harness restart', async () => {
+      bot = createTestBot({ generativeUi: { enabled: true } })
+      const parent = await postUserMessage('Context before generative UI turns.')
+
+      await mentionInThread('summarize the close in plain text only', parent.ts)
+      await mentionInThread('now as a table', parent.ts)
+      codexApi.queueCreateResponse({ harness_switched: true, harness_type: 'claudecode' })
+      await mentionInThread('again on claude --claude', parent.ts)
+
+      expect(codexApi.executes).toHaveLength(3)
+      expect(executeText(0)).not.toContain(NOTE_HEADING)
+      expect(executeText(1)).toContain(NOTE_HEADING)
+      expect(executeText(2)).toContain(NOTE_HEADING)
+    })
+
+    it('sends no note with the flag off', async () => {
+      bot = createTestBot()
+      const parent = await postUserMessage('Context before plain turns.')
+
+      await mentionInThread('summarize the close', parent.ts)
+
+      expect(executeText(0)).not.toContain(NOTE_HEADING)
+    })
+  })
+})
+
 function createTestBot(
   overrides: Partial<Parameters<typeof createSlackbotV2>[0]> = {}
 ): SlackbotV2 {
@@ -5287,6 +6464,13 @@ function createProductionDefaultTestBot(
     signingSecret: SIGNING_SECRET,
     slackApiUrl,
     state: createMemoryState(),
+    // slackbotv2 downloads files with the bot token only from Slack's file
+    // origins, so serve files.slack.com from the emulator, as the adapter's
+    // file transport below does.
+    fetch: (input, init) => {
+      const url = new URL(input instanceof Request ? input.url : String(input))
+      return fetch(url.hostname === 'files.slack.com' ? new URL(url.pathname, slackApi.url) : input, init)
+    },
     ...overrides
   })
   Object.assign(instance.chat.getAdapter('slack'), {
@@ -5647,6 +6831,19 @@ function signedSlackInteraction(payload: Record<string, unknown>): RequestInit {
  * A Slack event the bot received: its webhook response, and `finished`, which
  * settles once the work the webhook scheduled has finished.
  */
+/** Messages still queued for their own turn in `threadKey`. */
+async function pendingTurnIds(state: StateAdapter, threadKey: string): Promise<string[]> {
+  const ids: string[] = []
+  for (const turn of await state.getList<{ message: { id: string } }>(
+    `slackbotv2:pending-turns:${threadKey}`
+  )) {
+    if (!(await state.get(`slackbotv2:pending-turn:done:${threadKey}:${turn.message.id}`))) {
+      ids.push(turn.message.id)
+    }
+  }
+  return ids
+}
+
 type Delivery = { response: Response; finished: () => Promise<unknown> }
 
 let eventCount = 0
@@ -5760,6 +6957,8 @@ type MockSessionApi = {
   /** Slack Connect allowlist api-rs returns; null makes the lookup fail. */
   externalTeamIds: string[] | null
   holdNextExecute(): () => void
+  /** Steering outcome the next user-message append reports, as api-rs does. */
+  nextAppendSteering: Record<string, unknown> | null
   queueCreateResponse(body: Record<string, unknown>, status?: number): void
   reset(): void
   streamCount: number
@@ -5785,6 +6984,7 @@ async function startMockCodexApi(): Promise<MockSessionApi> {
   let failNextExecute = false
   let failNextExecuteAfterAccept = false
   let externalTeamIds: string[] | null = []
+  let nextAppendSteering: Record<string, unknown> | null = null
   const port = await availablePort(4063)
   const closeStreams = () => {
     for (const stream of streams) stream.end()
@@ -5817,6 +7017,11 @@ async function startMockCodexApi(): Promise<MockSessionApi> {
         return failNextEvents
       },
       idempotentExecutions,
+      takeAppendSteering() {
+        const steering = nextAppendSteering
+        nextAppendSteering = null
+        return steering
+      },
       nextEventId() {
         eventId += 1
         return eventId
@@ -5863,6 +7068,7 @@ async function startMockCodexApi(): Promise<MockSessionApi> {
       failNextExecute = false
       failNextExecuteAfterAccept = false
       externalTeamIds = []
+      nextAppendSteering = null
       workflowEvents.length = 0
     },
     queueCreateResponse(body: Record<string, unknown>, status = 200) {
@@ -5900,6 +7106,12 @@ async function startMockCodexApi(): Promise<MockSessionApi> {
     },
     set externalTeamIds(value: string[] | null) {
       externalTeamIds = value
+    },
+    get nextAppendSteering() {
+      return nextAppendSteering
+    },
+    set nextAppendSteering(value: Record<string, unknown> | null) {
+      nextAppendSteering = value
     },
     holdNextExecute() {
       if (executeHoldRelease) throw new Error('execute is already held')
@@ -5966,6 +7178,7 @@ async function handleMockCodexRequest(
     failNextEvents: boolean
     failNextExecute: boolean
     idempotentExecutions: Map<string, string>
+    takeAppendSteering(): Record<string, unknown> | null
     nextEventId(): number
     port: number
     setFailNextEvents(value: boolean): void
@@ -6060,7 +7273,12 @@ async function handleMockCodexRequest(
   if (endpoint === 'messages') {
     const body = (await request.json()) as SlackbotV2AppendMessagesRequest
     input.appends.push({ threadKey, body })
-    await sendWebResponse(res, Response.json({ ok: true, message_ids: body.messages.map((_, index) => `msg-${index + 1}`) }))
+    const steering = input.takeAppendSteering()
+    await sendWebResponse(res, Response.json({
+      ok: true,
+      message_ids: body.messages.map((_, index) => `msg-${index + 1}`),
+      ...(steering ? { steering } : {})
+    }))
     return
   }
 
@@ -6154,6 +7372,8 @@ type PatchedSlackApi = {
   failStreamAppendsAfter(count: number, error: string): void
   failStreamStopsLongerThan(maxChars: number): void
   failNextStreamStop(): void
+  /** Rejects the next chat.postMessage/chat.update that carries Block Kit blocks. */
+  failNextBlocksMessage(): void
   fileInfoRequestCount(fileId: string): number
   holdAssistantStatus(): () => void
   reset(): void
@@ -6225,6 +7445,7 @@ async function startPatchedSlackApi(emulatorUrl: string): Promise<PatchedSlackAp
   let releaseAssistantStatusGate: (() => void) | null = null
   let maxStreamStopChars: number | null = null
   const stopFailure = { remaining: 0 }
+  const blocksFailure = { remaining: 0 }
   const appendFailure: { error: string; remaining: number } = { error: '', remaining: -1 }
   const streams = new Map<string, StreamRecord>()
   const releaseCurrentAssistantStatusGate = () => {
@@ -6251,6 +7472,7 @@ async function startPatchedSlackApi(emulatorUrl: string): Promise<PatchedSlackAp
       fileInfoRequests,
       maxStreamStopChars,
       stopFailure,
+      blocksFailure,
       port,
       reactionResponses,
       streams,
@@ -6289,6 +7511,9 @@ async function startPatchedSlackApi(emulatorUrl: string): Promise<PatchedSlackAp
     failNextStreamStop() {
       stopFailure.remaining = 1
     },
+    failNextBlocksMessage() {
+      blocksFailure.remaining = 1
+    },
     failStreamStopsLongerThan(maxChars: number) {
       maxStreamStopChars = maxChars
     },
@@ -6309,6 +7534,7 @@ async function startPatchedSlackApi(emulatorUrl: string): Promise<PatchedSlackAp
       botInfoRequests.clear()
       maxStreamStopChars = null
       stopFailure.remaining = 0
+      blocksFailure.remaining = 0
       appendFailure.remaining = -1
       appendFailure.error = ''
       conversationsJoinResponses.length = 0
@@ -6361,6 +7587,7 @@ async function handlePatchedSlackRequest(
     fileInfoRequests: Map<string, number>
     maxStreamStopChars: number | null
     stopFailure: { remaining: number }
+    blocksFailure: { remaining: number }
     port: number
     reactionResponses: QueuedSlackApiResponse[]
     streams: Map<string, StreamRecord>
@@ -6523,6 +7750,15 @@ async function handlePatchedSlackRequest(
   }
   if (path === '/api/chat.postMessage' || path === '/api/chat.update') {
     const body = await requestBody(request.clone())
+    if (input.blocksFailure.remaining > 0 && body.blocks !== undefined && body.markdown_text === undefined) {
+      input.blocksFailure.remaining -= 1
+      input.calls.push({
+        method: path === '/api/chat.postMessage' ? 'chat.postMessage' : 'chat.update',
+        body
+      })
+      await sendWebResponse(res, Response.json({ ok: false, error: 'invalid_blocks' }))
+      return
+    }
     if (typeof body.markdown_text === 'string') {
       input.calls.push({
         method: path === '/api/chat.postMessage' ? 'chat.postMessage' : 'chat.update',

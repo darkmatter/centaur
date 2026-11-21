@@ -10,6 +10,7 @@ use crate::cache::SyncCache;
 
 #[derive(Clone)]
 pub(crate) struct AppState {
+    pub(crate) ssh_targets: Vec<crate::ssh::TargetPolicy>,
     pub(crate) pool: PgPool,
     pub(crate) encryption: Arc<ActiveRecordEncryption>,
     pub(crate) jwt_secret: Option<String>,
@@ -33,6 +34,10 @@ pub(crate) struct ProxyRecord {
     pub(crate) console_user_email: Option<String>,
     pub(crate) console_user_id: Option<i64>,
     pub(crate) slack_history_channel_ids: Value,
+    /// An owner-only token's liveness (expiry, owner status, app state) is
+    /// not covered by the principal cache version, so such configs are always
+    /// assembled live.
+    pub(crate) has_owner_only_grant: bool,
 }
 
 impl ProxyRecord {

@@ -2,6 +2,7 @@
 {{- $secretEnv := include "centaur.secretEnvName" . }}
 {{- $prefix := .Values.secretManager.envPrefix }}
 {{- $console := include "centaur.consoleValues" . | fromYaml }}
+{{- $companyContext := include "centaur.companyContextValues" . | fromYaml }}
 {{- $apiRsName := include "centaur.componentName" (dict "root" . "component" "api-rs") }}
 {{- $metricsAnnotations := dict -}}
 {{- if .Values.proxySync.metrics.scrapeAnnotations -}}
@@ -12,10 +13,6 @@ apiVersion: v1
 kind: Service
 metadata:
   name: {{ $name }}
-{{- with $metricsAnnotations }}
-  annotations:
-{{ toYaml . | nindent 4 }}
-{{- end }}
   labels:
 {{ include "centaur.componentLabels" (dict "root" . "component" "proxy-sync") | nindent 4 }}
 spec:
@@ -86,7 +83,7 @@ spec:
                   key: {{ printf "%sCENTAUR_JWT_SIGNING_SECRET" $prefix }}
             - name: CENTAUR_CONSOLE_URL
               value: {{ include "centaur.consoleUrl" . | quote }}
-{{- if .Values.experimentalCompanyContext.enabled }}
+{{- if $companyContext.enabled }}
             # Proxies inject the principal API JWT into requests to these hosts
             # in addition to CENTAUR_API_URL's.
             - name: CENTAUR_API_SERVER_PROXY_HOSTS
@@ -98,6 +95,8 @@ spec:
 {{- end }}
             - name: RUST_LOG
               value: info
+            - name: CENTAUR_SSH_TARGETS
+              value: {{ .Values.proxySync.sshTargets | toJson | quote }}
           ports:
             - name: http
               containerPort: {{ .Values.proxySync.port }}

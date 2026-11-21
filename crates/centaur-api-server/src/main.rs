@@ -3,7 +3,7 @@ mod args;
 
 use centaur_api_server::{
     ApiAuthConfig, AppState, build_router_with_app_state, partition_slack_external_team_ids,
-    warm_slack_public_channel_cache,
+    spawn_scheduled_task_scheduler, warm_slack_public_channel_cache,
 };
 use centaur_session_runtime::SessionRuntime;
 use centaur_session_sqlx::PgSessionStore;
@@ -14,7 +14,7 @@ use thiserror::Error;
 use tokio::net::TcpListener;
 use tracing::{info, warn};
 
-use args::{Args, MigrateArgs};
+use args::{Args, InstallAgentSandboxCrdsArgs, MigrateArgs};
 
 #[tokio::main]
 async fn main() -> Result<(), ServerError> {
@@ -26,8 +26,14 @@ async fn main() -> Result<(), ServerError> {
         telemetry.shutdown();
         return result;
     }
+    if let Some(args) = InstallAgentSandboxCrdsArgs::from_command_line() {
+        let result = install_agent_sandbox_crds(args).await;
+        telemetry.shutdown();
+        return result;
+    }
 
     let args = Args::parse();
+    info!(enabled = centaur_api_server::mcp_enabled(), "MCP endpoint");
     let api_auth = ApiAuthConfig::from_env()?;
     let listener = TcpListener::bind(args.server.bind_addr).await?;
     info!(
@@ -35,7 +41,10 @@ async fn main() -> Result<(), ServerError> {
         "starting centaur api-rs server"
     );
 
-    let app_state = AppState::unready(api_auth);
+    let mut app_state = AppState::unready(api_auth);
+    if let Some(pool) = args.console_db() {
+        app_state = app_state.with_console_db(pool);
+    }
     let app = build_router_with_app_state(app_state.clone());
     warm_slack_public_channel_cache();
     let shutdown_state = app_state.clone();
@@ -79,6 +88,12 @@ async fn migrate(args: MigrateArgs) -> Result<(), ServerError> {
     let store = PgSessionStore::connect(&args.database_url).await?;
     store.run_migrations(args.text_search).await?;
     info!(text_search = %args.text_search, "database migrations applied");
+    Ok(())
+}
+
+async fn install_agent_sandbox_crds(args: InstallAgentSandboxCrdsArgs) -> Result<(), ServerError> {
+    let client = kube::Client::try_default().await?;
+    centaur_sandbox_agent_k8s::install_agent_sandbox_crds(&client, &args.stop_deployments).await?;
     Ok(())
 }
 
@@ -127,13 +142,20 @@ async fn initialize_runtime(args: Args, app_state: AppState) -> Result<(), Serve
         .with_session_principal_admission(args.session_principal_admission())
         .with_openai_session_title_generator_from_env();
     runtime = runtime.with_personas(args.persona_registry()?);
+    if centaur_api_server::mcp_enabled() {
+        let image = args.codemode_image();
+        info!(image = %image, "MCP Code Mode sandboxes enabled");
+        runtime = runtime.with_codemode(image);
+    }
     let sandbox_capacity_config = args.sandbox_capacity_config();
     if let Some(config) = sandbox_capacity_config {
         runtime = runtime.with_sandbox_capacity(config);
     }
-    if let Some(config) = args.warm_pool_config(&iron_control.warm_pool_bootstrap_principal) {
-        runtime = runtime.with_warm_pool(config);
-    }
+    let (warm_pools, warm_pool_config) =
+        args.warm_pools(&iron_control.warm_pool_bootstrap_principal)?;
+    runtime = runtime
+        .with_warm_pools(warm_pools, warm_pool_config)
+        .map_err(|error| ServerError::UnsupportedConfig(error.to_string()))?;
     runtime = runtime.with_sandbox_reaper(args.sandbox_reaper_config());
     runtime = runtime.with_sandbox_cleanup(args.sandbox_cleanup_config());
     if let Some(config) = args.session_event_retention_config() {
@@ -142,15 +164,19 @@ async fn initialize_runtime(args: Args, app_state: AppState) -> Result<(), Serve
     let workflow_host_sandbox = args
         .workflow_host_sandbox_runtime(&iron_control.workflow_host_principal)
         .await?;
-    let workflows = Some(
-        WorkflowRuntime::new(
-            store,
-            runtime.clone(),
-            workflow_host_sandbox,
-            iron_control.workflow_principal_registrar,
-        )
-        .await?,
-    );
+    let workflows = WorkflowRuntime::new(
+        store,
+        runtime.clone(),
+        workflow_host_sandbox,
+        iron_control.workflow_principal_registrar,
+    )
+    .await?;
+    // Console stores scheduled tasks; api-rs runs them.
+    match args.console_db() {
+        Some(console_db) => spawn_scheduled_task_scheduler(console_db, workflows.clone()),
+        None => warn!("Console database is not configured; scheduled tasks will not run"),
+    }
+    let workflows = Some(workflows);
 
     // Adopt executions orphaned by another control plane process
     // (deploy/crash): recover finished turns from recorded sandbox output,
@@ -223,6 +249,8 @@ pub(crate) enum ServerError {
     Kube(#[from] kube::Error),
     #[error(transparent)]
     Sandbox(#[from] centaur_sandbox_core::SandboxError),
+    #[error(transparent)]
+    AgentSandboxCrds(#[from] centaur_sandbox_agent_k8s::CrdMigrationError),
     #[error(transparent)]
     IronProxy(#[from] centaur_iron_proxy::IronProxyConfigError),
     #[error(transparent)]

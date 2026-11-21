@@ -141,14 +141,17 @@ def test_create_scheduled_task_posts_schedule_and_delivery():
         name="Daily briefing",
         prompt="Summarize updates.",
         cron_expression="0 9 * * *",
+        delivery_channel="dm",
     )
 
     assert result == {"id": "tsk_123", "delivery_channel": "U0123456789"}
 
 
-def test_create_scheduled_task_allows_an_omitted_schedule():
+def test_create_scheduled_task_allows_an_omitted_schedule_and_destination():
     def handler(request: httpx.Request) -> httpx.Response:
-        assert json.loads(request.content)["data"]["cron_expression"] is None
+        data = json.loads(request.content)["data"]
+        assert data["cron_expression"] is None
+        assert "delivery_channel" not in data
         return json_response({"data": {"id": "tsk_123", "cron_expression": None}}, 201)
 
     result = make_client(handler).create_scheduled_task(
@@ -157,6 +160,30 @@ def test_create_scheduled_task_allows_an_omitted_schedule():
     )
 
     assert result["cron_expression"] is None
+
+
+def test_create_personal_scheduled_task_sends_owner_me():
+    def handler(request: httpx.Request) -> httpx.Response:
+        data = json.loads(request.content)["data"]
+        assert data["owner"] == "me"
+        assert "delivery_channel" not in data
+        return json_response({"data": {"id": "tsk_123", "delivery_channel": "U0123456789"}}, 201)
+
+    result = make_client(handler).create_scheduled_task(
+        name="Remind me",
+        prompt="Remind me to review PRs.",
+        personal=True,
+    )
+
+    assert result["delivery_channel"] == "U0123456789"
+
+
+def test_create_scheduled_task_omits_owner_by_default():
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert "owner" not in json.loads(request.content)["data"]
+        return json_response({"data": {"id": "tsk_123"}}, 201)
+
+    make_client(handler).create_scheduled_task(name="Channel digest", prompt="Summarize.")
 
 
 def test_update_scheduled_task_patches_only_provided_fields():

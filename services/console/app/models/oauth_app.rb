@@ -30,6 +30,14 @@ class OauthApp < ApplicationRecord
 
   encrypts :client_secret
 
+  # owner_only: each Console user connects their own account (the credential is
+  # keyed by that user, not by a provider identity), and its token is delivered
+  # only to that user's own principals through a direct grant -- never through
+  # roles, other principals, or email matching -- and only while the token is
+  # live, the app enabled, and the user active. Enforced in Console
+  # (PrincipalCredentialReconciliation#connection_owner?, Grant, SecretSource)
+  # and in proxy-sync (crates/centaur-console-db/sql/effective_credentials.sql).
+
   # The slug is the app's whole identity: globally unique and URL-safe. It both
   # addresses the app in the API (oid or slug) and names the consent links, so it
   # must not start with the opaque-id prefix or the two forms would collide.
@@ -42,10 +50,17 @@ class OauthApp < ApplicationRecord
   validate :labels_is_a_hash
   validate :allowed_scopes_valid
   validate :shared_configuration_valid
+  validate :owner_only_configuration_valid
+  validate :provider_config_valid
 
   # The provider strategy backing this app, or nil if the provider column somehow
-  # holds an unknown key (the inclusion validation normally prevents that).
-  def provider_strategy = Oauth::Providers.fetch(provider)
+  # holds an unknown key (the inclusion validation normally prevents that). The
+  # custom provider is configured per app from provider_config.
+  def provider_strategy
+    return Oauth::Providers::Custom.new(self) if provider == Oauth::Providers::Custom::KEY
+
+    Oauth::Providers.fetch(provider)
+  end
 
   # True when every requested scope is within the allowlist.
   def scopes_allowed?(requested) = (Array(requested) - Array(allowed_scopes)).empty?
@@ -67,6 +82,22 @@ class OauthApp < ApplicationRecord
   def shared_configuration_valid
     errors.add(:shared, "cannot be changed after creation") if persisted? && will_save_change_to_shared?
     errors.add(:shared, "cannot be always available to the connecting user") if shared? && always_available?
+  end
+
+  def owner_only_configuration_valid
+    # Credentials are keyed differently with and without owner_only.
+    errors.add(:owner_only, "cannot be changed after creation") if persisted? && will_save_change_to_owner_only?
+    errors.add(:owner_only, "cannot be combined with a shared app") if owner_only? && shared?
+  end
+
+  def provider_config_valid
+    if !provider_config.is_a?(Hash)
+      errors.add(:provider_config, "must be a hash")
+    elsif provider == Oauth::Providers::Custom::KEY
+      Oauth::Providers::Custom.config_errors(provider_config).each { |message| errors.add(:provider_config, message) }
+    elsif provider_config.present?
+      errors.add(:provider_config, "is only supported by the custom provider")
+    end
   end
 
   def slug_does_not_shadow_oid

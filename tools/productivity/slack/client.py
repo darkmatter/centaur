@@ -1,6 +1,5 @@
 """Slack API client for bot-token Slack tool operations."""
 
-import asyncio
 import base64
 import binascii
 import json
@@ -17,16 +16,48 @@ from pathlib import Path
 from typing import Any, ClassVar
 from urllib.parse import urlparse
 
-import asyncpg
 import structlog
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 
-from centaur_sdk.tool_sdk import COMPANY_CONTEXT_DSN_ENV, company_context_database_url, secret
+from centaur_sdk.tool_sdk import secret
 
 # structlog so these lines render as JSON through the tool-server's
 # configure_structlog() pipeline, like the rest of the service's logs.
 logger = structlog.get_logger()
+
+_DOWNLOAD_CHUNK_BYTES = 64 * 1024
+
+
+def _download_path(output_dir: str | Path, filename: str, fallback: str) -> Path:
+    """Resolve a server-supplied filename to a path directly inside ``output_dir``."""
+    name = Path(filename).name
+    if name in ("", ".", ".."):
+        name = fallback
+    directory = Path(output_dir)
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory / name
+
+
+def _stream_response_to_file(response: Any, path: Path) -> int:
+    """Stream an HTTP response body to ``path`` and return the byte count.
+
+    Writes to a sibling temp file and renames it into place, so a failed
+    download never leaves a truncated file at ``path``.
+    """
+    temp_path = path.with_name(f".{path.name}.part")
+    total = 0
+    try:
+        with temp_path.open("wb") as file:
+            while chunk := response.read(_DOWNLOAD_CHUNK_BYTES):
+                total += len(chunk)
+                file.write(chunk)
+        temp_path.replace(path)
+    except BaseException:
+        temp_path.unlink(missing_ok=True)
+        raise
+    return total
+
 
 # Cache for channel list to avoid repeated API calls
 
@@ -74,142 +105,162 @@ class SlackRateLimitError(RuntimeError):
 
 
 class IndexedSlackClient:
-    """Search RLS-scoped Slack messages stored by the Slack sync."""
+    """Search indexed Slack history through the company-context v2 query API.
 
+    In sandboxes, iron-proxy injects the principal's API JWT into requests to the
+    service, which limits results to the Slack conversations that principal can
+    see. Results are channel-day transcript chunks, passed through as the API
+    sends them.
+    """
+
+    API_URL_ENV = "COMPANY_CONTEXT_API_URL"
+    DOCUMENT_TYPE = "slack_message"
+    TIMEOUT_SECONDS = 30
     _DEFAULT_LIMIT = 20
     _MAX_LIMIT = 50
+    _MAX_CHANNELS = 100
+    _CONVERSATION_ID_RE = re.compile(r"^[CGD][A-Z0-9]{2,}$")
 
-    def __init__(self, database_url: str | None = None):
-        value = company_context_database_url(database_url)
-        if not value:
-            raise RuntimeError(f"{COMPANY_CONTEXT_DSN_ENV} is not configured")
-        self.database_url = value
-
-    async def _search_messages(
+    def __init__(
         self,
-        *,
-        query: str,
-        limit: int,
-        channels: list[str] | None,
-        from_user: str | None,
-    ) -> dict[str, Any]:
-        conn = await asyncpg.connect(self.database_url)
-        try:
-            rows = await conn.fetch(
-                """
-                SELECT
-                    messages.channel_id,
-                    channels.channel_name,
-                    messages.message_ts,
-                    messages.occurred_at,
-                    messages.thread_ts,
-                    messages.user_id,
-                    messages.bot_id,
-                    messages.text,
-                    messages.permalink,
-                    messages.reply_count,
-                    COALESCE(
-                        NULLIF(users.display_name, ''),
-                        NULLIF(users.real_name, ''),
-                        NULLIF(users.user_name, ''),
-                        NULLIF(messages.user_id, ''),
-                        messages.bot_id
-                    ) AS author_name,
-                    ts_rank_cd(
-                        to_tsvector('english', COALESCE(messages.text, '')),
-                        websearch_to_tsquery('english', $1)
-                    ) AS score
-                FROM company_context_slack_messages messages
-                JOIN slack_sync_channels channels
-                  ON channels.channel_id = messages.channel_id
-                LEFT JOIN company_context_slack_users users
-                  ON users.user_id = messages.user_id
-                WHERE to_tsvector('english', COALESCE(messages.text, ''))
-                      @@ websearch_to_tsquery('english', $1)
-                  AND (
-                      $2::text[] IS NULL
-                      OR LOWER(messages.channel_id) = ANY($2::text[])
-                      OR LOWER(channels.channel_name) = ANY($2::text[])
-                  )
-                  AND (
-                      $3::text IS NULL
-                      OR LOWER(messages.user_id) = $3
-                      OR LOWER(users.user_name) = $3
-                      OR LOWER(users.real_name) = $3
-                      OR LOWER(users.display_name) = $3
-                  )
-                ORDER BY score DESC, messages.occurred_at DESC NULLS LAST
-                LIMIT $4
-                """,
-                query,
-                channels,
-                from_user,
-                limit,
-            )
-            return {
-                "status": "ok",
-                "query": query,
-                "results": [
-                    {
-                        "channel": str(row.get("channel_name") or ""),
-                        "channel_id": str(row.get("channel_id") or ""),
-                        "user": str(row.get("author_name") or ""),
-                        "user_id": str(row.get("user_id") or ""),
-                        "bot_id": str(row.get("bot_id") or ""),
-                        "text": str(row.get("text") or ""),
-                        "timestamp": str(row.get("message_ts") or ""),
-                        "occurred_at": self._isoformat(row.get("occurred_at")),
-                        "permalink": str(row.get("permalink") or ""),
-                        "thread_ts": str(row.get("thread_ts") or "") or None,
-                        "reply_count": int(row.get("reply_count") or 0),
-                        "score": float(row.get("score") or 0.0),
-                    }
-                    for row in rows
-                ],
-            }
-        finally:
-            await conn.close()
+        base_url: str | None = None,
+        channel_resolver: Callable[[str], str] | None = None,
+    ):
+        self._base_url = base_url
+        self._channel_resolver = channel_resolver
 
-    @staticmethod
-    def _isoformat(value: Any) -> str | None:
-        if value is None:
-            return None
-        if hasattr(value, "isoformat"):
-            return value.isoformat()
-        return str(value)
+    def _api_url(self) -> str:
+        base_url = self._base_url or os.getenv(self.API_URL_ENV, "")  # noqa: TID251 - non-secret
+        return base_url.strip().rstrip("/")
+
+    def _request(self, method: str, path: str, body: dict[str, Any] | None = None) -> dict:
+        base_url = self._api_url()
+        if not base_url:
+            return {
+                "status": "error",
+                "error": (
+                    f"{self.API_URL_ENV} is not configured; the company-context API is not "
+                    "deployed. Use search-direct with a linked Slack user credential instead."
+                ),
+            }
+        if not re.match(r"^https?://", base_url):
+            base_url = f"http://{base_url}"
+        headers = {"Accept": "application/json"}
+        data = None
+        if body is not None:
+            headers["Content-Type"] = "application/json"
+            data = json.dumps(body).encode()
+        request = urllib.request.Request(
+            f"{base_url}{path}", data=data, headers=headers, method=method
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=self.TIMEOUT_SECONDS) as response:
+                payload = response.read()
+                return {"status": "ok", **(json.loads(payload) if payload else {})}
+        except urllib.error.HTTPError as exc:
+            # The API reports failures as {"error": "..."}.
+            try:
+                message = json.loads(exc.read())["error"]
+            except (ValueError, KeyError, TypeError):
+                message = exc.reason
+            return {"status": "error", "error": f"HTTP {exc.code}: {message}"}
+        except (urllib.error.URLError, TimeoutError, ValueError) as exc:
+            return {"status": "error", "error": str(exc)}
+
+    def _resolve_channel_id(self, channel: str) -> str:
+        normalized = str(channel).strip()
+        if normalized.startswith("<#") and normalized.endswith(">"):
+            normalized = normalized[2:-1].split("|", 1)[0]
+        normalized = normalized.lstrip("#").strip()
+        if not normalized:
+            return ""
+        if self._CONVERSATION_ID_RE.match(normalized):
+            return normalized
+        resolver = self._channel_resolver or _resolve_bot_channel_id
+        return resolver(normalized.lower())
 
     def search_messages(
         self,
         query: str,
         limit: int = _DEFAULT_LIMIT,
         channels: list[str] | None = None,
-        from_user: str | None = None,
+        after: str | None = None,
+        before: str | None = None,
+        sort: str = "score",
+        cursor: str | None = None,
     ) -> dict[str, Any]:
+        """Search indexed Slack messages visible to the caller.
+
+        ``channels`` takes conversation IDs or channel names; names resolve
+        through the channels the bot is a member of. ``after`` (inclusive) and
+        ``before`` (exclusive) take RFC 3339 times or ``YYYY-MM-DD`` dates in
+        UTC. ``sort="timestamp"`` returns every chunk containing all query terms,
+        newest first; pass a response's ``next_cursor`` as ``cursor`` for the
+        next page.
+        """
         normalized_query = query.strip()
         if not normalized_query:
             return {"status": "error", "error": "query cannot be empty"}
+        if sort not in {"score", "timestamp"}:
+            return {"status": "error", "error": "sort must be 'score' or 'timestamp'"}
 
-        normalized_channels = []
-        for channel in channels or []:
-            normalized = str(channel).strip()
-            if normalized.startswith("<#") and normalized.endswith(">"):
-                normalized = normalized[2:-1].split("|", 1)[0]
-            normalized = normalized.lstrip("#").strip().lower()
-            if normalized and normalized not in normalized_channels:
-                normalized_channels.append(normalized)
-
-        normalized_from_user = from_user.strip().lstrip("@").lower() if from_user else None
+        channel_ids: list[str] = []
         try:
-            return asyncio.run(
-                self._search_messages(
-                    query=normalized_query,
-                    limit=max(1, min(int(limit), self._MAX_LIMIT)),
-                    channels=normalized_channels or None,
-                    from_user=normalized_from_user or None,
-                )
-            )
-        except Exception as exc:
+            for channel in channels or []:
+                channel_id = self._resolve_channel_id(channel)
+                if channel_id and channel_id not in channel_ids:
+                    channel_ids.append(channel_id)
+        except (RuntimeError, ValueError) as exc:
             return {"status": "error", "error": str(exc)}
+        if len(channel_ids) > self._MAX_CHANNELS:
+            return {
+                "status": "error",
+                "error": f"at most {self._MAX_CHANNELS} channels can be searched at once",
+            }
+
+        filters: dict[str, Any] = {"types": [self.DOCUMENT_TYPE]}
+        if channel_ids:
+            filters["channel_ids"] = channel_ids
+        if after:
+            filters["occurred_after"] = _rfc3339(after)
+        if before:
+            filters["occurred_before"] = _rfc3339(before)
+        body: dict[str, Any] = {
+            "query": normalized_query,
+            "filters": filters,
+            "limit": max(1, min(int(limit), self._MAX_LIMIT)),
+        }
+        if sort == "timestamp":
+            body["mode"] = "keyword"
+        if cursor:
+            body["cursor"] = cursor
+
+        result = self._request("POST", "/query", body)
+        if result.get("status") != "ok":
+            return result
+        return {
+            "status": "ok",
+            "query": normalized_query,
+            "results": result.get("results") or [],
+            "next_cursor": result.get("next_cursor"),
+        }
+
+
+def _rfc3339(value: str) -> str:
+    """Expand a ``YYYY-MM-DD`` date to midnight UTC; pass other values through."""
+    value = value.strip()
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+        return f"{value}T00:00:00Z"
+    return value
+
+
+def _resolve_bot_channel_id(name: str) -> str:
+    for channel in _client().list_bot_channels():
+        if channel.get("name") == name:
+            return channel["id"]
+    raise RuntimeError(
+        f"Channel '{name}' not found among the bot's channels; pass its conversation ID instead"
+    )
 
 
 class SlackClient:
@@ -236,6 +287,7 @@ class SlackClient:
     _NUMERIC_TS_RE = re.compile(r"^\d+(?:\.\d+)?$")
     _CHANNEL_ID_RE = re.compile(r"^[CGD][A-Z0-9]+$")
     _FILE_ID_RE = re.compile(r"^F[A-Z0-9]+$")
+    _USER_ID_RE = re.compile(r"^[UW][A-Z0-9]{8,}$")
     _USER_ID_RE = re.compile(r"^[UW][A-Z0-9]+$")
     _AUTH_ERROR_CODES: ClassVar[frozenset[str]] = frozenset(
         {
@@ -522,19 +574,25 @@ class SlackClient:
             raise RuntimeError(f"Centaur API request failed on {path}: {exc.reason}") from exc
         return json.loads(raw) if raw else {}
 
-    def _centaur_api_get_bytes(
+    def _centaur_api_download(
         self,
         path: str,
         params: dict[str, Any],
-        max_bytes: int,
-    ) -> tuple[bytes, dict[str, str]]:
-        """GET bytes from a Centaur API endpoint."""
+        output_dir: str | Path,
+        default_filename: str,
+    ) -> tuple[Path, int, dict[str, str]]:
+        """Stream a Centaur API file download into ``output_dir``."""
         url = self._centaur_api_url_for(path, params)
         request = urllib.request.Request(url, headers=self._centaur_api_headers(), method="GET")
         try:
             with urllib.request.urlopen(request, timeout=self._api_timeout_seconds()) as response:
-                body = response.read(max_bytes + 1)
                 headers = {key.lower(): value for key, value in response.headers.items()}
+                filename = (
+                    self._content_disposition_filename(headers.get("content-disposition"))
+                    or default_filename
+                )
+                out_path = _download_path(output_dir, filename, default_filename)
+                size = _stream_response_to_file(response, out_path)
         except urllib.error.HTTPError as exc:
             raw = exc.read().decode("utf-8", errors="replace")
             detail = raw
@@ -546,9 +604,7 @@ class SlackClient:
             raise RuntimeError(f"Centaur API error {exc.code} on {path}: {detail}") from exc
         except urllib.error.URLError as exc:
             raise RuntimeError(f"Centaur API request failed on {path}: {exc.reason}") from exc
-        if len(body) > max_bytes:
-            raise ValueError(f"Slack file exceeds the {max_bytes}-byte download limit")
-        return body, headers
+        return out_path, size, headers
 
     def _message_permalink(self, channel_id: str, ts: str) -> str:
         """Build a generic fallback permalink from channel and timestamp."""
@@ -1074,7 +1130,9 @@ class SlackClient:
         principal's `slack.history_channels` claim.
         """
         normalized_channel_id = self._clean_channel_ref(channel_id).upper()
-        if len(normalized_channel_id) < 9 or not self._looks_like_channel_id(normalized_channel_id):
+        if len(normalized_channel_id) < 9 or not self._looks_like_channel_id(
+            normalized_channel_id
+        ):
             raise ValueError("channel_id must be a Slack conversation ID like C123456789")
 
         params: dict[str, Any] = {
@@ -1587,8 +1645,25 @@ class SlackClient:
         members = self.get_channel_members(channel)
         return [m["email"] for m in members if m.get("email")]
 
-    def get_user_email(self, user_id: str) -> str | None:
-        """Get a user's email address by their Slack user ID.
+    def get_user_email_proxy(self, user_id: str) -> str | None:
+        """Get a user's email address through the Centaur API server proxy.
+
+        Args:
+            user_id: Slack user ID (e.g., 'U123ABC')
+
+        Returns:
+            Email address or None if the profile has no email
+        """
+        normalized_user_id = str(user_id).strip().upper()
+        if not self._USER_ID_RE.fullmatch(normalized_user_id):
+            raise ValueError("user_id must be a Slack user ID like U123456789")
+        response = self._centaur_api_get_json(
+            f"/api/slack/users/{urllib.parse.quote(normalized_user_id, safe='')}/email", {}
+        )
+        return response.get("email")
+
+    def get_user_email_direct(self, user_id: str) -> str | None:
+        """Get a user's email address directly with the Slack SDK.
 
         Args:
             user_id: Slack user ID (e.g., 'U123ABC')
@@ -2066,30 +2141,29 @@ class SlackClient:
             content_type or "application/octet-stream",
         )
 
-    def download_file_proxy(self, file_id: str, channel_id: str) -> dict[str, Any]:
-        """Download a Slack file through the Centaur API server Slack proxy.
+    def download_file_proxy(
+        self, file_id: str, channel_id: str, output_dir: str | Path = "/tmp/downloads"
+    ) -> dict[str, Any]:
+        """Stream a Slack file through the Centaur API server Slack proxy to disk.
 
-        Returns base64-encoded file bytes plus filename, content type, and size.
+        Defaults to ``/tmp/downloads``. Returns the written path plus filename,
+        content type, and size.
         """
         normalized_file_id = self._normalize_file_id(file_id)
         normalized_channel_id = self._normalize_explicit_channel_id(channel_id)
-        body, headers = self._centaur_api_get_bytes(
+        out_path, size, headers = self._centaur_api_download(
             f"/api/slack/files/{urllib.parse.quote(normalized_file_id, safe='')}/download",
             {"channel_id": normalized_channel_id},
-            self._MAX_DOWNLOAD_BYTES,
+            output_dir,
+            normalized_file_id,
         )
-        filename = (
-            self._content_disposition_filename(headers.get("content-disposition"))
-            or normalized_file_id
-        )
-        content_type = headers.get("content-type") or "application/octet-stream"
         return {
             "file_id": normalized_file_id,
             "channel_id": normalized_channel_id,
-            "filename": filename,
-            "content_type": content_type,
-            "size_bytes": len(body),
-            "content_base64": base64.b64encode(body).decode(),
+            "filename": out_path.name,
+            "content_type": headers.get("content-type") or "application/octet-stream",
+            "size_bytes": size,
+            "output_path": str(out_path.absolute()),
         }
 
     def file_info_proxy(self, file_id: str, channel_id: str) -> dict[str, Any]:
@@ -2240,12 +2314,10 @@ class SlackClient:
             )
         return dict(response.get("file") or {})
 
-    # Slack file downloads buffer the file in memory before writing it, so cap the
-    # size regardless of Slack's own (much larger) per-file limit.
-    _MAX_DOWNLOAD_BYTES = 10 * 1024 * 1024
-
-    def _fetch_slack_file(self, url: str) -> tuple[str, str, bytes]:
-        """Download a Slack file's bytes: returns ``(filename, mime_type, body)``.
+    def _fetch_slack_file(
+        self, url: str, output_dir: str | Path, filename: str | None = None
+    ) -> tuple[Path, int]:
+        """Stream a Slack file into ``output_dir``: returns ``(path, size_bytes)``.
 
         ``url`` must be an ``https://files.slack.com/`` URL. The token is sent
         only to that host, so it can never be aimed at a Slack API endpoint
@@ -2260,17 +2332,10 @@ class SlackClient:
             )
 
         req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
+        out_path = _download_path(output_dir, filename or Path(parsed.path).name, "slack-file")
         with urllib.request.urlopen(req) as response:
-            # Read one byte past the cap so an oversized file is rejected
-            # without buffering an unbounded response.
-            body = response.read(self._MAX_DOWNLOAD_BYTES + 1)
-            mime_type = response.headers.get_content_type()
-        if len(body) > self._MAX_DOWNLOAD_BYTES:
-            raise ValueError(
-                f"Slack file exceeds the {self._MAX_DOWNLOAD_BYTES}-byte download limit"
-            )
-
-        return Path(parsed.path).name or "slack-file", mime_type, body
+            size = _stream_response_to_file(response, out_path)
+        return out_path, size
 
     def search_files(
         self,
@@ -2607,8 +2672,12 @@ def get_channel_member_emails(*args, **kwargs):
     return _client().get_channel_member_emails(*args, **kwargs)
 
 
-def get_user_email(*args, **kwargs):
-    return _client().get_user_email(*args, **kwargs)
+def get_user_email_proxy(*args, **kwargs):
+    return _client().get_user_email_proxy(*args, **kwargs)
+
+
+def get_user_email_direct(*args, **kwargs):
+    return _client().get_user_email_direct(*args, **kwargs)
 
 
 def send_message(*args, **kwargs):

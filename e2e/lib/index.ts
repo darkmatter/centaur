@@ -8,6 +8,7 @@
 //   const turn = await thread.nextTurn()
 //   expect(turn.reply).toBe('Hello.')
 import { randomUUID } from 'node:crypto'
+import { afterAll } from 'bun:test'
 import { SQL } from 'bun'
 import { BOT, CHANNEL, USER, type SlackUser } from '../fakes/slack-fixture'
 
@@ -38,6 +39,7 @@ export type Execution = { execution_id: string; status: string; error: string | 
 export type ModelRequest = {
   provider: 'openai' | 'anthropic'
   model?: string
+  host?: string
   /** The credential header as the provider received it, after iron-proxy. */
   credential?: string
   /** The ChatGPT workspace the request was sent for, after iron-proxy. */
@@ -94,6 +96,7 @@ const consoleUrl = required('E2E_CONSOLE_URL')
 const consoleApiKey = required('E2E_CONSOLE_API_KEY')
 const logDir = required('E2E_LOG_DIR')
 const namespace = 'centaur'
+const sshNamespace = 'centaur-e2e-ssh'
 const release = 'centaur'
 
 /** How the stack's Codex and Claude Code authenticate: api_key, or access_token (subscriptions). */
@@ -112,6 +115,14 @@ export const turnTimeoutMs = Number(process.env.E2E_TURN_TIMEOUT_MS ?? 300_000)
 /** How long a finished execution may take to show up in Slack. */
 const renderTimeoutMs = 60_000
 
+export async function executionOutput(executionId: string): Promise<any[]> {
+  const events = await db`
+    select payload from session_events
+    where execution_id = ${executionId} and event_type = 'session.output.line'
+    order by event_id`
+  return events.map(({ payload }: { payload: string }) => JSON.parse(payload))
+}
+
 export const model = {
   /**
    * Scripts the model's answer to the message this is attached to. `delayMs`
@@ -124,8 +135,19 @@ export const model = {
    * Scripts the model to run a shell command through the harness's shell tool
    * (OpenAI harnesses), then answer with `text` once the command finishes.
    */
-  runs(command: string, text = 'Ran it.'): Script {
-    return { token: `e2e-${randomUUID().slice(0, 8)}`, text, run: command }
+  runs(command: string, text = 'Ran it.', options: { delayMs?: number } = {}): Script {
+    return { token: `e2e-${randomUUID().slice(0, 8)}`, text, run: command, ...options }
+  },
+  /** What the harness's shell tool returned for a `runs` script's command, as the model received it. */
+  async commandOutput(script: Script): Promise<string> {
+    for (const { body } of await modelRequests(script.token)) {
+      const outputs = (Array.isArray(body.input) ? body.input : [])
+        .filter((item: any) => String(item?.type ?? '').endsWith('_call_output'))
+        .map((item: any) => (typeof item.output === 'string' ? item.output : contentText(item.output)))
+        .map(commandText)
+      if (outputs.length > 0) return outputs.join('\n')
+    }
+    throw new Error(`the harness returned no command output for script ${script.token}`)
   },
   /**
    * The X-E2E-Credential header of each request a command made to
@@ -189,6 +211,24 @@ export const api = {
   }
 }
 
+/**
+ * Stops the file's idle sandboxes once all its tests finish. Call it at the top
+ * level of every test file.
+ *
+ * A thread keeps its sandbox and iron-proxy pod until it idles out (hours),
+ * so without this a run holds two pods for every thread it opened, and the
+ * single kind node runs out of pods. Bun runs files one at a time, so when a
+ * file's tests are done, every idle sandbox is one of its own finished
+ * threads. api-rs leaves sandboxes with a running execution alone.
+ */
+export function releaseSandboxesAfterAll(): void {
+  afterAll(async () => {
+    const report = await api.ok('POST', '/api/sandboxes/drain')
+    if (report.failed.length > 0) throw new Error(`sandbox release failed: ${JSON.stringify(report.failed)}`)
+    console.log(`released ${report.stopped_count} idle sandboxes; ${report.busy_count} busy`)
+  }, 60_000)
+}
+
 export const cluster = {
   /** Runs a shell script in the api-rs pod, optionally feeding it stdin. */
   async exec(script: string, stdin?: string): Promise<string> {
@@ -236,6 +276,21 @@ export const cluster = {
   }
 }
 
+/**
+ * The remote development environment behind the e2e SSH gateway
+ * (e2e/infra/ssh-gateway.yaml), as its owner sees it.
+ */
+export const sshGateway = {
+  /** The WSS URL the deployment's SSH target policy allows. */
+  url: 'wss://workspace.ssh-gateway.test/events/events',
+  /** The private key the gateway authorizes for its `dev` user. */
+  privateKey: required('E2E_SSH_PRIVATE_KEY'),
+  /** Runs a shell script on the remote host as root; the workspace is /workspace, owned by `dev`. */
+  async exec(script: string): Promise<string> {
+    return kubectl({ namespace: sshNamespace }, 'exec', 'deploy/ssh-gateway', '-c', 'sshd', '--', 'sh', '-c', script)
+  }
+}
+
 type MentionOptions = {
   channel?: Channel
   as?: SlackUser
@@ -271,6 +326,11 @@ export const slack = {
   async message(channel: Channel, ts: string): Promise<SlackMessage> {
     const { message } = await slackApi<{ message: SlackMessage }>(USER, 'reactions.get', { channel: channel.id, timestamp: ts })
     return message
+  },
+  /** A channel's top-level messages, newest first. */
+  async history(channel: Channel): Promise<SlackMessage[]> {
+    const { messages } = await slackApi<{ messages: SlackMessage[] }>(USER, 'conversations.history', { channel: channel.id })
+    return messages
   },
   /** Ephemeral messages a user was shown, oldest first. */
   async ephemeral(user: SlackUser): Promise<Array<{ channel: string; text: string }>> {
@@ -355,6 +415,235 @@ export const ironControl = {
         slack_team_id as "slackTeamId", slack_email as "slackEmail"
       from principals where slack_user_id = ${user.id}`
     return row
+  }
+}
+
+/** A Console scheduled task, with the columns api-rs writes when it runs it. */
+export type ScheduledTask = {
+  id: number
+  oid: string
+  enabled: boolean
+  nextRunAt: Date | null
+  lastEnqueuedAt: Date | null
+  lastRunAt: Date | null
+  lastRunId: string | null
+  lastError: string | null
+}
+
+/** What happened when a Console user pressed "Run now". */
+export type ScheduledTaskRun = { started: true; runId: string } | { started: false; status: number; message: string }
+
+/**
+ * Console's scheduled tasks. Console stores them; api-rs runs them, on their
+ * schedule and when a user runs one now.
+ */
+export const scheduledTasks = {
+  /**
+   * Creates a task as `as`'s Console account would, delivering to `channel`,
+   * which the bot is in. A null `cron` makes a manual task.
+   */
+  async create(options: { prompt: string; channel: Channel; cron: string | null; as?: SlackUser }): Promise<ScheduledTask> {
+    const user = options.as ?? USER
+    const params = JSON.stringify({
+      name: `e2e-${randomUUID().slice(0, 8)}`,
+      prompt: options.prompt,
+      cron: options.cron,
+      email: user.email,
+      user_name: user.displayName,
+      slack_user_id: user.id,
+      team_id: user.teamId,
+      channel: options.channel.id,
+      channel_name: options.channel.name,
+      bot_user_id: BOT.userId
+    })
+    const out = await consoleRunner(`
+      params = JSON.parse(${JSON.stringify(params)})
+      # Concurrent tests share the user, identity, and channel; whichever loses
+      # the race to create one finds the winner's row on retry. Each step
+      # retries on its own: a shared budget runs out when one process loses
+      # all three races in a row.
+      upsert = lambda do |&step|
+        attempts = 0
+        begin
+          step.call
+        rescue ActiveRecord::RecordInvalid, ActiveRecord::RecordNotUnique
+          attempts += 1
+          retry if attempts < 3
+          raise
+        end
+      end
+      user = upsert.call { User.find_or_create_by!(email: params["email"]) { |u| u.name = params["user_name"] } }
+      user.update!(status: "active") unless user.active?
+      upsert.call do
+        user.user_identities.find_or_create_by!(provider: "slack", subject: params["slack_user_id"]) do |identity|
+          identity.team_id = params["team_id"]
+        end
+      end
+      upsert.call do
+        SlackBotChannel.find_or_initialize_by(team_id: params["team_id"], channel_id: params["channel"]).update!(
+          bot_user_id: params["bot_user_id"], name: params["channel_name"], private: false, active: true, archived: false
+        )
+      end
+      task = ScheduledTask.create!(author: user, name: params["name"], prompt: params["prompt"],
+                                   delivery_channel: params["channel"], cron_expression: params["cron"])
+      puts "E2E_RESULT " + { id: task.id }.to_json`)
+    const { id } = consoleResult(out)
+    return scheduledTasks.get(id)
+  },
+  async get(id: number): Promise<ScheduledTask> {
+    // Console stores UTC times without a zone.
+    const [row] = await ironControlDb`
+      select id, enabled, next_run_at at time zone 'UTC' as next_run_at,
+        last_enqueued_at at time zone 'UTC' as last_enqueued_at,
+        last_run_at at time zone 'UTC' as last_run_at, last_run_id, last_error
+      from scheduled_tasks where id = ${id}`
+    if (!row) throw new Error(`scheduled task ${id} does not exist`)
+    const oid = consoleResult(await consoleRunner(`puts "E2E_RESULT " + ScheduledTask.find(${id}).oid.to_json`))
+    return {
+      id: Number(row.id),
+      oid,
+      enabled: row.enabled,
+      nextRunAt: row.next_run_at,
+      lastEnqueuedAt: row.last_enqueued_at,
+      lastRunAt: row.last_run_at,
+      lastRunId: row.last_run_id,
+      lastError: row.last_error
+    }
+  },
+  /** Runs the task now, as its author pressing "Run now" in Console. */
+  async runNow(task: ScheduledTask): Promise<ScheduledTaskRun> {
+    const out = await consoleRunner(`
+      task = ScheduledTask.find(${task.id})
+      result =
+        begin
+          { started: true, runId: ScheduledTaskRunner.call(task)["run_id"] }
+        rescue CentaurApiClient::Error => e
+          { started: false, status: e.status, message: e.message }
+        end
+      puts "E2E_RESULT " + result.to_json`)
+    return consoleResult(out)
+  },
+  /** The author turns the task off in Console. */
+  async disable(task: ScheduledTask): Promise<void> {
+    await consoleRunner(`ScheduledTask.find(${task.id}).update!(enabled: false)`)
+  },
+  /** The bot leaves the channel, as Console's channel catalog would record it. */
+  async botLeaves(channel: Channel): Promise<void> {
+    await consoleRunner(`SlackBotChannel.where(channel_id: ${JSON.stringify(channel.id)}).update_all(active: false)`)
+  }
+}
+
+async function consoleRunner(script: string): Promise<string> {
+  return kubectl({}, 'exec', `deploy/${release}-centaur-console`, '--', 'bin/rails', 'runner', script)
+}
+
+function consoleResult(out: string): any {
+  const line = out.split('\n').find(line => line.startsWith('E2E_RESULT '))
+  if (!line) throw new Error(`the console printed no result: ${out}`)
+  return JSON.parse(line.slice('E2E_RESULT '.length))
+}
+
+/** An API client an operator created in the console, with its one dedicated principal. */
+export type ApiClient = { clientId: string; secret: string; principalId: string; principalForeignId: string }
+
+/** A session API event, as its SSE frame named and carried it. */
+export type SessionEvent = { event: string; data: string }
+
+/**
+ * Machine callers of the session API: created as an operator would in the
+ * console, then calling api-rs with the access token they exchange their
+ * secret for.
+ */
+export const apiClients = {
+  async create(options: { scopes?: string[] } = {}): Promise<ApiClient> {
+    const params = JSON.stringify({
+      name: `e2e-${randomUUID().slice(0, 8)}`,
+      scopes: options.scopes ?? ['sessions:read', 'sessions:write']
+    })
+    const out = await kubectl(
+      {},
+      'exec', `deploy/${release}-centaur-console`, '--', 'bin/rails', 'runner', `
+        params = JSON.parse(${JSON.stringify(params)})
+        admin = User.where(admin: true).order(:id).first or raise "no admin user"
+        principal = Principal.new(kind: "unknown", foreign_id: params["name"], name: params["name"], created_by: admin)
+        principal.apply_default_sandbox_capabilities!
+        principal.save!
+        client = ApiClient.create!(name: params["name"], scopes: params["scopes"], created_by: admin)
+        client.attach_principal!(principal)
+        puts "E2E_API_CLIENT " + { clientId: client.oid, secret: client.secret, principalId: principal.oid,
+                                   principalForeignId: principal.foreign_id }.to_json`
+    )
+    const line = out.split('\n').find(line => line.startsWith('E2E_API_CLIENT '))
+    if (!line) throw new Error('creating an API client printed no result')
+    return JSON.parse(line.slice('E2E_API_CLIENT '.length))
+  },
+  /** Rotates the client's secret; returns the client with its new secret. */
+  async rotate(client: ApiClient): Promise<ApiClient> {
+    const out = await kubectl(
+      {},
+      'exec', `deploy/${release}-centaur-console`, '--', 'bin/rails', 'runner', `
+        client = ApiClient.find_by_oid!(${JSON.stringify(client.clientId)})
+        client.rotate_secret!
+        puts "E2E_API_CLIENT_SECRET " + client.secret`
+    )
+    const line = out.split('\n').find(line => line.startsWith('E2E_API_CLIENT_SECRET '))
+    if (!line) throw new Error('rotating the API client secret printed no secret')
+    return { ...client, secret: line.slice('E2E_API_CLIENT_SECRET '.length) }
+  },
+  async disable(client: ApiClient): Promise<void> {
+    await kubectl(
+      {},
+      'exec', `deploy/${release}-centaur-console`, '--', 'bin/rails', 'runner',
+      `ApiClient.find_by_oid!(${JSON.stringify(client.clientId)}).update!(disabled_at: Time.current)`
+    )
+  },
+  /** The client credentials token exchange, authenticating with HTTP Basic. */
+  async token(client: ApiClient, scope?: string): Promise<{ status: number; body: any }> {
+    const response = await fetch(`${apiUrl}/oauth/token`, {
+      method: 'POST',
+      headers: {
+        authorization: `Basic ${btoa(`${client.clientId}:${client.secret}`)}`,
+        'content-type': 'application/x-www-form-urlencoded'
+      },
+      body: new URLSearchParams({ grant_type: 'client_credentials', ...(scope ? { scope } : {}) })
+    })
+    return { status: response.status, body: await response.json() }
+  },
+  /** api-rs, called with an API client's access token. */
+  as(accessToken: string) {
+    return {
+      ...operatorApi(apiUrl, accessToken),
+      /** A session's events for one execution, through its terminal event. */
+      async events(threadKey: string, executionId: string): Promise<SessionEvent[]> {
+        const query = new URLSearchParams({ execution_id: executionId, after_event_id: '0' })
+        const response = await fetch(`${apiUrl}/api/session/${encodeURIComponent(threadKey)}/events?${query}`, {
+          headers: { authorization: `Bearer ${accessToken}` },
+          signal: AbortSignal.timeout(turnTimeoutMs)
+        })
+        if (!response.ok || !response.body) throw new Error(`event stream failed: ${response.status}`)
+        const events: SessionEvent[] = []
+        let buffer = ''
+        const decoder = new TextDecoder()
+        const reader = response.body.getReader()
+        for (let chunk = await reader.read(); !chunk.done; chunk = await reader.read()) {
+          buffer += decoder.decode(chunk.value, { stream: true })
+          let end: number
+          while ((end = buffer.indexOf('\n\n')) >= 0) {
+            const frame = buffer.slice(0, end).split('\n')
+            buffer = buffer.slice(end + 2)
+            const event = frame.find(line => line.startsWith('event:'))?.slice(6).trim()
+            if (!event) continue
+            const data = frame.filter(line => line.startsWith('data:')).map(line => line.slice(5).trimStart()).join('\n')
+            events.push({ event, data })
+            if (['session.execution_completed', 'session.execution_failed', 'session.execution_cancelled'].includes(event)) {
+              await reader.cancel()
+              return events
+            }
+          }
+        }
+        throw new Error(`event stream ended before execution ${executionId} finished: ${JSON.stringify(events)}`)
+      }
+    }
   }
 }
 
@@ -470,6 +759,21 @@ export class Thread {
     }
   }
 
+  async nextCancelledExecution(): Promise<Execution> {
+    const index = this.turnsSeen++
+    return eventually(`cancelled execution ${index + 1} of ${this.key}`, turnTimeoutMs, async () => {
+      const execution = (await this.executions())[index]
+      if (!execution || !isTerminal(execution.status)) return undefined
+      if (execution.status !== 'cancelled') throw new Error(`expected cancellation, got ${JSON.stringify(execution)}`)
+      return execution
+    })
+  }
+
+  /** Every bot message in the conversation so far, oldest first. */
+  async botReplies(): Promise<SlackMessage[]> {
+    return this.repliesTo(0, { untilNextTrigger: false })
+  }
+
   /** Sandboxes that served this thread, in the order they became ready. */
   async sandboxes(): Promise<Array<{ id: string; harness: string }>> {
     return db`
@@ -489,7 +793,7 @@ export class Thread {
   }
 
   /** Bot messages posted after a turn's trigger and before the next turn's trigger. */
-  private async repliesTo(index: number): Promise<SlackMessage[]> {
+  private async repliesTo(index: number, options: { untilNextTrigger?: boolean } = {}): Promise<SlackMessage[]> {
     const { messages } = this.dm
       ? await slackApi<{ messages: SlackMessage[] }>(USER, 'conversations.history', { channel: this.channel.id })
       : await slackApi<{ messages: SlackMessage[] }>(USER, 'conversations.replies', {
@@ -497,7 +801,7 @@ export class Thread {
         ts: this.ts
       })
     messages.sort((a, b) => (a.ts < b.ts ? -1 : 1))
-    const next = this.triggers[index + 1]
+    const next = options.untilNextTrigger === false ? undefined : this.triggers[index + 1]
     return messages.filter(message =>
       message.bot_id === BOT.id && message.ts > this.triggers[index]! && (!next || message.ts < next)
     )
@@ -556,6 +860,21 @@ async function modelRequests(token: string): Promise<ModelRequest[]> {
   })
 }
 
+/** Codex's code mode returns each nested exec_command result as JSON; keep only what the command printed. */
+function commandText(output: string): string {
+  return output
+    .split('\n')
+    .map(line => {
+      try {
+        const parsed = JSON.parse(line)
+        return typeof parsed?.output === 'string' ? parsed.output : line
+      } catch {
+        return line
+      }
+    })
+    .join('\n')
+}
+
 function lastBlockText(content: unknown): string {
   return Array.isArray(content) ? contentText(content.slice(-1)) : contentText(content)
 }
@@ -592,8 +911,8 @@ async function slackApi<T>(user: SlackUser, method: string, body: Record<string,
   return payload
 }
 
-async function kubectl(options: { stdin?: string }, ...args: string[]): Promise<string> {
-  const proc = Bun.spawn(['kubectl', '-n', namespace, ...args], {
+async function kubectl(options: { stdin?: string; namespace?: string }, ...args: string[]): Promise<string> {
+  const proc = Bun.spawn(['kubectl', '-n', options.namespace ?? namespace, ...args], {
     stdin: options.stdin === undefined ? 'ignore' : new Blob([options.stdin]),
     stdout: 'pipe',
     stderr: 'pipe'

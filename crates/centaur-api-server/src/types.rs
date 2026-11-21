@@ -1,6 +1,6 @@
 use axum::response::sse::Event;
 use centaur_session_core::{HarnessType, Session, SessionEvent, SessionMessageInput, ThreadKey};
-use centaur_session_runtime::SESSION_OUTPUT_LINE_EVENT;
+use centaur_session_runtime::{SESSION_OUTPUT_LINE_EVENT, SteeringOutcome};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
@@ -19,6 +19,10 @@ pub struct CreateSessionRequest {
     /// with no conversational memory).
     #[serde(default)]
     pub on_harness_conflict: Option<OnHarnessConflict>,
+    /// API clients only: the principal (OID or foreign ID) a new session runs
+    /// as. It must be attached to the client; omitted, the client's default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
@@ -105,6 +109,10 @@ pub struct AppendMessagesRequest {
 pub struct AppendMessagesResponse {
     pub ok: bool,
     pub message_ids: Vec<String>,
+    /// Whether the appended user messages steered an active execution.
+    /// Omitted when the append held no user message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub steering: Option<SteeringOutcome>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

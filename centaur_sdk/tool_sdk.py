@@ -14,13 +14,15 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote, urlparse, urlunparse
+from urllib.parse import quote
 
 log = logging.getLogger(__name__)
 
-COMPANY_CONTEXT_DSN_ENV = "CENTAUR_POSTGRES_DSN"
-COMPANY_CONTEXT_DATABASE_ENV = "COMPANY_CONTEXT_POSTGRES_DATABASE"
-DEFAULT_COMPANY_CONTEXT_DATABASE = "ai_v2"
+# harness-server writes the sandbox context file before a sandbox's first
+# turn. Warm sandboxes boot before a session claims them, so their environment
+# has no CENTAUR_THREAD_KEY and this file is the only place it appears.
+SANDBOX_CONTEXT_FILE_ENV = "CENTAUR_SANDBOX_CONTEXT_FILE"
+DEFAULT_SANDBOX_CONTEXT_FILE = Path(".centaur") / "sandbox.json"
 
 
 @dataclass
@@ -83,26 +85,37 @@ def secret(key: str, default: str | None = None) -> str:
     raise KeyError(f"Missing secret '{key}'{ctx_name}")
 
 
-def company_context_database_url(dsn: str | None = None) -> str:
-    """Return the Postgres URL company context data is read through.
+def sandbox_context_path() -> Path:
+    """Return where harness-server writes this sandbox's context file."""
+    configured = os.environ.get(SANDBOX_CONTEXT_FILE_ENV, "").strip()
+    if configured:
+        return Path(configured)
+    return Path.home() / DEFAULT_SANDBOX_CONTEXT_FILE
 
-    The sandbox receives one database-less iron-proxy DSN and the proxy routes
-    by database name, so every tool reading indexed company context must pick
-    the same database. Returns an empty string when no DSN is configured.
+
+def sandbox_context() -> dict[str, Any]:
+    """Return the sandbox context file's contents, or ``{}`` before it exists.
+
+    The file records the session's ``thread_key``, the harness and persona, and
+    under ``sandbox`` the Console principal, capabilities, and redacted grants.
+    It is informational: never base an authorization decision on it.
     """
-    value = dsn
-    if value is None:
-        value = os.environ.get(COMPANY_CONTEXT_DSN_ENV)
-    if value is None:
-        value = secret(COMPANY_CONTEXT_DSN_ENV, default="")
-    value = value.strip()
-    if value == COMPANY_CONTEXT_DSN_ENV:
-        return ""
-    parsed = urlparse(value)
-    if parsed.scheme and parsed.netloc and parsed.path in ("", "/"):
-        database = os.environ.get(COMPANY_CONTEXT_DATABASE_ENV, "").strip()
-        return urlunparse(parsed._replace(path=f"/{database or DEFAULT_COMPANY_CONTEXT_DATABASE}"))
-    return value
+    try:
+        context = json.loads(sandbox_context_path().read_text())
+    except (OSError, ValueError):
+        return {}
+    return context if isinstance(context, dict) else {}
+
+
+def sandbox_thread_key() -> str | None:
+    """Return the thread key of the session this sandbox serves, if known."""
+    thread_key = os.environ.get("CENTAUR_THREAD_KEY", "").strip()
+    if thread_key:
+        return thread_key
+    thread_key = sandbox_context().get("thread_key")
+    if isinstance(thread_key, str) and thread_key.strip():
+        return thread_key.strip()
+    return None
 
 
 def current_thread_key() -> str:
@@ -111,6 +124,8 @@ def current_thread_key() -> str:
         thread_key = _tool_ctx.get().thread_key
     except LookupError:
         thread_key = None
+    if not thread_key:
+        thread_key = sandbox_thread_key()
     if not thread_key:
         raise RuntimeError(
             "this operation must run inside a scoped thread: no thread_key "
@@ -250,7 +265,7 @@ def _sandbox_uploads_dir() -> Path | None:
     configured = os.environ.get("CENTAUR_UPLOADS_DIR", "").strip()
     if configured:
         return Path(configured)
-    if os.environ.get("CENTAUR_THREAD_KEY", "").strip():
+    if sandbox_thread_key():
         return Path.home() / "uploads"
     return None
 

@@ -1,3 +1,4 @@
+import { automatedReviewerLogins } from "../src/automated-reviewers";
 import { describe, expect, test } from "bun:test";
 import { drainBackgroundWork } from "../src/context";
 import {
@@ -5,6 +6,7 @@ import {
   handleCiEvent,
   handlePullRequestEvent,
   handleReviewEvent,
+  isAutomatedReviewer,
   isOwnedPr,
   type PrManagerContext,
 } from "../src/pr-manager";
@@ -1471,5 +1473,134 @@ describe("management turn reaction ack", () => {
       content: "EYES",
     });
     await drainBackgroundWork(5_000);
+  });
+});
+
+describe("automated review bounds", () => {
+  test("recognizes GitHub App reviewers without classifying people as bots", () => {
+    expect(isAutomatedReviewer({ login: "reviewer[bot]" })).toBe(true);
+    expect(isAutomatedReviewer({ login: "reviewer", type: "Bot" })).toBe(true);
+    expect(isAutomatedReviewer({ login: "reviewer", type: "User" })).toBe(false);
+    expect(isAutomatedReviewer({ login: "AgentUser", type: "User" }, ["agentuser"])).toBe(true);
+  });
+
+  function fixture() {
+    const reactions: string[] = [];
+    let headSha = "head-1";
+    const ctx = {
+      octokit: {
+        graphql: async (_query: string, vars: { content: string }) => {
+          reactions.push(vars.content);
+          return {};
+        },
+        rest: { pulls: { get: async () => ({
+          data: prPayload({ headRepoFullName: "base/repo", headSha }),
+        }) } },
+      },
+      options: {
+        apiUrl: "http://localhost",
+        logger: quietLogger,
+        fetch: () => Promise.resolve(new Response("no", { status: 400 })),
+      },
+      state: makeState(),
+      userName: "centaur-bot",
+    } as unknown as PrManagerContext;
+    const review = (id: number, reviewer = "reviewer[bot]", sha = headSha) =>
+      JSON.stringify({
+        action: "submitted",
+        repository: { full_name: "base/repo" },
+        pull_request: { number: 7 },
+        review: {
+          id,
+          node_id: `PRR_${id}`,
+          commit_id: sha,
+          state: "changes_requested",
+          author_association: "MEMBER",
+          user: { login: reviewer, type: reviewer.endsWith("[bot]") ? "Bot" : "User" },
+        },
+      });
+    return { ctx, reactions, review, setHead: (sha: string) => { headSha = sha; } };
+  }
+
+  test("responds once per automated reviewer and revision", async () => {
+    const { ctx, reactions, review } = fixture();
+    await handleReviewEvent(ctx, review(1));
+    await handleReviewEvent(ctx, review(2));
+    await drainBackgroundWork(5_000);
+    expect(reactions.filter((value) => value === "EYES")).toHaveLength(1);
+  });
+
+  test("stops automated responses after three PR review cycles", async () => {
+    const { ctx, reactions, review, setHead } = fixture();
+    for (let cycle = 1; cycle <= 4; cycle++) {
+      setHead(`head-${cycle}`);
+      await handleReviewEvent(ctx, review(cycle));
+    }
+    await drainBackgroundWork(5_000);
+    expect(reactions.filter((value) => value === "EYES")).toHaveLength(3);
+  });
+
+  test("runtime default list bounds the deployed User-account reviewer", async () => {
+    const {ctx, reactions, review, setHead} = fixture();
+    ctx.options.automatedReviewerLogins = [...automatedReviewerLogins(undefined)];
+    expect(isAutomatedReviewer({login: "DarkmatterAgent", type: "User"})).toBe(true);
+    expect(isAutomatedReviewer({login: "darkmatteragent", type: "User"}, [])).toBe(false);
+    for (let cycle = 1; cycle <= 4; cycle++) {
+      setHead(`head-${cycle}`);
+      await handleReviewEvent(ctx, review(cycle, "darkmatteragent"));
+    }
+    await drainBackgroundWork(5000);
+    expect(reactions.filter(value => value === "EYES")).toHaveLength(3);
+  });
+
+  test("bounds explicitly configured User-account automation", async () => {
+    const {ctx, reactions, review, setHead} = fixture();
+    ctx.options.automatedReviewerLogins = ["agentuser"];
+    for (let cycle = 1; cycle <= 4; cycle++) {
+      setHead(`head-${cycle}`);
+      await handleReviewEvent(ctx, review(cycle, "AgentUser"));
+    }
+    await drainBackgroundWork(5000);
+    expect(reactions.filter((value) => value === "EYES")).toHaveLength(3);
+  });
+
+  test("retries transient claim errors and exposes a persistent outage on the PR", async () => {
+    const {ctx, reactions, review} = fixture();
+    const claim = ctx.state.setIfNotExists.bind(ctx.state);
+    let attempts = 0;
+    ctx.state.setIfNotExists = async (...args) => {
+      if (++attempts === 1) throw new Error("temporary failure");
+      return claim(...args);
+    };
+    await handleReviewEvent(ctx, review(1, "human"));
+    await drainBackgroundWork(5000);
+    expect(reactions.filter(value => value === "EYES")).toHaveLength(1);
+    const notices: string[] = [];
+    ctx.octokit.rest.issues = {createComment: async (input: {body: string}) => {notices.push(input.body); return {};}} as never;
+    ctx.state.setIfNotExists = async () => {throw new Error("storage unavailable");};
+    await handleReviewEvent(ctx, review(2, "human"));
+    expect(notices).toHaveLength(1);
+    expect(notices[0]).toContain("Review processing is paused");
+  });
+
+  test("ignores stale bot feedback and stops when the claim store fails", async () => {
+    const { ctx, reactions, review, setHead } = fixture();
+    setHead("new-head");
+    await handleReviewEvent(ctx, review(1, "reviewer[bot]", "old-head"));
+    ctx.state.setIfNotExists = async () => { throw new Error("store unavailable"); };
+    await handleReviewEvent(ctx, review(2));
+    await drainBackgroundWork(5_000);
+    expect(reactions).toEqual([]);
+  });
+
+  test("still responds to human review after the bot budget is exhausted", async () => {
+    const { ctx, reactions, review, setHead } = fixture();
+    for (let cycle = 1; cycle <= 3; cycle++) {
+      setHead(`head-${cycle}`);
+      await handleReviewEvent(ctx, review(cycle));
+    }
+    await handleReviewEvent(ctx, review(4, "human-reviewer"));
+    await drainBackgroundWork(5_000);
+    expect(reactions.filter((value) => value === "EYES")).toHaveLength(4);
   });
 });

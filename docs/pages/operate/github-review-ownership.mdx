@@ -1,0 +1,20 @@
+# GitHub review ownership
+
+When more than one agent platform can review pull requests, assign each repository's
+automatic review path to one owner. Githubbot starts in `observe` mode and logs
+eligible `review_requested` deliveries as `githubbot_review_request_observed`.
+The log includes the PR, head SHA, and whether the repository is on Centaur's
+assignment list. It does not start a sandbox or post to GitHub.
+
+Review the observations and decide which platform should handle each repository.
+Set `githubbot.reviewMode: execute` and list only the repositories assigned to
+Centaur in `githubbot.reviewRepositories` (comma-separated `owner/repo` values).
+An unlisted repository remains inactive even in `execute` mode. Use `off` when
+review requests should be ignored entirely. The setting affects review-request
+turns only; it does not change issue assignments, PR self-management, or direct
+comment mentions.
+
+Use the same observe-first sequence before adding any new automatic issue pickup:
+record eligible events and decisions, inspect false positives and overlap with
+other platforms, then grant execution only to the chosen repositories and roles.
+That pickup workflow is not enabled by this review setting.

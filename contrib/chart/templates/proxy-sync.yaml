@@ -2,6 +2,7 @@
 {{- $secretEnv := include "centaur.secretEnvName" . }}
 {{- $prefix := .Values.secretManager.envPrefix }}
 {{- $console := include "centaur.consoleValues" . | fromYaml }}
+{{- $companyContext := include "centaur.companyContextValues" . | fromYaml }}
 {{- $apiRsName := include "centaur.componentName" (dict "root" . "component" "api-rs") }}
 {{- $metricsAnnotations := dict -}}
 {{- if .Values.proxySync.metrics.scrapeAnnotations -}}
@@ -12,10 +13,6 @@ apiVersion: v1
 kind: Service
 metadata:
   name: {{ $name }}
-{{- with $metricsAnnotations }}
-  annotations:
-{{ toYaml . | nindent 4 }}
-{{- end }}
   labels:
 {{ include "centaur.componentLabels" (dict "root" . "component" "proxy-sync") | nindent 4 }}
 spec:
@@ -53,6 +50,15 @@ spec:
 {{ toYaml . | nindent 8 }}
       {{- end }}
 {{- include "centaur.podScheduling" (dict "values" .Values.proxySync "indent" 6) }}
+      initContainers:
+        # proxy-sync reads principals, proxies, and their grants from the Console
+        # database, so wait for the schema api-rs applies.
+{{ include "centaur.consoleDbWait" (dict
+  "root" .
+  "name" "wait-for-console-schema"
+  "database" $console.database.name
+  "query" "SELECT to_regclass('public.users') IS NOT NULL"
+  "message" "waiting for the Console schema (api-rs)…") | nindent 8 }}
       containers:
         - name: proxy-sync
           image: {{ printf "%s:%s" .Values.proxySync.image.repository .Values.proxySync.image.tag | quote }}
@@ -86,18 +92,32 @@ spec:
                   key: {{ printf "%sCENTAUR_JWT_SIGNING_SECRET" $prefix }}
             - name: CENTAUR_CONSOLE_URL
               value: {{ include "centaur.consoleUrl" . | quote }}
-{{- if .Values.experimentalCompanyContext.enabled }}
-            # Proxies inject the principal API JWT into requests to these hosts
-            # in addition to CENTAUR_API_URL's.
-            - name: CENTAUR_API_SERVER_PROXY_HOSTS
-              value: {{ include "centaur.componentName" (dict "root" . "component" "company-context") | quote }}
+            # Proxies inject the sandbox token into requests to these hosts in
+            # addition to CENTAUR_API_URL's and CENTAUR_CONSOLE_URL's. The
+            # compatibility Console Service also routes to api-rs, and connectors
+            # and tools default to it when CENTAUR_CONSOLE_URL is unset, so it
+            # needs the token too.
+{{- $proxyHosts := list (include "centaur.consoleName" .) }}
+{{- if $companyContext.enabled }}
+{{- $proxyHosts = append $proxyHosts (include "centaur.componentName" (dict "root" . "component" "company-context")) }}
 {{- end }}
+            - name: CENTAUR_API_SERVER_PROXY_HOSTS
+              value: {{ join "," $proxyHosts | quote }}
 {{- if .Values.apiRs.enabled }}
             - name: CENTAUR_API_URL
               value: {{ printf "http://%s:%v" $apiRsName .Values.apiRs.port | quote }}
 {{- end }}
             - name: RUST_LOG
               value: info
+            - name: CENTAUR_SSH_TARGETS
+              value: {{ .Values.proxySync.sshTargets | toJson | quote }}
+{{- if .Values.codemode.executor.enabled }}
+            # Code Mode principal config for the tenancy iron-proxy: the sync
+            # token authenticates the proxy, the public key verifies the turn
+            # token it forwards.
+{{ include "centaur.codemodeSecretEnv" (dict "root" . "name" "CENTAUR_CODEMODE_SYNC_TOKEN" "key" "sync-token") | indent 12 }}
+{{ include "centaur.codemodeSecretEnv" (dict "root" . "name" "CENTAUR_CODEMODE_TOKEN_PUBLIC_KEY" "key" "token-public-key") | indent 12 }}
+{{- end }}
           ports:
             - name: http
               containerPort: {{ .Values.proxySync.port }}
@@ -131,6 +151,12 @@ spec:
         - podSelector:
             matchLabels:
               centaur.ai/iron-proxy: "true"
+{{- if .Values.codemode.executor.enabled }}
+        # The Code Mode tenancy iron-proxy fetches turn principal configuration.
+        - podSelector:
+            matchLabels:
+{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "codemode-iron-proxy") | nindent 14 }}
+{{- end }}
 {{- range .Values.networkPolicy.apiIngressSourceNamespaces }}
         - namespaceSelector:
             matchLabels:

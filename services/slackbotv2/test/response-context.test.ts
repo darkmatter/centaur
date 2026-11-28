@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 import {
+  buildProactiveMuteBlock,
   buildSlackResponseContextBlock,
   defaultModelForHarness,
   defaultReasoningForHarness,
@@ -8,6 +9,7 @@ import {
   harnessDisplayName,
   modelDisplayName,
   personaFallbackNotice,
+  proactiveMutedBlocks,
   reasoningForModel
 } from '../src/response-context'
 import claudeSettings from '../../../harness/claude/settings.json'
@@ -16,7 +18,7 @@ import codexConfig from '../../../harness/codex/config.toml'
 describe('harnessDisplayName', () => {
   test('maps known harness wire values to display names', () => {
     expect(harnessDisplayName('codex')).toBe('Codex')
-    expect(harnessDisplayName('nanocodex')).toBe('Nanocodex')
+    expect(harnessDisplayName('nanocode')).toBe('Nanocode')
     expect(harnessDisplayName('claudecode')).toBe('Claude Code')
     expect(harnessDisplayName('amp')).toBe('Amp')
     expect(harnessDisplayName('omp')).toBe('OMP')
@@ -61,6 +63,8 @@ describe('reasoningForModel', () => {
     'gpt-6-sol': [...standardEfforts, 'max'],
     'gpt-6.1-sol': ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'],
     'gpt-6.1-terra': ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'],
+    'gpt-6.2-astra': ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'],
+    'gpt-6.2-sol': ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'],
     'gpt-6-luna': [...standardEfforts, 'max']
   }
 
@@ -74,12 +78,11 @@ describe('reasoningForModel', () => {
     }
   })
 
-  test('validates Nanocodex against its selected model after mapping minimal to low', () => {
+  test('validates Nanocode efforts like Codex', () => {
     for (const [model, supportedEfforts] of Object.entries(effortsByModel)) {
       for (const effort of allEfforts) {
-        const effectiveEffort = effort === 'minimal' ? 'low' : effort
-        expect(reasoningForModel('nanocodex', model, effort)).toBe(
-          supportedEfforts.includes(effectiveEffort) ? effort : undefined
+        expect(reasoningForModel('nanocode', model, effort)).toBe(
+          supportedEfforts.includes(effort) ? effort : undefined
         )
       }
     }
@@ -87,20 +90,16 @@ describe('reasoningForModel', () => {
 
   test('supports current model aliases and snapshots without widening their effort sets', () => {
     expect(reasoningForModel('codex', 'gpt-5.6', 'max')).toBe('max')
-    expect(reasoningForModel('nanocodex', 'gpt-5.6', 'max')).toBe('max')
+    expect(reasoningForModel('nanocode', 'gpt-5.6', 'max')).toBe('max')
     expect(reasoningForModel('codex', 'gpt-5.6-sol-2026-07-01', 'minimal')).toBeUndefined()
-    expect(reasoningForModel('nanocodex', 'gpt-5.6-sol-2026-07-01', 'minimal')).toBe(
-      'minimal'
-    )
     expect(reasoningForModel('codex', 'gpt-5.5-pro-2026-07-01', 'low')).toBeUndefined()
-    expect(reasoningForModel('nanocodex', 'gpt-5.5-pro-2026-07-01', 'low')).toBeUndefined()
     expect(reasoningForModel('codex', 'gpt-5.4-2026-03-05', 'xhigh')).toBe('xhigh')
     expect(reasoningForModel('codex', 'gpt-5.3', 'high')).toBeUndefined()
   })
 
   test('forwards Claude Code effort levels and rejects Codex-only efforts', () => {
     for (const effort of ['low', 'medium', 'high', 'xhigh', 'max']) {
-      for (const model of ['claude-opus-5-5', 'claude-fable-5-1', 'claude-sonnet-5-5', 'claude-haiku-5-5']) {
+      for (const model of ['claude-opus-5-5', 'claude-fable-5-2', 'claude-fable-5-1', 'claude-sonnet-5-5', 'claude-haiku-5-5']) {
         expect(reasoningForModel('claudecode', model, effort)).toBe(effort)
       }
     }
@@ -142,7 +141,7 @@ describe('defaultModelForHarness', () => {
     expect(bakedCodexModel).toBeTruthy()
     expect(defaultModelForHarness('claudecode')).toBe(bakedClaudeModel)
     expect(defaultModelForHarness('codex')).toBe(bakedCodexModel)
-    expect(defaultModelForHarness('nanocodex')).toBe(bakedCodexModel)
+    expect(defaultModelForHarness('nanocode')).toBe(bakedCodexModel)
   })
 
   test('prefers the deployment-configured model over the baked default', () => {
@@ -175,22 +174,23 @@ describe('defaultReasoningForHarness', () => {
   const bakedCodexReasoning = (codexConfig as { model_reasoning_effort: string })
     .model_reasoning_effort
 
-  test('shares the baked Codex reasoning default with Nanocodex', () => {
+  test('reads the baked Codex reasoning default', () => {
     expect(bakedCodexReasoning).toBe('medium')
     expect(defaultReasoningForHarness('codex')).toBe(bakedCodexReasoning)
-    expect(defaultReasoningForHarness('nanocodex')).toBe(bakedCodexReasoning)
+    expect(defaultReasoningForHarness('nanocode')).toBe(bakedCodexReasoning)
     expect(defaultReasoningForHarness('claudecode')).toBeUndefined()
   })
 
   test('prefers a deployment-configured Codex-compatible default', () => {
-    const configured = { codex: 'HIGH', nanocodex: 'HIGH' }
+    const configured = { codex: 'HIGH', nanocode: 'HIGH' }
     expect(defaultReasoningForHarness('codex', configured)).toBe('high')
-    expect(defaultReasoningForHarness('nanocodex', configured)).toBe('high')
+    expect(defaultReasoningForHarness('nanocode', configured)).toBe('high')
   })
 
   test('reports the effort the selected harness actually runs', () => {
     expect(effectiveReasoningForHarness('codex', 'xhigh')).toBe('xhigh')
-    expect(effectiveReasoningForHarness('nanocodex', 'minimal')).toBe('low')
+    expect(effectiveReasoningForHarness('codex', 'minimal')).toBe('minimal')
+    expect(effectiveReasoningForHarness('nanocode', 'minimal')).toBe('minimal')
     expect(effectiveReasoningForHarness('claudecode', 'high')).toBe('high')
     expect(effectiveReasoningForHarness('claudecode', undefined)).toBeUndefined()
     expect(effectiveReasoningForHarness('omp', 'max')).toBe('max')
@@ -205,7 +205,6 @@ describe('defaultServiceTierForHarness', () => {
   test('reports the baked Codex service tier only for the Codex harness', () => {
     expect(bakedServiceTier).toBe('fast')
     expect(defaultServiceTierForHarness('codex')).toBe(bakedServiceTier)
-    expect(defaultServiceTierForHarness('nanocodex')).toBeUndefined()
     expect(defaultServiceTierForHarness('claudecode')).toBeUndefined()
   })
 })
@@ -215,10 +214,13 @@ describe('modelDisplayName', () => {
     expect(modelDisplayName('claude-opus-5-5')).toBe('Opus 5.5')
     expect(modelDisplayName('claude-fable-5')).toBe('Fable 5')
     expect(modelDisplayName('claude-fable-5-1')).toBe('Fable 5.1')
+    expect(modelDisplayName('claude-fable-5-2')).toBe('Fable 5.2')
     expect(modelDisplayName('claude-sonnet-5-5')).toBe('Sonnet 5.5')
     expect(modelDisplayName('claude-haiku-5-5')).toBe('Haiku 5.5')
     expect(modelDisplayName('gpt-6.1-sol')).toBe('Sol 6.1')
     expect(modelDisplayName('gpt-6.1-terra')).toBe('Terra 6.1')
+    expect(modelDisplayName('gpt-6.2-sol')).toBe('Sol 6.2')
+    expect(modelDisplayName('gpt-6.2-astra')).toBe('Astra 6.2')
     expect(modelDisplayName('claude-haiku-4-5-20251001')).toBe('Haiku 4.5')
     expect(modelDisplayName('claude-opus-5-fast')).toBe('Opus 5 Fast')
     expect(modelDisplayName('gpt-5.6-sol')).toBe('Sol 5.6')
@@ -275,17 +277,6 @@ describe('buildSlackResponseContextBlock', () => {
     expect(block?.elements[0]?.text).toBe('Claude Code')
   })
 
-  test('shows the resolved Nanocodex harness', () => {
-    const block = buildSlackResponseContextBlock({
-      harnessType: 'nanocodex',
-      metadataEnabled: true,
-      model: 'gpt-5.6-sol',
-      reasoning: 'low'
-    })
-
-    expect(block?.elements[0]?.text).toBe('Sol 5.6 · Nanocodex · Low')
-  })
-
   test('skips the block when metadata and notices are absent', () => {
     expect(
       buildSlackResponseContextBlock({
@@ -332,4 +323,23 @@ test('personaFallbackNotice describes the resolved fallback', () => {
     `Persona "honk" isn't available. Continuing without a persona.`
   )
   expect(personaFallbackNotice(undefined, 'eng')).toBeUndefined()
+})
+
+test('proactiveMutedBlocks relabels the mute button as muted', () => {
+  const answer = { type: 'section', text: { type: 'mrkdwn', text: 'Answer' } }
+  const footer = { type: 'context', elements: [{ type: 'mrkdwn', text: 'GPT-5' }] }
+  const mute = buildProactiveMuteBlock()
+  expect(proactiveMutedBlocks([answer, footer, mute])).toEqual([
+    answer,
+    footer,
+    {
+      ...mute,
+      elements: [{
+        ...mute.elements[0],
+        accessibility_label: 'Proactive replies are muted in this thread',
+        text: { type: 'plain_text', text: ':mute: Muted', emoji: true }
+      }]
+    }
+  ])
+  expect(proactiveMutedBlocks([answer, footer])).toBeUndefined()
 })

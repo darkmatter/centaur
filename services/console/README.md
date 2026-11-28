@@ -2,7 +2,7 @@
 
 `iron-control` is the control plane for [`iron-proxy`](https://github.com/ironsh/iron-proxy), a forwarding proxy that adds credentials to outbound HTTP requests. Applications route their traffic through `iron-proxy` and never hold the secrets themselves. `iron-control` stores the credentials, decides which proxy may use which credential on which requests, and hands each proxy its configuration.
 
-It is a Rails application backed by Postgres. It provides a JSON API, an operator console, and encryption at rest for the secrets it stores.
+api-rs serves it from Postgres: a JSON API, an operator console, and encryption at rest for the secrets it stores. The server code is in [`crates/centaur-api-server/src/console/`](../../crates/centaur-api-server/src/console/README.md) and [`crates/centaur-console-db`](../../crates/centaur-console-db/); this directory holds the operator UI (`web/`), the static files api-rs serves (`public/`), and the API reference (`docs/API.md`).
 
 ## What It Does
 
@@ -28,48 +28,90 @@ It is a Rails application backed by Postgres. It provides a JSON API, an operato
 
 Operators manage credentials, principals, roles, and grants through the API or the console. Each `iron-proxy` instance signs in with its own token, fetches the configuration for its assigned principal, and adds the granted credentials to matching outbound requests.
 
+## Console UI
+
+The operator console is a React SPA in [`web/`](web/) (Vite, TypeScript,
+shadcn/ui on Tailwind CSS, React Router, TanStack Query) that uses the same
+JSON API. The login, pending-approval, MCP OAuth consent, and broker OAuth
+result pages are server-rendered by api-rs, so installed MCP clients keep the
+protocol behaviour they were built against and sign-in works without
+JavaScript.
+
+- **Serving.** `pnpm -C web build` writes the shell to `public/spa/index.html`
+  and content-hashed assets to `public/spa/assets` (URLs under `/spa/`). api-rs
+  serves the shell (`no-cache`, with the Content-Security-Policy) for `/` and
+  every `/console/...` path, and React Router renders the page, including
+  not-found. Nothing serves `/spa/index.html` directly. See
+  `crates/centaur-api-server/src/console/static_files.rs`.
+- **Data.** The SPA calls only the console API, `/api/v1/console/*`, with the
+  console session cookie (`web/src/lib/api.ts` refuses any other path). It
+  reads the session and nav flags from `GET /api/v1/console/me` and sends no
+  CSRF token; api-rs checks an exact same-origin `Origin` on unsafe requests. A
+  `401` sends the browser to `/login?return_to=<current page>` and a pending
+  account to `/pending` (full page loads); sign-out is
+  `DELETE /api/v1/console/session`. See
+  [docs/API.md](docs/API.md#console-api).
+- **Server routes**, answering with pages, redirects, or JSON:
+  `/login`, `/logout`, `/pending`, `/auth/:provider/{start,callback}` (SSO),
+  `/oauth/:slug/{start,callback}` (broker OAuth consent),
+  `/mcp/oauth/{authorize,token,register}` and the `/.well-known` metadata (MCP
+  OAuth). The server-rendered pages use plain CSS from
+  `public/assets/oauth-page` (the SPA's colours, dark by default, light under
+  `prefers-color-scheme: light`), embedded into api-rs, with no JavaScript. See
+  [docs/API.md](docs/API.md#console-auth-pages).
+
 ## Local Development
 
-Console runs on stock PostgreSQL 16, including managed services such as RDS
-and Cloud SQL. Install Docker, Ruby using the version in `.ruby-version`, and
-Overmind or Foreman, then run:
+Install Node.js with pnpm (the versions CI uses are in
+`.github/workflows/console-ci.yml`). From the repository root:
 
 ```bash
-just dev
+pnpm install --frozen-lockfile --filter @centaur/console-web
+pnpm -C services/console/web typecheck
+pnpm -C services/console/web lint
+pnpm -C services/console/web test
+pnpm -C services/console/web build
 ```
 
-This starts a persistent `postgres:16` container named
-`centaur-console-postgres`, exposes it on `127.0.0.1:55432`, prepares the Rails
-database, and starts the web and CSS processes. Database files are retained in
-the `centaur-console-postgres-data` Docker volume between runs.
+To run the SPA against a live Console, start the local stack (`just up`) and
+forward the Console Service:
 
-To use an existing PostgreSQL server instead, set
-`CENTAUR_CONSOLE_DB_HOST`, `CENTAUR_CONSOLE_DB_PORT`,
-`CENTAUR_CONSOLE_DB_USERNAME`, and `CENTAUR_CONSOLE_DB_PASSWORD`, then set
-`CENTAUR_CONSOLE_MANAGE_POSTGRES=false` so `just dev` does not start Docker.
+```bash
+kubectl port-forward -n <namespace> service/<release>-centaur-console 3000:3000
+pnpm -C services/console/web dev
+```
+
+The Vite dev server (`http://localhost:5173`) proxies the API and server routes
+to `CONSOLE_API_URL` (default `http://localhost:3000`) and keeps the browser's
+`Host` header. api-rs selects the Console by host and checks writes against an
+exact `Origin`, so set `console.publicUrl: http://localhost:5173` in your local
+values while using the dev server. Sign in with the initial user's
+`IRON_CONTROL_INITIAL_USER_EMAIL` / `IRON_CONTROL_INITIAL_USER_PASSWORD` from
+the infra Secret.
+
+The dev server sends no Content-Security-Policy; after a policy, dependency, or
+`index.html` change, check the built SPA as api-rs serves it.
 
 ## Environment Variables
 
-All of the console's environment variables use the `CENTAUR_CONSOLE_` prefix. For backwards compatibility, every variable also resolves from the legacy `IRON_CONTROL_` name when the `CENTAUR_CONSOLE_` one is unset, so existing deployments keep working until they migrate. The `CENTAUR_CONSOLE_` name wins when both are set.
-
-For local development, sign in through the normal login form at
-`http://localhost:3000/login` with the seeded initial user's
-`CENTAUR_CONSOLE_INITIAL_USER_EMAIL` / `CENTAUR_CONSOLE_INITIAL_USER_PASSWORD`
-credentials, the same as every other environment.
+api-rs reads the Console settings below from `CENTAUR_CONSOLE_*` variables. The
+chart mounts them from the shared infra Secret, where the older ones keep their
+original `IRON_CONTROL_*` keys.
 
 ## First Boot
 
-The console requires an authenticated user and API key before any API endpoint will respond. To bootstrap a fresh deployment without a console, set the following environment variables on startup:
+The console requires an authenticated user before any API endpoint will respond. To bootstrap a fresh deployment, set the following environment variables on api-rs:
 
 | Variable                          | Required | Description                                                                                              |
 | --------------------------------- | -------- | -------------------------------------------------------------------------------------------------------- |
 | `CENTAUR_CONSOLE_INITIAL_USER_EMAIL`    | yes      | Email for the initial user.                                                                              |
 | `CENTAUR_CONSOLE_INITIAL_USER_PASSWORD` | yes      | Password for the initial user (minimum 12 characters).                                                   |
-| `CENTAUR_CONSOLE_INITIAL_API_KEY`       | no       | Plaintext API key for the initial user. Must match `iak_` followed by 64 lowercase hex characters (a 32-byte hex string). If omitted, a token is generated and logged once at startup. |
+
+Operators create API keys on the Console's API Keys page.
 
 Behavior:
 
-- Bootstrap runs after Rails initialization on every boot, but is a no-op if any user already exists. It is safe to leave the env vars set across rolling restarts.
+- Bootstrap runs at api-rs startup on every boot, but is a no-op if any user already exists. It is safe to leave the env vars set across rolling restarts.
 - If `CENTAUR_CONSOLE_INITIAL_USER_EMAIL` is set without `CENTAUR_CONSOLE_INITIAL_USER_PASSWORD`, the process exits with a clear error.
 - Concurrent pods racing the first boot are serialized with a Postgres advisory lock; exactly one user is created.
 
@@ -81,7 +123,7 @@ The operator console supports email and password sign-in by default. To add Goog
 
 | Variable                              | Required | Description                                                                                 |
 | ------------------------------------- | -------- | ------------------------------------------------------------------------------------------- |
-| `CENTAUR_CONSOLE_PUBLIC_URL`             | recommended | Public origin for this deployment, for example `https://control.example.com`. Use this when `iron-control` runs behind a proxy or load balancer whose internal host does not match the public URL. |
+| `CENTAUR_CONSOLE_PUBLIC_URL`             | recommended | Public origin for this deployment, for example `https://control.example.com`. Required: api-rs selects the Console by this host and checks writes against this origin. |
 | `CENTAUR_CONSOLE_GOOGLE_CLIENT_ID`       | for Google | Google OAuth client ID for console login.                                                    |
 | `CENTAUR_CONSOLE_GOOGLE_CLIENT_SECRET`   | for Google | Google OAuth client secret for console login.                                                |
 | `CENTAUR_CONSOLE_SLACK_CLIENT_ID`        | for Slack | Slack OpenID Connect client ID for console login.                                            |
@@ -102,23 +144,17 @@ Register these callback URLs with the provider:
 
 The Okta application must use the authorization-code flow with PKCE and the RS256 ID-token signing algorithm; request the `openid`, `email`, and `profile` scopes. The Console discovers the authorization, token, UserInfo, and JWKS endpoints from the issuer. It verifies each ID token's signature, issuer, audience, expiry, issued-at time, and nonce, then requires UserInfo to return the same subject and a verified email before signing a user in.
 
-All three providers request the `openid`, `email`, and `profile` scopes. Client credentials may also be stored in Rails credentials under `console_auth.<provider>.client_id` and `console_auth.<provider>.client_secret`, but environment variables take precedence. Okta's issuer and token-endpoint authentication method may likewise be stored at `console_auth.okta.issuer` and `console_auth.okta.token_endpoint_auth_method`.
+All three providers request the `openid`, `email`, and `profile` scopes.
 
 Google OAuth consent apps for broker credentials are configured separately in the console under **OAuth Apps**. Those app callbacks use `/oauth/<slug>/callback` and currently support Google only; Slack support here applies to operator console sign-in.
 
-## Google Docs Sync
+## Company Context Syncs
 
-Google Docs metadata and document-content ETL is disabled by default. Set
-`CENTAUR_CONSOLE_GOOGLE_DOCS_SYNC_ENABLED=true` to enable the recurring poller
-and queued Google Docs sync jobs. This switch does not affect Google OAuth,
-credential refresh, or previously indexed content.
-
-## Company Context v1 Sync
-
-`CENTAUR_CONSOLE_COMPANY_CONTEXT_V1_ENABLED=false` stops the Slack DM, Google
-Docs, and Granola sync jobs, including jobs already queued, without deleting
-synced data. It defaults to enabled; Google Docs sync also still requires
-`CENTAUR_CONSOLE_GOOGLE_DOCS_SYNC_ENABLED`.
+The Console no longer runs Slack DM, Google Docs, or Granola sync jobs. Those
+sources are ingested by [`centaur-company-context`](../../crates/centaur-company-context/),
+which also stores the normalized documents and embeddings. Previously indexed
+content is unchanged, and Google OAuth and broker-credential refresh still run
+as before.
 
 ## Broker Credential Refresh
 
@@ -127,20 +163,39 @@ credentials; the Console only creates and administers them.
 
 ## Encryption Keys
 
-`iron-control` uses ActiveRecord encryption to protect secrets stored in the control plane (for example, the `control_plane` secret source type). The following environment variables configure the encryption keys:
+The Console encrypts secrets stored in the control plane (for example, the `control_plane` secret source type, SSH keys, and broker tokens) in the Active Record encryption format, which existing databases already hold. api-rs reads these keys; proxy-sync, token-broker, and company-context read the same values under their `IRON_CONTROL_AR_ENCRYPTION_*` names:
 
 | Variable                                 | Required           | Description                                  |
 | ---------------------------------------- | ------------------ | -------------------------------------------- |
-| `CENTAUR_CONSOLE_AR_ENCRYPTION_PRIMARY_KEY`         | yes (in production) | Primary key used for non-deterministic encryption. |
-| `CENTAUR_CONSOLE_AR_ENCRYPTION_DETERMINISTIC_KEY`   | yes (in production) | Key used for deterministic encryption.       |
-| `CENTAUR_CONSOLE_AR_ENCRYPTION_KEY_DERIVATION_SALT` | yes (in production) | Salt used to derive per-attribute keys.      |
+| `CENTAUR_CONSOLE_AR_ENCRYPTION_PRIMARY_KEY`         | yes | Primary key used for non-deterministic encryption. |
+| `CENTAUR_CONSOLE_AR_ENCRYPTION_KEY_DERIVATION_SALT` | yes | Salt used to derive per-attribute keys.      |
 
-Generate suitable values with `bin/rails db:encryption:init` and store them in your secret manager. In production, the process refuses to boot if any of the three are missing. In `development` and `test`, fixed fallback values are used so the suite runs without configuration.
+The chart mounts them from `IRON_CONTROL_AR_ENCRYPTION_PRIMARY_KEY` and `IRON_CONTROL_AR_ENCRYPTION_KEY_DERIVATION_SALT`, which local bootstrap generates when absent. A request that needs encryption fails when they are missing.
 
-Rotating any of these keys makes previously encrypted data unreadable. Treat them as long-lived secrets and back them up alongside other production credentials.
+Rotating either key makes previously encrypted data unreadable. Treat them as long-lived secrets and back them up alongside other production credentials.
 
 ## API
 
-`iron-control` exposes a JSON API under `/api/v1`. All resource endpoints authenticate with an API key sent as a bearer token (`Authorization: Bearer iak_...`). `iron-proxy` instances fetch their configuration from the separate `proxy-sync` service with a proxy bearer token.
+The deployed Console API is the Rust one in
+`crates/centaur-api-server/src/console/` (see its `README.md`): every credential
+maps to one capability set and every route declares the capability it requires.
+It exposes the JSON API under `/api/v1` in three namespaces:
 
-See [docs/API.md](docs/API.md) for the full reference: authentication, request/response conventions, pagination, error formats, the shared secret-source and request-rule shapes, and detailed payloads for every endpoint (static secrets, GCP auth secrets, OAuth token secrets, principals, roles, grants, API keys, proxies, and proxy sync).
+- `/api/v1/*` is the operator API for machine callers. It takes an API key sent as a bearer token (`Authorization: Bearer iak_...`) whose owner is an active admin, and does not accept the console session cookie.
+- `/api/v1/console/*` is the console API that the SPA calls. It takes the console session cookie, with an exact same-origin `Origin` check on writes (no CSRF token), or a sandbox-delegated user credential: a sandbox token from an active admin's Slack DM with the bot. It never accepts an API key (`403 session_required`). Endpoints are admin-only unless documented otherwise.
+- `/api/v1/sandbox/*` takes the single sandbox token that `iron-proxy` injects for the plain per-sandbox resources.
+
+`iron-proxy` instances fetch their configuration from the separate `proxy-sync` service with a proxy bearer token.
+
+See [docs/API.md](docs/API.md) for the full reference: authentication, request/response conventions, pagination, error formats, the shared secret-source and request-rule shapes, and detailed payloads for every endpoint (static secrets, GCP auth secrets, OAuth token secrets, principals, roles, grants, API keys, proxies, and proxy sync), plus the [Console API](docs/API.md#console-api).
+
+## Owner-only OAuth apps
+
+An OAuth app with `owner_only` gives each Console user their own connection.
+The credential is keyed by the connecting user, so the provider needs no
+identity endpoint, and its token reaches only that user's own principals, in
+DMs and, with `always_available`, in channels. It never reaches roles, other
+principals, or email matches. Users can disconnect from Integrations; a
+`custom` app's optional `revocation_endpoint` revokes the tokens at the
+provider. The Runlayer preset sets one up for a tenant's MCP URL; see
+[Runlayer setup](../../tools/infra/runlayer/README.md).

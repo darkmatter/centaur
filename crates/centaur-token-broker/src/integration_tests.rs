@@ -1,8 +1,8 @@
 //! Refreshes against a Postgres database holding Console's schema and a local
 //! token endpoint.
 //!
-//! Set `TOKEN_BROKER_TEST_DATABASE_URL` to a database prepared with Console's
-//! `bin/rails db:schema:load`. Each test refreshes only the rows it inserts,
+//! Set `TOKEN_BROKER_TEST_DATABASE_URL` to a database migrated with
+//! `cargo run -p centaur-console-db --example migrate -- <url>`. Each test refreshes only the rows it inserts,
 //! so tests can share one database and run in parallel.
 
 use std::{
@@ -597,6 +597,37 @@ async fn app_credentials_refresh_with_their_providers_client_authentication() {
     assert_eq!(
         unseeded.dead_reason.as_deref(),
         Some("missing_initial_refresh_token")
+    );
+}
+
+#[tokio::test]
+async fn custom_app_credentials_refresh_with_the_apps_resource_indicator() {
+    let fixture = fixture![(200, json!({"access_token": "AT"}))];
+    let id = fixture
+        .credential("refresh_token", &[("refresh_token", "RT")])
+        .await;
+    fixture.link_oauth_app(id, "custom", "cid", "secret").await;
+    sqlx::query(
+        "UPDATE oauth_apps SET provider_config = '{\"resource\": \"https://api.example.test/mcp\"}' \
+         WHERE id = (SELECT oauth_app_id FROM broker_credentials WHERE id = $1)",
+    )
+    .bind(id)
+    .execute(&fixture.pool)
+    .await
+    .unwrap();
+
+    fixture.refresh(id).await;
+
+    // Custom apps keep their granted scopes and name the protected resource.
+    assert_eq!(
+        fixture.requests()[0].form(),
+        form(&[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", "RT"),
+            ("client_id", "cid"),
+            ("client_secret", "secret"),
+            ("resource", "https://api.example.test/mcp"),
+        ])
     );
 }
 

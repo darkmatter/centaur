@@ -219,7 +219,7 @@ impl ChatDestination {
                 format!(
                     "[chat surface: Discord · channel {channel_id}{thread} (guild {guild_id}). \
                      Centaur delivers your reply to this thread automatically — do not repost it with the discord tool. \
-                     Send files here with `discord upload`.]"
+                     Send files here with the `discord.upload_file` connector.]"
                 )
             }
             Self::Linear {
@@ -370,7 +370,8 @@ pub enum HarnessType {
     Codex,
     Amp,
     ClaudeCode,
-    Nanocodex,
+    /// Runs in the long-lived `centaur-brain` service instead of a sandbox.
+    Nanocode,
     Hermes,
     Pi,
     Omp,
@@ -820,7 +821,7 @@ mod tests {
             .context_line();
         assert!(discord.contains("Discord"));
         assert!(discord.contains("222"));
-        assert!(discord.contains("discord upload"));
+        assert!(discord.contains("discord.upload_file"));
 
         let linear = ThreadKey::parse("linear:ISSUE:c:CMT")
             .unwrap()
@@ -879,8 +880,8 @@ mod tests {
         assert_eq!(HarnessType::from_str("codex").unwrap(), HarnessType::Codex);
         assert_eq!(HarnessType::from_str("amp").unwrap(), HarnessType::Amp);
         assert_eq!(
-            HarnessType::from_str("nanocodex").unwrap(),
-            HarnessType::Nanocodex
+            HarnessType::from_str("nanocode").unwrap(),
+            HarnessType::Nanocode
         );
         assert_eq!(
             HarnessType::from_str("claudecode").unwrap(),
@@ -899,10 +900,21 @@ mod tests {
             serde_json::from_value::<HarnessType>(serde_json::json!("codex")).unwrap(),
             HarnessType::Codex
         );
+        assert_eq!(
+            serde_json::to_value(HarnessType::Nanocode).unwrap(),
+            serde_json::json!("nanocode")
+        );
+        assert_eq!(HarnessType::Nanocode.to_string(), "nanocode");
+        assert_eq!(HarnessType::Nanocode.as_ref(), "nanocode");
+        assert_eq!(
+            serde_json::from_value::<HarnessType>(serde_json::json!("nanocode")).unwrap(),
+            HarnessType::Nanocode
+        );
     }
 
     #[test]
     fn harness_type_rejects_unsupported_values() {
         assert!(HarnessType::from_str("claude-code").is_err());
+        assert!(HarnessType::from_str("nanocodex").is_err());
     }
 }

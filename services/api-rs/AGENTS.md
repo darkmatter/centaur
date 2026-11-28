@@ -21,8 +21,6 @@ repository-wide Cargo workspace. Important crate boundaries:
   control-plane integration and authorization resources.
 - `centaur-telemetry`: shared tracing and metrics support.
 
-Read the relevant RFC under `rfcs/` before changing a core protocol.
-
 ## Invariants
 
 - The session flow remains create/reuse -> append messages -> execute -> replay
@@ -56,6 +54,14 @@ Every backend migration needs a counterpart with the same version in each
 backend directory; add a no-op migration where a backend has nothing to change.
 `.github/scripts/check-migration-order.sh` enforces the numbering, and
 `tests/migrations.rs` covers fresh installs and legacy BM25 databases.
+
+The Console database has its own migrations in
+`crates/centaur-console-db/migrations`, applied by `centaur_console_db::migrate`
+on every start, independent of `RUN_MIGRATIONS`. The first
+is a baseline of the schema the retired Rails Console last produced; `migrate`
+adopts it on a database the retired Rails Console migrated and refuses one it
+left behind. Add Console changes as the next numbered file there, and prepare a
+test database with `cargo run -p centaur-console-db --example migrate -- <url>`.
 
 Database-backed tests skip when their URL is absent. Point these variables at a
 disposable Postgres as required by the packages you run:

@@ -1,19 +1,21 @@
 //! Tests against a Postgres database holding Console's schema.
 //!
-//! Set `CONSOLE_DB_TEST_DATABASE_URL` to a database prepared with Console's
-//! `bin/rails db:prepare`. Each test inserts uniquely named rows, so tests can
+//! Set `CONSOLE_DB_TEST_DATABASE_URL` to a database migrated with
+//! `cargo run -p centaur-console-db --example migrate -- <url>`. Each test inserts uniquely named rows, so tests can
 //! share one database and run in parallel.
-
-use std::env;
 
 use active_record_encryption::ActiveRecordEncryption;
 use centaur_console_db::{
-    REDACTED, SecretValues, SlackChannelPermission, Subject, build_config,
-    find_direct_slack_channel_permission, find_principal, find_principal_by_foreign_id,
-    find_user_id_by_email, models::Config,
+    ApiClient, ApiClientPrincipal, REDACTED, SecretValues, SlackChannelPermission, Subject,
+    api_client_principals, build_config, find_api_client, find_direct_slack_channel_permission,
+    find_principal, find_principal_by_foreign_id, find_user_id_by_email, models::Config,
 };
 use serde_json::{Value, json};
-use sqlx::{PgPool, postgres::PgPoolOptions};
+use sqlx::PgPool;
+
+mod common;
+
+use common::database;
 
 const PRIMARY_KEY: &str = "dev_ar_encryption_primary_key_0000000000000000";
 const SALT: &str = "dev_ar_encryption_key_derivation_salt_000000000";
@@ -21,24 +23,6 @@ const SALT: &str = "dev_ar_encryption_key_derivation_salt_000000000";
 const ENCRYPTED: &str =
     r#"{"p":"xOiyro9XYBkfABUF","h":{"iv":"pCjJC5SxH78ZN0Nm","at":"s9DIUyHAkF8ZAthKO6ROtw=="}}"#;
 const PLAINTEXT: &str = "known secret";
-
-async fn database() -> Option<PgPool> {
-    let Ok(url) = env::var("CONSOLE_DB_TEST_DATABASE_URL") else {
-        assert!(
-            env::var_os("CI").is_none(),
-            "CONSOLE_DB_TEST_DATABASE_URL must be set in CI"
-        );
-        eprintln!("skipping: set CONSOLE_DB_TEST_DATABASE_URL to a database with Console's schema");
-        return None;
-    };
-    Some(
-        PgPoolOptions::new()
-            .max_connections(2)
-            .connect(&url)
-            .await
-            .expect("connect to the test database"),
-    )
-}
 
 struct Fixture {
     pool: PgPool,
@@ -396,5 +380,66 @@ async fn reads_principals_users_and_direct_slack_permissions() {
             .await
             .unwrap(),
         None
+    );
+}
+
+#[tokio::test]
+async fn reads_api_clients_and_their_principals() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let default = fixture.principal("default").await;
+    let other = fixture.principal("other").await;
+    let client: i64 = sqlx::query_scalar(
+        "INSERT INTO api_clients (name, secret_digest, scopes, disabled_at, created_by_id, created_at, updated_at) \
+         VALUES ($1, $2, '[\"sessions:read\", \"sessions:write\"]', now(), $3, now(), now()) RETURNING id",
+    )
+    .bind(fixture.name("client"))
+    .bind(fixture.name("digest"))
+    .bind(fixture.admin)
+    .fetch_one(&fixture.pool)
+    .await
+    .unwrap();
+    for (principal, is_default) in [(default, true), (other, false)] {
+        sqlx::query(
+            "INSERT INTO api_client_principals (api_client_id, principal_id, \"default\", created_at, updated_at) \
+             VALUES ($1, $2, $3, now(), now())",
+        )
+        .bind(client)
+        .bind(principal)
+        .bind(is_default)
+        .execute(&fixture.pool)
+        .await
+        .unwrap();
+    }
+
+    assert_eq!(
+        find_api_client(&fixture.pool, client).await.unwrap(),
+        Some(ApiClient {
+            id: client,
+            name: fixture.name("client"),
+            secret_digest: fixture.name("digest"),
+            scopes: vec!["sessions:read".to_owned(), "sessions:write".to_owned()],
+            disabled: true,
+        })
+    );
+    assert_eq!(
+        find_api_client(&fixture.pool, i64::MAX).await.unwrap(),
+        None
+    );
+    assert_eq!(
+        api_client_principals(&fixture.pool, client).await.unwrap(),
+        vec![
+            ApiClientPrincipal {
+                principal_id: default,
+                foreign_id: Some(fixture.name("default")),
+                default: true,
+            },
+            ApiClientPrincipal {
+                principal_id: other,
+                foreign_id: Some(fixture.name("other")),
+                default: false,
+            },
+        ]
     );
 }

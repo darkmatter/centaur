@@ -8,6 +8,7 @@
  * out of the shared `@centaur/rendering` package used by Discord/Teams.
  */
 
+import { configuredModels, configuredModelReasoning, findConfiguredModel } from './model-catalog'
 import claudeSettings from '../../../harness/claude/settings.json'
 import codexConfig from '../../../harness/codex/config.toml'
 
@@ -15,7 +16,7 @@ const HARNESS_DISPLAY_NAMES: Record<string, string> = {
   amp: 'Amp',
   claudecode: 'Claude Code',
   codex: 'Codex',
-  nanocodex: 'Nanocodex',
+  nanocode: 'Nanocode',
   pi: 'Pi',
   omp: 'OMP'
 }
@@ -90,6 +91,8 @@ const CODEX_REASONING_EFFORTS_BY_MODEL: Record<string, ReadonlySet<string>> = {
   'gpt-6-sol': GPT_5_6_REASONING_EFFORTS,
   'gpt-6.1-sol': GPT_6_ULTRA_REASONING_EFFORTS,
   'gpt-6.1-terra': GPT_6_ULTRA_REASONING_EFFORTS,
+  'gpt-6.2-astra': GPT_6_ULTRA_REASONING_EFFORTS,
+  'gpt-6.2-sol': GPT_6_ULTRA_REASONING_EFFORTS,
   'gpt-6-luna': GPT_5_6_REASONING_EFFORTS
 }
 
@@ -112,18 +115,17 @@ const CODEX_CONFIG = codexConfig as {
 const BAKED_DEFAULT_MODELS: Record<string, string | undefined> = {
   claudecode: typeof claudeSettings.model === 'string' ? claudeSettings.model : undefined,
   codex: typeof CODEX_CONFIG.model === 'string' ? CODEX_CONFIG.model : undefined,
-  nanocodex: typeof CODEX_CONFIG.model === 'string' ? CODEX_CONFIG.model : undefined
+  nanocode: typeof CODEX_CONFIG.model === 'string' ? CODEX_CONFIG.model : undefined
 }
 
-// Nanocodex deliberately shares Codex's default reasoning policy. Its harness
-// adapter consumes the same CODEX_MODEL_REASONING_EFFORT deployment override,
-// and falls back to the baked Codex effort when that override is absent.
+// Nanocode shares Codex's default reasoning policy and the same
+// CODEX_MODEL_REASONING_EFFORT deployment override.
 const BAKED_DEFAULT_REASONING: Record<string, string | undefined> = {
   codex:
     typeof CODEX_CONFIG.model_reasoning_effort === 'string'
       ? CODEX_CONFIG.model_reasoning_effort
       : undefined,
-  nanocodex:
+  nanocode:
     typeof CODEX_CONFIG.model_reasoning_effort === 'string'
       ? CODEX_CONFIG.model_reasoning_effort
       : undefined
@@ -205,21 +207,22 @@ export function effectiveReasoningForHarness(
   if (key === 'claudecode' || key === 'pi' || key === 'omp') {
     return requested?.trim().toLowerCase() || undefined
   }
-  if (key !== 'codex' && key !== 'nanocodex') return undefined
-  const reasoning = requested?.trim().toLowerCase() || defaultReasoningForHarness(key, configured)
-  // Nanocodex has no distinct Minimal level; its adapter maps Minimal to Low.
-  return key === 'nanocodex' && reasoning === 'minimal' ? 'low' : reasoning
+  if (key !== 'codex' && key !== 'nanocode') return undefined
+  return requested?.trim().toLowerCase() || defaultReasoningForHarness(key, configured)
 }
 
 /** Returns the requested effort only when the selected model supports it. */
 export function reasoningForModel(
   harnessType: string | null | undefined,
   model: string | null | undefined,
-  reasoning: string | null | undefined
+  reasoning: string | null | undefined,
+  provider?: string | null
 ): string | undefined {
   const harness = harnessType?.trim().toLowerCase()
   const selectedModel = model?.trim().toLowerCase()
   const effort = reasoning?.trim().toLowerCase()
+  const customModel = harness === 'codex' ? findConfiguredModel(model, provider) : undefined
+  if (customModel) return configuredModelReasoning(customModel, reasoning)
   if (harness === 'claudecode') {
     const supported =
       Object.entries(CLAUDE_REASONING_EFFORTS_BY_MODEL).find(
@@ -231,18 +234,14 @@ export function reasoningForModel(
     return effort && PI_REASONING_EFFORTS.has(effort) ? effort : undefined
   }
   if (!selectedModel || !effort) return undefined
-  if (harness !== 'codex' && harness !== 'nanocodex') return undefined
-  // Nanocodex maps its compatibility-only Minimal value to Low before it
-  // reaches the Responses API, so validate the effective value against the
-  // selected model while preserving Minimal for the adapter to normalize.
-  const effectiveEffort = harness === 'nanocodex' && effort === 'minimal' ? 'low' : effort
+  if (harness !== 'codex' && harness !== 'nanocode') return undefined
   if (selectedModel === 'gpt-5.6') {
-    return GPT_5_6_REASONING_EFFORTS.has(effectiveEffort) ? effort : undefined
+    return GPT_5_6_REASONING_EFFORTS.has(effort) ? effort : undefined
   }
   const supported = Object.entries(CODEX_REASONING_EFFORTS_BY_MODEL).find(
     ([modelId]) => selectedModel === modelId || selectedModel.startsWith(`${modelId}-20`)
   )?.[1]
-  return supported?.has(effectiveEffort) ? effort : undefined
+  return supported?.has(effort) ? effort : undefined
 }
 
 // Claude model IDs: family, dash-separated version, optional variant words,
@@ -260,7 +259,9 @@ const GPT_CODENAMES = new Set(['sol', 'luna', 'terra', 'astra'])
  * "Opus 5.5", gpt-5.6-sol -> "Sol 5.6", gpt-5.2 -> "GPT 5.2". Unrecognized
  * models (provider-prefixed IDs, o-series) are uppercased.
  */
-export function modelDisplayName(model: string): string {
+export function modelDisplayName(model: string, provider?: string | null): string {
+  const configured = findConfiguredModel(model, provider)
+  if (configured) return configured.displayName
   const id = model.toLowerCase()
   const gpt = GPT_MODEL_ID.exec(id)
   if (gpt) {
@@ -288,6 +289,73 @@ export type SlackContextBlock = {
   elements: Array<{ type: 'mrkdwn'; text: string }>
 }
 
+export type SlackActionsBlock = {
+  type: 'actions'
+  block_id: string
+  elements: Array<{
+    type: 'button'
+    action_id: string
+    accessibility_label: string
+    text: { type: 'plain_text'; text: string; emoji: true }
+  }>
+}
+
+/** Blocks appended to a finalized streamed reply via chat.stopStream. */
+export type SlackStopBlock = SlackContextBlock | SlackActionsBlock
+
+/** Action and block id of the mute button on proactive replies. */
+export const PROACTIVE_MUTE_ACTION_ID = 'slackbotv2.proactive.mute'
+
+export const PROACTIVE_MUTED_NOTICE =
+  ':mute: Proactive replies are off in this thread. Mention me to turn them back on.'
+
+/** A small mute button that stops proactive replies in the thread. */
+export function buildProactiveMuteBlock(): SlackActionsBlock {
+  return {
+    type: 'actions',
+    block_id: PROACTIVE_MUTE_ACTION_ID,
+    elements: [{
+      type: 'button',
+      action_id: PROACTIVE_MUTE_ACTION_ID,
+      accessibility_label: 'Stop replying proactively in this thread',
+      text: { type: 'plain_text', text: ':mute: Mute', emoji: true }
+    }]
+  }
+}
+
+/**
+ * Relabels the mute button in a message's blocks as "Muted", leaving the rest
+ * of the message unchanged. Returns undefined when the blocks carry no mute
+ * button. A repeat click is harmless: muting is idempotent.
+ */
+export function proactiveMutedBlocks(blocks: readonly unknown[]): unknown[] | undefined {
+  let replaced = false
+  const next = blocks.map(block => {
+    if (
+      !block || typeof block !== 'object'
+      || (block as { block_id?: unknown }).block_id !== PROACTIVE_MUTE_ACTION_ID
+    ) return block
+    const elements = (block as { elements?: unknown }).elements
+    if (!Array.isArray(elements)) return block
+    return {
+      ...block,
+      elements: elements.map(element => {
+        if (
+          !element || typeof element !== 'object'
+          || (element as { action_id?: unknown }).action_id !== PROACTIVE_MUTE_ACTION_ID
+        ) return element
+        replaced = true
+        return {
+          ...element,
+          accessibility_label: 'Proactive replies are muted in this thread',
+          text: { type: 'plain_text', text: ':mute: Muted', emoji: true }
+        }
+      })
+    }
+  })
+  return replaced ? next : undefined
+}
+
 export function personaFallbackNotice(
   unavailablePersonaId: string | undefined,
   personaId: string | null | undefined
@@ -302,6 +370,7 @@ export function personaFallbackNotice(
 export function buildSlackResponseContextBlock(params: {
   harnessType?: string | null
   metadataEnabled?: boolean
+  provider?: string | null
   model?: string | null
   notice?: string | null
   reasoning?: string | null
@@ -314,7 +383,9 @@ export function buildSlackResponseContextBlock(params: {
   if (notice) segments.push(`:warning: ${escapeSlackMrkdwn(notice)}`)
   if (includeMetadata) {
     const model = params.model?.trim()
-    if (model) segments.push(escapeSlackMrkdwn(modelDisplayName(model)))
+    if (model) segments.push(escapeSlackMrkdwn(modelDisplayName(model, params.provider)))
+    const provider = configuredModels().find(entry => entry.provider === params.provider)
+    if (provider) segments.push(escapeSlackMrkdwn(provider.providerName))
     const harness = harnessDisplayName(params.harnessType)
     if (harness) segments.push(escapeSlackMrkdwn(harness))
     const reasoning = reasoningDisplayName(params.reasoning)

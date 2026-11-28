@@ -28,8 +28,7 @@ Credentials minted by Console's OAuth flows use their OAuth app's client
 credentials and the provider's rules in
 [`providers.json`](../../crates/centaur-token-broker/providers.json): whether
 the refresh re-requests the granted scopes, and whether the client
-authenticates in the form or with HTTP Basic authentication. A Console test fails until every
-Console provider is listed there. A credential whose provider is not listed is
+authenticates in the form or with HTTP Basic authentication. A credential whose provider is not listed is
 retried with backoff.
 
 Each token request times out after the credential's `refresh_timeout_seconds`,
@@ -113,8 +112,6 @@ local token endpoint. Load the schema into an empty database, then point the
 tests at it:
 
 ```bash
-cd services/console
-RAILS_ENV=test CENTAUR_CONSOLE_DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:55432/token_broker_test bin/rails db:prepare
-cd ../..
+cargo run -p centaur-console-db --example migrate -- postgresql://postgres:postgres@127.0.0.1:55432/token_broker_test
 TOKEN_BROKER_TEST_DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:55432/token_broker_test cargo test -p centaur-token-broker
 ```

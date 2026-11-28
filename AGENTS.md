@@ -77,8 +77,19 @@ Ownership by tree:
 - `services/iron-proxy/`: credential-injecting proxy image and startup config.
 - `services/workflow-python/`: Python workflow compatibility host; durability
   remains in `api-rs`.
-- `services/console/`: operator UI and credential-control API.
+- `services/console/`: the Console operator UI, a React SPA in
+  `services/console/web/`, its static files, and the Console API reference.
+  api-rs serves the Console (`crates/centaur-api-server/src/console/`).
 - `tools/`: independently packaged agent-facing CLI plugins.
+- `connectors/`: experimental Code Mode connectors, run by
+  `crates/centaur-codemode` and not yet deployed. Each is a
+  `connector.toml` (description and secrets, in the `[tool.centaur]` schema)
+  plus an `index.ts` whose exported async functions are tools; helpers shared
+  by connectors live in `connectors/_lib/`. Return upstream data as the API
+  sends it. Check with `pnpm --filter @centaur/connectors lint`,
+  `pnpm --filter @centaur/connectors typecheck`, and
+  `cargo test -p centaur-codemode`; the runtime's security invariants are in
+  `crates/centaur-codemode/README.md`.
 - `workflows/`: discoverable workflow definitions.
 - `contrib/chart/`: Helm wiring, policies, probes, and service configuration.
 - `packages/`: shared TypeScript event and rendering contracts used by ingress
@@ -130,7 +141,7 @@ Python code targets Python 3.11+ and uses `uv` for environments and commands.
 Follow the local package's import style: service modules generally use
 top-level absolute imports, while independently packaged tool CLIs and optional
 dependencies may deliberately import lazily. Do not mechanically rewrite those
-boundaries. Rust, Ruby, TypeScript, shell, and image-only services have their
+boundaries. Rust, TypeScript, shell, and image-only services have their
 own commands in local guides; there is no single repository-wide lint command
 that accurately validates every service.
 
@@ -171,7 +182,6 @@ scoped access.
 - `docs/pages/quickstart.mdx`: local stack and end-to-end smoke path.
 - `contrib/chart/values.yaml`: supported deployment configuration.
 - Service `README.md` files, where present: behavior and environment variables.
-- `services/api-rs/rfcs/`: control-plane and sandbox design contracts.
 
 "Chat SDK" means the Vercel Chat SDK. When adapter behavior matters, inspect
 the source checkout at `~/github/vercel/chat` rather than generated files under

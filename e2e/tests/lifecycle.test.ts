@@ -3,7 +3,9 @@
 // restart mid-turn, and cleanup after a harness switch. These disrupt shared
 // components, so they run one at a time rather than alongside other scenarios.
 import { expect, test } from 'bun:test'
-import { api, cluster, eventually, model, slack, turnTimeoutMs } from '../lib'
+import { api, cluster, eventually, model, releaseSandboxesAfterAll, slack, turnTimeoutMs } from '../lib'
+
+releaseSandboxesAfterAll()
 
 test('a paused thread resumes in the same sandbox on its next turn', async () => {
   const first = model.says('First answer.')
@@ -71,7 +73,7 @@ test('a harness switch removes the old sandbox and its proxy', async () => {
   expect(owned).toContain(`pod/${before.sandbox.id}`)
   expect(owned).toContainEqual(expect.stringMatching(new RegExp(`^pod/${before.sandbox.id}-proxy-`)))
   expect(owned).toContain(`service/${before.sandbox.id}-proxy`)
-  expect(owned.filter(name => name.startsWith('networkpolicy'))).toHaveLength(2)
+  expect(owned.filter(name => name.startsWith('networkpolicy'))).toHaveLength(3)
 
   await thread.mention('--claude Switch.', second)
   const after = await thread.nextTurn()

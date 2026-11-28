@@ -1,4 +1,3 @@
-import base64
 import json
 import sys
 import types
@@ -257,6 +256,30 @@ def test_channel_members_calls_proxy_client(monkeypatch) -> None:
     assert json.loads(result.output) == [{"id": "U123456789", "name": "alice"}]
 
 
+@pytest.mark.parametrize(
+    ("command", "client_function"),
+    [
+        ("user-email", "get_user_email_proxy"),
+        ("user-email-direct", "get_user_email_direct"),
+    ],
+)
+def test_user_email_commands_call_matching_client(monkeypatch, command, client_function) -> None:
+    calls = []
+
+    def fake_get_user_email(*args, **kwargs):
+        calls.append((args, kwargs))
+        return "person@example.com"
+
+    fake_client = types.SimpleNamespace(**{client_function: fake_get_user_email})
+    monkeypatch.setitem(sys.modules, "slack.client", fake_client)
+
+    result = CliRunner().invoke(app, [command, "U123456789"])
+
+    assert result.exit_code == 0
+    assert calls == [(("U123456789",), {})]
+    assert json.loads(result.output) == {"user_id": "U123456789", "email": "person@example.com"}
+
+
 def test_channel_members_direct_calls_direct_client(monkeypatch) -> None:
     calls = []
 
@@ -476,9 +499,11 @@ def test_download_direct_resolves_workspace_file_permalink(monkeypatch, tmp_path
             "url_private_download": "https://files.slack.com/files-pri/T1-F1/report.pdf",
         }
 
-    def fake_fetch_slack_file(url):
+    def fake_fetch_slack_file(url, output_dir, filename=None):
         calls.append(url)
-        return "report.pdf", "application/pdf", b"report"
+        out_path = Path(output_dir) / filename
+        out_path.write_bytes(b"report")
+        return out_path, 6
 
     fake_client = types.SimpleNamespace(
         get_file_info_direct=fake_get_file_info_direct,
@@ -505,15 +530,15 @@ def test_download_direct_resolves_workspace_file_permalink(monkeypatch, tmp_path
     assert (tmp_path / "report.pdf").read_bytes() == b"report"
 
 
-def test_download_writes_file_with_proxy(monkeypatch, tmp_path: Path) -> None:
+def test_download_prints_proxy_download_metadata(monkeypatch, tmp_path: Path) -> None:
     calls = []
 
     def fake_download_file_proxy(**kwargs):
         calls.append(kwargs)
         return {
             "filename": "report.pdf",
-            "content_base64": base64.b64encode(b"%PDF").decode(),
             "size_bytes": 4,
+            "output_path": str(tmp_path / "report.pdf"),
         }
 
     fake_client = types.SimpleNamespace(download_file_proxy=fake_download_file_proxy)
@@ -525,9 +550,10 @@ def test_download_writes_file_with_proxy(monkeypatch, tmp_path: Path) -> None:
     )
 
     assert result.exit_code == 0
-    assert calls == [{"file_id": "F1234567890", "channel_id": "C1234567890"}]
-    assert (tmp_path / "report.pdf").read_bytes() == b"%PDF"
-    assert json.loads(result.output)["output_path"] == str((tmp_path / "report.pdf").absolute())
+    assert calls == [
+        {"file_id": "F1234567890", "channel_id": "C1234567890", "output_dir": str(tmp_path)}
+    ]
+    assert json.loads(result.output)["output_path"] == str(tmp_path / "report.pdf")
 
 
 def test_file_info_calls_proxy_client(monkeypatch) -> None:
@@ -635,14 +661,19 @@ def test_search_uses_indexed_slack_client(monkeypatch) -> None:
             calls.append(kwargs)
             return {
                 "status": "ok",
+                "query": "database migration",
                 "results": [
                     {
-                        "channel": "eng-infra",
-                        "user": "alice",
+                        "document_id": "slack:C123:2026-09-17:0",
+                        "type": "slack_message",
+                        "title": "#eng-infra 2026-09-17",
+                        "url": "https://example.slack.com/archives/C123/p123",
                         "text": "database migration completed",
-                        "permalink": "https://example.slack.com/archives/C123/p123",
+                        "occurred_at": "2026-09-17T12:00:00Z",
+                        "metadata": {"conversation_id": "C123", "channel_name": "eng-infra"},
                     }
                 ],
+                "next_cursor": None,
             }
 
     monkeypatch.setitem(
@@ -658,8 +689,10 @@ def test_search_uses_indexed_slack_client(monkeypatch) -> None:
             "database migration",
             "--channels",
             "eng-infra,C1234567890",
-            "--from",
-            "alice",
+            "--after",
+            "2026-09-01",
+            "--sort",
+            "timestamp",
             "--limit",
             "5",
         ],
@@ -672,9 +705,63 @@ def test_search_uses_indexed_slack_client(monkeypatch) -> None:
             "query": "database migration",
             "limit": 5,
             "channels": ["eng-infra", "C1234567890"],
-            "from_user": "alice",
+            "after": "2026-09-01",
+            "before": None,
+            "sort": "timestamp",
+            "cursor": None,
         }
     ]
+
+
+def test_search_renders_indexed_results_as_table(monkeypatch) -> None:
+    class FakeIndexedSlackClient:
+        def search_messages(self, **kwargs):
+            return {
+                "status": "ok",
+                "query": "deploy",
+                "results": [
+                    {
+                        "document_id": "slack:C123:2026-09-17:0",
+                        "type": "slack_message",
+                        "title": "#eng-infra 2026-09-17",
+                        "url": None,
+                        "text": "alice: deploy completed",
+                        "occurred_at": "2026-09-17T12:00:00Z",
+                        "metadata": {"conversation_id": "C123", "channel_name": "eng-infra"},
+                    }
+                ],
+                "next_cursor": "next",
+            }
+
+    monkeypatch.setitem(
+        sys.modules,
+        "slack.client",
+        types.SimpleNamespace(IndexedSlackClient=FakeIndexedSlackClient),
+    )
+
+    result = CliRunner().invoke(app, ["search", "deploy", "--no-json"])
+
+    assert result.exit_code == 0
+    assert "#eng-infra" in result.output
+    assert "2026-09-17" in result.output
+    assert "deploy completed" in result.output
+    assert "next cursor: next" in result.output
+
+
+def test_search_reports_indexed_errors(monkeypatch) -> None:
+    class FakeIndexedSlackClient:
+        def search_messages(self, **kwargs):
+            return {"status": "error", "error": "HTTP 403: no access"}
+
+    monkeypatch.setitem(
+        sys.modules,
+        "slack.client",
+        types.SimpleNamespace(IndexedSlackClient=FakeIndexedSlackClient),
+    )
+
+    result = CliRunner().invoke(app, ["search", "deploy"])
+
+    assert result.exit_code == 1
 
 
 def test_search_direct_calls_native_search_client(monkeypatch) -> None:

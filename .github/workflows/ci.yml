@@ -33,6 +33,7 @@ jobs:
       discordbot_checks: ${{ steps.filter.outputs.discordbot_checks }}
       githubbot_checks: ${{ steps.filter.outputs.githubbot_checks }}
       teamsbot_checks: ${{ steps.filter.outputs.teamsbot_checks }}
+      connector_checks: ${{ steps.filter.outputs.connector_checks }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -77,12 +78,13 @@ jobs:
           set_output migration_order \
             '^crates/centaur-session-sqlx/migrations/' \
             '^crates/centaur-session-sqlx/search-migrations/' \
-            '^services/console/db/migrate/' \
+            '^crates/centaur-console-db/migrations/' \
             '^\.github/scripts/check-migration-order\.sh$' \
             '^\.github/workflows/ci\.yml$'
           set_output rust_checks \
             '^Cargo\.(toml|lock)$' \
             '^crates/' \
+            '^contrib/chart/charts/agent-sandbox/crds/' \
             '^\.github/workflows/ci\.yml$'
           set_output harness_server_checks \
             '^Cargo\.(toml|lock)$' \
@@ -101,14 +103,13 @@ jobs:
             '^crates/active-record-encryption/' \
             '^crates/centaur-proxy-sync/' \
             '^crates/centaur-console-db/' \
-            '^services/console/' \
             '^\.github/scripts/start-test-postgres\.sh$' \
             '^\.github/workflows/ci\.yml$'
           set_output token_broker_checks \
             '^Cargo\.(toml|lock)$' \
             '^crates/active-record-encryption/' \
             '^crates/centaur-token-broker/' \
-            '^services/console/' \
+            '^crates/centaur-console-db/' \
             '^\.github/scripts/start-test-postgres\.sh$' \
             '^\.github/workflows/ci\.yml$'
           set_output rust_api \
@@ -117,6 +118,8 @@ jobs:
             '^crates/active-record-encryption/' \
             '^crates/centaur-' \
             '^services/api-rs/' \
+            '^services/console/public/' \
+            '^contrib/chart/charts/agent-sandbox/crds/' \
             '^\.github/scripts/start-test-postgres\.sh$' \
             '^services/workflow-python/' \
             '^workflows/' \
@@ -158,6 +161,14 @@ jobs:
             '^\.github/workflows/ci\.yml$'
           set_output teamsbot_checks \
             '^services/teamsbot/' \
+            '^package\.json$' \
+            '^pnpm-lock\.yaml$' \
+            '^pnpm-workspace\.yaml$' \
+            '^\.github/workflows/ci\.yml$'
+          set_output connector_checks \
+            '^connectors/' \
+            '^crates/centaur-codemode/' \
+            '^Cargo\.(toml|lock)$' \
             '^package\.json$' \
             '^pnpm-lock\.yaml$' \
             '^pnpm-workspace\.yaml$' \
@@ -274,9 +285,21 @@ jobs:
       - name: Start Test Postgres
         run: .github/scripts/start-test-postgres.sh company-context-test-postgres 5432 postgres
 
+      # On ParadeDB, tests use the paradedb text-search backend; migration
+      # tests also cover postgres there.
       - name: Test
         env:
           COMPANY_CONTEXT_TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/postgres
+        run: cargo test --locked -p centaur-company-context
+
+      # Stock PostgreSQL plus pgvector, as on RDS and Cloud SQL: every test runs
+      # on the postgres text-search backend without pg_search.
+      - name: Start Plain Test Postgres
+        run: .github/scripts/start-test-postgres.sh company-context-plain-postgres 5433 postgres pgvector
+
+      - name: Test on plain Postgres
+        env:
+          COMPANY_CONTEXT_TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5433/postgres
         run: cargo test --locked -p centaur-company-context
 
   proxy-sync-checks:
@@ -303,22 +326,10 @@ jobs:
       - name: Start test database
         run: .github/scripts/start-test-postgres.sh proxy-sync-test-postgres 5432 proxy_sync_test pgvector
 
-      - name: Install Console packages
-        run: sudo apt-get update && sudo apt-get install --no-install-recommends -y libvips libpq-dev
-
-      - uses: ruby/setup-ruby@7f797815d8adceb1c412e7abefdd1ab4abc47a5f # v1.335.0
-        with:
-          working-directory: services/console
-          bundler-cache: true
-
       # proxy-sync reads Console's tables directly, so its integration tests
-      # run against the schema Console currently ships.
-      - name: Load Console schema
-        working-directory: services/console
-        env:
-          RAILS_ENV: test
-          CENTAUR_CONSOLE_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/proxy_sync_test
-        run: bin/rails db:prepare
+      # run against the schema api-rs migrates.
+      - name: Migrate Console schema
+        run: cargo run --locked -p centaur-console-db --example migrate -- postgresql://postgres:postgres@localhost:5432/proxy_sync_test
 
       - name: Test Console database crate
         env:
@@ -351,40 +362,15 @@ jobs:
       - name: Start test database
         run: .github/scripts/start-test-postgres.sh token-broker-test-postgres 5432 token_broker_test pgvector
 
-      - name: Install Console packages
-        run: sudo apt-get update && sudo apt-get install --no-install-recommends -y libvips libpq-dev
-
-      - uses: ruby/setup-ruby@7f797815d8adceb1c412e7abefdd1ab4abc47a5f # v1.335.0
-        with:
-          working-directory: services/console
-          bundler-cache: true
-
       # token-broker reads and writes Console's tables directly, so its
-      # integration tests run against the schema Console currently ships.
-      - name: Load Console schema
-        working-directory: services/console
-        env:
-          RAILS_ENV: test
-          CENTAUR_CONSOLE_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/token_broker_test
-        run: bin/rails db:prepare
+      # integration tests run against the schema api-rs migrates.
+      - name: Migrate Console schema
+        run: cargo run --locked -p centaur-console-db --example migrate -- postgresql://postgres:postgres@localhost:5432/token_broker_test
 
       - name: Test
         env:
           TOKEN_BROKER_TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/token_broker_test
         run: cargo test --locked -p centaur-token-broker
-
-      # The tests store tokens encrypted by token-broker; Console must read them.
-      - name: Decrypt token-broker's writes with Console
-        working-directory: services/console
-        env:
-          RAILS_ENV: test
-          CENTAUR_CONSOLE_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/token_broker_test
-        run: |
-          bin/rails runner '
-            credentials = BrokerCredential.where.not(access_token: nil).to_a
-            abort "token-broker tests stored no tokens" if credentials.empty?
-            credentials.each { |credential| [credential.access_token, credential.refresh_token] }
-            puts "Console decrypted #{credentials.size} credentials token-broker wrote"'
 
   rust-api:
     name: Rust API tests
@@ -407,6 +393,14 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
+      # api-rs serves the Console from Console's tables, so its Console tests
+      # run against the schema api-rs migrates. template0 keeps the ParadeDB
+      # image's demo extensions out of it.
+      - name: Migrate Console schema
+        run: |
+          docker exec centaur-api-test-postgres createdb -U postgres --template template0 console_test
+          cargo run --locked -p centaur-console-db --example migrate -- postgresql://postgres:postgres@localhost:5432/console_test
+
       - name: Test Absurd SDK
         env:
           ABSURD_TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/absurd_sdk
@@ -421,6 +415,7 @@ jobs:
       - name: Test
         env:
           SESSION_SQLX_TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/postgres
+          CONSOLE_DB_TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/console_test
         run: |
           cargo test --locked --workspace \
             --exclude absurd-sdk \
@@ -486,13 +481,16 @@ jobs:
           python-version: "3.11"
 
       # Tool-host integration tests execute real CLIs through uvx.
-      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
 
       - name: Sandbox Python tests
         env:
           GIT_CONFIG_GLOBAL: /dev/null
           PYTHONPATH: ${{ github.workspace }}
-        run: python -m unittest discover -s services/sandbox -p 'test_*.py'
+        # tomli-w matches the version baked into the sandbox image.
+        run: >-
+          uv run --no-project --python 3.11 --with tomli-w==1.2.0
+          python -m unittest discover -s services/sandbox -p 'test_*.py'
 
   workflow-python-tests:
     name: Workflow Python tests
@@ -508,7 +506,7 @@ jobs:
         with:
           python-version: "3.11"
 
-      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           enable-cache: true
           prune-cache: true
@@ -524,7 +522,7 @@ jobs:
       - name: Workflow definition tests
         run: >-
           uv run --project services/workflow-python --with pytest
-          python -m pytest workflows/tests workflows/slack/tests
+          python -m pytest workflows/tests
 
   tool-tests:
     name: Tool tests
@@ -540,7 +538,7 @@ jobs:
         with:
           python-version: "3.11"
 
-      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           enable-cache: true
           prune-cache: true
@@ -566,11 +564,11 @@ jobs:
 
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: "24.22.1"
+          node-version: "24.22.3"
 
-      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
         with:
-          version: 10.34.7
+          version: 10.34.9
           run_install: false
 
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
@@ -592,11 +590,11 @@ jobs:
 
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: "24.22.1"
+          node-version: "24.22.3"
 
-      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
         with:
-          version: 10.34.7
+          version: 10.34.9
           run_install: false
 
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
@@ -624,11 +622,11 @@ jobs:
 
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: "24.22.1"
+          node-version: "24.22.3"
 
-      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
         with:
-          version: 10.34.7
+          version: 10.34.9
           run_install: false
 
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
@@ -658,11 +656,11 @@ jobs:
 
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: "24.22.1"
+          node-version: "24.22.3"
 
-      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
         with:
-          version: 10.34.7
+          version: 10.34.9
           run_install: false
 
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
@@ -692,11 +690,11 @@ jobs:
 
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: "24.22.1"
+          node-version: "24.22.3"
 
-      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
         with:
-          version: 10.34.7
+          version: 10.34.9
           run_install: false
 
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
@@ -711,6 +709,50 @@ jobs:
       - name: Teamsbot tests
         working-directory: services/teamsbot
         run: bun run test
+
+  connector-checks:
+    name: Code Mode connectors lint, typecheck, and tests
+    runs-on: depot-ubuntu-24.04-16
+    needs: ci_changes
+    if: needs.ci_changes.outputs.connector_checks == 'true'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24.22.3"
+
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+        with:
+          version: 10.34.9
+          run_install: false
+
+      - name: Install Node dependencies
+        run: pnpm install --frozen-lockfile
+
+      # The runtime strips types without checking them, so this is the only
+      # place connector types are checked.
+      - name: Typecheck connectors
+        working-directory: connectors
+        run: pnpm run typecheck
+
+      - name: Lint connectors
+        working-directory: connectors
+        run: pnpm run lint
+
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # Includes loading every repository connector the way the runtime does.
+      - name: Test centaur-codemode
+        run: cargo test --locked -p centaur-codemode
 
   ci-success:
     name: CI success
@@ -734,10 +776,11 @@ jobs:
       - discordbot-checks
       - githubbot-checks
       - teamsbot-checks
+      - connector-checks
     timeout-minutes: 30
     steps:
       - name: Decide whether the needed jobs succeeded or failed
         uses: re-actors/alls-green@b5b5b37504aa4183270bd3d855c52a67f212be35 # v1.3.0
         with:
-          allowed-skips: migration-order, rust-checks, harness-server-checks, harness-server-conformance, company-context-checks, proxy-sync-checks, token-broker-checks, rust-api, rust-api-postgres, sandbox-tests, workflow-python-tests, tool-tests, slackbotv2-tests, discordbot-checks, githubbot-checks, teamsbot-checks
+          allowed-skips: migration-order, rust-checks, harness-server-checks, harness-server-conformance, company-context-checks, proxy-sync-checks, token-broker-checks, rust-api, rust-api-postgres, sandbox-tests, workflow-python-tests, tool-tests, slackbotv2-tests, discordbot-checks, githubbot-checks, teamsbot-checks, connector-checks
           jobs: ${{ toJSON(needs) }}

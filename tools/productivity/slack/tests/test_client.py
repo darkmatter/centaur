@@ -1,11 +1,12 @@
 import base64
-import datetime as dt
 import email.message
+import io
 import json
+import urllib.error
+from pathlib import Path
 
 import pytest
 import slack.client as slack_client
-from centaur_sdk import company_context_database_url
 from slack.client import IndexedSlackClient, SlackAuthError, SlackClient, SlackRateLimitError
 from slack_sdk.errors import SlackApiError
 
@@ -891,38 +892,42 @@ def test_upload_file_proxy_posts_file_bytes_to_centaur_api(
     }
 
 
-def test_download_file_proxy_returns_base64_file(
-    monkeypatch: pytest.MonkeyPatch,
+def test_download_file_proxy_streams_file_to_disk(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     import urllib.parse
     import urllib.request
 
     client, _ = _make_client()
     request_info: dict[str, str | None] = {}
+    body = b"%PDF" + b"x" * (3 * 64 * 1024)
 
     def fake_urlopen(req, *args, **kwargs):
         request_info["url"] = req.full_url
         request_info["authorization"] = req.get_header("Authorization")
         return _FakeHTTPResponse(
-            b"%PDF",
+            body,
             "application/pdf",
-            {"Content-Disposition": 'attachment; filename="report.pdf"'},
+            {"Content-Disposition": 'attachment; filename="../report.pdf"'},
         )
 
     monkeypatch.setenv("CENTAUR_API_URL", "http://api.internal:8080")
     monkeypatch.setenv("CENTAUR_API_BEARER_TOKEN", "test-jwt")
     monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
 
-    result = client.download_file_proxy(file_id="F123456789", channel_id="C123456789")
+    result = client.download_file_proxy(
+        file_id="F123456789", channel_id="C123456789", output_dir=tmp_path
+    )
 
     assert result == {
         "file_id": "F123456789",
         "channel_id": "C123456789",
         "filename": "report.pdf",
         "content_type": "application/pdf",
-        "size_bytes": 4,
-        "content_base64": base64.b64encode(b"%PDF").decode(),
+        "size_bytes": len(body),
+        "output_path": str((tmp_path / "report.pdf").absolute()),
     }
+    assert (tmp_path / "report.pdf").read_bytes() == body
     assert request_info["authorization"] == "Bearer test-jwt"
     parsed = urllib.parse.urlparse(request_info["url"])
     assert parsed.path == "/api/slack/files/F123456789/download"
@@ -962,6 +967,22 @@ def test_file_info_proxy_calls_centaur_api(
     parsed = urllib.parse.urlparse(request_info["url"])
     assert parsed.path == "/api/slack/files/F123456789/info"
     assert urllib.parse.parse_qs(parsed.query) == {"channel_id": ["C123456789"]}
+
+
+def test_get_user_email_proxy_calls_centaur_api() -> None:
+    client, _ = _make_client()
+    calls: list[tuple[str, dict]] = []
+
+    def fake_get_json(path, params):
+        calls.append((path, params))
+        return {"ok": True, "user_id": "U123456789", "email": "person@example.com"}
+
+    client._centaur_api_get_json = fake_get_json  # type: ignore[method-assign]
+
+    assert client.get_user_email_proxy(" u123456789 ") == "person@example.com"
+    assert calls == [("/api/slack/users/U123456789/email", {})]
+    with pytest.raises(ValueError, match="user_id"):
+        client.get_user_email_proxy("C123456789")
 
 
 def test_get_channel_members_proxy_paginates_and_resolves_names() -> None:
@@ -1179,78 +1200,143 @@ def test_search_files_direct_reports_auth_failure() -> None:
     assert excinfo.value.payload["slack_method"] == "files.list"
 
 
-def test_indexed_search_queries_scoped_slack_rows(monkeypatch) -> None:
-    class FakeConnection:
-        def __init__(self) -> None:
-            self.fetch_calls = []
-            self.closed = False
+class _FakeResponse:
+    def __init__(self, payload: dict) -> None:
+        self._body = json.dumps(payload).encode()
 
-        async def fetch(self, query, *args):
-            self.fetch_calls.append((query, args))
-            return [
-                {
-                    "channel_id": "C123",
-                    "channel_name": "eng-infra",
-                    "message_ts": "1780000000.000001",
-                    "occurred_at": dt.datetime(2026, 9, 17, 12, 0, tzinfo=dt.UTC),
-                    "thread_ts": "1780000000.000000",
-                    "user_id": "U123",
-                    "bot_id": "",
-                    "text": "database migration completed",
-                    "permalink": "https://example.slack.com/archives/C123/p1780000000000001",
-                    "reply_count": 0,
-                    "author_name": "Alice",
-                    "score": 0.75,
-                }
-            ]
+    def read(self) -> bytes:
+        return self._body
 
-        async def close(self):
-            self.closed = True
+    def __enter__(self):
+        return self
 
-    fake = FakeConnection()
+    def __exit__(self, *exc) -> None:
+        return None
 
-    async def fake_connect(*args, **kwargs):
-        return fake
 
-    monkeypatch.setattr(slack_client.asyncpg, "connect", fake_connect)
+def test_indexed_search_queries_company_context_v2(monkeypatch) -> None:
+    requests = []
+    document = {
+        "document_id": "slack:C123:2026-09-17:0",
+        "type": "slack_message",
+        "title": "#eng-infra 2026-09-17",
+        "url": "https://example.slack.com/archives/C123/p1780000000000001",
+        "text": "alice: database migration completed",
+        "occurred_at": "2026-09-17T12:00:00Z",
+        "score": 0.75,
+        "metadata": {"conversation_id": "C123", "channel_name": "eng-infra"},
+    }
 
-    result = IndexedSlackClient("postgresql://example/centaur").search_messages(
+    def fake_urlopen(request, timeout):
+        requests.append((request, timeout))
+        return _FakeResponse({"results": [document], "next_cursor": "next"})
+
+    monkeypatch.setattr(slack_client.urllib.request, "urlopen", fake_urlopen)
+    resolved = []
+
+    def resolver(name: str) -> str:
+        resolved.append(name)
+        return "C999"
+
+    result = IndexedSlackClient("http://company-context:8080/", channel_resolver=resolver).search_messages(
         " database migration ",
         limit=500,
-        channels=["#eng-infra", "<#C123|eng-infra>", "ENG-INFRA"],
-        from_user="@Alice",
+        channels=["#Eng-Infra", "<#C123|eng-infra>", "C123", "G456"],
+        after="2026-09-01",
+        before="2026-09-18T00:00:00Z",
+        sort="timestamp",
+        cursor="prev",
     )
 
-    assert result["status"] == "ok"
-    assert result["query"] == "database migration"
-    assert result["results"] == [
-        {
-            "channel": "eng-infra",
-            "channel_id": "C123",
-            "user": "Alice",
-            "user_id": "U123",
-            "bot_id": "",
-            "text": "database migration completed",
-            "timestamp": "1780000000.000001",
-            "occurred_at": "2026-09-17T12:00:00+00:00",
-            "permalink": "https://example.slack.com/archives/C123/p1780000000000001",
-            "thread_ts": "1780000000.000000",
-            "reply_count": 0,
-            "score": 0.75,
-        }
-    ]
-    query, args = fake.fetch_calls[0]
-    assert "FROM company_context_slack_messages messages" in query
-    assert "LEFT JOIN company_context_slack_users users" in query
-    assert "websearch_to_tsquery('english', $1)" in query
-    assert args == ("database migration", ["eng-infra", "c123"], "alice", 50)
-    assert fake.closed is True
+    assert result == {
+        "status": "ok",
+        "query": "database migration",
+        "results": [document],
+        "next_cursor": "next",
+    }
+    assert resolved == ["eng-infra"]
+    request, timeout = requests[0]
+    assert request.full_url == "http://company-context:8080/query"
+    assert request.get_method() == "POST"
+    assert timeout == IndexedSlackClient.TIMEOUT_SECONDS
+    assert json.loads(request.data) == {
+        "query": "database migration",
+        "filters": {
+            "types": ["slack_message"],
+            "channel_ids": ["C999", "C123", "G456"],
+            "occurred_after": "2026-09-01T00:00:00Z",
+            "occurred_before": "2026-09-18T00:00:00Z",
+        },
+        "limit": 50,
+        "mode": "keyword",
+        "cursor": "prev",
+    }
+
+
+def test_indexed_search_reads_api_url_from_env(monkeypatch) -> None:
+    requests = []
+
+    def fake_urlopen(request, timeout):
+        requests.append(request)
+        return _FakeResponse({"results": []})
+
+    monkeypatch.setenv("COMPANY_CONTEXT_API_URL", "company-context:8080")
+    monkeypatch.setattr(slack_client.urllib.request, "urlopen", fake_urlopen)
+
+    result = IndexedSlackClient().search_messages("deploy")
+
+    assert result == {"status": "ok", "query": "deploy", "results": [], "next_cursor": None}
+    assert requests[0].full_url == "http://company-context:8080/query"
+    assert json.loads(requests[0].data) == {
+        "query": "deploy",
+        "filters": {"types": ["slack_message"]},
+        "limit": 20,
+    }
+
+
+def test_indexed_search_reports_missing_api_url(monkeypatch) -> None:
+    monkeypatch.delenv("COMPANY_CONTEXT_API_URL", raising=False)
+
+    result = IndexedSlackClient().search_messages("deploy")
+
+    assert result["status"] == "error"
+    assert "COMPANY_CONTEXT_API_URL is not configured" in result["error"]
+
+
+def test_indexed_search_reports_api_errors(monkeypatch) -> None:
+    def fake_urlopen(request, timeout):
+        raise urllib.error.HTTPError(
+            request.full_url, 403, "Forbidden", {}, io.BytesIO(b'{"error": "no access"}')
+        )
+
+    monkeypatch.setattr(slack_client.urllib.request, "urlopen", fake_urlopen)
+
+    result = IndexedSlackClient("http://company-context").search_messages("deploy")
+
+    assert result == {"status": "error", "error": "HTTP 403: no access"}
+
+
+def test_indexed_search_reports_unresolved_channel() -> None:
+    def resolver(name: str) -> str:
+        raise RuntimeError(f"Channel '{name}' not found")
+
+    result = IndexedSlackClient("http://company-context", channel_resolver=resolver).search_messages(
+        "deploy", channels=["missing"]
+    )
+
+    assert result == {"status": "error", "error": "Channel 'missing' not found"}
 
 
 def test_indexed_search_rejects_empty_query() -> None:
-    result = IndexedSlackClient("postgresql://example/centaur").search_messages("   ")
+    result = IndexedSlackClient("http://company-context").search_messages("   ")
 
     assert result == {"status": "error", "error": "query cannot be empty"}
+
+
+def test_indexed_search_rejects_unknown_sort() -> None:
+    result = IndexedSlackClient("http://company-context").search_messages("deploy", sort="recent")
+
+    assert result == {"status": "error", "error": "sort must be 'score' or 'timestamp'"}
 
 
 def test_search_messages_direct_uses_native_filters_without_scanning_history() -> None:
@@ -1666,7 +1752,7 @@ class _FakeHTTPResponse:
     def __init__(
         self, body: bytes, content_type: str, headers: dict[str, str] | None = None
     ) -> None:
-        self._body = body
+        self._body = io.BytesIO(body)
         self._content_type = content_type
         self._headers = headers or {}
 
@@ -1676,8 +1762,8 @@ class _FakeHTTPResponse:
     def __exit__(self, *exc: object) -> bool:
         return False
 
-    def read(self, _amt: int = -1) -> bytes:
-        return self._body
+    def read(self, amt: int = -1) -> bytes:
+        return self._body.read(amt)
 
     @property
     def headers(self) -> "email.message.Message":
@@ -1688,19 +1774,19 @@ class _FakeHTTPResponse:
         return msg
 
 
-def test_fetch_slack_file_rejects_non_files_host() -> None:
+def test_fetch_slack_file_rejects_non_files_host(tmp_path: Path) -> None:
     client, _ = _make_client()
     client.token = "SLACK_BOT_TOKEN"
 
     with pytest.raises(ValueError, match=r"files\.slack\.com"):
-        client._fetch_slack_file("https://slack.com/api/api.test?x=SLACK_BOT_TOKEN")
+        client._fetch_slack_file("https://slack.com/api/api.test?x=SLACK_BOT_TOKEN", tmp_path)
 
     with pytest.raises(ValueError, match=r"files\.slack\.com"):
-        client._fetch_slack_file("http://files.slack.com/files-pri/T1-F1/report.pdf")
+        client._fetch_slack_file("http://files.slack.com/files-pri/T1-F1/report.pdf", tmp_path)
 
 
-def test_fetch_slack_file_returns_file_metadata_and_bytes(
-    monkeypatch: pytest.MonkeyPatch,
+def test_fetch_slack_file_streams_file_to_disk(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     import urllib.request
 
@@ -1715,13 +1801,40 @@ def test_fetch_slack_file_returns_file_metadata_and_bytes(
 
     monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
 
-    filename, mime_type, body = client._fetch_slack_file(
-        "https://files.slack.com/files-pri/T1-F1/report.pdf"
+    out_path, size = client._fetch_slack_file(
+        "https://files.slack.com/files-pri/T1-F1/report.pdf", tmp_path
     )
 
-    assert filename == "report.pdf"
-    assert mime_type == "application/pdf"
-    assert body == b"%PDF-1.4 report"
+    assert out_path == tmp_path / "report.pdf"
+    assert size == len(b"%PDF-1.4 report")
+    assert out_path.read_bytes() == b"%PDF-1.4 report"
+
+
+def test_fetch_slack_file_interrupted_download_leaves_no_partial_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import urllib.request
+
+    client, _ = _make_client()
+    client.token = "SLACK_BOT_TOKEN"
+
+    class _InterruptedResponse(_FakeHTTPResponse):
+        def read(self, amt: int = -1) -> bytes:
+            chunk = super().read(amt)
+            if not chunk:
+                raise ConnectionResetError("connection reset")
+            return chunk
+
+    monkeypatch.setattr(
+        urllib.request,
+        "urlopen",
+        lambda *_args, **_kwargs: _InterruptedResponse(b"partial", "application/pdf"),
+    )
+
+    with pytest.raises(ConnectionResetError):
+        client._fetch_slack_file("https://files.slack.com/files-pri/T1-F1/report.pdf", tmp_path)
+
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_get_file_info_direct_fetches_file_metadata() -> None:
@@ -1849,14 +1962,6 @@ def test_list_users_paginates_and_skips_deleted_by_default() -> None:
         {"limit": 10},
         {"limit": 9, "cursor": "cursor-2"},
     ]
-
-
-def test_indexed_search_uses_company_context_database(monkeypatch):
-    monkeypatch.setenv("CENTAUR_POSTGRES_DSN", "postgresql://u:p@proxy:5432")
-    monkeypatch.delenv("COMPANY_CONTEXT_POSTGRES_DATABASE", raising=False)
-
-    assert IndexedSlackClient().database_url == company_context_database_url()
-    assert IndexedSlackClient().database_url == "postgresql://u:p@proxy:5432/ai_v2"
 
 
 @pytest.mark.parametrize("emoji", ["pencil2", ":pencil2:", " :pencil2: "])

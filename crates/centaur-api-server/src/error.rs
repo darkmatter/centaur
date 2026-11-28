@@ -25,6 +25,8 @@ pub enum ApiError {
     #[error("{0}")]
     PayloadTooLarge(String),
     #[error("{0}")]
+    Unprocessable(String),
+    #[error("{0}")]
     ServiceUnavailable(String),
     /// Server-side misconfiguration or invariant failure. The message is
     /// logged but never returned to the client.
@@ -55,9 +57,11 @@ impl IntoResponse for ApiError {
             Self::NotFound(_) => StatusCode::NOT_FOUND,
             Self::MethodNotAllowed(_) => StatusCode::METHOD_NOT_ALLOWED,
             Self::PayloadTooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
+            Self::Unprocessable(_) => StatusCode::UNPROCESSABLE_ENTITY,
             Self::ServiceUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             Self::Runtime(SessionRuntimeError::BadRequest(_)) => StatusCode::BAD_REQUEST,
             Self::Runtime(SessionRuntimeError::ShuttingDown) => StatusCode::SERVICE_UNAVAILABLE,
+            Self::Runtime(SessionRuntimeError::Brain(_)) => StatusCode::BAD_GATEWAY,
             Self::Runtime(SessionRuntimeError::Store(SessionStoreError::NotFound { .. })) => {
                 StatusCode::NOT_FOUND
             }
@@ -67,6 +71,10 @@ impl IntoResponse for ApiError {
             Self::Runtime(SessionRuntimeError::Store(SessionStoreError::PrincipalConflict {
                 ..
             })) => StatusCode::CONFLICT,
+            Self::Runtime(SessionRuntimeError::Store(
+                SessionStoreError::ExecutionActive { .. }
+                | SessionStoreError::WorkflowOwnedSandbox { .. },
+            )) => StatusCode::CONFLICT,
             Self::Runtime(SessionRuntimeError::IronControl(
                 centaur_iron_control::IronControlError::PrincipalDerivation(_),
             )) => StatusCode::BAD_REQUEST,
@@ -152,6 +160,12 @@ pub(crate) fn error_chain(error: &dyn std::error::Error) -> String {
         source = cause.source();
     }
     message
+}
+
+impl From<centaur_console_db::Error> for ApiError {
+    fn from(error: centaur_console_db::Error) -> Self {
+        Self::Internal(error.to_string())
+    }
 }
 
 #[cfg(test)]

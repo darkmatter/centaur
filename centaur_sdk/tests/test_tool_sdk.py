@@ -7,14 +7,16 @@ import pytest
 
 from centaur_sdk import (
     ToolContext,
-    company_context_database_url,
     current_chat_destination,
     current_discord_thread,
     current_github_thread,
     current_linear_thread,
     current_session_context,
     current_slack_thread,
+    current_thread_key,
     reset_tool_context,
+    sandbox_context,
+    sandbox_thread_key,
     save_attachment,
     secret,
     set_tool_context,
@@ -365,6 +367,45 @@ def test_current_discord_thread_rejects_slack_thread(monkeypatch: pytest.MonkeyP
         reset_tool_context(token)
 
 
+def test_thread_key_falls_back_to_the_sandbox_context_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    context_file = tmp_path / "sandbox.json"
+    context_file.write_text(
+        '{"version": 1, "thread_key": "slack:T1:C1:1.0", "sandbox": {"principal_id": "prn_a"}}'
+    )
+    monkeypatch.delenv("CENTAUR_THREAD_KEY", raising=False)
+    monkeypatch.setenv("CENTAUR_SANDBOX_CONTEXT_FILE", str(context_file))
+
+    assert sandbox_context()["sandbox"] == {"principal_id": "prn_a"}
+    assert sandbox_thread_key() == "slack:T1:C1:1.0"
+    assert current_thread_key() == "slack:T1:C1:1.0"
+
+    # The environment wins where it is set, and the tool context over both.
+    monkeypatch.setenv("CENTAUR_THREAD_KEY", "slack:T1:C1:2.0")
+    assert current_thread_key() == "slack:T1:C1:2.0"
+    token = set_tool_context(ToolContext(name="test", thread_key="slack:T1:C1:3.0"))
+    try:
+        assert current_thread_key() == "slack:T1:C1:3.0"
+    finally:
+        reset_tool_context(token)
+
+
+def test_thread_key_is_missing_without_env_or_context_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    monkeypatch.delenv("CENTAUR_THREAD_KEY", raising=False)
+    monkeypatch.setenv("CENTAUR_SANDBOX_CONTEXT_FILE", str(tmp_path / "missing.json"))
+
+    assert sandbox_context() == {}
+    assert sandbox_thread_key() is None
+    with pytest.raises(RuntimeError, match="scoped thread"):
+        current_thread_key()
+
+    (tmp_path / "missing.json").write_text("not json")
+    assert sandbox_context() == {}
+
+
 def test_save_attachment_writes_to_sandbox_uploads_dir(
     monkeypatch: pytest.MonkeyPatch, tmp_path
 ):
@@ -456,38 +497,3 @@ async def test_get_sync_uses_background_thread_inside_running_loop():
     assert backend.get_sync("TOKEN") == "inside-loop"
     assert len(backend.get_thread_ids) == 1
     assert backend.get_thread_ids[0] != caller_thread_id
-
-
-def test_company_context_database_url_defaults_to_ai_v2(monkeypatch):
-    monkeypatch.delenv("COMPANY_CONTEXT_POSTGRES_DATABASE", raising=False)
-
-    assert company_context_database_url("postgresql://u:p@proxy:5432") == (
-        "postgresql://u:p@proxy:5432/ai_v2"
-    )
-
-
-def test_company_context_database_url_honors_database_override(monkeypatch):
-    monkeypatch.setenv("COMPANY_CONTEXT_POSTGRES_DATABASE", "centaur")
-
-    assert company_context_database_url("postgresql://proxy/") == "postgresql://proxy/centaur"
-
-
-def test_company_context_database_url_uses_default_for_blank_override(monkeypatch):
-    monkeypatch.setenv("COMPANY_CONTEXT_POSTGRES_DATABASE", " ")
-
-    assert company_context_database_url("postgresql://proxy") == "postgresql://proxy/ai_v2"
-
-
-def test_company_context_database_url_keeps_explicit_database():
-    assert company_context_database_url("postgresql://proxy/other") == "postgresql://proxy/other"
-
-
-def test_company_context_database_url_reads_dsn_env(monkeypatch):
-    monkeypatch.setenv("CENTAUR_POSTGRES_DSN", "postgresql://scoped")
-    monkeypatch.delenv("COMPANY_CONTEXT_POSTGRES_DATABASE", raising=False)
-
-    assert company_context_database_url() == "postgresql://scoped/ai_v2"
-
-
-def test_company_context_database_url_ignores_unresolved_placeholder():
-    assert company_context_database_url("CENTAUR_POSTGRES_DSN") == ""

@@ -115,6 +115,7 @@ async fn main() -> Result<()> {
                     "source": "centaur-session-cli",
                 })),
                 on_harness_conflict: None,
+                principal: None,
             },
         )
         .await
@@ -582,7 +583,7 @@ enum HarnessTypeArg {
     Amp,
     #[value(name = "claudecode")]
     ClaudeCode,
-    Nanocodex,
+    Nanocode,
     Hermes,
     Pi,
     Omp,
@@ -594,7 +595,7 @@ impl From<HarnessTypeArg> for HarnessType {
             HarnessTypeArg::Codex => Self::Codex,
             HarnessTypeArg::Amp => Self::Amp,
             HarnessTypeArg::ClaudeCode => Self::ClaudeCode,
-            HarnessTypeArg::Nanocodex => Self::Nanocodex,
+            HarnessTypeArg::Nanocode => Self::Nanocode,
             HarnessTypeArg::Hermes => Self::Hermes,
             HarnessTypeArg::Pi => Self::Pi,
             HarnessTypeArg::Omp => Self::Omp,

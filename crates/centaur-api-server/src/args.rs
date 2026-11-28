@@ -13,9 +13,10 @@ use std::{
 use std::os::unix::fs::PermissionsExt;
 
 use centaur_api_server::{
-    DiscoveredToolProxyFragment, SandboxRuntime, ToolDiscoveryConfig, discover_persona_registry,
-    discover_tool_proxy_fragment,
+    ConsoleSessionConfig, DiscoveredToolProxyFragment, SandboxRuntime, ToolDiscoveryConfig,
+    discover_persona_registry, discover_tool_proxy_fragment,
 };
+use centaur_codemode_protocol::TOKEN_SIGNING_KEY_ENV;
 use centaur_iron_control::{
     IdentityInput, IronControlClient, IronControlError, PrincipalInput, RegisterError, RoleSpec,
     SessionRegistrar, register_role,
@@ -25,18 +26,22 @@ use centaur_iron_proxy::{
     harness_auth_fragment, infra_fragment,
 };
 use centaur_sandbox_agent_k8s::{
-    AgentSandboxBackend, AgentSandboxConfig, GitHubTokenRef, IronControlSettings, IronProxyConfig,
-    OtlpEgressTarget, SecurityContext, StateVolumeConfig, Toleration, ToolSource, ToolsConfig,
+    AgentSandboxBackend, AgentSandboxConfig, DeploymentRef, GitHubTokenRef, IronControlSettings,
+    IronProxyConfig, OtlpEgressTarget, SecurityContext, SshProxyConfig, StateVolumeConfig,
+    Toleration, ToolSource, ToolsConfig,
 };
 use centaur_sandbox_core::{Mount, MountKind, ResourceRequirements, SandboxSpec};
 use centaur_sandbox_manager::{SandboxReaperConfig, WarmPoolConfig};
-use centaur_session_core::HarnessType;
+use centaur_session_core::{HarnessType, SandboxRepoCacheAccess};
 use centaur_session_runtime::{
-    PersonaRegistry, SandboxCapacityConfig, SandboxWorkloadMode, SessionEventRetentionConfig,
-    SessionPrincipalAdmission, SessionSandboxCleanupConfig,
+    BrainClient, PersonaRegistry, SandboxCapacityConfig, SandboxWorkloadMode,
+    SessionEventRetentionConfig, SessionPrincipalAdmission, SessionSandboxCleanupConfig,
+    TurnTokenSigner, WarmPoolTarget,
 };
 use centaur_session_sqlx::TextSearchBackend;
-use centaur_workflows::{WorkflowHostSandboxRuntime, WorkflowPrincipalRegistrar};
+use centaur_workflows::{
+    WorkflowDiscoveryClient, WorkflowHostSandboxRuntime, WorkflowPrincipalRegistrar,
+};
 use clap::{Args as ClapArgs, Parser, ValueEnum};
 use sqlx::{
     PgPool,
@@ -44,7 +49,10 @@ use sqlx::{
 };
 use tracing::{info, warn};
 
-use crate::{ServerError, activity_summary::ActivitySummaryConfig};
+use crate::{
+    ServerError,
+    activity_summary::{ActivitySummaryConfig, ProgressUpdateConfig},
+};
 
 const SANDBOX_REPOS_MOUNT_PATH: &str = "/home/agent/github";
 const GITHUB_TOKEN_ENV: &str = "GITHUB_TOKEN";
@@ -83,6 +91,10 @@ pub(crate) struct Args {
     session_principal_admission: SessionPrincipalAdmissionArg,
     #[command(flatten)]
     activity_summary: ActivitySummaryArgs,
+    #[command(flatten)]
+    console_session: ConsoleSessionArgs,
+    #[command(flatten)]
+    console_bootstrap: ConsoleBootstrapArgs,
 }
 
 impl Args {
@@ -90,20 +102,73 @@ impl Args {
         self.sandbox.runtime().await
     }
 
+    /// Base URL of the out-of-sandbox `nanocode` brain, when configured.
+    pub(crate) fn brain_url(&self) -> Option<String> {
+        self.sandbox.brain_url()
+    }
+
+    /// The `nanocode` brain client, when `CENTAUR_BRAIN_URL` is configured.
+    /// `nanocode` sessions are rejected at admission without one.
+    pub(crate) fn brain_client(&self) -> Result<Option<Arc<BrainClient>>, ServerError> {
+        let Some(url) = self.brain_url() else {
+            return Ok(None);
+        };
+        let client = BrainClient::new(&url).map_err(|error| {
+            ServerError::UnsupportedConfig(format!("invalid CENTAUR_BRAIN_URL: {error}"))
+        })?;
+        info!(url = %client.base_url(), "nanocode sessions run in centaur-brain");
+        Ok(Some(Arc::new(client)))
+    }
+
+    /// The Code Mode turn-token signer, when
+    /// `CENTAUR_CODEMODE_TOKEN_SIGNING_KEY` holds a PKCS#8 PEM Ed25519 key.
+    /// Read from the environment only, never a flag, since it is a private
+    /// key. Without it `nanocode` turns run without Code Mode tools.
+    pub(crate) fn codemode_token_signer(
+        &self,
+    ) -> Result<Option<Arc<TurnTokenSigner>>, ServerError> {
+        let Some(pem) = std::env::var(TOKEN_SIGNING_KEY_ENV)
+            .ok()
+            .filter(|pem| !pem.trim().is_empty())
+        else {
+            return Ok(None);
+        };
+        let signer = TurnTokenSigner::from_pem(pem.as_bytes()).map_err(|error| {
+            ServerError::UnsupportedConfig(format!("invalid {TOKEN_SIGNING_KEY_ENV}: {error}"))
+        })?;
+        info!("nanocode turns get Code Mode turn tokens");
+        Ok(Some(Arc::new(signer)))
+    }
+
+    /// The image Code Mode sandboxes run. Missing or blank falls back to
+    /// `centaur-codemode:latest`, like the session sandbox image.
+    pub(crate) fn codemode_image(&self) -> String {
+        clean_optional_value(self.sandbox.codemode_image.as_deref())
+            .unwrap_or_else(|| DEFAULT_CODEMODE_IMAGE.to_owned())
+    }
+
     pub(crate) async fn iron_control_runtime(&self) -> Result<IronControlRuntime, ServerError> {
         self.sandbox.iron_control_runtime().await
+    }
+
+    /// Console's database pool, when configured. Call within a Tokio runtime.
+    pub(crate) fn console_db(&self) -> Option<PgPool> {
+        self.sandbox.iron_control.console_db().ok()
     }
 
     pub(crate) fn persona_registry(&self) -> Result<PersonaRegistry, ServerError> {
         self.sandbox.persona_registry()
     }
 
-    pub(crate) fn warm_pool_config(
+    pub(crate) fn warm_pools(
         &self,
         bootstrap_iron_control_principal: &str,
-    ) -> Option<WarmPoolConfig> {
-        self.sandbox
-            .warm_pool_config(bootstrap_iron_control_principal)
+    ) -> Result<(Vec<WarmPoolTarget>, WarmPoolConfig), ServerError> {
+        Ok((
+            self.sandbox.warm_pool_targets()?,
+            self.sandbox
+                .warm_pool_config(bootstrap_iron_control_principal),
+        ))
     }
 
     pub(crate) fn sandbox_capacity_config(&self) -> Option<SandboxCapacityConfig> {
@@ -132,14 +197,65 @@ impl Args {
     pub(crate) async fn workflow_host_sandbox_runtime(
         &self,
         bootstrap_iron_control_principal: &str,
-    ) -> Result<Option<WorkflowHostSandboxRuntime>, ServerError> {
+    ) -> Result<WorkflowHostSandboxRuntime, ServerError> {
         self.sandbox
             .workflow_host_sandbox_runtime(bootstrap_iron_control_principal)
             .await
     }
 
+    /// The workflow discovery service (`workflow-host serve`). Discovery never
+    /// runs in this process, so a deployment without the service cannot start.
+    pub(crate) fn workflow_discovery_client(&self) -> Result<WorkflowDiscoveryClient, ServerError> {
+        let url = clean_optional_value(self.sandbox.workflow_discovery_url.as_deref()).ok_or_else(
+            || {
+                ServerError::UnsupportedConfig(
+                    "WORKFLOW_DISCOVERY_URL must point at the workflow discovery service"
+                        .to_owned(),
+                )
+            },
+        )?;
+        Ok(WorkflowDiscoveryClient::new(
+            &url,
+            &self.sandbox.agent_k8s_workflow_dirs(),
+            self.sandbox.discovery_env(),
+        ))
+    }
+
     pub(crate) fn activity_summary_config(&self) -> Option<ActivitySummaryConfig> {
         self.activity_summary.config()
+    }
+
+    pub(crate) fn console_session_config(
+        &self,
+    ) -> Result<Option<ConsoleSessionConfig>, ServerError> {
+        // Console booleans are strict: a typo is a startup error instead of a
+        // guess.
+        centaur_api_server::validate_boolean_settings().map_err(ServerError::UnsupportedConfig)?;
+        ConsoleSessionConfig::from_settings(
+            self.console_session.session_secret.as_deref(),
+            self.console_session.public_url.as_deref(),
+        )
+        .map_err(|error| ServerError::UnsupportedConfig(error.to_string()))
+    }
+
+    /// A writable Console pool for the ported Console handlers. The pool used
+    /// by the turn path stays read-only. Both come from the same URL.
+    pub(crate) fn console_write_db(&self) -> Option<PgPool> {
+        self.sandbox.iron_control.console_write_db().ok()
+    }
+
+    /// The operator to create on a Console database with no users, when
+    /// `CENTAUR_CONSOLE_INITIAL_USER_EMAIL` is set.
+    pub(crate) fn console_initial_admin(&self) -> Option<centaur_console_db::InitialAdmin> {
+        let email = non_empty(self.console_bootstrap.initial_user_email.as_deref())?;
+        Some(centaur_console_db::InitialAdmin {
+            email: email.to_owned(),
+            password: self
+                .console_bootstrap
+                .initial_user_password
+                .clone()
+                .unwrap_or_default(),
+        })
     }
 
     pub(crate) fn shutdown_execution_drain_timeout(&self) -> Duration {
@@ -163,6 +279,38 @@ pub(crate) struct IronControlRuntime {
     pub(crate) warm_pool_bootstrap_principal: String,
     pub(crate) workflow_host_principal: String,
     pub(crate) workflow_principal_registrar: WorkflowPrincipalRegistrar,
+}
+
+/// The initial Console operator, created as an active admin when the Console
+/// database has no users.
+#[derive(Debug, ClapArgs)]
+struct ConsoleBootstrapArgs {
+    #[arg(
+        long = "console-initial-user-email",
+        env = "CENTAUR_CONSOLE_INITIAL_USER_EMAIL"
+    )]
+    initial_user_email: Option<String>,
+    #[arg(
+        long = "console-initial-user-password",
+        env = "CENTAUR_CONSOLE_INITIAL_USER_PASSWORD",
+        hide_env_values = true
+    )]
+    initial_user_password: Option<String>,
+}
+
+#[derive(Debug, ClapArgs)]
+struct ConsoleSessionArgs {
+    /// Secret used to authenticate the Rust Console session cookie. Setting it
+    /// enables the Console API; it requires `CENTAUR_CONSOLE_PUBLIC_URL`.
+    #[arg(
+        long = "console-session-secret",
+        env = "CONSOLE_SESSION_SECRET",
+        hide_env_values = true
+    )]
+    session_secret: Option<String>,
+    /// Console's public origin, used to validate `Origin` on writes.
+    #[arg(long = "console-public-url", env = "CENTAUR_CONSOLE_PUBLIC_URL")]
+    public_url: Option<String>,
 }
 
 #[derive(Debug, ClapArgs)]
@@ -227,6 +375,31 @@ struct ActivitySummaryArgs {
         default_value = "low"
     )]
     reasoning_effort: String,
+    /// Post model-written progress updates to the chat thread while a
+    /// long-running execution is still working.
+    #[arg(
+        long = "session-progress-update-enabled",
+        env = "SESSION_PROGRESS_UPDATE_ENABLED",
+        default_value_t = false,
+        action = clap::ArgAction::Set
+    )]
+    progress_update_enabled: bool,
+    /// Execution age before the first progress update.
+    #[arg(
+        long = "session-progress-update-after-secs",
+        env = "SESSION_PROGRESS_UPDATE_AFTER_SECS",
+        default_value_t = 60,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    progress_update_after_secs: u64,
+    /// Minimum time between progress updates for one execution.
+    #[arg(
+        long = "session-progress-update-interval-secs",
+        env = "SESSION_PROGRESS_UPDATE_INTERVAL_SECS",
+        default_value_t = 120,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    progress_update_interval_secs: u64,
 }
 
 #[derive(Debug, ClapArgs)]
@@ -285,6 +458,10 @@ impl ActivitySummaryArgs {
             model: self.model.clone(),
             reasoning_effort: clean_optional_value(Some(self.reasoning_effort.as_str())),
             timeout: Duration::from_secs(self.timeout_secs),
+            progress: self.progress_update_enabled.then(|| ProgressUpdateConfig {
+                after: Duration::from_secs(self.progress_update_after_secs),
+                interval: Duration::from_secs(self.progress_update_interval_secs),
+            }),
         })
     }
 }
@@ -504,6 +681,8 @@ fn slug_path_component(value: &str) -> String {
 
 #[derive(Debug, ClapArgs)]
 struct IronControlArgs {
+    /// The Console's in-cluster URL, handed to sandboxes (`CENTAUR_CONSOLE_URL`)
+    /// and their network policy.
     #[arg(long = "iron-control-url", env = "IRON_CONTROL_URL")]
     url: Option<String>,
     #[arg(
@@ -511,10 +690,8 @@ struct IronControlArgs {
         env = "IRON_CONTROL_PROXY_SYNC_URL"
     )]
     proxy_sync_url: Option<String>,
-    #[arg(long = "iron-control-api-key", env = "IRON_CONTROL_API_KEY")]
-    api_key: Option<String>,
-    /// Console's database. Principals and their effective config are read from
-    /// it directly instead of through the Console API.
+    /// Console's database. api-rs migrates it, serves the Console from it, and
+    /// registers principals, roles, secrets, and proxies in it directly.
     #[arg(
         long = "iron-control-database-url",
         env = "IRON_CONTROL_DATABASE_URL",
@@ -527,33 +704,29 @@ struct IronControlArgs {
         env = "IRON_CONTROL_DATABASE_NAME"
     )]
     console_database_name: Option<String>,
+    /// At least 2: the Slack channel catalog refresh holds one connection for
+    /// its advisory lock while its queries use another.
     #[arg(
         long = "iron-control-database-max-connections",
         env = "IRON_CONTROL_DATABASE_MAX_CONNECTIONS",
-        default_value_t = 5
+        default_value_t = 5,
+        value_parser = clap::value_parser!(u32).range(2..)
     )]
     console_database_max_connections: u32,
-    /// The Console database pool shared by every client built from these args.
+    /// The read-only Console database pool shared by every client built from
+    /// these args.
     #[arg(skip)]
     console_db: OnceLock<PgPool>,
+    /// The writable Console pool. `None` until first use.
+    #[arg(skip)]
+    console_write_db: OnceLock<PgPool>,
 }
 
 impl IronControlArgs {
-    /// An [`IronControlClient`] when both URL and API key are configured.
-    fn client(&self) -> Option<IronControlClient> {
-        let url = non_empty(self.url.as_deref())?;
-        let api_key = non_empty(self.api_key.as_deref())?;
-        Some(IronControlClient::new(url, api_key))
-    }
-
+    /// The client api-rs registers its Console model with, on the writable
+    /// Console pool.
     fn required_client(&self) -> Result<IronControlClient, ServerError> {
-        let client = self.client().ok_or_else(|| {
-            ServerError::UnsupportedConfig(
-                "iron-control is required: set IRON_CONTROL_URL and IRON_CONTROL_API_KEY"
-                    .to_owned(),
-            )
-        })?;
-        Ok(client.with_console_db(self.console_db()?))
+        Ok(IronControlClient::new(self.console_write_db()?))
     }
 
     /// The shared Console database pool. Call it within a Tokio runtime: the
@@ -575,10 +748,34 @@ impl IronControlArgs {
         Ok(self.console_db.get_or_init(|| pool).clone())
     }
 
+    /// The writable Console pool, from the same settings as the read-only one.
+    /// Call within a Tokio runtime.
+    fn console_write_db(&self) -> Result<PgPool, ServerError> {
+        if let Some(pool) = self.console_write_db.get() {
+            return Ok(pool.clone());
+        }
+        let url = non_empty(self.console_database_url.as_deref()).ok_or_else(|| {
+            ServerError::UnsupportedConfig(
+                "the Console database is required: set IRON_CONTROL_DATABASE_URL".to_owned(),
+            )
+        })?;
+        let options =
+            console_write_db_options(url, non_empty(self.console_database_name.as_deref()))?;
+        let pool = PgPoolOptions::new()
+            .max_connections(self.console_database_max_connections)
+            .acquire_timeout(CONSOLE_DB_ACQUIRE_TIMEOUT)
+            .connect_lazy_with(options);
+        Ok(self.console_write_db.get_or_init(|| pool).clone())
+    }
+
     /// Required backend sync settings (admin client + proxy-sync URL).
     fn settings(&self) -> Result<IronControlSettings, ServerError> {
         let client = self.required_client()?;
-        let admin_url = non_empty(self.url.as_deref()).expect("required client validates URL");
+        let console_url = non_empty(self.url.as_deref()).ok_or_else(|| {
+            ServerError::UnsupportedConfig(
+                "the Console URL is required: set IRON_CONTROL_URL".to_owned(),
+            )
+        })?;
         let control_url = non_empty(self.proxy_sync_url.as_deref()).ok_or_else(|| {
             ServerError::UnsupportedConfig(
                 "proxy-sync is required: set IRON_CONTROL_PROXY_SYNC_URL".to_owned(),
@@ -586,7 +783,7 @@ impl IronControlArgs {
         })?;
         Ok(IronControlSettings {
             client,
-            console_url: admin_url.to_owned(),
+            console_url: console_url.to_owned(),
             control_url: control_url.to_owned(),
         })
     }
@@ -599,8 +796,9 @@ impl IronControlArgs {
 /// sooner than sqlx's 30 second default.
 const CONSOLE_DB_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// Connection options for Console's database. Sessions are read-only:
-/// Console owns every write to its schema.
+/// Connection options for Console's database. Sessions are read-only by
+/// default: Console owns its schema, and the scheduled-task scheduler writes
+/// its rows only in explicitly read-write transactions.
 fn console_db_options(
     url: &str,
     database_name: Option<&str>,
@@ -615,6 +813,23 @@ fn console_db_options(
         None => options,
     };
     Ok(options.options([("default_transaction_read_only", "on")]))
+}
+
+/// The writable counterpart of [`console_db_options`], for the Rust Console
+/// handlers. Same URL, no read-only transaction default.
+fn console_write_db_options(
+    url: &str,
+    database_name: Option<&str>,
+) -> Result<PgConnectOptions, ServerError> {
+    let options = PgConnectOptions::from_str(url).map_err(|_| {
+        ServerError::UnsupportedConfig(
+            "IRON_CONTROL_DATABASE_URL is not a valid PostgreSQL URL".to_owned(),
+        )
+    })?;
+    Ok(match database_name {
+        Some(name) => options.database(name),
+        None => options,
+    })
 }
 
 fn non_empty(value: Option<&str>) -> Option<&str> {
@@ -646,6 +861,33 @@ impl MigrateArgs {
     /// Parse `migrate` arguments when the command line starts with `migrate`.
     pub(crate) fn from_command_line() -> Option<Self> {
         if env::args_os().nth(1)? != "migrate" {
+            return None;
+        }
+        Some(Self::parse_from(env::args_os().skip(1)))
+    }
+}
+
+// `centaur-api-server install-agent-sandbox-crds` runs as the chart's
+// pre-upgrade hook, so like `migrate` it needs none of the server's
+// configuration; it reaches the Kubernetes API through the pod's service
+// account.
+#[derive(Debug, Parser)]
+#[command(
+    bin_name = "centaur-api-server install-agent-sandbox-crds",
+    about = "Install the bundled agent-sandbox CRDs, migrating v1alpha1 objects to v1beta1"
+)]
+pub(crate) struct InstallAgentSandboxCrdsArgs {
+    /// Deployment (<namespace>/<name>) whose pods only understand the
+    /// v1alpha1 API. It is deleted before a migration changes the CRDs, and
+    /// the release recreates it. Repeatable.
+    #[arg(long = "stop-deployment")]
+    pub(crate) stop_deployments: Vec<DeploymentRef>,
+}
+
+impl InstallAgentSandboxCrdsArgs {
+    /// Parse the arguments when the command line starts with the subcommand.
+    pub(crate) fn from_command_line() -> Option<Self> {
+        if env::args_os().nth(1)? != "install-agent-sandbox-crds" {
             return None;
         }
         Some(Self::parse_from(env::args_os().skip(1)))
@@ -716,6 +958,11 @@ struct SandboxArgs {
         default_value = "codex"
     )]
     default_harness: HarnessType,
+    /// Base HTTP URL of the out-of-sandbox `nanocode` brain
+    /// (`centaur-brain`). When set, sessions whose harness is `nanocode` run in
+    /// the brain instead of a sandbox; when unset, creating one is rejected.
+    #[arg(long = "brain-url", env = "CENTAUR_BRAIN_URL")]
+    brain_url: Option<String>,
     #[arg(long = "centaur-default-persona", env = "CENTAUR_DEFAULT_PERSONA")]
     default_persona: Option<String>,
     #[arg(
@@ -731,6 +978,10 @@ struct SandboxArgs {
         env = "SESSION_SANDBOX_IMAGE"
     )]
     agent_image: Option<String>,
+    /// Full image reference for MCP Code Mode sandboxes. Defaults to
+    /// `centaur-codemode:latest`.
+    #[arg(long = "codemode-image", env = "CENTAUR_CODEMODE_IMAGE")]
+    codemode_image: Option<String>,
     #[arg(
         long = "session-sandbox-image-pull-policy",
         alias = "kubernetes-agent-image-pull-policy",
@@ -779,6 +1030,15 @@ struct SandboxArgs {
         default_value_t = 0
     )]
     warm_pool_size: usize,
+    /// Warm pools as a JSON list of `{"harness", "repoCache", "persona"?,
+    /// "size"}` objects, one per harness, repo-cache access, and persona. A
+    /// pool without `persona` serves only sessions without one. Replaces
+    /// `SESSION_SANDBOX_WARM_POOL_SIZE` when set.
+    #[arg(
+        long = "session-sandbox-warm-pools",
+        env = "SESSION_SANDBOX_WARM_POOLS"
+    )]
+    warm_pools_json: Option<String>,
     #[arg(
         long = "session-sandbox-warm-pool-replenish-interval-secs",
         env = "SESSION_SANDBOX_WARM_POOL_REPLENISH_INTERVAL_SECS",
@@ -796,9 +1056,10 @@ struct SandboxArgs {
         default_value_t = 0
     )]
     sandbox_running_limit: usize,
-    /// Stop any sandbox older than this regardless of status; sessions replace
-    /// reaped sandboxes on their next message. 0 disables the max-lifetime
-    /// sweep.
+    /// Stop any sandbox older than this; sessions replace reaped sandboxes on
+    /// their next message. Warm-pool sandboxes age from their claim, and
+    /// sandboxes with an active execution are skipped unless that execution
+    /// outlived this too. 0 disables the max-lifetime sweep.
     #[arg(
         long = "session-sandbox-max-lifetime-secs",
         env = "SESSION_SANDBOX_MAX_LIFETIME_SECS",
@@ -950,12 +1211,10 @@ struct SandboxArgs {
         action = clap::ArgAction::Set
     )]
     iron_control_sync_infra_secrets: bool,
-    #[arg(
-        long = "workflow-host-sandbox",
-        env = "WORKFLOW_HOST_SANDBOX",
-        default_value_t = true
-    )]
-    workflow_host_sandbox: bool,
+    /// Base URL of the workflow discovery service, which imports workflow
+    /// modules on api-rs's behalf.
+    #[arg(long = "workflow-discovery-url", env = "WORKFLOW_DISCOVERY_URL")]
+    workflow_discovery_url: Option<String>,
     #[arg(long = "workflow-host-image", env = "WORKFLOW_HOST_IMAGE")]
     workflow_host_image: Option<String>,
     #[arg(long = "workflow-host-command", env = "WORKFLOW_HOST_COMMAND")]
@@ -1053,23 +1312,20 @@ impl SandboxArgs {
                 "drained sandboxes with stale pod identity or agent security contexts before enabling reuse"
             );
         }
-        let artifact_backend = backend.clone();
-        Ok(
-            SandboxRuntime::backend_with_workload(backend, self.container_workload_mode()?)
-                .with_artifact_reader(move |id, path, max_bytes| {
-                    let backend = artifact_backend.clone();
-                    async move { backend.read_artifact(&id, &path, max_bytes).await }
-                }),
-        )
+        Ok(SandboxRuntime::backend_with_workload(
+            backend,
+            self.container_workload_mode()?,
+        ))
+    }
+
+    fn brain_url(&self) -> Option<String> {
+        clean_optional_value(self.brain_url.as_deref())
     }
 
     async fn workflow_host_sandbox_runtime(
         &self,
         bootstrap_iron_control_principal: &str,
-    ) -> Result<Option<WorkflowHostSandboxRuntime>, ServerError> {
-        if !self.workflow_host_sandbox {
-            return Ok(None);
-        }
+    ) -> Result<WorkflowHostSandboxRuntime, ServerError> {
         let spec = self.workflow_host_spec(bootstrap_iron_control_principal)?;
         let runtime = SandboxRuntime::backend(
             Arc::new(AgentSandboxBackend::new(
@@ -1078,7 +1334,7 @@ impl SandboxArgs {
             )),
             spec.clone(),
         );
-        Ok(Some(WorkflowHostSandboxRuntime::new(runtime, spec)))
+        Ok(WorkflowHostSandboxRuntime::new(runtime, spec))
     }
 
     fn workflow_host_spec(
@@ -1114,9 +1370,6 @@ impl SandboxArgs {
             env::var("WORKFLOW_HOST_DATABASE_URL").or_else(|_| env::var("DATABASE_URL"))
         {
             spec = spec.env("DATABASE_URL", value);
-        }
-        if env::var_os("PYTHON_WORKFLOW_HOST_PATH").is_some() {
-            spec = spec.env("PYTHON_WORKFLOW_HOST_PATH", WORKFLOW_HOST_PATH);
         }
         if let Ok(value) = env::var("PYTHON_WORKFLOW_HOST_PYTHON") {
             spec = spec.env("PYTHON_WORKFLOW_HOST_PYTHON", value);
@@ -1527,6 +1780,28 @@ impl SandboxArgs {
             .to_owned()
     }
 
+    /// The `SESSION_SANDBOX_PASSTHROUGH_ENV` values workflow-host sandboxes
+    /// get. Discovery receives the same values, so a module that reads config
+    /// at import (for example to enable a schedule) sees what runs see.
+    fn passthrough_env(&self) -> BTreeMap<String, String> {
+        self.passthrough_env_names()
+            .filter_map(|name| env::var(name).ok().map(|value| (name.to_owned(), value)))
+            .collect()
+    }
+
+    /// The env a discovery pass imports workflows with: the passthrough env,
+    /// plus the enablement policy so the host skips disabled modules before
+    /// importing them, as it does in api-rs's own filtering.
+    fn discovery_env(&self) -> BTreeMap<String, String> {
+        let mut discovery_env = self.passthrough_env();
+        for name in ["WORKFLOW_ENABLE_MODE", "WORKFLOW_ALLOWED_NAMES"] {
+            if let Some(value) = clean_optional_value(env::var(name).ok().as_deref()) {
+                discovery_env.insert(name.to_owned(), value);
+            }
+        }
+        discovery_env
+    }
+
     fn passthrough_env_names(&self) -> impl Iterator<Item = &str> {
         self.passthrough_env
             .iter()
@@ -1570,14 +1845,53 @@ impl SandboxArgs {
         self.tools.resolve_tool_dirs()
     }
 
-    fn warm_pool_config(&self, bootstrap_iron_control_principal: &str) -> Option<WarmPoolConfig> {
-        (self.warm_pool_size > 0).then(|| WarmPoolConfig {
-            target_size: self.warm_pool_size,
+    /// `SESSION_SANDBOX_WARM_POOLS`, or a single pool of
+    /// `SESSION_SANDBOX_WARM_POOL_SIZE` default-harness sandboxes with full
+    /// repo-cache access when unset.
+    fn warm_pool_targets(&self) -> Result<Vec<WarmPoolTarget>, ServerError> {
+        let Some(raw) = self
+            .warm_pools_json
+            .as_deref()
+            .map(str::trim)
+            .filter(|raw| !raw.is_empty())
+        else {
+            return Ok(vec![WarmPoolTarget {
+                harness: self.default_harness.clone(),
+                repo_cache: SandboxRepoCacheAccess::All,
+                persona: None,
+                size: self.warm_pool_size,
+            }]);
+        };
+        let targets: Vec<WarmPoolTarget> = serde_json::from_str(raw).map_err(|error| {
+            ServerError::UnsupportedConfig(format!(
+                "SESSION_SANDBOX_WARM_POOLS must be a JSON list of \
+                 {{\"harness\", \"repoCache\", \"persona\"?, \"size\"}} objects: {error}"
+            ))
+        })?;
+        for (index, target) in targets.iter().enumerate() {
+            if targets[..index].iter().any(|earlier| {
+                earlier.harness == target.harness
+                    && earlier.repo_cache == target.repo_cache
+                    && earlier.persona == target.persona
+            }) {
+                return Err(ServerError::UnsupportedConfig(format!(
+                    "SESSION_SANDBOX_WARM_POOLS lists harness {} with repoCache {} and persona {} more than once",
+                    target.harness,
+                    target.repo_cache.as_str(),
+                    target.persona.as_deref().unwrap_or("(none)")
+                )));
+            }
+        }
+        Ok(targets)
+    }
+
+    fn warm_pool_config(&self, bootstrap_iron_control_principal: &str) -> WarmPoolConfig {
+        WarmPoolConfig {
             replenish_interval: Duration::from_secs(self.warm_pool_replenish_interval_secs),
             bootstrap_iron_control_principal: bootstrap_iron_control_principal.to_owned(),
             max_running_sandboxes: (self.sandbox_running_limit > 0)
                 .then_some(self.sandbox_running_limit),
-        })
+        }
     }
 
     fn sandbox_capacity_config(&self) -> Option<SandboxCapacityConfig> {
@@ -1643,14 +1957,10 @@ fn should_retry_iron_control_register(error: &RegisterError) -> bool {
         RegisterError::Translate(_) => false,
         RegisterError::Control(IronControlError::PrincipalDerivation(_))
         | RegisterError::Control(IronControlError::SessionPrincipalNotPreapproved { .. }) => false,
-        RegisterError::Control(IronControlError::Transport { .. }) => true,
-        RegisterError::Control(IronControlError::Decode { .. })
-        | RegisterError::Control(IronControlError::NotFound { .. }) => false,
+        RegisterError::Control(IronControlError::NotFound { .. })
+        | RegisterError::Control(IronControlError::InProcess { .. }) => false,
         RegisterError::Control(IronControlError::ConsoleDb(error)) => {
             matches!(error, centaur_console_db::Error::Database(_))
-        }
-        RegisterError::Control(IronControlError::Status { status, .. }) => {
-            *status == 429 || (500..600).contains(status)
         }
     }
 }
@@ -1952,6 +2262,26 @@ fn repository_visibility(value: Option<&str>) -> String {
 #[derive(Debug, ClapArgs)]
 struct IronProxyArgs {
     #[arg(
+        long = "kubernetes-iron-proxy-ssh-enabled",
+        env = "KUBERNETES_IRON_PROXY_SSH_ENABLED",
+        default_value_t = false
+    )]
+    ssh_enabled: bool,
+    #[arg(
+        long = "kubernetes-iron-proxy-ssh-workspace",
+        env = "KUBERNETES_IRON_PROXY_SSH_WORKSPACE",
+        default_value = "/workspace"
+    )]
+    ssh_workspace: String,
+    /// Stable secret every sandbox's disposable SSH keys are derived from.
+    /// Required when SSH is enabled; at least 32 bytes.
+    #[arg(
+        long = "kubernetes-iron-proxy-ssh-seed",
+        env = "CENTAUR_SSH_SEED",
+        hide_env_values = true
+    )]
+    ssh_seed: Option<String>,
+    #[arg(
         long = "kubernetes-iron-proxy-image",
         env = "KUBERNETES_IRON_PROXY_IMAGE",
         default_value = "centaur-iron-proxy:latest"
@@ -2045,6 +2375,21 @@ struct IronProxyArgs {
 }
 
 impl IronProxyArgs {
+    /// Fails at startup, not at the first sandbox, when SSH is misconfigured.
+    fn ssh_config(&self) -> Result<Option<SshProxyConfig>, ServerError> {
+        if !self.ssh_enabled {
+            return Ok(None);
+        }
+        let seed = self.ssh_seed.as_deref().ok_or_else(|| {
+            ServerError::UnsupportedConfig(
+                "KUBERNETES_IRON_PROXY_SSH_ENABLED requires CENTAUR_SSH_SEED".to_owned(),
+            )
+        })?;
+        SshProxyConfig::new(seed, self.ssh_workspace.clone())
+            .map(Some)
+            .map_err(ServerError::UnsupportedConfig)
+    }
+
     fn to_config(&self) -> Result<IronProxyConfig, ServerError> {
         let (ca_cert_secret_name, ca_key_secret_name) = self.ca.secrets()?;
 
@@ -2077,6 +2422,8 @@ impl IronProxyArgs {
         config.database_namespace =
             non_empty(self.database_namespace.as_deref()).map(ToOwned::to_owned);
         config.database_port = self.database_port;
+        config.ssh = self.ssh_config()?;
+
         self.source.apply_to_config(&mut config);
         config.fragments = harness_fragments;
         config.env_from_secret_names = self.env_from_secret_names();
@@ -2372,6 +2719,10 @@ impl IronProxyHarnessArgs {
         if let Some(fragment) = harness_auth_fragment("meta-ai", "api_key")? {
             fragments.push(fragment);
         }
+        // Pi's `google` provider (Gemini through the Generative Language API).
+        if let Some(fragment) = harness_auth_fragment("google", "api_key")? {
+            fragments.push(fragment);
+        }
         if let Ok(raw) = env::var("CODEX_CUSTOM_PROVIDERS") {
             fragments.extend(custom_provider_auth_fragments(&raw)?);
         }
@@ -2388,6 +2739,7 @@ impl IronProxyHarnessArgs {
 }
 
 const DEFAULT_SANDBOX_IMAGE: &str = "centaur-agent:latest";
+const DEFAULT_CODEMODE_IMAGE: &str = "centaur-codemode:latest";
 /// Where the sandbox image installs the Python workflow host.
 const WORKFLOW_HOST_PATH: &str = "/usr/local/bin/workflow-host";
 
@@ -2396,7 +2748,8 @@ fn harness_fragment_engine_name(engine: &HarnessType) -> &'static str {
         HarnessType::Codex => "codex",
         HarnessType::Amp => "amp",
         HarnessType::ClaudeCode => "claude-code",
-        HarnessType::Nanocodex => "codex",
+        // nanocode uses OpenAI credentials, like Codex.
+        HarnessType::Nanocode => "codex",
         HarnessType::Hermes => "hermes",
         // Pi and OMP default to Anthropic when its key is present.
         HarnessType::Pi | HarnessType::Omp => "claude-code",
@@ -2414,7 +2767,7 @@ fn merge_fragment(target: &mut ProxyFragment, source: ProxyFragment) {
 
 fn harness_auth_mode_env(engine: &HarnessType) -> Option<String> {
     match engine {
-        HarnessType::Codex | HarnessType::Nanocodex => env::var("CODEX_AUTH_MODE").ok(),
+        HarnessType::Codex | HarnessType::Nanocode => env::var("CODEX_AUTH_MODE").ok(),
         HarnessType::ClaudeCode | HarnessType::Pi | HarnessType::Omp => {
             env::var("CLAUDE_CODE_AUTH_MODE").ok()
         }
@@ -2568,24 +2921,52 @@ mod tests {
 
     #[test]
     fn iron_control_registration_retry_policy_is_transient_only() {
-        let status_error = |status| {
-            RegisterError::Control(IronControlError::Status {
-                method: "PUT".to_owned(),
-                path: "/api/v1/static_secrets/example".to_owned(),
-                status,
-                body: String::new(),
+        assert!(should_retry_iron_control_register(&RegisterError::Control(
+            IronControlError::ConsoleDb(centaur_console_db::Error::Database(
+                sqlx::Error::PoolTimedOut
+            ))
+        )));
+        assert!(!should_retry_iron_control_register(
+            &RegisterError::Control(IronControlError::InProcess {
+                operation: "upsert static secret",
+                message: "validation failed".to_owned(),
             })
-        };
-
-        assert!(should_retry_iron_control_register(&status_error(500)));
-        assert!(should_retry_iron_control_register(&status_error(503)));
-        assert!(should_retry_iron_control_register(&status_error(429)));
-        assert!(!should_retry_iron_control_register(&status_error(400)));
+        ));
+        assert!(!should_retry_iron_control_register(
+            &RegisterError::Control(IronControlError::NotFound {
+                resource: "role",
+                ident: "missing".to_owned(),
+            })
+        ));
         assert!(!should_retry_iron_control_register(
             &RegisterError::Translate(centaur_iron_control::TranslateError::Unsupported {
                 what: "unsupported transform".to_owned(),
             })
         ));
+    }
+
+    #[test]
+    fn console_initial_admin_requires_an_email() {
+        let parse = |extra: &[&str]| {
+            let mut argv = vec![
+                "centaur-api-server",
+                "--database-url",
+                "postgres://postgres:postgres@localhost/centaur",
+            ];
+            argv.extend_from_slice(extra);
+            Args::try_parse_from(argv).unwrap().console_initial_admin()
+        };
+        assert!(parse(&[]).is_none());
+        assert!(parse(&["--console-initial-user-email", " "]).is_none());
+        let admin = parse(&[
+            "--console-initial-user-email",
+            "admin@example.com",
+            "--console-initial-user-password",
+            "correct horse battery",
+        ])
+        .expect("an email configures the initial admin");
+        assert_eq!(admin.email, "admin@example.com");
+        assert_eq!(admin.password, "correct horse battery");
     }
 
     #[test]
@@ -2706,6 +3087,32 @@ mod tests {
     }
 
     #[test]
+    fn progress_updates_require_their_feature_flag() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _env = EnvGuard::set(&[("OPENAI_API_KEY", "sk-test")]);
+        let parse = |extra: &[&str]| {
+            let mut argv = vec![
+                "centaur-api-server",
+                "--database-url",
+                "postgres://postgres:postgres@localhost/centaur",
+                "--session-activity-summary-enabled",
+                "true",
+            ];
+            argv.extend_from_slice(extra);
+            Args::try_parse_from(argv)
+                .unwrap()
+                .activity_summary_config()
+                .unwrap()
+                .progress
+        };
+
+        assert!(parse(&[]).is_none());
+        let progress = parse(&["--session-progress-update-enabled", "true"]).unwrap();
+        assert_eq!(progress.after, Duration::from_secs(60));
+        assert_eq!(progress.interval, Duration::from_secs(120));
+    }
+
+    #[test]
     fn activity_summary_preserves_legacy_base_url_when_global_url_is_unset() {
         let _lock = ENV_LOCK.lock().unwrap();
         let _env = EnvGuard::set(&[
@@ -2777,6 +3184,26 @@ mod tests {
         assert_eq!(config.api_key, "sk-mounted");
     }
 
+    #[test]
+    fn codemode_image_defaults_when_missing_or_blank() {
+        let base = [
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+        ];
+        for (flags, expected) in [
+            (vec![], "centaur-codemode:latest"),
+            (vec!["--codemode-image", "   "], "centaur-codemode:latest"),
+            (
+                vec!["--codemode-image", "registry.local/centaur-codemode:tag"],
+                "registry.local/centaur-codemode:tag",
+            ),
+        ] {
+            let args = Args::try_parse_from(base.into_iter().chain(flags)).unwrap();
+            assert_eq!(args.codemode_image(), expected);
+        }
+    }
+
     #[tokio::test]
     async fn session_sandbox_state_volume_requires_opt_in() {
         for flags in [
@@ -2799,8 +3226,6 @@ mod tests {
                     "http://console.local",
                     "--iron-control-proxy-sync-url",
                     "http://proxy-sync.local:8080",
-                    "--iron-control-api-key",
-                    "iak_test",
                     "--iron-control-database-url",
                     "postgres://console@localhost/console",
                 ]
@@ -2825,8 +3250,6 @@ mod tests {
                 "http://console.local",
                 "--iron-control-proxy-sync-url",
                 "http://proxy-sync.local:8080",
-                "--iron-control-api-key",
-                "iak_test",
                 "--iron-control-database-url",
                 "postgres://console@localhost/console",
                 "--session-sandbox-state-volume-enabled",
@@ -2896,8 +3319,6 @@ mod tests {
             "http://console.local",
             "--iron-control-proxy-sync-url",
             "http://proxy-sync.local:8080",
-            "--iron-control-api-key",
-            "iak_test",
             "--iron-control-database-url",
             "postgres://console@localhost/console",
         ])
@@ -2924,8 +3345,6 @@ mod tests {
             "http://console.local:3000",
             "--iron-control-proxy-sync-url",
             "http://proxy-sync.local:8080",
-            "--iron-control-api-key",
-            "iak_test",
             "--iron-control-database-url",
             "postgres://console@localhost/console",
         ])
@@ -2941,6 +3360,45 @@ mod tests {
                 .get("app.kubernetes.io/component"),
             Some(&"console".to_owned())
         );
+    }
+
+    #[test]
+    fn console_pool_needs_at_least_two_connections() {
+        let parse = |max: &str| {
+            Args::try_parse_from([
+                "centaur-api-server",
+                "--database-url",
+                "postgres://postgres:postgres@localhost/centaur",
+                "--iron-control-database-max-connections",
+                max,
+            ])
+        };
+        assert!(parse("1").is_err());
+        assert!(parse("2").is_ok());
+    }
+
+    #[tokio::test]
+    async fn iron_control_requires_the_console_database() {
+        let parse = |extra: &[&str]| {
+            let mut argv = vec![
+                "centaur-api-server",
+                "--database-url",
+                "postgres://postgres:postgres@localhost/centaur",
+            ];
+            argv.extend_from_slice(extra);
+            Args::try_parse_from(argv).unwrap()
+        };
+        assert!(
+            parse(&[
+                "--iron-control-database-url",
+                "postgres://console@localhost/console"
+            ])
+            .sandbox
+            .iron_control
+            .required_client()
+            .is_ok()
+        );
+        assert!(parse(&[]).sandbox.iron_control.required_client().is_err());
     }
 
     #[test]
@@ -2972,8 +3430,6 @@ mod tests {
             "http://console.local:3000",
             "--iron-control-proxy-sync-url",
             "http://proxy-sync.local:8080",
-            "--iron-control-api-key",
-            "iak_test",
         ])
         .unwrap();
 
@@ -2991,8 +3447,6 @@ mod tests {
             "postgres://postgres:postgres@localhost/centaur",
             "--iron-control-url",
             "http://console.local:3000",
-            "--iron-control-api-key",
-            "iak_test",
             "--iron-control-database-url",
             "postgres://console@localhost/console",
         ])
@@ -3014,8 +3468,6 @@ mod tests {
             "http://console.local",
             "--iron-control-proxy-sync-url",
             "http://proxy-sync.local:8080",
-            "--iron-control-api-key",
-            "iak_test",
             "--iron-control-database-url",
             "postgres://console@localhost/console",
             "--kubernetes-tools-repo",
@@ -3163,6 +3615,42 @@ mod tests {
                 && mount.read_only
                 && mount.kind == MountKind::NamedVolume("centaur-repo-cache".to_owned())
         }));
+    }
+
+    #[test]
+    fn discovery_gets_the_passthrough_env_and_enablement_policy() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _env = EnvGuard::set(&[
+            (
+                "SESSION_SANDBOX_PASSTHROUGH_ENV",
+                "ENABLE_FOO_WORKFLOW, UNSET_FLAG",
+            ),
+            ("ENABLE_FOO_WORKFLOW", "false"),
+            ("SLACK_BOT_TOKEN", "xoxb-real"),
+            ("WORKFLOW_ENABLE_MODE", "allowlist"),
+            ("WORKFLOW_ALLOWED_NAMES", "foo"),
+        ]);
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+        ])
+        .unwrap();
+
+        assert_eq!(
+            args.sandbox.discovery_env(),
+            BTreeMap::from([
+                ("ENABLE_FOO_WORKFLOW".to_owned(), "false".to_owned()),
+                ("WORKFLOW_ALLOWED_NAMES".to_owned(), "foo".to_owned()),
+                ("WORKFLOW_ENABLE_MODE".to_owned(), "allowlist".to_owned()),
+            ])
+        );
+        let spec = args.sandbox.workflow_host_spec("prn_test").unwrap();
+        assert!(
+            spec.env
+                .iter()
+                .any(|env| env.name == "ENABLE_FOO_WORKFLOW" && env.value == "false")
+        );
     }
 
     #[test]
@@ -3394,8 +3882,6 @@ mod tests {
                     "http://console.local",
                     "--iron-control-proxy-sync-url",
                     "http://proxy-sync.local:8080",
-                    "--iron-control-api-key",
-                    "iak_test",
                     "--iron-control-database-url",
                     "postgres://console@localhost/console",
                 ]
@@ -3491,6 +3977,99 @@ mod tests {
         assert_eq!(
             args.sandbox.priority_class_name.as_deref(),
             Some("centaur-sandbox")
+        );
+    }
+
+    #[test]
+    fn warm_pools_parse_per_harness_and_repo_cache() {
+        let parse = |extra: &[&str]| {
+            let mut argv = vec![
+                "centaur-api-server",
+                "--database-url",
+                "postgres://postgres:postgres@localhost/centaur",
+                "--session-sandbox-harness",
+                "claudecode",
+                "--session-sandbox-warm-pool-size",
+                "3",
+            ];
+            argv.extend_from_slice(extra);
+            Args::try_parse_from(argv)
+                .unwrap()
+                .sandbox
+                .warm_pool_targets()
+        };
+
+        assert_eq!(
+            parse(&[]).unwrap(),
+            vec![WarmPoolTarget {
+                harness: HarnessType::ClaudeCode,
+                repo_cache: SandboxRepoCacheAccess::All,
+                persona: None,
+                size: 3,
+            }],
+            "the legacy size configures one default-harness pool"
+        );
+        assert_eq!(
+            parse(&[
+                "--session-sandbox-warm-pools",
+                r#"[{"harness":"codex","repoCache":"all","size":2},
+                    {"harness":"codex","repoCache":"public","size":1}]"#,
+            ])
+            .unwrap(),
+            vec![
+                WarmPoolTarget {
+                    harness: HarnessType::Codex,
+                    repo_cache: SandboxRepoCacheAccess::All,
+                    persona: None,
+                    size: 2,
+                },
+                WarmPoolTarget {
+                    harness: HarnessType::Codex,
+                    repo_cache: SandboxRepoCacheAccess::Public,
+                    persona: None,
+                    size: 1,
+                },
+            ]
+        );
+        assert_eq!(
+            parse(&[
+                "--session-sandbox-warm-pools",
+                r#"[{"harness":"codex","repoCache":"all","size":2},
+                    {"harness":"codex","repoCache":"all","persona":"eng","size":1}]"#,
+            ])
+            .unwrap()[1],
+            WarmPoolTarget {
+                harness: HarnessType::Codex,
+                repo_cache: SandboxRepoCacheAccess::All,
+                persona: Some("eng".to_owned()),
+                size: 1,
+            },
+            "a persona splits a pool from its harness and repo-cache pool"
+        );
+        assert!(
+            parse(&[
+                "--session-sandbox-warm-pools",
+                r#"[{"harness":"codex","repoCache":"all","persona":"eng","size":2},
+                    {"harness":"codex","repoCache":"all","persona":"eng","size":1}]"#,
+            ])
+            .is_err(),
+            "duplicate persona pools are rejected"
+        );
+        assert!(
+            parse(&[
+                "--session-sandbox-warm-pools",
+                r#"[{"harness":"codex","repoCache":"all","size":2},
+                    {"harness":"codex","repoCache":"all","size":1}]"#,
+            ])
+            .is_err(),
+            "duplicate pools are rejected"
+        );
+        assert!(
+            parse(&[
+                "--session-sandbox-warm-pools",
+                r#"[{"harness":"codex","repoCache":"some","size":1}]"#,
+            ])
+            .is_err()
         );
     }
 
@@ -3742,6 +4321,55 @@ mod tests {
     }
 
     #[test]
+    fn iron_proxy_ssh_requires_a_valid_seed_at_startup() {
+        let parse = |extra: &[&str]| {
+            let mut argv = vec![
+                "centaur-api-server",
+                "--database-url",
+                "postgres://postgres:postgres@localhost/centaur",
+                "--kubernetes-firewall-ca-secret-name",
+                "centaur-firewall-ca",
+                "--kubernetes-firewall-ca-key-secret-name",
+                "centaur-firewall-ca-key",
+            ];
+            argv.extend_from_slice(extra);
+            Args::try_parse_from(argv).unwrap()
+        };
+
+        let off = parse(&[]).sandbox.iron_proxy.to_config().unwrap();
+        assert!(off.ssh.is_none());
+        assert!(
+            !off.extra_env
+                .keys()
+                .any(|name| name.starts_with("IRON_SSH"))
+        );
+
+        for extra in [
+            &["--kubernetes-iron-proxy-ssh-enabled"][..],
+            &[
+                "--kubernetes-iron-proxy-ssh-enabled",
+                "--kubernetes-iron-proxy-ssh-seed",
+                "too-short",
+            ][..],
+        ] {
+            assert!(parse(extra).sandbox.iron_proxy.to_config().is_err());
+        }
+
+        let on = parse(&[
+            "--kubernetes-iron-proxy-ssh-enabled",
+            "--kubernetes-iron-proxy-ssh-seed",
+            "test-only-seed-with-at-least-32-bytes",
+        ])
+        .sandbox
+        .iron_proxy
+        .to_config()
+        .unwrap();
+        let ssh = on.ssh.expect("SSH enabled");
+        assert!(!format!("{ssh:?}").contains("test-only-seed"));
+        assert!(!on.extra_env.keys().any(|name| name.starts_with("IRON_SSH")));
+    }
+
+    #[test]
     fn iron_proxy_upstream_deny_cidrs_are_parsed() {
         let args = Args::try_parse_from([
             "centaur-api-server",
@@ -3833,8 +4461,6 @@ mod tests {
             "http://console.local",
             "--iron-control-proxy-sync-url",
             "http://proxy-sync.local:8080",
-            "--iron-control-api-key",
-            "iak_test",
             "--iron-control-database-url",
             "postgres://console@localhost/console",
         ])
@@ -3894,8 +4520,6 @@ mod tests {
             "http://console.local",
             "--iron-control-proxy-sync-url",
             "http://proxy-sync.local:8080",
-            "--iron-control-api-key",
-            "iak_test",
             "--iron-control-database-url",
             "postgres://console@localhost/console",
         ])
@@ -3954,16 +4578,16 @@ mod tests {
     }
 
     #[test]
-    fn nanocodex_reuses_the_codex_proxy_fragment() {
+    fn nanocode_reuses_the_codex_proxy_fragment() {
         let _guard = ENV_LOCK.lock().unwrap();
         let _env = EnvGuard::set(&[("CODEX_AUTH_MODE", "access_token")]);
 
         assert_eq!(
-            harness_fragment_engine_name(&HarnessType::Nanocodex),
+            harness_fragment_engine_name(&HarnessType::Nanocode),
             harness_fragment_engine_name(&HarnessType::Codex)
         );
         assert_eq!(
-            harness_auth_mode_env(&HarnessType::Nanocodex).as_deref(),
+            harness_auth_mode_env(&HarnessType::Nanocode).as_deref(),
             Some("access_token")
         );
     }

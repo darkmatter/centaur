@@ -1,6 +1,7 @@
+mod support;
+
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
@@ -9,6 +10,8 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use uuid::Uuid;
+
+use support::write_executable;
 
 const LONG_PROMPT: &str = "Write exactly 24 lines. Each line must be 'LONG_STREAM_DELTA_LINE_N: abcdefghijklmnopqrstuvwxyz 0123456789' where N is 01 through 24. Do not use markdown, bullets, tools, or extra text.";
 
@@ -324,12 +327,7 @@ fn fake_codex_blocks_mode_uses_openrouter_provider_when_model_is_configured() {
     let fake_codex = temp_path("fake-openrouter-codex.sh");
     let fake_codex_log = temp_path("fake-openrouter-codex-requests.jsonl");
     let script = fake_codex_app_server_script(&fake_codex_log);
-    std::fs::write(&fake_codex, script).expect("write fake codex script");
-    let mut permissions = std::fs::metadata(&fake_codex)
-        .expect("fake codex metadata")
-        .permissions();
-    permissions.set_mode(0o755);
-    std::fs::set_permissions(&fake_codex, permissions).expect("chmod fake codex script");
+    write_executable(&fake_codex, script);
 
     let mut bridge = BridgeProcess::spawn_harness_blocks_envs(
         Harness::Codex,
@@ -386,12 +384,7 @@ fn fake_codex_blocks_mode_uses_openrouter_provider_for_explicit_model_slug() {
     let fake_codex = temp_path("fake-openrouter-flag-codex.sh");
     let fake_codex_log = temp_path("fake-openrouter-flag-codex-requests.jsonl");
     let script = fake_codex_app_server_script(&fake_codex_log);
-    std::fs::write(&fake_codex, script).expect("write fake codex script");
-    let mut permissions = std::fs::metadata(&fake_codex)
-        .expect("fake codex metadata")
-        .permissions();
-    permissions.set_mode(0o755);
-    std::fs::set_permissions(&fake_codex, permissions).expect("chmod fake codex script");
+    write_executable(&fake_codex, script);
 
     let mut bridge = BridgeProcess::spawn_harness_blocks(
         Harness::Codex,
@@ -451,12 +444,7 @@ fn fake_codex_blocks_mode_resumes_thread_on_the_configured_model() {
     let fake_codex = temp_path("fake-resume-model-codex.sh");
     let fake_codex_log = temp_path("fake-resume-model-codex-requests.jsonl");
     let script = fake_codex_app_server_script(&fake_codex_log);
-    std::fs::write(&fake_codex, script).expect("write fake codex script");
-    let mut permissions = std::fs::metadata(&fake_codex)
-        .expect("fake codex metadata")
-        .permissions();
-    permissions.set_mode(0o755);
-    std::fs::set_permissions(&fake_codex, permissions).expect("chmod fake codex script");
+    write_executable(&fake_codex, script);
 
     let mut bridge = BridgeProcess::spawn_harness_blocks_envs(
         Harness::Codex,
@@ -510,12 +498,7 @@ fn fake_codex_blocks_mode_uses_bedrock_provider_when_selected() {
     let fake_codex = temp_path("fake-bedrock-codex.sh");
     let fake_codex_log = temp_path("fake-bedrock-codex-requests.jsonl");
     let script = fake_codex_app_server_script(&fake_codex_log);
-    std::fs::write(&fake_codex, script).expect("write fake codex script");
-    let mut permissions = std::fs::metadata(&fake_codex)
-        .expect("fake codex metadata")
-        .permissions();
-    permissions.set_mode(0o755);
-    std::fs::set_permissions(&fake_codex, permissions).expect("chmod fake codex script");
+    write_executable(&fake_codex, script);
 
     let mut bridge = BridgeProcess::spawn_harness_blocks(
         Harness::Codex,
@@ -622,6 +605,129 @@ fn fake_claude_blocks_mode_accepts_user_blocks_by_default() {
             .all(|line| response_id(&serde_json::from_str(line).expect("JSON stdout")).is_none()),
         "blocks mode should emit notifications only, not JSON-RPC responses"
     );
+}
+
+#[test]
+fn blocks_mode_runs_session_prompt_hooks_once_before_the_harness_starts() {
+    // A real overlay hook prints to stdout, which must never reach the protocol
+    // channel. The fake composer records each run and copies the hook output it
+    // is given into the prompt the fake harness reads.
+    let overlay = temp_path("session-prompt-overlay");
+    let hook = overlay.join("services/sandbox/hooks/session-prompt.sh");
+    std::fs::create_dir_all(hook.parent().expect("hook dir")).expect("create hook dir");
+    std::fs::write(&hook, "printf hooked\n").expect("write hook");
+    let prompt = temp_path("session-prompt.md");
+    let runs = temp_path("session-prompt-runs.log");
+    let composer = temp_path("fake-compose-system-prompt.sh");
+    write_executable(
+        &composer,
+        format!(
+            concat!(
+                "#!/bin/sh\n",
+                "echo \"$1 $2 $3\" >> {runs}\n",
+                "cat \"$4\" > {prompt}\n",
+                "echo not-json\n"
+            ),
+            runs = shell_quote(&runs),
+            prompt = shell_quote(&prompt),
+        ),
+    );
+    let fake_claude = format!(
+        concat!(
+            "text=$(cat {prompt}); ",
+            "printf '%s\\n' ",
+            "'{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"claude-session\"}}' ",
+            "\"{{\\\"type\\\":\\\"assistant\\\",\\\"is_partial\\\":false,\\\"message\\\":{{\\\"id\\\":\\\"msg_1\\\",\\\"content\\\":[{{\\\"type\\\":\\\"text\\\",\\\"text\\\":\\\"$text\\\"}}]}}}}\" ",
+            "\"{{\\\"type\\\":\\\"result\\\",\\\"subtype\\\":\\\"success\\\",\\\"result\\\":\\\"$text\\\"}}\""
+        ),
+        prompt = shell_quote(&prompt),
+    );
+    let overlay_path = overlay.to_string_lossy().into_owned();
+    let composer_path = composer.to_string_lossy().into_owned();
+
+    let mut bridge = BridgeProcess::spawn_harness_blocks_envs(
+        Harness::ClaudeCode,
+        Some(fake_claude),
+        None,
+        &[
+            ("CENTAUR_OVERLAY_REPO_DIRS", &overlay_path),
+            ("CENTAUR_COMPOSE_SYSTEM_PROMPT_BIN", &composer_path),
+        ],
+    );
+    let first = bridge.run_blocks_user_turn("first", Duration::from_secs(10));
+    let second = bridge.run_blocks_user_turn("second", Duration::from_secs(10));
+    bridge.finish_successfully();
+
+    assert_completed_turn(&first);
+    assert_eq!(first.text_from_deltas, "hooked");
+    assert_completed_turn(&second);
+    assert_eq!(
+        std::fs::read_to_string(&runs).expect("composer runs"),
+        "--target-prompt AGENTS.md --session-prompt\n"
+    );
+    for path in [&prompt, &runs, &composer] {
+        let _ = std::fs::remove_file(path);
+    }
+    let _ = std::fs::remove_dir_all(&overlay);
+}
+
+#[test]
+fn blocks_mode_recomposes_the_prompt_without_hook_output() {
+    // A warm sandbox composes its prompt at boot; an overlay prompt changed
+    // since then must still reach the first turn, even with no hook to run.
+    let overlay = temp_path("session-prompt-no-hook-overlay");
+    std::fs::create_dir_all(&overlay).expect("create overlay dir");
+    let prompt = temp_path("session-prompt-no-hook.md");
+    std::fs::write(&prompt, "boot").expect("write boot prompt");
+    let runs = temp_path("session-prompt-no-hook-runs.log");
+    let composer = temp_path("fake-compose-system-prompt-no-hook.sh");
+    write_executable(
+        &composer,
+        format!(
+            concat!(
+                "#!/bin/sh\n",
+                "echo \"$*\" >> {runs}\n",
+                "printf recomposed > {prompt}\n"
+            ),
+            runs = shell_quote(&runs),
+            prompt = shell_quote(&prompt),
+        ),
+    );
+    let fake_claude = format!(
+        concat!(
+            "text=$(cat {prompt}); ",
+            "printf '%s\\n' ",
+            "'{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"claude-session\"}}' ",
+            "\"{{\\\"type\\\":\\\"assistant\\\",\\\"is_partial\\\":false,\\\"message\\\":{{\\\"id\\\":\\\"msg_1\\\",\\\"content\\\":[{{\\\"type\\\":\\\"text\\\",\\\"text\\\":\\\"$text\\\"}}]}}}}\" ",
+            "\"{{\\\"type\\\":\\\"result\\\",\\\"subtype\\\":\\\"success\\\",\\\"result\\\":\\\"$text\\\"}}\""
+        ),
+        prompt = shell_quote(&prompt),
+    );
+    let overlay_path = overlay.to_string_lossy().into_owned();
+    let composer_path = composer.to_string_lossy().into_owned();
+
+    let mut bridge = BridgeProcess::spawn_harness_blocks_envs(
+        Harness::ClaudeCode,
+        Some(fake_claude),
+        None,
+        &[
+            ("CENTAUR_OVERLAY_REPO_DIRS", &overlay_path),
+            ("CENTAUR_COMPOSE_SYSTEM_PROMPT_BIN", &composer_path),
+        ],
+    );
+    let first = bridge.run_blocks_user_turn("first", Duration::from_secs(10));
+    bridge.finish_successfully();
+
+    assert_completed_turn(&first);
+    assert_eq!(first.text_from_deltas, "recomposed");
+    assert_eq!(
+        std::fs::read_to_string(&runs).expect("composer runs"),
+        "--target-prompt AGENTS.md\n"
+    );
+    for path in [&prompt, &runs, &composer] {
+        let _ = std::fs::remove_file(path);
+    }
+    let _ = std::fs::remove_dir_all(&overlay);
 }
 
 #[test]
@@ -754,12 +860,7 @@ fn fake_codex_blocks_mode_spawns_app_server_and_translates_user_blocks() {
     let fake_codex = temp_path("fake-codex.sh");
     let fake_codex_log = temp_path("fake-codex-requests.jsonl");
     let script = fake_codex_app_server_script(&fake_codex_log);
-    std::fs::write(&fake_codex, script).expect("write fake codex script");
-    let mut permissions = std::fs::metadata(&fake_codex)
-        .expect("fake codex metadata")
-        .permissions();
-    permissions.set_mode(0o755);
-    std::fs::set_permissions(&fake_codex, permissions).expect("chmod fake codex script");
+    write_executable(&fake_codex, script);
 
     let mut bridge = BridgeProcess::spawn_harness_blocks(
         Harness::Codex,
@@ -819,12 +920,7 @@ fn fake_codex_blocks_mode_queues_active_turns_in_order() {
     let fake_codex = temp_path("fake-queued-codex.sh");
     let fake_codex_log = temp_path("fake-queued-codex-requests.jsonl");
     let script = fake_codex_app_server_script(&fake_codex_log);
-    std::fs::write(&fake_codex, script).expect("write fake codex script");
-    let mut permissions = std::fs::metadata(&fake_codex)
-        .expect("fake codex metadata")
-        .permissions();
-    permissions.set_mode(0o755);
-    std::fs::set_permissions(&fake_codex, permissions).expect("chmod fake codex script");
+    write_executable(&fake_codex, script);
 
     let mut bridge = BridgeProcess::spawn_harness_blocks_envs(
         Harness::Codex,
@@ -887,12 +983,7 @@ fn fake_codex_blocks_mode_interrupts_active_turn() {
     let fake_codex = temp_path("fake-interruptible-codex.sh");
     let fake_codex_log = temp_path("fake-interruptible-codex-requests.jsonl");
     let script = fake_codex_interruptible_app_server_script(&fake_codex_log);
-    std::fs::write(&fake_codex, script).expect("write fake codex script");
-    let mut permissions = std::fs::metadata(&fake_codex)
-        .expect("fake codex metadata")
-        .permissions();
-    permissions.set_mode(0o755);
-    std::fs::set_permissions(&fake_codex, permissions).expect("chmod fake codex script");
+    write_executable(&fake_codex, script);
 
     let mut bridge = BridgeProcess::spawn_harness_blocks(
         Harness::Codex,
@@ -954,12 +1045,7 @@ fn fake_codex_blocks_mode_steers_active_turn() {
     let fake_codex = temp_path("fake-steerable-codex.sh");
     let fake_codex_log = temp_path("fake-steerable-codex-requests.jsonl");
     let script = fake_codex_app_server_script(&fake_codex_log);
-    std::fs::write(&fake_codex, script).expect("write fake codex script");
-    let mut permissions = std::fs::metadata(&fake_codex)
-        .expect("fake codex metadata")
-        .permissions();
-    permissions.set_mode(0o755);
-    std::fs::set_permissions(&fake_codex, permissions).expect("chmod fake codex script");
+    write_executable(&fake_codex, script);
 
     let mut bridge = BridgeProcess::spawn_harness_blocks_envs(
         Harness::Codex,
@@ -1018,17 +1104,275 @@ fn fake_codex_blocks_mode_steers_active_turn() {
     let _ = std::fs::remove_file(fake_codex_log);
 }
 
+/// A fake Claude Code that logs its stdin, answers the first prompt, and
+/// handles the steer it receives as `steer_body` (shell) describes.
+fn fake_claude_steer_script(log: &std::path::Path, steer_body: &str) -> String {
+    format!(
+        concat!(
+            "printf '%s\\n' '{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"claude-session\"}}'; ",
+            "IFS= read -r prompt; printf '%s\\n' \"$prompt\" >> '{log}'; ",
+            "printf '%s\\n' '{{\"type\":\"stream_event\",\"event\":{{\"type\":\"message_start\",\"message\":{{\"id\":\"msg_1\",\"content\":[]}}}}}}'; ",
+            "IFS= read -r steer; printf '%s\\n' \"$steer\" >> '{log}'; ",
+            "uuid=$(printf '%s' \"$steer\" | sed -n 's/.*\"uuid\":\"\\([^\"]*\\)\".*/\\1/p'); ",
+            "replay=\"{{\\\"type\\\":\\\"user\\\",\\\"isReplay\\\":true,\\\"uuid\\\":\\\"$uuid\\\",\\\"message\\\":{{\\\"role\\\":\\\"user\\\",\\\"content\\\":[{{\\\"type\\\":\\\"text\\\",\\\"text\\\":\\\"steer\\\"}}]}}}}\"; ",
+            "{steer_body} ",
+            "while IFS= read -r line; do printf '%s\\n' \"$line\" >> '{log}'; done"
+        ),
+        log = log.display(),
+        steer_body = steer_body,
+    )
+}
+
+fn logged_lines(log: &std::path::Path) -> Vec<Value> {
+    std::fs::read_to_string(log)
+        .expect("read fake stdin log")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("fake stdin JSON"))
+        .collect()
+}
+
+#[test]
+fn fake_claude_blocks_mode_folds_a_steer_into_the_active_turn() {
+    // Claude Code takes the steer in at its next tool result and echoes it,
+    // then ends the turn with one `result` answering both.
+    let log = temp_path("fake-claude-fold-stdin.jsonl");
+    let fake_claude = fake_claude_steer_script(
+        &log,
+        concat!(
+            "printf '%s\\n' \"$replay\" ",
+            "'{\"type\":\"assistant\",\"is_partial\":false,\"message\":{\"id\":\"msg_1\",\"stop_reason\":\"end_turn\",\"content\":[{\"type\":\"text\",\"text\":\"did both\"}]}}' ",
+            "'{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"did both\"}';"
+        ),
+    );
+    let mut bridge =
+        BridgeProcess::spawn_harness_blocks(Harness::ClaudeCode, Some(fake_claude), None);
+    let turn = bridge.run_blocks_steered_turn("start", "also this", Duration::from_secs(10));
+    bridge.finish_successfully();
+
+    assert_completed_turn(&turn);
+    assert_eq!(turn.text_from_deltas, "did both");
+    assert_eq!(turn.turn_completed_count, 1);
+    assert_eq!(
+        turn.user_message_client_ids,
+        vec![None, Some("steer-message-1".to_string())]
+    );
+    let lines = logged_lines(&log);
+    assert_eq!(lines.len(), 2, "stdin={lines:?}");
+    assert_eq!(lines[1]["message"]["content"][0]["text"], "also this");
+    assert!(
+        lines[1]["uuid"]
+            .as_str()
+            .is_some_and(|uuid| !uuid.is_empty())
+    );
+    let _ = std::fs::remove_file(log);
+}
+
+#[test]
+fn fake_claude_blocks_mode_keeps_a_follow_up_steer_answer_in_the_turn() {
+    // No tool result is left to carry the steer, so Claude Code ends its turn
+    // and answers the steer in a follow-up turn of its own; both belong to
+    // the one Centaur turn (and so to the api-rs execution).
+    let log = temp_path("fake-claude-follow-up-stdin.jsonl");
+    let fake_claude = fake_claude_steer_script(
+        &log,
+        concat!(
+            "printf '%s\\n' ",
+            "'{\"type\":\"assistant\",\"is_partial\":false,\"message\":{\"id\":\"msg_1\",\"stop_reason\":\"end_turn\",\"content\":[{\"type\":\"text\",\"text\":\"first part\"}]}}' ",
+            "'{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"first part\"}' ",
+            "'{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"claude-session\"}' ",
+            "\"$replay\" ",
+            "'{\"type\":\"stream_event\",\"event\":{\"type\":\"message_start\",\"message\":{\"id\":\"msg_2\",\"content\":[]}}}' ",
+            "'{\"type\":\"assistant\",\"is_partial\":false,\"message\":{\"id\":\"msg_2\",\"stop_reason\":\"end_turn\",\"content\":[{\"type\":\"text\",\"text\":\"steered\"}]}}' ",
+            "'{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"steered\"}';"
+        ),
+    );
+    let mut bridge =
+        BridgeProcess::spawn_harness_blocks(Harness::ClaudeCode, Some(fake_claude), None);
+    let turn = bridge.run_blocks_steered_turn("start", "also this", Duration::from_secs(10));
+    bridge.finish_successfully();
+
+    assert_completed_turn(&turn);
+    assert_eq!(turn.turn_completed_count, 1);
+    assert!(turn.text_from_deltas.contains("first part"), "{turn:?}");
+    assert!(turn.text_from_deltas.ends_with("steered"), "{turn:?}");
+    assert_eq!(
+        turn.user_message_client_ids,
+        vec![None, Some("steer-message-1".to_string())]
+    );
+    let _ = std::fs::remove_file(log);
+}
+
+#[test]
+fn fake_claude_blocks_mode_resets_turn_state_when_a_held_steer_respawns_the_process() {
+    // The errored turn leaves a native steer unanswered, so the process is
+    // replaced. The held steer's answer must not be swallowed by that dead
+    // process's outstanding-steer state.
+    let log = temp_path("fake-claude-held-steer-respawn-stdin.jsonl");
+    let fake_claude = format!(
+        concat!(
+            "printf '%s\\n' '{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"claude-session\"}}'; ",
+            "while IFS= read -r line; do printf '%s\\n' \"$line\" >> '{log}'; ",
+            "case \"$line\" in ",
+            "*'\"text\":\"steer one\"'*) ",
+            "printf '%s\\n' '{{\"type\":\"assistant\",\"is_partial\":false,\"message\":{{\"id\":\"msg_1\",\"stop_reason\":\"end_turn\",\"content\":[{{\"type\":\"text\",\"text\":\"first part\"}}]}}}}'; ",
+            "sleep 0.5; ",
+            "printf '%s\\n' '{{\"type\":\"result\",\"subtype\":\"error_during_execution\",\"is_error\":true,\"result\":\"boom\"}}';; ",
+            "*'\"text\":\"steer two\"'*) ",
+            "printf '%s\\n' '{{\"type\":\"assistant\",\"is_partial\":false,\"message\":{{\"id\":\"msg_2\",\"stop_reason\":\"end_turn\",\"content\":[{{\"type\":\"text\",\"text\":\"steered\"}}]}}}}'; ",
+            "printf '%s\\n' '{{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"steered\"}}';; ",
+            "esac; done"
+        ),
+        log = log.display(),
+    );
+    let mut bridge =
+        BridgeProcess::spawn_harness_blocks(Harness::ClaudeCode, Some(fake_claude), None);
+    bridge.send(json!({
+        "type": "user",
+        "thread_key": "slack:C123:123.456",
+        "trace_metadata": {"source": "slackbotv2", "action": "execute"},
+        "message": {"role": "user", "content": [{"type": "text", "text": "start"}]},
+    }));
+    bridge.send(json!({
+        "type": "user",
+        "thread_key": "slack:C123:123.456",
+        "trace_metadata": {"source": "session.append_messages", "action": "steer_active_execution"},
+        "client_user_message_id": "steer-message-1",
+        "message": {"role": "user", "content": [{"type": "text", "text": "steer one"}]},
+    }));
+    // The first steer is native; this one arrives after Claude Code's final
+    // assistant message and is held for the next native turn.
+    std::thread::sleep(Duration::from_millis(250));
+    bridge.send(json!({
+        "type": "user",
+        "thread_key": "slack:C123:123.456",
+        "trace_metadata": {"source": "session.append_messages", "action": "steer_active_execution"},
+        "client_user_message_id": "steer-message-2",
+        "message": {"role": "user", "content": [{"type": "text", "text": "steer two"}]},
+    }));
+    let turn = bridge.read_blocks_turn(Instant::now() + Duration::from_secs(10));
+    bridge.finish_successfully();
+
+    assert_eq!(turn.terminal_status.as_deref(), Some("failed"));
+    assert_eq!(turn.terminal_error.as_deref(), Some("boom"), "{turn:?}");
+    assert_eq!(turn.turn_completed_count, 1);
+    assert_eq!(turn.text_from_deltas, "first partsteered");
+    assert_eq!(
+        turn.user_message_client_ids,
+        vec![
+            None,
+            Some("steer-message-1".to_string()),
+            Some("steer-message-2".to_string())
+        ]
+    );
+    let lines = logged_lines(&log);
+    assert_eq!(lines.len(), 3, "stdin={lines:?}");
+    assert_eq!(lines[1]["message"]["content"][0]["text"], "steer one");
+    assert_eq!(lines[2]["message"]["content"][0]["text"], "steer two");
+    let _ = std::fs::remove_file(log);
+}
+
+#[test]
+fn fake_amp_blocks_mode_continues_the_turn_with_a_held_steer() {
+    // Amp's turn ends at its terminal stop, so a steer waits for it and is
+    // sent as Amp's next native turn, which this turn continues into.
+    let log = temp_path("fake-amp-held-steer-stdin.jsonl");
+    let fake_amp = format!(
+        concat!(
+            "printf '%s\\n' '{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"T-amp-session\"}}'; ",
+            "IFS= read -r prompt; printf '%s\\n' \"$prompt\" >> '{log}'; ",
+            "sleep 1; ",
+            "printf '%s\\n' '{{\"type\":\"assistant\",\"is_partial\":false,\"message\":{{\"id\":\"msg_1\",\"stop_reason\":\"end_turn\",\"content\":[{{\"type\":\"text\",\"text\":\"first part\"}}]}}}}'; ",
+            "IFS= read -r steer; printf '%s\\n' \"$steer\" >> '{log}'; ",
+            "printf '%s\\n' '{{\"type\":\"assistant\",\"is_partial\":false,\"message\":{{\"id\":\"msg_2\",\"stop_reason\":\"end_turn\",\"content\":[{{\"type\":\"text\",\"text\":\"steered\"}}]}}}}'; ",
+            "while IFS= read -r line; do printf '%s\\n' \"$line\" >> '{log}'; done"
+        ),
+        log = log.display(),
+    );
+    let mut bridge = BridgeProcess::spawn_harness_blocks(Harness::Amp, Some(fake_amp), None);
+    let turn = bridge.run_blocks_steered_turn("start", "also this", Duration::from_secs(10));
+    bridge.finish_successfully();
+
+    assert_completed_turn(&turn);
+    assert_eq!(turn.turn_completed_count, 1);
+    assert_eq!(turn.text_from_deltas, "first partsteered");
+    assert_eq!(
+        turn.user_message_client_ids,
+        vec![None, Some("steer-message-1".to_string())]
+    );
+    let lines = logged_lines(&log);
+    assert_eq!(lines.len(), 2, "stdin={lines:?}");
+    assert!(
+        lines[1].get("steer").is_none(),
+        "held steer is a plain turn"
+    );
+    assert_eq!(lines[1]["message"]["content"][0]["text"], "also this");
+    let _ = std::fs::remove_file(log);
+}
+
+#[test]
+fn fake_amp_blocks_mode_runs_multiple_held_steers_one_native_turn_at_a_time() {
+    // A second held steer must wait for the first one's native turn instead of
+    // being written to an Amp process that already answered the first.
+    let log = temp_path("fake-amp-held-steers-stdin.jsonl");
+    let fake_amp = format!(
+        concat!(
+            "printf '%s\\n' '{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"T-amp-session\"}}'; ",
+            "IFS= read -r prompt; printf '%s\\n' \"$prompt\" >> '{log}'; ",
+            "sleep 1; ",
+            "printf '%s\\n' '{{\"type\":\"assistant\",\"is_partial\":false,\"message\":{{\"id\":\"msg_1\",\"stop_reason\":\"end_turn\",\"content\":[{{\"type\":\"text\",\"text\":\"first part\"}}]}}}}'; ",
+            "IFS= read -r steer; printf '%s\\n' \"$steer\" >> '{log}'; ",
+            "printf '%s\\n' '{{\"type\":\"assistant\",\"is_partial\":false,\"message\":{{\"id\":\"msg_2\",\"stop_reason\":\"end_turn\",\"content\":[{{\"type\":\"text\",\"text\":\"steered one\"}}]}}}}'; ",
+            "IFS= read -r steer; printf '%s\\n' \"$steer\" >> '{log}'; ",
+            "printf '%s\\n' '{{\"type\":\"assistant\",\"is_partial\":false,\"message\":{{\"id\":\"msg_3\",\"stop_reason\":\"end_turn\",\"content\":[{{\"type\":\"text\",\"text\":\"steered two\"}}]}}}}'; ",
+            "while IFS= read -r line; do printf '%s\\n' \"$line\" >> '{log}'; done"
+        ),
+        log = log.display(),
+    );
+    let mut bridge = BridgeProcess::spawn_harness_blocks(Harness::Amp, Some(fake_amp), None);
+    bridge.send(json!({
+        "type": "user",
+        "thread_key": "slack:C123:123.456",
+        "trace_metadata": {"source": "slackbotv2", "action": "execute"},
+        "message": {"role": "user", "content": [{"type": "text", "text": "start"}]},
+    }));
+    for (index, steer) in ["also this", "and this"].into_iter().enumerate() {
+        bridge.send(json!({
+            "type": "user",
+            "thread_key": "slack:C123:123.456",
+            "trace_metadata": {"source": "session.append_messages", "action": "steer_active_execution"},
+            "client_user_message_id": format!("steer-message-{}", index + 1),
+            "message": {"role": "user", "content": [{"type": "text", "text": steer}]},
+        }));
+    }
+    let turn = bridge.read_blocks_turn(Instant::now() + Duration::from_secs(10));
+    bridge.finish_successfully();
+
+    assert_completed_turn(&turn);
+    assert_eq!(turn.turn_completed_count, 1);
+    assert_eq!(turn.text_from_deltas, "first partsteered onesteered two");
+    assert_eq!(
+        turn.user_message_client_ids,
+        vec![
+            None,
+            Some("steer-message-1".to_string()),
+            Some("steer-message-2".to_string())
+        ]
+    );
+    let lines = logged_lines(&log);
+    assert_eq!(lines.len(), 3, "stdin={lines:?}");
+    for (line, steer) in lines[1..].iter().zip(["also this", "and this"]) {
+        assert!(line.get("steer").is_none(), "held steer is a plain turn");
+        assert_eq!(line["message"]["content"][0]["text"], steer);
+    }
+    let _ = std::fs::remove_file(log);
+}
+
 #[test]
 fn fake_codex_blocks_mode_forwards_traceparent_to_app_server_requests() {
     let fake_codex = temp_path("fake-codex-trace.sh");
     let fake_codex_log = temp_path("fake-codex-trace-requests.jsonl");
     let script = fake_codex_app_server_script(&fake_codex_log);
-    std::fs::write(&fake_codex, script).expect("write fake codex script");
-    let mut permissions = std::fs::metadata(&fake_codex)
-        .expect("fake codex metadata")
-        .permissions();
-    permissions.set_mode(0o755);
-    std::fs::set_permissions(&fake_codex, permissions).expect("chmod fake codex script");
+    write_executable(&fake_codex, script);
 
     let traceparent = "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01";
     let mut bridge = BridgeProcess::spawn_harness_blocks(
@@ -1082,12 +1426,7 @@ fn fake_codex_blocks_mode_forwards_reasoning_as_turn_start_effort() {
     let fake_codex = temp_path("fake-codex-effort.sh");
     let fake_codex_log = temp_path("fake-codex-effort-requests.jsonl");
     let script = fake_codex_app_server_script(&fake_codex_log);
-    std::fs::write(&fake_codex, script).expect("write fake codex script");
-    let mut permissions = std::fs::metadata(&fake_codex)
-        .expect("fake codex metadata")
-        .permissions();
-    permissions.set_mode(0o755);
-    std::fs::set_permissions(&fake_codex, permissions).expect("chmod fake codex script");
+    write_executable(&fake_codex, script);
 
     let mut bridge = BridgeProcess::spawn_harness_blocks(
         Harness::Codex,
@@ -1490,6 +1829,9 @@ struct TurnCapture {
     delta_text_by_item: HashMap<String, String>,
     terminal_status: Option<String>,
     terminal_error: Option<String>,
+    /// `clientId` of each completed userMessage item, in order.
+    user_message_client_ids: Vec<Option<String>>,
+    turn_completed_count: usize,
 }
 
 fn run_bridge_turn(config: BridgeTurnConfig) -> BridgeRun {
@@ -1628,6 +1970,8 @@ impl BridgeProcess {
         for env_key in [
             "CENTAUR_CLAUDE_APP_BRIDGE_COMMAND",
             "CENTAUR_AMP_APP_BRIDGE_COMMAND",
+            "CENTAUR_COMPOSE_SYSTEM_PROMPT_BIN",
+            "CENTAUR_OVERLAY_REPO_DIRS",
             "CODEX_MODEL",
             "CODEX_MODEL_PROVIDER",
             "FAKE_CODEX_TURN_DELAY",
@@ -2266,6 +2610,13 @@ impl TurnCapture {
                     .get("params")
                     .and_then(|params| params.get("item"))
                     .expect("completed item");
+                if item.get("type").and_then(Value::as_str) == Some("userMessage") {
+                    self.user_message_client_ids.push(
+                        item.get("clientId")
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                    );
+                }
                 if item.get("type").and_then(Value::as_str) == Some("agentMessage") {
                     let item_id = item
                         .get("id")
@@ -2280,6 +2631,7 @@ impl TurnCapture {
                 }
             }
             "turn/completed" => {
+                self.turn_completed_count += 1;
                 self.terminal_status = value
                     .pointer("/params/turn/status")
                     .and_then(Value::as_str)
@@ -2708,10 +3060,7 @@ fn fake_codex_handles_resolved_and_unresolved_citations_in_both_modes() {
                 &format!("\"items\":[{sources},{{\"type\":\"agentMessage\""),
             );
         }
-        std::fs::write(&fake_codex, script).expect("write fake codex script");
-        let mut permissions = std::fs::metadata(&fake_codex).unwrap().permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&fake_codex, permissions).unwrap();
+        write_executable(&fake_codex, script);
         let extra_env = Some(("CODEX_BIN", fake_codex.to_str().unwrap()));
         let mut bridge = if blocks {
             BridgeProcess::spawn_harness_blocks(Harness::Codex, None, extra_env)
@@ -2763,7 +3112,10 @@ fn spawn_fake_codex_recovery(name: &str) -> (BridgeProcess, PathBuf, PathBuf) {
     let fake_codex = temp_path(&format!("{name}.sh"));
     let log = temp_path(&format!("{name}-requests.jsonl"));
     let script = fake_codex_app_server_script(&log)
-        .replace("request_id() {", "echo $$ > \"$log.pid\"\n\nrequest_id() {")
+        .replace(
+            "request_id() {",
+            "echo $$ > \"$log.pid\"\nprintf '%s\\n' \"$*\" >> \"$log.args\"\n\nrequest_id() {",
+        )
         .replace(
             "    *'\"method\":\"turn/start\"'*)\n",
             "    *'\"method\":\"turn/start\"'*)\n      case \"$line\" in *'die mid turn'*) exit 7;; esac\n",
@@ -2772,14 +3124,47 @@ fn spawn_fake_codex_recovery(name: &str) -> (BridgeProcess, PathBuf, PathBuf) {
             "      fi\n      ;;",
             "      fi\n      case \"$line\" in *'exit after turn'*) exit 0;; esac\n      ;;",
         );
-    std::fs::write(&fake_codex, script).unwrap();
-    std::fs::set_permissions(&fake_codex, std::fs::Permissions::from_mode(0o755)).unwrap();
+    write_executable(&fake_codex, script);
     let bridge = BridgeProcess::spawn_harness_blocks(
         Harness::Codex,
         None,
         Some(("CODEX_BIN", fake_codex.to_str().unwrap())),
     );
     (bridge, fake_codex, log)
+}
+
+/// Makes the fake app-server report each thread's provider, give every fork a
+/// new id (`<parent>.<provider>`), and stream a turn only on the thread it was
+/// started on, so a harness that keeps using a stale thread id never completes.
+fn track_fake_codex_thread_providers(fake_codex: &Path) {
+    let script = std::fs::read_to_string(fake_codex).unwrap();
+    let provider =
+        r#"provider=$(printf '%s' "$line" | sed -n 's/.*"modelProvider":"\([^" ]*\)".*/\1/p')"#;
+    let thread = r#"tid=$(printf '%s' "$line" | sed -n 's/.*"threadId":"\([^"]*\)".*/\1/p')"#;
+    let script = script
+        .replace(
+            "    *'\"method\":\"thread/start\"'*)\n      id=$(request_id \"$line\")\n      printf '{\"id\":%s,\"result\":{\"thread\":{\"id\":\"thread-1\"}}}\\n' \"$id\"\n",
+            &format!(
+                "    *'\"method\":\"thread/start\"'*)\n      id=$(request_id \"$line\")\n      {provider}\n      printf '{{\"id\":%s,\"result\":{{\"thread\":{{\"id\":\"thread-1\"}},\"modelProvider\":\"%s\"}}}}\\n' \"$id\" \"$provider\"\n"
+            ),
+        )
+        .replace(
+            "    *'\"method\":\"thread/resume\"'*|*'\"method\":\"thread/fork\"'*)\n      id=$(request_id \"$line\")\n      printf '{\"id\":%s,\"result\":{\"thread\":{\"id\":\"thread-1\"}}}\\n' \"$id\"\n",
+            &format!(
+                "    *'\"method\":\"thread/resume\"'*|*'\"method\":\"thread/fork\"'*)\n      id=$(request_id \"$line\")\n      {provider}\n      {thread}\n      case \"$line\" in *'\"method\":\"thread/fork\"'*) tid=\"$tid.$provider\";; esac\n      printf '{{\"id\":%s,\"result\":{{\"thread\":{{\"id\":\"%s\"}},\"modelProvider\":\"%s\"}}}}\\n' \"$id\" \"$tid\" \"$provider\"\n"
+            ),
+        );
+    let turn_start = "    *'\"method\":\"turn/start\"'*)\n";
+    let turn_steer = "    *'\"method\":\"turn/steer\"'*)\n";
+    let (head, rest) = script.split_once(turn_start).unwrap();
+    let (turn, tail) = rest.split_once(turn_steer).unwrap();
+    let turn = turn.replace(r#""threadId":"thread-1""#, r#""threadId":"'"$tid"'""#);
+    let script = format!("{head}{turn_start}      {thread}\n{turn}{turn_steer}{tail}");
+    assert!(
+        script.contains("tid=\"$tid.$provider\""),
+        "fake app-server fork patch did not apply"
+    );
+    write_executable(fake_codex, script);
 }
 
 fn read_requests(log: &Path) -> Vec<Value> {
@@ -2811,6 +3196,152 @@ fn wait_for_fake_codex_exit(log: &Path) {
         assert!(Instant::now() < deadline, "fake codex did not exit");
         thread::sleep(Duration::from_millis(10));
     }
+}
+
+#[test]
+fn fake_codex_blocks_mode_switches_provider_by_forking_the_thread() {
+    let (mut bridge, fake_codex, log) = spawn_fake_codex_recovery("fake-provider-switch");
+    track_fake_codex_thread_providers(&fake_codex);
+    let user_line = |provider: &str, model: &str, text: &str| {
+        json!({
+            "type": "user", "provider": provider, "model": model,
+            "message": {"role": "user", "content": [{"type": "text", "text": text}]},
+        })
+    };
+    for (provider, model, text) in [
+        ("original", "original-model", "continue"),
+        ("other", "other-model", "continue"),
+        // The app-server exits after this turn, so the next one must resume the fork.
+        ("other", "other-model", "exit after turn"),
+        ("other", "other-model", "continue"),
+        ("openai", "default-model", "continue"),
+    ] {
+        assert_completed_turn(
+            &bridge.run_blocks_user_line(user_line(provider, model, text), Duration::from_secs(10)),
+        );
+        if text == "exit after turn" {
+            wait_for_fake_codex_exit(&log);
+        }
+    }
+    bridge.finish_successfully();
+    let requests = read_requests(&log);
+    let thread_ids = |method: &str| {
+        requests
+            .iter()
+            .filter(|request| request["method"] == method)
+            .map(|request| request["params"]["threadId"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(count_method(&requests, "initialize"), 4);
+    assert_eq!(count_method(&requests, "thread/start"), 1);
+    // Codex rejects resuming a thread on another provider; a switch forks it,
+    // and every later request uses the fork's id.
+    assert_eq!(thread_ids("thread/fork"), ["thread-1", "thread-1.other"]);
+    assert_eq!(thread_ids("thread/resume"), ["thread-1.other"]);
+    assert_eq!(
+        thread_ids("turn/start"),
+        [
+            "thread-1",
+            "thread-1.other",
+            "thread-1.other",
+            "thread-1.other",
+            "thread-1.other.openai",
+        ]
+    );
+    let fork = requests
+        .iter()
+        .find(|request| request["method"] == "thread/fork")
+        .unwrap();
+    assert_eq!(fork["params"]["modelProvider"], "other");
+    assert_eq!(fork["params"]["model"], "other-model");
+    // Codex admits input only on the provider its app-server was launched on.
+    let launches = std::fs::read_to_string(format!("{}.args", log.display())).unwrap();
+    assert_eq!(
+        launches.lines().collect::<Vec<_>>(),
+        [
+            r#"app-server --listen stdio:// -c model_provider="original""#,
+            r#"app-server --listen stdio:// -c model_provider="other""#,
+            r#"app-server --listen stdio:// -c model_provider="other""#,
+            r#"app-server --listen stdio:// -c model_provider="openai""#,
+        ]
+    );
+    let _ = std::fs::remove_file(format!("{}.args", log.display()));
+    let _ = std::fs::remove_file(fake_codex);
+    let _ = std::fs::remove_file(log);
+}
+
+#[test]
+fn fake_codex_blocks_mode_resolves_default_provider_for_a_new_model_without_provider() {
+    let (mut bridge, fake_codex, log) = spawn_fake_codex_recovery("fake-provider-default");
+    track_fake_codex_thread_providers(&fake_codex);
+    let user_line = |provider: Option<&str>, model: Option<&str>| {
+        let mut line = json!({
+            "type": "user",
+            "message": {"role": "user", "content": [{"type": "text", "text": "continue"}]},
+        });
+        if let Some(provider) = provider {
+            line["provider"] = json!(provider);
+        }
+        if let Some(model) = model {
+            line["model"] = json!(model);
+        }
+        line
+    };
+    for (provider, model) in [
+        (Some("private"), Some("private-model")),
+        // Same model, no provider: stays on the thread's provider.
+        (None, Some("private-model")),
+        (None, None),
+        // New model, no provider: the harness resolves its default route.
+        (None, Some("default-model")),
+        (None, Some("default-model")),
+    ] {
+        assert_completed_turn(
+            &bridge.run_blocks_user_line(user_line(provider, model), Duration::from_secs(10)),
+        );
+    }
+    bridge.finish_successfully();
+    let requests = read_requests(&log);
+    assert_eq!(count_method(&requests, "thread/start"), 1);
+    assert_eq!(count_method(&requests, "thread/fork"), 1);
+    assert_eq!(count_method(&requests, "turn/start"), 5);
+    let fork = requests
+        .iter()
+        .find(|request| request["method"] == "thread/fork")
+        .unwrap();
+    assert_eq!(fork["params"]["modelProvider"], "openai");
+    assert_eq!(fork["params"]["model"], "default-model");
+    let _ = std::fs::remove_file(fake_codex);
+    let _ = std::fs::remove_file(log);
+}
+
+#[test]
+fn fake_codex_blocks_mode_does_not_send_turn_if_provider_resume_is_unconfirmed() {
+    let (mut bridge, fake_codex, log) = spawn_fake_codex_recovery("fake-provider-unconfirmed");
+    assert_completed_turn(&bridge.run_blocks_user_turn("first", Duration::from_secs(10)));
+    bridge.send(json!({
+        "type": "user", "provider": "other", "model": "other-model",
+        "message": {"role": "user", "content": [{"type": "text", "text": "must not run"}]},
+    }));
+    let value = bridge.read_json(Instant::now() + Duration::from_secs(10));
+    assert_eq!(value["method"], "error", "{value}");
+    assert!(
+        value["params"]["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("did not switch"),
+        "{value}"
+    );
+    assert_eq!(value["params"]["willRetry"], false);
+    assert_eq!(count_method(&read_requests(&log), "turn/start"), 1);
+    assert_completed_turn(
+        &bridge.run_blocks_user_turn("continue original", Duration::from_secs(10)),
+    );
+    bridge.finish_successfully();
+    assert_eq!(count_method(&read_requests(&log), "thread/start"), 1);
+    assert_eq!(count_method(&read_requests(&log), "turn/start"), 2);
+    let _ = std::fs::remove_file(fake_codex);
+    let _ = std::fs::remove_file(log);
 }
 
 #[test]
@@ -2919,7 +3450,7 @@ while IFS= read -r line; do
       id=$(request_id "$line")
       printf '{"id":%s,"result":{"thread":{"id":"thread-1"}}}\n' "$id"
       ;;
-    *'"method":"thread/resume"'*)
+    *'"method":"thread/resume"'*|*'"method":"thread/fork"'*)
       id=$(request_id "$line")
       printf '{"id":%s,"result":{"thread":{"id":"thread-1"}}}\n' "$id"
       ;;
@@ -3061,10 +3592,7 @@ fn fake_codex_blocks_mode_filters_child_and_stale_notifications_across_queued_tu
             "      fi\n      ;;",
             &format!("      fi\n{replay}\n      ;;"),
         );
-    std::fs::write(&fake_codex, script).expect("write fake codex script");
-    let mut permissions = std::fs::metadata(&fake_codex).unwrap().permissions();
-    permissions.set_mode(0o755);
-    std::fs::set_permissions(&fake_codex, permissions).unwrap();
+    write_executable(&fake_codex, script);
     let mut bridge = BridgeProcess::spawn_harness_blocks(
         Harness::Codex,
         None,

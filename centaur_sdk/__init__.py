@@ -8,7 +8,6 @@ from __future__ import annotations
 
 from centaur_sdk.tool_sdk import (
     ToolContext,
-    company_context_database_url,
     current_chat_destination,
     current_discord_thread,
     current_github_thread,
@@ -18,6 +17,8 @@ from centaur_sdk.tool_sdk import (
     current_thread_key,
     get_tool_context,
     reset_tool_context,
+    sandbox_context,
+    sandbox_thread_key,
     save_attachment,
     save_attachment_from_path,
     secret,
@@ -26,7 +27,6 @@ from centaur_sdk.tool_sdk import (
 
 __all__ = [
     "ToolContext",
-    "company_context_database_url",
     "current_chat_destination",
     "current_discord_thread",
     "current_github_thread",
@@ -36,6 +36,8 @@ __all__ = [
     "current_thread_key",
     "get_tool_context",
     "reset_tool_context",
+    "sandbox_context",
+    "sandbox_thread_key",
     "save_attachment",
     "save_attachment_from_path",
     "secret",
